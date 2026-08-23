@@ -16,6 +16,7 @@ use crate::infra::dashboard::{self, LivePanel};
 use crate::infra::history::{residual_net, HistoryStore};
 
 use super::risk::{books_tradable, stable_ok};
+use super::scan::OpportunityTracker;
 
 pub struct Controller {
     cfg: AppConfig,
@@ -28,6 +29,7 @@ pub struct Controller {
     history: Option<HistoryStore>,
     panel: LivePanel,
     pending: HashMap<String, PendingLimit>,
+    scanner: OpportunityTracker,
 }
 
 #[derive(Clone)]
@@ -73,9 +75,14 @@ impl Controller {
             history,
             panel: LivePanel::new(0),
             pending: HashMap::new(),
+            scanner: OpportunityTracker::default(),
         };
         this.bootstrap().await?;
-        this.loop_events().await
+        if this.cfg.scan.enabled {
+            this.loop_scan().await
+        } else {
+            this.loop_events().await
+        }
     }
 
     async fn bootstrap(&mut self) -> Result<()> {
@@ -85,8 +92,13 @@ impl Controller {
         let left = self.adapters[0].list_perps().await?;
         let right = self.adapters[1].list_perps().await?;
         self.pairs = match_pairs(&left, &right);
-        info!(n = self.pairs.len(), "matched perp pairs");
-        for pair in &self.pairs {
+        info!(
+            n = self.pairs.len(),
+            scan = self.cfg.scan.enabled,
+            whitelist = ?self.cfg.pairs.whitelist,
+            "matched perp pairs"
+        );
+        for pair in self.pairs.iter().take(8) {
             info!(
                 pair = %pair.pair_id,
                 left = %pair.legs[0].raw_symbol,
@@ -96,6 +108,9 @@ impl Controller {
                 "pair ready"
             );
         }
+        if self.pairs.len() > 8 {
+            info!(more = self.pairs.len() - 8, "additional pairs omitted from log");
+        }
 
         let (tx, rx) = mpsc::unbounded_channel();
         let left_mkts: Vec<_> = self.pairs.iter().map(|p| p.legs[0].clone()).collect();
@@ -103,9 +118,73 @@ impl Controller {
         self.adapters[0].subscribe_bbo(&left_mkts, tx.clone()).await?;
         self.adapters[1].subscribe_bbo(&right_mkts, tx).await?;
         self.event_rx = Some(rx);
-        let slots = self.pairs.len() * self.pair_stride();
+        let slots = if self.cfg.scan.enabled {
+            self.cfg.scan.watch_top.max(1)
+        } else {
+            self.pairs.len() * self.pair_stride()
+        };
         self.panel = LivePanel::new(slots);
+        self.panel.scan_mode = self.cfg.scan.enabled;
         Ok(())
+    }
+
+    async fn loop_scan(&mut self) -> Result<()> {
+        let mut rx = self.event_rx.take().expect("bootstrap must run first");
+        let mut tick = tokio::time::interval(Duration::from_millis(
+            self.cfg.scan.analysis_interval_ms.max(10),
+        ));
+        loop {
+            tokio::select! {
+                msg = rx.recv() => {
+                    let Some((venue, pair_id, bbo)) = msg else {
+                        break;
+                    };
+                    self.books
+                        .insert((venue.as_str().to_string(), pair_id), bbo);
+                }
+                _ = tick.tick() => {
+                    self.paint_scan();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn paint_scan(&mut self) {
+        let round = self.scanner.evaluate(
+            &self.pairs,
+            &self.books,
+            self.cfg.system.data_freshness_ms,
+            self.cfg.scan.min_spread_pct,
+            Instant::now(),
+        );
+        self.panel.scan_line = dashboard::scan_header(
+            round.universe,
+            round.ready,
+            round.opportunities.len(),
+            self.cfg.scan.min_spread_pct,
+        );
+        self.panel.skip_line =
+            dashboard::scan_skip_line(round.wait, round.stale, round.invalid);
+        let top = self.cfg.scan.watch_top;
+        for i in 0..top {
+            let line = round
+                .opportunities
+                .get(i)
+                .map(|o| {
+                    dashboard::scan_opp_line(
+                        i + 1,
+                        &o.pair_id,
+                        &o.buy,
+                        &o.sell,
+                        o.raw_pct,
+                        o.age_secs(),
+                    )
+                })
+                .unwrap_or_default();
+            self.panel.set(i, line);
+        }
+        self.panel.flush();
     }
 
     async fn loop_events(&mut self) -> Result<()> {

@@ -63,6 +63,9 @@ pub struct LivePanel {
     enabled: bool,
     rows: Vec<String>,
     pub stats: IntentStats,
+    pub scan_mode: bool,
+    pub scan_line: String,
+    pub skip_line: String,
     last_paint: Option<Instant>,
     #[cfg(windows)]
     conout: Option<std::fs::File>,
@@ -75,6 +78,9 @@ impl LivePanel {
                 enabled: false,
                 rows: Vec::new(),
                 stats: IntentStats::default(),
+                scan_mode: false,
+                scan_line: String::new(),
+                skip_line: String::new(),
                 last_paint: None,
                 #[cfg(windows)]
                 conout: None,
@@ -96,6 +102,9 @@ impl LivePanel {
             enabled,
             rows: vec![String::new(); rows],
             stats: IntentStats::default(),
+            scan_mode: false,
+            scan_line: String::new(),
+            skip_line: String::new(),
             last_paint: None,
             #[cfg(windows)]
             conout,
@@ -121,7 +130,12 @@ impl LivePanel {
         self.last_paint = Some(Instant::now());
 
         let mut block = Vec::with_capacity(self.rows.len() + 3);
-        block.extend(self.stats.lines());
+        if self.scan_mode {
+            block.push(self.scan_line.clone());
+            block.push(self.skip_line.clone());
+        } else {
+            block.extend(self.stats.lines());
+        }
         block.push(String::new());
         for row in &self.rows {
             block.push(row.clone());
@@ -286,6 +300,38 @@ pub fn spread_lines(
             kv("res", &fmt_pct(residual), 10)
         ),
     ]
+}
+
+pub fn scan_header(universe: usize, ready: usize, opp: usize, min_raw: Decimal) -> String {
+    format!(
+        "scan  universe={}  ready={}  opp={}  min_raw={:.2}%",
+        universe,
+        ready,
+        opp,
+        min_raw
+    )
+}
+
+pub fn scan_skip_line(wait: usize, stale: usize, invalid: usize) -> String {
+    format!("skip  wait={wait}  stale={stale}  invalid={invalid}")
+}
+
+pub fn scan_opp_line(
+    rank: usize,
+    pair: &str,
+    buy: &str,
+    sell: &str,
+    raw: Decimal,
+    age_secs: f64,
+) -> String {
+    format!(
+        "{rank:<2}  pair={:<14}  buy={:<12}  sell={:<12}  raw={}  age={:.1}s",
+        pair,
+        buy,
+        sell,
+        fmt_pct(raw),
+        age_secs
+    )
 }
 
 pub fn skip_lines(pair: &str, reason: &str) -> [String; 2] {

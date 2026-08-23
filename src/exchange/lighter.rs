@@ -250,12 +250,15 @@ async fn run_ws(
         }
 
         if msg.kind == "connected" && !subscribed {
-            for (market_id, _) in &markets {
+            for (i, (market_id, _)) in markets.iter().enumerate() {
                 let sub = serde_json::json!({
                     "type": "subscribe",
                     "channel": format!("order_book/{market_id}")
                 });
                 write.send(Message::Text(sub.to_string().into())).await?;
+                if i + 1 < markets.len() && (i + 1) % 10 == 0 {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
             }
             subscribed = true;
             info!(

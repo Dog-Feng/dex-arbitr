@@ -8,7 +8,16 @@ venues:
   - lighter_rh
 
 pairs:
-  whitelist: [BTC]
+  # 空 = 两所永续交集全部进入扫描。要只盯少数币时写成 [BTC, ETH]。
+  whitelist: []
+
+# 对齐参考套利监控 V2：毛价差 ≥ 0.1% 记为机会，分析环扫内存盘口。
+# 不改格子、不下单。scan.enabled: false 则回到旧的单币格子监控。
+scan:
+  enabled: true
+  min_spread_pct: "0.1"
+  analysis_interval_ms: 50
+  watch_top: 20
 
 grid:
   # T1：净边达到该值才开第一格。单位是百分比，0.03 = 0.03%

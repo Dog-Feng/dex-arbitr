@@ -18,8 +18,28 @@ pub struct AppConfig {
     pub cost: CostConfig,
     pub history: HistoryConfig,
     pub risk: RiskConfig,
+    #[serde(default = "default_scan")]
+    pub scan: ScanConfig,
     #[serde(skip)]
     pub venue_fees: HashMap<String, VenueFees>,
+}
+
+/// 对齐参考监控 V2：毛价差门槛 + 定时分析环。不改格子、不下单。
+#[derive(Debug, Clone, Deserialize)]
+pub struct ScanConfig {
+    pub enabled: bool,
+    pub min_spread_pct: Decimal,
+    pub analysis_interval_ms: u64,
+    pub watch_top: usize,
+}
+
+fn default_scan() -> ScanConfig {
+    ScanConfig {
+        enabled: true,
+        min_spread_pct: Decimal::new(1, 1),
+        analysis_interval_ms: 50,
+        watch_top: 10,
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -287,5 +307,9 @@ mod tests {
         );
         assert!(cfg.history.enabled);
         assert_eq!(cfg.history.min_points, 10);
+        assert!(cfg.scan.enabled);
+        assert_eq!(cfg.scan.min_spread_pct, dec!(0.1));
+        assert_eq!(cfg.scan.watch_top, 10);
+        assert!(cfg.pairs.whitelist.is_empty());
     }
 }
