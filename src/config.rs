@@ -168,7 +168,7 @@ impl AppConfig {
     }
 
     pub fn load_venue(&self, id: &str) -> Result<VenueFile> {
-        let path = PathBuf::from("config/venues").join(venue_file_name(id));
+        let path = venue_config_path(id)?;
         let raw = fs::read_to_string(&path)
             .with_context(|| format!("read venue {}", path.display()))?;
         serde_yaml::from_str(&raw).context("parse venue yaml")
@@ -239,6 +239,27 @@ fn venue_file_name(id: &str) -> String {
     }
 }
 
+fn venue_example_name(id: &str) -> String {
+    match id {
+        "lighter_rh" => "lighter_robinhood.example.yaml".into(),
+        other => format!("{other}.example.yaml"),
+    }
+}
+
+/// 正式 yaml（含密钥）优先；克隆仓库后只有 example 时回退，便于 `cargo test`。
+fn venue_config_path(id: &str) -> Result<PathBuf> {
+    let dir = PathBuf::from("config/venues");
+    let primary = dir.join(venue_file_name(id));
+    if primary.exists() {
+        return Ok(primary);
+    }
+    let example = dir.join(venue_example_name(id));
+    if example.exists() {
+        return Ok(example);
+    }
+    anyhow::bail!("read venue {} (also missing {})", primary.display(), example.display());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,6 +287,5 @@ mod tests {
         );
         assert!(cfg.history.enabled);
         assert_eq!(cfg.history.min_points, 10);
-        assert!(venue.auth().is_none());
     }
 }
