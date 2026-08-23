@@ -1,0 +1,13 @@
+# 复制为 lighter_robinhood.yaml 后填密钥。不要提交该文件。
+id: lighter_rh
+rest: https://api.rh.lighter.xyz
+ws: wss://api.rh.lighter.xyz/stream
+chain_id: 466324
+quote: USDG
+# Premium：挂单 0.012% / 吃单 0.035%。
+fees:
+  maker: "0.012"
+  taker: "0.035"
+account_index: 0
+api_key_index: 0
+api_key_private_key: ""

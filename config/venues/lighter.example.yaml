@@ -1,0 +1,13 @@
+# 复制为 lighter.yaml 后填密钥。不要提交 lighter.yaml。
+id: lighter
+rest: https://mainnet.zklighter.elliot.ai
+ws: wss://mainnet.zklighter.elliot.ai/stream
+chain_id: 304
+quote: USDC
+# Plus：挂单 / 吃单都是 0.005%。
+fees:
+  maker: "0.005"
+  taker: "0.005"
+account_index: 0
+api_key_index: 0
+api_key_private_key: ""

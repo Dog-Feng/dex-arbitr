@@ -1,0 +1,50 @@
+system:
+  monitor_only: true
+  data_freshness_ms: 3000
+  stable_depeg_bps: 20
+
+venues:
+  - lighter
+  - lighter_rh
+
+pairs:
+  whitelist: [BTC]
+
+grid:
+  # T1：净边达到该值才开第一格。单位是百分比，0.03 = 0.03%
+  initial_spread_threshold: "0.03"
+  # 之后每扩大一格再加一份仓的间隔。第 n 格门槛 = T1 + (n-1) × grid_step
+  # 现在 max_segments=1，这一项还不会加仓，只影响以后开多格
+  grid_step: "0.03"
+  max_segments: 1
+  persistence_ms: 1000
+  base_qty:
+    BTC: "0.001"
+    ETH: "0.02"
+
+# limit_then_market：吃单费率高的一所先挂限价，成交后再对另一所市价。
+# 挂着期间价差不够了就撤；若已经成交，另一边仍市价对冲，避免单边。
+# market_taker：双腿同时市价。limit_maker：双腿限价。
+order:
+  style: limit_then_market
+  limit_timeout_ms: 2000
+
+cost:
+  # 预估滑点按 base_qty 走多档订单簿（买 ask + 卖 bid）。
+  # 本项是上限：走深滑点超过则本轮丢掉该方向。0 = 不设上限。不再当作固定扣减。
+  default_slip_pct: "0.01"
+
+# 对齐参考项目：SQLite 记毛价差，中位数当天然价差。
+# 开仓看 净边 − max(天然, 0) ≥ T1。样本不够时只记录、不开仓。
+history:
+  enabled: true
+  db_path: data/spreads.sqlite
+  sample_interval_secs: 5
+  window_hours: 24
+  min_points: 10
+  max_age_secs: 200
+
+risk:
+  min_book_qty:
+    BTC: "0.001"
+    ETH: "0.01"

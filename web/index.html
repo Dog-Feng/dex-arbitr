@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>DEX 跨所价差 · 静态预览</title>
+  <style>
+    :root {
+      --bg: #0a0e17;
+      --bg2: #0f1420;
+      --panel: #141924;
+      --panel2: #1a2235;
+      --border: #1e2d45;
+      --border2: #253350;
+      --txt: #dde6f0;
+      --mut: #6b82a0;
+      --mut2: #8fa5c0;
+      --grn: #22c55e;
+      --red: #ef4444;
+      --yel: #f59e0b;
+      --pur: #8b5cf6;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: var(--bg);
+      color: var(--txt);
+      font: 14px/1.5 -apple-system, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
+      min-height: 100vh;
+    }
+    .header {
+      display: flex; align-items: center; gap: 14px;
+      padding: 0 20px; height: 52px; background: var(--panel);
+      border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 100;
+    }
+    .header-logo { font-size: 17px; font-weight: 700; letter-spacing: -0.3px; }
+    .header-logo span { color: var(--pur); }
+    .header-sep { width: 1px; height: 20px; background: var(--border2); }
+    .ex-chips { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .header-right { margin-left: auto; display: flex; align-items: center; gap: 10px; }
+    .clock { font-variant-numeric: tabular-nums; color: var(--mut2); font-size: 13px; }
+    .ex-chip {
+      display: inline-flex; align-items: center; gap: 2px;
+      font-size: 12px; font-weight: 700; letter-spacing: .3px;
+      color: var(--mut2); padding: 3px 8px; border-radius: 6px;
+      border: 1px solid var(--border2); background: var(--bg2);
+    }
+    .preview-badge { color: var(--yel) !important; border-color: #f59e0b50 !important; }
+    .hdot {
+      display: inline-block; width: 9px; height: 9px; border-radius: 50%;
+      background: var(--mut); margin-right: 4px; vertical-align: middle;
+    }
+    .hdot.ok { background: var(--grn); box-shadow: 0 0 6px var(--grn); }
+    .conn {
+      display: inline-flex; align-items: center; gap: 6px;
+      font-size: 12px; font-weight: 600; padding: 3px 11px; border-radius: 20px;
+      border: 1px solid var(--border2); color: var(--mut2);
+    }
+    .conn.online { color: #86efac; background: #22c55e14; border-color: #22c55e40; }
+    .conn .cdot { width: 8px; height: 8px; border-radius: 50%; background: var(--grn); box-shadow: 0 0 6px var(--grn); }
+
+    .main-tabs {
+      display: flex; border-bottom: 1px solid var(--border);
+      background: var(--panel); padding: 0 20px;
+    }
+    .tab-btn {
+      padding: 10px 18px; cursor: pointer; font-size: 14px; font-weight: 500;
+      color: var(--mut2); border: none; background: none;
+      border-bottom: 2px solid transparent; margin-bottom: -1px;
+      font-family: inherit;
+    }
+    .tab-btn:hover { color: var(--txt); }
+    .tab-btn.active { color: var(--txt); border-bottom-color: var(--pur); }
+    .tab-panel { display: none; }
+    .tab-panel.active { display: block; }
+
+    .wrap { padding: 16px 20px; max-width: 1600px; margin: 0 auto; }
+    .static-banner {
+      margin-bottom: 14px; padding: 8px 12px; border-radius: 8px;
+      border: 1px dashed #8b5cf650; background: #8b5cf612;
+      color: #c4b5fd; font-size: 13px;
+    }
+    .total-row { display: grid; grid-template-columns: repeat(6, 1fr); gap: 12px; margin-bottom: 14px; }
+    .total-card {
+      background: var(--panel2); border: 1px solid var(--border2);
+      border-radius: 8px; padding: 12px 14px;
+    }
+    .total-card .lbl { font-size: 10px; color: var(--mut2); text-transform: uppercase; letter-spacing: .4px; }
+    .total-card .val { font-size: 20px; font-weight: 700; margin: 3px 0 1px; font-variant-numeric: tabular-nums; }
+    .total-card .sub { font-size: 11px; color: var(--mut); }
+
+    .spread-layout {
+      display: grid;
+      grid-template-columns: minmax(0, 1.35fr) minmax(300px, 0.65fr);
+      gap: 14px; align-items: start;
+    }
+    .stack { display: flex; flex-direction: column; gap: 14px; }
+    .panel {
+      background: var(--panel); border: 1px solid var(--border);
+      border-radius: 10px; padding: 16px;
+    }
+    .panel-table { padding: 0; overflow: hidden; }
+    .panel-title {
+      font-size: 11px; font-weight: 600; letter-spacing: .6px;
+      text-transform: uppercase; color: var(--mut2); margin-bottom: 12px;
+      display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    }
+    .panel-table .panel-title {
+      padding: 14px 16px 12px; margin-bottom: 0; border-bottom: 1px solid var(--border);
+    }
+    .panel-meta { font-size: 12px; font-weight: 400; text-transform: none; letter-spacing: 0; color: var(--mut); }
+    .panel-meta strong { color: var(--mut2); font-weight: 600; }
+
+    .table-scroll { overflow-x: auto; padding: 0 8px 8px; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td {
+      padding: 11px 8px; border-bottom: 1px solid var(--border);
+      vertical-align: middle; white-space: nowrap; text-align: left;
+    }
+    th {
+      color: var(--mut2); font-size: 11px; font-weight: 600;
+      letter-spacing: 0.4px; text-transform: uppercase;
+    }
+    td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+    tbody tr { cursor: pointer; }
+    tbody tr:hover td { background: var(--panel2); }
+    tbody tr.selected td { background: #8b5cf618; }
+    .tape tbody tr { cursor: default; }
+
+    .up { color: var(--grn); }
+    .down { color: var(--red); }
+    .mut { color: var(--mut2); }
+    .sess-tag {
+      display: inline-block; padding: 2px 8px; border-radius: 4px;
+      font-size: 11px; font-weight: 600; background: var(--bg2);
+      border: 1px solid var(--border2); color: var(--mut2);
+    }
+    .sess-tag.open { background: #22c55e14; border-color: #22c55e40; color: #86efac; }
+    .sess-tag.hold { background: #8b5cf614; border-color: #8b5cf640; color: #c4b5fd; }
+    .sess-tag.wait { background: #f59e0b14; border-color: #f59e0b40; color: #fcd34d; }
+
+    .ov-exname {
+      font-size: 12px; font-weight: 700; letter-spacing: .4px; margin-bottom: 10px;
+      display: flex; align-items: center; gap: 8px;
+    }
+    .kv {
+      display: flex; justify-content: space-between; padding: 5px 0;
+      font-size: 12px; border-bottom: 1px dashed var(--border2);
+    }
+    .kv:last-of-type { border-bottom: none; }
+    .kv .lbl { color: var(--mut2); }
+    .kv .val { font-weight: 500; font-variant-numeric: tabular-nums; }
+
+    .cell-flash-up { animation: flashUp 0.7s ease; }
+    .cell-flash-down { animation: flashDown 0.7s ease; }
+    @keyframes flashUp { 0% { background: #22c55e30; } 100% { background: transparent; } }
+    @keyframes flashDown { 0% { background: #ef444430; } 100% { background: transparent; } }
+
+    @media (max-width: 1100px) {
+      .spread-layout, .total-row { grid-template-columns: 1fr 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <header class="header">
+    <div class="header-logo">DEX <span>价差套利</span></div>
+    <div class="header-sep"></div>
+    <div class="ex-chips">
+      <span class="ex-chip"><i class="hdot ok"></i>Lighter</span>
+      <span class="ex-chip"><i class="hdot ok"></i>Lighter RH</span>
+      <span class="ex-chip">SEG-GRID</span>
+      <span class="ex-chip preview-badge">静态预览</span>
+    </div>
+    <div class="header-right">
+      <span class="conn online"><i class="cdot"></i>监控中</span>
+      <span class="clock" id="clock">—</span>
+    </div>
+  </header>
+
+  <nav class="main-tabs">
+    <button class="tab-btn active" data-tab="spread" type="button">价差监控</button>
+    <button class="tab-btn" data-tab="tape" type="button">执行带</button>
+  </nav>
+
+  <div class="wrap">
+    <div class="static-banner">
+      参考 dex-monitor 控制台样式。数字为示意，每 2 秒抖动一次。正式数据由后端推送。
+    </div>
+
+    <section class="tab-panel active" id="tab-spread">
+      <div class="total-row">
+        <div class="total-card"><div class="lbl">匹配对</div><div class="val">2</div><div class="sub">永续 · 白名单</div></div>
+        <div class="total-card"><div class="lbl">最优净边</div><div class="val up" id="best">+0.041%</div><div class="sub">已扣费/滑点</div></div>
+        <div class="total-card"><div class="lbl">当前格子</div><div class="val">T1 / 1</div><div class="sub">max_segments=1</div></div>
+        <div class="total-card"><div class="lbl">对锁敞口</div><div class="val">0.002</div><div class="sub">BTC</div></div>
+        <div class="total-card"><div class="lbl">今日成交</div><div class="val">6</div><div class="sub">双腿</div></div>
+        <div class="total-card"><div class="lbl">稳定币偏离</div><div class="val">1.4</div><div class="sub">bp · 1:1 计价</div></div>
+      </div>
+
+      <div class="spread-layout">
+        <div class="panel panel-table">
+          <div class="panel-title">
+            <span>永续匹配对 · 跨所价差</span>
+            <span class="panel-meta">共 <strong>2</strong> 个 · 更新于 <strong id="last-refresh">—</strong></span>
+          </div>
+          <div class="table-scroll">
+            <table>
+              <thead>
+                <tr>
+                  <th>标的</th>
+                  <th>方向</th>
+                  <th class="num">毛边</th>
+                  <th class="num">净边</th>
+                  <th class="num">格子</th>
+                  <th class="num">目标 / 实际</th>
+                  <th>状态</th>
+                </tr>
+              </thead>
+              <tbody id="pairs">
+                <tr class="selected" data-id="btc">
+                  <td>BTC-USD-PERP</td>
+                  <td>Lighter 买 → RH 卖</td>
+                  <td class="num up">+0.062%</td>
+                  <td class="num up" id="btc-net">+0.041%</td>
+                  <td class="num">T1</td>
+                  <td class="num">0.002 / 0.002</td>
+                  <td><span class="sess-tag hold">持有</span></td>
+                </tr>
+                <tr data-id="eth">
+                  <td>ETH-USD-PERP</td>
+                  <td>RH 买 → Lighter 卖</td>
+                  <td class="num">+0.028%</td>
+                  <td class="num mut" id="eth-net">+0.009%</td>
+                  <td class="num">T0</td>
+                  <td class="num">0 / 0</td>
+                  <td><span class="sess-tag wait">等待 T1</span></td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="stack">
+          <div class="panel">
+            <div class="panel-title">当前持仓</div>
+            <div class="ov-exname" id="pos-title">BTC-USD-PERP</div>
+            <div class="kv"><span class="lbl">多腿</span><span class="val">Lighter 0.002</span></div>
+            <div class="kv"><span class="lbl">空腿</span><span class="val">Robinhood 0.002</span></div>
+            <div class="kv"><span class="lbl">开仓均价</span><span class="val">108420 / 108465</span></div>
+            <div class="kv"><span class="lbl">浮动</span><span class="val up">+3.80</span></div>
+          </div>
+          <div class="panel">
+            <div class="panel-title">交易所</div>
+            <div class="kv"><span class="lbl">Lighter 保证金</span><span class="val">1,240 USDC</span></div>
+            <div class="kv"><span class="lbl">Robinhood 保证金</span><span class="val">980 USDG</span></div>
+            <div class="kv"><span class="lbl">WS / 上次 tick</span><span class="val">已连接 / <span id="tick">380</span>ms</span></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="tab-panel" id="tab-tape">
+      <div class="panel panel-table">
+        <div class="panel-title">
+          <span>执行带 · 最近意图与成交</span>
+          <span class="panel-meta">monitor_only · 双市价</span>
+        </div>
+        <div class="table-scroll">
+          <table class="tape">
+            <thead>
+              <tr>
+                <th>时间</th>
+                <th>动作</th>
+                <th>标的</th>
+                <th>路径</th>
+                <th class="num">数量</th>
+                <th class="num">净边</th>
+                <th>结果</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>11:32:04</td>
+                <td>开仓 T1</td>
+                <td>BTC-USD-PERP</td>
+                <td>Lighter → RH</td>
+                <td class="num">0.002</td>
+                <td class="num up">+0.044%</td>
+                <td><span class="sess-tag open">双腿成交</span></td>
+              </tr>
+              <tr>
+                <td>11:28:17</td>
+                <td>跳过</td>
+                <td>ETH-USD-PERP</td>
+                <td>RH → Lighter</td>
+                <td class="num">0.020</td>
+                <td class="num">+0.011%</td>
+                <td><span class="sess-tag wait">净边低于 T1</span></td>
+              </tr>
+              <tr>
+                <td>11:21:51</td>
+                <td>平仓 T0</td>
+                <td>BTC-USD-PERP</td>
+                <td>反向</td>
+                <td class="num">0.001</td>
+                <td class="num down">+0.008%</td>
+                <td><span class="sess-tag open">双腿成交</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <script>
+    (function () {
+      function $(id) { return document.getElementById(id); }
+      function fmt(n) { return (n >= 0 ? "+" : "") + n.toFixed(3) + "%"; }
+      function flash(el, up) {
+        el.classList.remove("cell-flash-up", "cell-flash-down");
+        void el.offsetWidth;
+        el.classList.add(up ? "cell-flash-up" : "cell-flash-down");
+      }
+      function tickClock() {
+        $("clock").textContent = new Date().toLocaleString("zh-CN", { hour12: false });
+        $("last-refresh").textContent = new Date().toLocaleTimeString("zh-CN", { hour12: false });
+      }
+      function jitter(id, base) {
+        var el = $(id);
+        var n = base + (Math.random() - 0.5) * 0.008;
+        var prev = parseFloat(el.textContent);
+        el.textContent = fmt(n);
+        el.className = "num " + (n >= 0.03 ? "up" : n < 0 ? "down" : "mut");
+        flash(el, n >= prev);
+        return n;
+      }
+      document.querySelectorAll(".tab-btn").forEach(function (btn) {
+        btn.onclick = function () {
+          document.querySelectorAll(".tab-btn").forEach(function (b) { b.classList.remove("active"); });
+          document.querySelectorAll(".tab-panel").forEach(function (p) { p.classList.remove("active"); });
+          btn.classList.add("active");
+          $("tab-" + btn.dataset.tab).classList.add("active");
+        };
+      });
+      document.querySelectorAll("#pairs tr").forEach(function (tr) {
+        tr.onclick = function () {
+          document.querySelectorAll("#pairs tr").forEach(function (r) { r.classList.remove("selected"); });
+          tr.classList.add("selected");
+          $("pos-title").textContent = tr.cells[0].textContent;
+        };
+      });
+      tickClock();
+      setInterval(function () {
+        tickClock();
+        var btc = jitter("btc-net", 0.041);
+        jitter("eth-net", 0.009);
+        $("best").textContent = fmt(btc);
+        $("best").className = "val " + (btc >= 0 ? "up" : "down");
+        $("tick").textContent = String(280 + Math.floor(Math.random() * 180));
+      }, 2000);
+    })();
+  </script>
+</body>
+</html>

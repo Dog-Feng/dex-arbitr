@@ -1,0 +1,14 @@
+/target
+/data
+.env
+config/secrets.yaml
+*.log
+.idea
+.vscode
+
+# 含私钥，只提交 *.example.yaml
+config/venues/*.yaml
+!config/venues/*.example.yaml
+
+# 参考项目本地副本，不进本仓库
+/crypto-trading-open-main
