@@ -103,7 +103,7 @@ impl Controller {
         self.adapters[0].subscribe_bbo(&left_mkts, tx.clone()).await?;
         self.adapters[1].subscribe_bbo(&right_mkts, tx).await?;
         self.event_rx = Some(rx);
-        let slots = self.pairs.len() * (self.cfg.venues.len() + 1);
+        let slots = self.pairs.len() * self.pair_stride();
         self.panel = LivePanel::new(slots);
         Ok(())
     }
@@ -135,12 +135,22 @@ impl Controller {
         Ok(())
     }
 
+    fn pair_stride(&self) -> usize {
+        self.cfg.venues.len() + 2
+    }
+
     fn book_slot(&self, pair_i: usize, venue_i: usize) -> usize {
-        pair_i * (self.cfg.venues.len() + 1) + venue_i
+        pair_i * self.pair_stride() + venue_i
     }
 
     fn spread_slot(&self, pair_i: usize) -> usize {
-        pair_i * (self.cfg.venues.len() + 1) + self.cfg.venues.len()
+        pair_i * self.pair_stride() + self.cfg.venues.len()
+    }
+
+    fn set_spread(&mut self, pair_i: usize, lines: [String; 2]) {
+        let slot = self.spread_slot(pair_i);
+        self.panel.set(slot, lines[0].clone());
+        self.panel.set(slot + 1, lines[1].clone());
     }
 
     fn on_pair(&mut self, pair: &Pair, pair_i: usize) {
@@ -156,14 +166,12 @@ impl Controller {
         };
         if let Err(reason) = books_tradable(&self.cfg, pair, b0, b1) {
             self.panel.stats.bump_skip(reason);
-            self.panel
-                .set(self.spread_slot(pair_i), dashboard::skip_line(&pair.pair_id, reason));
+            self.set_spread(pair_i, dashboard::skip_lines(&pair.pair_id, reason));
             return;
         }
         if !stable_ok(&self.cfg, Decimal::ONE) {
             self.panel.stats.bump_skip("depeg");
-            self.panel
-                .set(self.spread_slot(pair_i), dashboard::skip_line(&pair.pair_id, "depeg"));
+            self.set_spread(pair_i, dashboard::skip_lines(&pair.pair_id, "depeg"));
             return;
         }
 
@@ -178,10 +186,7 @@ impl Controller {
             params.base_qty,
         ) else {
             self.panel.stats.bump_skip("no_spread");
-            self.panel.set(
-                self.spread_slot(pair_i),
-                dashboard::skip_line(&pair.pair_id, "no_spread"),
-            );
+            self.set_spread(pair_i, dashboard::skip_lines(&pair.pair_id, "no_spread"));
             return;
         };
 
@@ -238,9 +243,9 @@ impl Controller {
             );
             match action {
                 LimitWatch::StillWait => {
-                    self.panel.set(
-                        self.spread_slot(pair_i),
-                        dashboard::spread_line(
+                    self.set_spread(
+                        pair_i,
+                        dashboard::spread_lines(
                             &pair.pair_id,
                             net.buy.as_str(),
                             net.sell.as_str(),
@@ -287,9 +292,9 @@ impl Controller {
         }
 
         self.panel.stats.bump_intent(label);
-        self.panel.set(
-            self.spread_slot(pair_i),
-            dashboard::spread_line(
+        self.set_spread(
+            pair_i,
+            dashboard::spread_lines(
                 &pair.pair_id,
                 net.buy.as_str(),
                 net.sell.as_str(),

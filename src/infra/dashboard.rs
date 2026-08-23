@@ -39,20 +39,22 @@ impl IntentStats {
         }
     }
 
-    fn line(&self) -> String {
-        format!(
-            "intent  hold={:<6} open={:<4} close={:<4} skip_send={:<4} skip_stale={:<4} skip_thin={:<4} skip_spread={:<4} cancel_gone={:<4} cancel_to={:<4} late_hedge={:<4}",
-            self.hold,
-            self.open,
-            self.close,
-            self.skip_send,
-            self.skip_stale,
-            self.skip_thin,
-            self.skip_spread,
-            self.cancel_gone,
-            self.cancel_timeout,
-            self.late_hedge
-        )
+    fn lines(&self) -> [String; 2] {
+        [
+            format!(
+                "decide  hold={}  open={}  close={}  skip_send={}",
+                self.hold, self.open, self.close, self.skip_send
+            ),
+            format!(
+                "filter  stale={}  thin={}  spread={}  cancel_gone={}  cancel_to={}  late_hedge={}",
+                self.skip_stale,
+                self.skip_thin,
+                self.skip_spread,
+                self.cancel_gone,
+                self.cancel_timeout,
+                self.late_hedge
+            ),
+        ]
     }
 }
 
@@ -110,8 +112,8 @@ impl LivePanel {
         }
         self.last_paint = Some(Instant::now());
 
-        let mut block = Vec::with_capacity(self.rows.len() + 2);
-        block.push(self.stats.line());
+        let mut block = Vec::with_capacity(self.rows.len() + 3);
+        block.extend(self.stats.lines());
         block.push(String::new());
         for row in &self.rows {
             block.push(row.clone());
@@ -144,18 +146,73 @@ impl Drop for LivePanel {
 }
 
 fn paint_ansi(lines: &[String], painted: bool) {
+    let cols = term_cols();
     let mut out = io::stdout();
-    if painted {
-        let _ = write!(out, "\x1b[{}A", lines.len());
+    if !painted {
+        let _ = write!(out, "\x1b[s");
+    } else {
+        // 回到第一帧原点再清后面，避免折行/日志把旧的 decide 行顶出去。
+        let _ = write!(out, "\x1b[u\x1b[J");
     }
     for line in lines {
-        let _ = write!(out, "\x1b[2K{}\n", pad_line(line));
+        let _ = write!(out, "\x1b[2K{}\n", fit_line(line, cols));
     }
     let _ = out.flush();
 }
 
-fn pad_line(line: &str) -> String {
-    format!("{line:<160}")
+fn term_cols() -> usize {
+    #[cfg(windows)]
+    {
+        if let Some(n) = win_con::width() {
+            return n;
+        }
+    }
+    #[cfg(unix)]
+    {
+        if let Some(n) = unix_cols() {
+            return n;
+        }
+    }
+    120
+}
+
+fn fit_line(line: &str, cols: usize) -> String {
+    let max = cols.saturating_sub(1).max(20);
+    let n = line.chars().count();
+    if n <= max {
+        return line.to_string();
+    }
+    let mut s: String = line.chars().take(max.saturating_sub(1)).collect();
+    s.push('…');
+    s
+}
+
+#[cfg(unix)]
+fn unix_cols() -> Option<usize> {
+    #[repr(C)]
+    struct Winsize {
+        row: u16,
+        col: u16,
+        x: u16,
+        y: u16,
+    }
+    extern "C" {
+        fn ioctl(fd: i32, req: std::os::raw::c_ulong, ws: *mut Winsize) -> i32;
+    }
+    // Linux TIOCGWINSZ. macOS uses a different request; COLUMNS 作兜底。
+    const TIOCGWINSZ: std::os::raw::c_ulong = 0x5413;
+    let mut ws = Winsize {
+        row: 0,
+        col: 0,
+        x: 0,
+        y: 0,
+    };
+    unsafe {
+        if ioctl(1, TIOCGWINSZ, &mut ws) == 0 && ws.col > 0 {
+            return Some(ws.col as usize);
+        }
+    }
+    std::env::var("COLUMNS").ok()?.parse().ok()
 }
 
 fn write_raw(s: &str) {
@@ -170,11 +227,11 @@ fn write_raw(s: &str) {
 }
 
 pub fn fmt_pct(v: Decimal) -> String {
-    let v = v.round_dp(6);
+    let v = v.round_dp(4);
     if v < Decimal::ZERO {
-        format!("{v:.6}%")
+        format!("{v:.4}%")
     } else {
-        format!("+{v:.6}%")
+        format!("+{v:.4}%")
     }
 }
 
@@ -190,18 +247,11 @@ pub fn book_line(
     bid_qty: Decimal,
     ask_qty: Decimal,
 ) -> String {
-    [
-        kv("venue", venue, 10),
-        kv("pair", pair, 12),
-        kv("bid", &format!("{bid}"), 12),
-        kv("ask", &format!("{ask}"), 12),
-        kv("bid_qty", &format!("{bid_qty}"), 10),
-        kv("ask_qty", &format!("{ask_qty}"), 10),
-    ]
-    .join("  ")
+    format!("{venue:<10} {pair:<12} bid={bid}  ask={ask}  bq={bid_qty}  aq={ask_qty}")
 }
 
-pub fn spread_line(
+/// 价差拆成两短行，避免 80 列终端折行后把旧的 intent 留在屏幕上。
+pub fn spread_lines(
     pair: &str,
     buy: &str,
     sell: &str,
@@ -213,7 +263,7 @@ pub fn spread_line(
     points: usize,
     min_points: usize,
     intent: &str,
-) -> String {
+) -> [String; 2] {
     let nat = natural.map(fmt_pct).unwrap_or_else(|| "--".to_string());
     let pts = if natural.is_some() {
         points.to_string()
@@ -221,32 +271,40 @@ pub fn spread_line(
         format!("{points}/{min_points}")
     };
     [
-        kv("pair", pair, 12),
-        kv("buy", buy, 10),
-        kv("sell", sell, 10),
-        kv("raw", &fmt_pct(raw), 11),
-        kv("slip", &fmt_pct(slip), 11),
-        kv("net", &fmt_pct(net), 11),
-        kv("nat", &nat, 11),
-        kv("res", &fmt_pct(residual), 11),
-        kv("pts", &pts, 7),
-        kv("intent", intent, 8),
+        format!(
+            "{}  {}  {}  {}  {}",
+            kv("pair", pair, 12),
+            kv("buy", buy, 10),
+            kv("sell", sell, 10),
+            kv("intent", intent, 8),
+            kv("pts", &pts, 7)
+        ),
+        format!(
+            "{}  {}  {}  {}  {}",
+            kv("raw", &fmt_pct(raw), 10),
+            kv("slip", &fmt_pct(slip), 10),
+            kv("net", &fmt_pct(net), 10),
+            kv("nat", &nat, 10),
+            kv("res", &fmt_pct(residual), 10)
+        ),
     ]
-    .join("  ")
 }
 
-pub fn skip_line(pair: &str, reason: &str) -> String {
-    format!(
-        "{}  {}  {}",
-        kv("pair", pair, 12),
-        kv("intent", "skip", 8),
-        kv("note", reason, 12)
-    )
+pub fn skip_lines(pair: &str, reason: &str) -> [String; 2] {
+    [
+        format!(
+            "{}  {}  {}",
+            kv("pair", pair, 12),
+            kv("intent", "skip", 8),
+            kv("note", reason, 12)
+        ),
+        String::new(),
+    ]
 }
 
 #[cfg(windows)]
 mod win_con {
-    use super::pad_line;
+    use super::fit_line;
     use std::fs::{File, OpenOptions};
     use std::io::Write;
     use std::os::windows::fs::OpenOptionsExt;
@@ -305,13 +363,24 @@ mod win_con {
     }
 
     pub fn cursor_y(file: &File) -> Option<i16> {
+        info(file).map(|i| i.cursor.y)
+    }
+
+    pub fn width() -> Option<usize> {
+        let file = open()?;
+        let info = info(&file)?;
+        let cols = info.size.x as usize;
+        (cols > 0).then_some(cols)
+    }
+
+    fn info(file: &File) -> Option<ConsoleScreenBufferInfo> {
         unsafe {
             let h = file.as_raw_handle() as isize;
             let mut info = std::mem::zeroed();
             if GetConsoleScreenBufferInfo(h, &mut info) == 0 {
                 return None;
             }
-            Some(info.cursor.y)
+            Some(info)
         }
     }
 
@@ -320,8 +389,10 @@ mod win_con {
             let h = file.as_raw_handle() as isize;
             let _ = SetConsoleCursorPosition(h, Coord { x: 0, y: origin_y });
         }
+        let cols = info(file).map(|i| i.size.x as usize).unwrap_or(120);
+        let _ = write!(file, "\x1b[J");
         for line in lines {
-            let _ = write!(file, "{}\r\n", pad_line(line));
+            let _ = write!(file, "\x1b[2K{}\r\n", fit_line(line, cols));
         }
         let _ = file.flush();
     }

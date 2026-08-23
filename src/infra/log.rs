@@ -13,6 +13,7 @@ pub fn init_log() {
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
+        .with_writer(std::io::stderr)
         .with_target(false)
         .with_timer(LocalHms)
         .compact()
