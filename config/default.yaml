@@ -2,13 +2,16 @@ system:
   monitor_only: true
   data_freshness_ms: 3000
   stable_depeg_bps: 20
+  # 文本日志按天滚动。Linux 拷回：scp user@host:/opt/dex-arbitr/data/logs/*.log .
+  log_dir: data/logs
 
 venues:
   - lighter
   - lighter_rh
+  - sodex
 
 pairs:
-  # 空 = 两所永续交集全部进入扫描。要只盯少数币时写成 [BTC, ETH]。
+  # 空 = 各所两两交集全部进入扫描。要只盯少数币时写成 [BTC, ETH]。
   whitelist: []
 
 # 对齐参考套利监控 V2：毛价差 ≥ 0.1% 记为机会，分析环扫内存盘口。
@@ -18,6 +21,10 @@ scan:
   min_spread_pct: "0.1"
   analysis_interval_ms: 50
   watch_top: 20
+  # SoDEX 与 Lighter 不同链，raw 里常有天然基差。true = 跨 DEX 上榜看 residual = raw − max(nat,0)
+  cross_use_natural: true
+  # 控制台和文件同一套：只打每个币的关键行。上榜/下榜立刻记，仍在榜上至少隔这么多秒。
+  log_interval_secs: 30
 
 grid:
   # T1：净边达到该值才开第一格。单位是百分比，0.03 = 0.03%

@@ -4,7 +4,8 @@ use rust_decimal::Decimal;
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
-use crate::domain::{spread::raw_spread_pct, Bbo, Pair, VenueId};
+use crate::domain::{is_cross_dex, spread::raw_spread_pct, Bbo, Pair, VenueId};
+use crate::infra::history::{residual_net, HistoryStore};
 
 #[derive(Debug, Clone)]
 pub struct ScanOpportunity {
@@ -12,6 +13,9 @@ pub struct ScanOpportunity {
     pub buy: String,
     pub sell: String,
     pub raw_pct: Decimal,
+    pub nat_pct: Option<Decimal>,
+    pub residual_pct: Decimal,
+    pub cross_dex: bool,
     pub price_buy: Decimal,
     pub price_sell: Decimal,
     pub first_seen: Instant,
@@ -34,6 +38,7 @@ pub struct ScanRound {
     pub wait: usize,
     pub stale: usize,
     pub invalid: usize,
+    pub cross_hold: usize,
     pub opportunities: Vec<ScanOpportunity>,
 }
 
@@ -115,8 +120,47 @@ impl OpportunityTracker {
         self.live.retain(|k, _| current_keys.contains(k));
         round
             .opportunities
-            .sort_by(|a, b| b.raw_pct.cmp(&a.raw_pct));
+            .sort_by(|a, b| b.residual_pct.cmp(&a.residual_pct));
         round
+    }
+
+    /// 跨 DEX：样本够了才按 residual = raw − max(nat,0) 上榜；同协议家族仍看 raw。
+    pub fn apply_cross_natural(
+        round: &mut ScanRound,
+        history: Option<&HistoryStore>,
+        min_spread_pct: Decimal,
+        min_points: usize,
+        enabled: bool,
+    ) {
+        if !enabled {
+            return;
+        }
+        let mut kept = Vec::new();
+        for mut o in round.opportunities.drain(..) {
+            if !o.cross_dex {
+                kept.push(o);
+                continue;
+            }
+            let Some(store) = history else {
+                round.cross_hold += 1;
+                continue;
+            };
+            let Some(nat) = store.natural(&o.pair_id, &o.buy, &o.sell) else {
+                round.cross_hold += 1;
+                continue;
+            };
+            if nat.points < min_points {
+                round.cross_hold += 1;
+                continue;
+            }
+            o.nat_pct = Some(nat.value);
+            o.residual_pct = residual_net(o.raw_pct, nat.value);
+            if o.residual_pct >= min_spread_pct {
+                kept.push(o);
+            }
+        }
+        kept.sort_by(|a, b| b.residual_pct.cmp(&a.residual_pct));
+        round.opportunities = kept;
     }
 }
 
@@ -145,11 +189,15 @@ fn push_if_hit(
     let key = opportunity_key(pair_id, buy.as_str(), sell.as_str());
     current_keys.insert(key.clone());
     let first_seen = *live.entry(key).or_insert(now);
+    let cross = is_cross_dex(buy.as_str(), sell.as_str());
     out.push(ScanOpportunity {
         pair_id: pair_id.to_string(),
         buy: buy.as_str().to_string(),
         sell: sell.as_str().to_string(),
         raw_pct: raw,
+        nat_pct: None,
+        residual_pct: raw,
+        cross_dex: cross,
         price_buy: buy_book.ask,
         price_sell: sell_book.bid,
         first_seen,

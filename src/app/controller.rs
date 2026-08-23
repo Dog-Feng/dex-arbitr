@@ -1,6 +1,6 @@
 use anyhow::Result;
 use rust_decimal::Decimal;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -8,10 +8,11 @@ use tracing::{info, warn};
 
 use crate::config::AppConfig;
 use crate::domain::{
-    match_pairs, Bbo, GridEngine, Intent, Pair, Position, VenueId,
+    is_cross_dex, match_all_pairs, Bbo, GridEngine, Intent, Pair, Position, VenueId, VenueMarket,
 };
+use crate::domain::spread::raw_spread_pct;
 use crate::exec::{plan_hedge, watch_resting_limit, LimitWatch, best_sequenced_spread, HedgePlan};
-use crate::exchange::{ExchangePort, LighterAdapter};
+use crate::exchange::{make_adapter, ExchangePort};
 use crate::infra::dashboard::{self, LivePanel};
 use crate::infra::history::{residual_net, HistoryStore};
 
@@ -30,6 +31,16 @@ pub struct Controller {
     panel: LivePanel,
     pending: HashMap<String, PendingLimit>,
     scanner: OpportunityTracker,
+    last_token_log: HashMap<String, LoggedToken>,
+}
+
+struct LoggedToken {
+    pair_id: String,
+    buy: String,
+    sell: String,
+    raw: Decimal,
+    residual: Decimal,
+    at: Instant,
 }
 
 #[derive(Clone)]
@@ -43,19 +54,26 @@ impl Controller {
         let mut adapters: Vec<Arc<dyn ExchangePort>> = Vec::new();
         for id in &cfg.venues {
             let venue = cfg.load_venue(id)?;
-            match venue.auth() {
-                Some(auth) if auth.is_ready() => tracing::info!(
-                    venue = id,
-                    account_index = auth.account_index,
-                    api_key_index = auth.api_key_index,
-                    "signing keys loaded"
-                ),
-                _ => tracing::info!(venue = id, "no signing keys; monitor_only still works"),
+            if venue.keys_ready() {
+                if venue.id == "sodex" {
+                    tracing::info!(
+                        venue = id,
+                        account_id = venue.account_index,
+                        api_key_name = %venue.api_key_name,
+                        "sodex keys loaded"
+                    );
+                } else {
+                    tracing::info!(
+                        venue = id,
+                        account_index = venue.account_index,
+                        api_key_index = venue.api_key_index,
+                        "signing keys loaded"
+                    );
+                }
+            } else {
+                tracing::info!(venue = id, "no signing keys; monitor_only still works");
             }
-            adapters.push(Arc::new(LighterAdapter::new(
-                venue,
-                cfg.pairs.whitelist.clone(),
-            )));
+            adapters.push(make_adapter(venue, cfg.pairs.whitelist.clone()));
         }
         let history = if cfg.history.enabled {
             let store = HistoryStore::open(cfg.history.clone())?;
@@ -76,6 +94,7 @@ impl Controller {
             panel: LivePanel::new(0),
             pending: HashMap::new(),
             scanner: OpportunityTracker::default(),
+            last_token_log: HashMap::new(),
         };
         this.bootstrap().await?;
         if this.cfg.scan.enabled {
@@ -87,43 +106,53 @@ impl Controller {
 
     async fn bootstrap(&mut self) -> Result<()> {
         if self.adapters.len() < 2 {
-            anyhow::bail!("need two venues");
+            anyhow::bail!("need at least two venues");
         }
-        let left = self.adapters[0].list_perps().await?;
-        let right = self.adapters[1].list_perps().await?;
-        self.pairs = match_pairs(&left, &right);
+        let mut books = Vec::new();
+        for adapter in &self.adapters {
+            books.push(adapter.list_perps().await?);
+        }
+        self.pairs = match_all_pairs(&books);
         info!(
             n = self.pairs.len(),
+            venues = self.adapters.len(),
             scan = self.cfg.scan.enabled,
             whitelist = ?self.cfg.pairs.whitelist,
             "matched perp pairs"
         );
-        for pair in self.pairs.iter().take(8) {
-            info!(
-                pair = %pair.pair_id,
-                left = %pair.legs[0].raw_symbol,
-                left_market_index = pair.legs[0].market_index,
-                right = %pair.legs[1].raw_symbol,
-                right_market_index = pair.legs[1].market_index,
-                "pair ready"
-            );
+        for i in 0..self.adapters.len() {
+            for j in (i + 1)..self.adapters.len() {
+                let left = self.adapters[i].id();
+                let right = self.adapters[j].id();
+                let n = self
+                    .pairs
+                    .iter()
+                    .filter(|p| {
+                        let a = p.legs[0].venue.as_str();
+                        let b = p.legs[1].venue.as_str();
+                        (a == left.as_str() && b == right.as_str())
+                            || (a == right.as_str() && b == left.as_str())
+                    })
+                    .count();
+                info!(
+                    left = left.as_str(),
+                    right = right.as_str(),
+                    n,
+                    "venue pair intersection"
+                );
+            }
         }
-        if self.pairs.len() > 8 {
-            info!(more = self.pairs.len() - 8, "additional pairs omitted from log");
-        }
-
         let (tx, rx) = mpsc::unbounded_channel();
-        let left_mkts: Vec<_> = self.pairs.iter().map(|p| p.legs[0].clone()).collect();
-        let right_mkts: Vec<_> = self.pairs.iter().map(|p| p.legs[1].clone()).collect();
-        self.adapters[0].subscribe_bbo(&left_mkts, tx.clone()).await?;
-        self.adapters[1].subscribe_bbo(&right_mkts, tx).await?;
+        for adapter in &self.adapters {
+            let mkts = markets_for_venue(&self.pairs, &adapter.id());
+            adapter.subscribe_bbo(&mkts, tx.clone()).await?;
+        }
         self.event_rx = Some(rx);
-        let slots = if self.cfg.scan.enabled {
-            self.cfg.scan.watch_top.max(1)
+        if self.cfg.scan.enabled {
+            self.panel = LivePanel::new(0);
         } else {
-            self.pairs.len() * self.pair_stride()
-        };
-        self.panel = LivePanel::new(slots);
+            self.panel = LivePanel::new(self.pairs.len() * self.pair_stride());
+        }
         self.panel.scan_mode = self.cfg.scan.enabled;
         Ok(())
     }
@@ -151,40 +180,119 @@ impl Controller {
     }
 
     fn paint_scan(&mut self) {
-        let round = self.scanner.evaluate(
+        self.sample_scan_history();
+        let mut round = self.scanner.evaluate(
             &self.pairs,
             &self.books,
             self.cfg.system.data_freshness_ms,
             self.cfg.scan.min_spread_pct,
             Instant::now(),
         );
-        self.panel.scan_line = dashboard::scan_header(
-            round.universe,
-            round.ready,
-            round.opportunities.len(),
+        super::scan::OpportunityTracker::apply_cross_natural(
+            &mut round,
+            self.history.as_ref(),
             self.cfg.scan.min_spread_pct,
+            self.cfg.history.min_points,
+            self.cfg.scan.cross_use_natural,
         );
-        self.panel.skip_line =
-            dashboard::scan_skip_line(round.wait, round.stale, round.invalid);
-        let top = self.cfg.scan.watch_top;
-        for i in 0..top {
-            let line = round
-                .opportunities
-                .get(i)
-                .map(|o| {
-                    dashboard::scan_opp_line(
-                        i + 1,
-                        &o.pair_id,
-                        &o.buy,
-                        &o.sell,
-                        o.raw_pct,
-                        o.age_secs(),
-                    )
-                })
-                .unwrap_or_default();
-            self.panel.set(i, line);
+        self.emit_token_lines(&round);
+    }
+
+    fn sample_scan_history(&self) {
+        let Some(store) = &self.history else {
+            return;
+        };
+        for pair in &self.pairs {
+            let v0 = pair.legs[0].venue.as_str();
+            let v1 = pair.legs[1].venue.as_str();
+            let Some(b0) = self.books.get(&(v0.to_string(), pair.pair_id.clone())) else {
+                continue;
+            };
+            let Some(b1) = self.books.get(&(v1.to_string(), pair.pair_id.clone())) else {
+                continue;
+            };
+            if !b0.is_fresh(self.cfg.system.data_freshness_ms)
+                || !b1.is_fresh(self.cfg.system.data_freshness_ms)
+                || !b0.valid()
+                || !b1.valid()
+            {
+                continue;
+            }
+            if !is_cross_dex(v0, v1) {
+                continue;
+            }
+            for (buy, sell, bb, sb) in [
+                (v0, v1, b0, b1),
+                (v1, v0, b1, b0),
+            ] {
+                let Some(raw) = raw_spread_pct(bb.ask, sb.bid) else {
+                    continue;
+                };
+                if let Err(err) = store.maybe_sample(&pair.pair_id, buy, sell, raw, raw) {
+                    warn!(error = %err, pair = %pair.pair_id, "scan history sample failed");
+                }
+            }
         }
-        self.panel.flush();
+    }
+
+    fn emit_token_lines(&mut self, round: &super::scan::ScanRound) {
+        let interval = Duration::from_secs(self.cfg.scan.log_interval_secs.max(5));
+        let min_change = Decimal::new(5, 2);
+        let mut live = HashSet::new();
+        let now = Instant::now();
+        for o in &round.opportunities {
+            let key = o.key();
+            live.insert(key.clone());
+            let due = match self.last_token_log.get(&key) {
+                None => true,
+                Some(prev) => {
+                    prev.at.elapsed() >= interval
+                        || (prev.raw - o.raw_pct).abs() >= min_change
+                        || (prev.residual - o.residual_pct).abs() >= min_change
+                }
+            };
+            if !due {
+                continue;
+            }
+            info!(
+                "{}",
+                dashboard::token_key_line(
+                    &o.pair_id,
+                    &o.buy,
+                    &o.sell,
+                    o.raw_pct,
+                    o.nat_pct,
+                    o.residual_pct,
+                    o.cross_dex,
+                    o.age_secs(),
+                )
+            );
+            self.last_token_log.insert(
+                key,
+                LoggedToken {
+                    pair_id: o.pair_id.clone(),
+                    buy: o.buy.clone(),
+                    sell: o.sell.clone(),
+                    raw: o.raw_pct,
+                    residual: o.residual_pct,
+                    at: now,
+                },
+            );
+        }
+        let gone: Vec<String> = self
+            .last_token_log
+            .keys()
+            .filter(|k| !live.contains(*k))
+            .cloned()
+            .collect();
+        for key in gone {
+            if let Some(prev) = self.last_token_log.remove(&key) {
+                info!(
+                    "{}",
+                    dashboard::token_gone_line(&prev.pair_id, &prev.buy, &prev.sell)
+                );
+            }
+        }
     }
 
     async fn loop_events(&mut self) -> Result<()> {
@@ -420,6 +528,19 @@ impl Controller {
         }
         warn!("live send is disabled until signer is wired");
     }
+}
+
+fn markets_for_venue(pairs: &[Pair], venue: &VenueId) -> Vec<VenueMarket> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for pair in pairs {
+        for leg in &pair.legs {
+            if &leg.venue == venue && seen.insert(leg.pair_id.clone()) {
+                out.push(leg.clone());
+            }
+        }
+    }
+    out
 }
 
 fn intent_label(intent: &Intent) -> &'static str {

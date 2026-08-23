@@ -312,8 +312,46 @@ pub fn scan_header(universe: usize, ready: usize, opp: usize, min_raw: Decimal) 
     )
 }
 
-pub fn scan_skip_line(wait: usize, stale: usize, invalid: usize) -> String {
-    format!("skip  wait={wait}  stale={stale}  invalid={invalid}")
+pub fn scan_skip_line(wait: usize, stale: usize, invalid: usize, cross_hold: usize) -> String {
+    format!("skip  wait={wait}  stale={stale}  invalid={invalid}  cross_hold={cross_hold}")
+}
+
+/// 控制台和文件共用的代币关键行。
+pub fn token_key_line(
+    pair: &str,
+    buy: &str,
+    sell: &str,
+    raw: Decimal,
+    nat: Option<Decimal>,
+    residual: Decimal,
+    cross_dex: bool,
+    age_secs: f64,
+) -> String {
+    if cross_dex {
+        format!(
+            "pair={} buy={} sell={} raw={} nat={} res={} age={:.1}s",
+            pair,
+            buy,
+            sell,
+            fmt_pct(raw),
+            nat.map(fmt_pct).unwrap_or_else(|| "-".into()),
+            fmt_pct(residual),
+            age_secs
+        )
+    } else {
+        format!(
+            "pair={} buy={} sell={} raw={} age={:.1}s",
+            pair,
+            buy,
+            sell,
+            fmt_pct(raw),
+            age_secs
+        )
+    }
+}
+
+pub fn token_gone_line(pair: &str, buy: &str, sell: &str) -> String {
+    format!("pair={pair} buy={buy} sell={sell} gone")
 }
 
 pub fn scan_opp_line(
@@ -322,16 +360,32 @@ pub fn scan_opp_line(
     buy: &str,
     sell: &str,
     raw: Decimal,
+    nat: Option<Decimal>,
+    residual: Decimal,
+    cross_dex: bool,
     age_secs: f64,
 ) -> String {
-    format!(
-        "{rank:<2}  pair={:<14}  buy={:<12}  sell={:<12}  raw={}  age={:.1}s",
-        pair,
-        buy,
-        sell,
-        fmt_pct(raw),
-        age_secs
-    )
+    if cross_dex {
+        format!(
+            "{rank:<2}  pair={:<14}  buy={:<12}  sell={:<12}  raw={}  nat={}  res={}  age={:.1}s",
+            pair,
+            buy,
+            sell,
+            fmt_pct(raw),
+            nat.map(|v| fmt_pct(v)).unwrap_or_else(|| "-".into()),
+            fmt_pct(residual),
+            age_secs
+        )
+    } else {
+        format!(
+            "{rank:<2}  pair={:<14}  buy={:<12}  sell={:<12}  raw={}  age={:.1}s",
+            pair,
+            buy,
+            sell,
+            fmt_pct(raw),
+            age_secs
+        )
+    }
 }
 
 pub fn skip_lines(pair: &str, reason: &str) -> [String; 2] {

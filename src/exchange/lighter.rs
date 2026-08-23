@@ -173,14 +173,6 @@ impl ExchangePort for LighterAdapter {
             });
         }
         info!(venue = self.venue.id, n = out.len(), "loaded perp markets");
-        for m in &out {
-            info!(
-                venue = self.venue.id,
-                symbol = %m.raw_symbol,
-                market_index = m.market_index,
-                "market_index ready"
-            );
-        }
         Ok(out)
     }
 

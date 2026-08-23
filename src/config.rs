@@ -31,6 +31,20 @@ pub struct ScanConfig {
     pub min_spread_pct: Decimal,
     pub analysis_interval_ms: u64,
     pub watch_top: usize,
+    /// 跨 DEX（如 SoDEX ↔ Lighter）用 24h raw 中位数当天然价差，上榜看 residual。
+    #[serde(default = "default_true")]
+    pub cross_use_natural: bool,
+    /// 仍在榜上的币至少隔这么多秒再打一行。上榜/下榜立刻记。
+    #[serde(default = "default_log_interval_secs")]
+    pub log_interval_secs: u64,
+}
+
+fn default_log_interval_secs() -> u64 {
+    30
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_scan() -> ScanConfig {
@@ -39,6 +53,8 @@ fn default_scan() -> ScanConfig {
         min_spread_pct: Decimal::new(1, 1),
         analysis_interval_ms: 50,
         watch_top: 10,
+        cross_use_natural: true,
+        log_interval_secs: 30,
     }
 }
 
@@ -47,6 +63,13 @@ pub struct SystemConfig {
     pub monitor_only: bool,
     pub data_freshness_ms: u64,
     pub stable_depeg_bps: u32,
+    /// 文本日志目录。按天滚动 `dex-arbitr.YYYY-MM-DD.log`。空 = 只打 stderr。
+    #[serde(default = "default_log_dir")]
+    pub log_dir: String,
+}
+
+fn default_log_dir() -> String {
+    "data/logs".into()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -128,11 +151,16 @@ pub struct VenueFile {
     pub chain_id: u64,
     pub quote: String,
     pub fees: VenueFees,
-    #[serde(default)]
+    /// Lighter: `account_index`。SoDEX: `account_id` / 环境变量 `SODEX_ACCOUNT_ID`。
+    #[serde(default, alias = "account_id")]
     pub account_index: i64,
     #[serde(default)]
     pub api_key_index: i32,
+    /// SoDEX：`X-API-Key` 用的是名称，不是地址。环境变量 `SODEX_API_KEY_NAME`。
     #[serde(default)]
+    pub api_key_name: String,
+    /// Lighter / SoDEX 私钥。SoDEX 也可用 `private_key` 或环境变量 `SODEX_PRIVATE_KEY`。
+    #[serde(default, alias = "private_key")]
     pub api_key_private_key: String,
 }
 
@@ -145,8 +173,19 @@ impl VenueFile {
         Some(VenueAuth {
             account_index: self.account_index,
             api_key_index: self.api_key_index,
+            api_key_name: self.api_key_name.trim().to_string(),
             api_key_private_key: key.to_string(),
         })
+    }
+
+    pub fn keys_ready(&self) -> bool {
+        let Some(auth) = self.auth() else {
+            return false;
+        };
+        if self.id == "sodex" {
+            return auth.is_ready() && !auth.api_key_name.is_empty();
+        }
+        auth.is_ready()
     }
 }
 
@@ -154,6 +193,7 @@ impl VenueFile {
 pub struct VenueAuth {
     pub account_index: i64,
     pub api_key_index: i32,
+    pub api_key_name: String,
     pub api_key_private_key: String,
 }
 
@@ -162,6 +202,7 @@ impl std::fmt::Debug for VenueAuth {
         f.debug_struct("VenueAuth")
             .field("account_index", &self.account_index)
             .field("api_key_index", &self.api_key_index)
+            .field("api_key_name", &self.api_key_name)
             .field("api_key_private_key", &"<redacted>")
             .finish()
     }
@@ -191,7 +232,9 @@ impl AppConfig {
         let path = venue_config_path(id)?;
         let raw = fs::read_to_string(&path)
             .with_context(|| format!("read venue {}", path.display()))?;
-        serde_yaml::from_str(&raw).context("parse venue yaml")
+        let mut venue: VenueFile = serde_yaml::from_str(&raw).context("parse venue yaml")?;
+        overlay_venue_env(&mut venue);
+        Ok(venue)
     }
 
     pub fn grid_for(&self, base: &str) -> GridParams {
@@ -266,6 +309,27 @@ fn venue_example_name(id: &str) -> String {
     }
 }
 
+fn overlay_venue_env(venue: &mut VenueFile) {
+    if venue.id != "sodex" {
+        return;
+    }
+    if let Ok(v) = std::env::var("SODEX_ACCOUNT_ID") {
+        if let Ok(n) = v.trim().parse() {
+            venue.account_index = n;
+        }
+    }
+    if let Ok(v) = std::env::var("SODEX_API_KEY_NAME") {
+        if !v.trim().is_empty() {
+            venue.api_key_name = v;
+        }
+    }
+    if let Ok(v) = std::env::var("SODEX_PRIVATE_KEY") {
+        if !v.trim().is_empty() {
+            venue.api_key_private_key = v;
+        }
+    }
+}
+
 /// 正式 yaml（含密钥）优先；克隆仓库后只有 example 时回退，便于 `cargo test`。
 fn venue_config_path(id: &str) -> Result<PathBuf> {
     let dir = PathBuf::from("config/venues");
@@ -289,7 +353,8 @@ mod tests {
     fn loads_default_yaml() {
         let cfg = AppConfig::load_from(Path::new("config/default.yaml")).unwrap();
         assert!(cfg.system.monitor_only);
-        assert_eq!(cfg.venues, ["lighter", "lighter_rh"]);
+        assert_eq!(cfg.system.log_dir, "data/logs");
+        assert_eq!(cfg.venues, ["lighter", "lighter_rh", "sodex"]);
         assert_eq!(cfg.grid.initial_spread_threshold, dec!(0.03));
         assert_eq!(cfg.grid_for("BTC").base_qty, dec!(0.001));
         let venue = cfg.load_venue("lighter_rh").unwrap();
@@ -301,6 +366,7 @@ mod tests {
         assert_eq!(cfg.maker_fee(&VenueId::from("lighter_rh")), dec!(0.012));
         assert_eq!(cfg.taker_fee(&VenueId::from("lighter")), dec!(0.005));
         assert_eq!(cfg.taker_fee(&VenueId::from("lighter_rh")), dec!(0.035));
+        assert!(cfg.maker_fee(&VenueId::from("sodex")) > dec!(0));
         assert_eq!(
             cfg.exec_fee(&VenueId::from("lighter")) + cfg.exec_fee(&VenueId::from("lighter_rh")),
             dec!(0.040)
@@ -309,7 +375,11 @@ mod tests {
         assert_eq!(cfg.history.min_points, 10);
         assert!(cfg.scan.enabled);
         assert_eq!(cfg.scan.min_spread_pct, dec!(0.1));
-        assert_eq!(cfg.scan.watch_top, 10);
+        assert_eq!(cfg.scan.watch_top, 20);
+        assert!(cfg.scan.cross_use_natural);
         assert!(cfg.pairs.whitelist.is_empty());
+        let sodex = cfg.load_venue("sodex").unwrap();
+        assert_eq!(sodex.chain_id, 623);
+        assert_eq!(sodex.id, "sodex");
     }
 }
