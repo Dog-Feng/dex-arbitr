@@ -58,20 +58,29 @@ impl IntentStats {
     }
 }
 
-/// 固定行数原地刷新。Windows 写 CONOUT$，避免 cargo 管道把回退光标吃掉。
+/// 交互终端进备用屏，每帧从顶部重绘。不依赖 ESC[s / 光标回退（很多 Linux 终端不认）。
 pub struct LivePanel {
     enabled: bool,
     rows: Vec<String>,
     pub stats: IntentStats,
     last_paint: Option<Instant>,
-    origin_y: Option<i16>,
-    painted: bool,
     #[cfg(windows)]
     conout: Option<std::fs::File>,
 }
 
 impl LivePanel {
     pub fn new(rows: usize) -> Self {
+        if rows == 0 {
+            return Self {
+                enabled: false,
+                rows: Vec::new(),
+                stats: IntentStats::default(),
+                last_paint: None,
+                #[cfg(windows)]
+                conout: None,
+            };
+        }
+
         #[cfg(windows)]
         let conout = win_con::open();
         #[cfg(windows)]
@@ -80,15 +89,14 @@ impl LivePanel {
         let enabled = io::IsTerminal::is_terminal(&io::stdout());
 
         if enabled {
-            let _ = write_raw("\x1b[?25l");
+            // 备用屏 + 关自动折行 + 藏光标。退出时在 Drop 里还原。
+            let _ = write_raw("\x1b[?1049h\x1b[?7l\x1b[?25l");
         }
         Self {
             enabled,
             rows: vec![String::new(); rows],
             stats: IntentStats::default(),
             last_paint: None,
-            origin_y: None,
-            painted: false,
             #[cfg(windows)]
             conout,
         }
@@ -122,40 +130,30 @@ impl LivePanel {
         #[cfg(windows)]
         {
             if let Some(file) = self.conout.as_mut() {
-                if self.origin_y.is_none() {
-                    self.origin_y = win_con::cursor_y(file);
-                }
-                if let Some(y) = self.origin_y {
-                    win_con::paint(file, y, &block);
-                    return;
-                }
+                win_con::paint(file, &block);
+                return;
             }
         }
 
-        paint_ansi(&block, self.painted);
-        self.painted = true;
+        paint_ansi(&block);
     }
 }
 
 impl Drop for LivePanel {
     fn drop(&mut self) {
         if self.enabled {
-            let _ = write_raw("\x1b[?25h");
+            let _ = write_raw("\x1b[?25h\x1b[?7h\x1b[?1049l");
         }
     }
 }
 
-fn paint_ansi(lines: &[String], painted: bool) {
+fn paint_ansi(lines: &[String]) {
     let cols = term_cols();
     let mut out = io::stdout();
-    if !painted {
-        let _ = write!(out, "\x1b[s");
-    } else {
-        // 回到第一帧原点再清后面，避免折行/日志把旧的 decide 行顶出去。
-        let _ = write!(out, "\x1b[u\x1b[J");
-    }
+    // 备用屏左上角清空再画，不会往主屏下面追加。
+    let _ = write!(out, "\x1b[H\x1b[J");
     for line in lines {
-        let _ = write!(out, "\x1b[2K{}\n", fit_line(line, cols));
+        let _ = writeln!(out, "{}", fit_line(line, cols));
     }
     let _ = out.flush();
 }
@@ -362,10 +360,6 @@ mod win_con {
         Some(file)
     }
 
-    pub fn cursor_y(file: &File) -> Option<i16> {
-        info(file).map(|i| i.cursor.y)
-    }
-
     pub fn width() -> Option<usize> {
         let file = open()?;
         let info = info(&file)?;
@@ -384,15 +378,15 @@ mod win_con {
         }
     }
 
-    pub fn paint(file: &mut File, origin_y: i16, lines: &[String]) {
+    pub fn paint(file: &mut File, lines: &[String]) {
         unsafe {
             let h = file.as_raw_handle() as isize;
-            let _ = SetConsoleCursorPosition(h, Coord { x: 0, y: origin_y });
+            let _ = SetConsoleCursorPosition(h, Coord { x: 0, y: 0 });
         }
         let cols = info(file).map(|i| i.size.x as usize).unwrap_or(120);
-        let _ = write!(file, "\x1b[J");
+        let _ = write!(file, "\x1b[H\x1b[J");
         for line in lines {
-            let _ = write!(file, "\x1b[2K{}\r\n", fit_line(line, cols));
+            let _ = writeln!(file, "{}", fit_line(line, cols));
         }
         let _ = file.flush();
     }
