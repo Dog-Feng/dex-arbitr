@@ -5,6 +5,7 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::str::FromStr;
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tracing::{debug, warn};
@@ -12,6 +13,15 @@ use tracing::{debug, warn};
 use super::port::{AccountSnapshot, Balance, CancelReq, OrderAck, OrderReq, OrderStatus, VenuePosition};
 
 const SIDECAR_DIR: &str = "scripts/exchange_sidecar";
+const DEFAULT_SIDECAR_TIMEOUT: Duration = Duration::from_secs(45);
+
+fn sidecar_timeout() -> Duration {
+    std::env::var("DEX_SIDECAR_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_SIDECAR_TIMEOUT)
+}
 
 #[derive(Debug, Deserialize)]
 struct BridgeResp {
@@ -69,7 +79,26 @@ pub async fn bridge_call(venue_yaml: &Path, cmd: &str, params: Value) -> Result<
             .await
             .context("write sidecar stdin")?;
     }
-    let out = child.wait_with_output().await.context("sidecar wait")?;
+    let wait = async move {
+        child
+            .wait_with_output()
+            .await
+            .context("sidecar wait")
+    };
+    let out = match tokio::time::timeout(sidecar_timeout(), wait).await {
+        Ok(r) => r?,
+        Err(_) => {
+            warn!(
+                cmd,
+                timeout_secs = sidecar_timeout().as_secs(),
+                "exchange sidecar timed out"
+            );
+            anyhow::bail!(
+                "sidecar {cmd} timed out after {}s",
+                sidecar_timeout().as_secs()
+            );
+        }
+    };
     let stdout = String::from_utf8_lossy(&out.stdout);
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
