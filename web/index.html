@@ -252,6 +252,10 @@
               <div class="kv"><span class="lbl">—</span><span class="val mut">等待后端数据</span></div>
             </div>
           </div>
+          <div class="panel" id="naked-panel" style="display:none;border-color:#c53030">
+            <div class="panel-title" style="color:#fc8181">⚠ 单边裸仓（需对冲）</div>
+            <div id="naked-exposures"></div>
+          </div>
           <div class="panel">
             <div class="panel-title">交易所持仓</div>
             <div id="exchange-positions">
@@ -392,6 +396,20 @@
             '<div class="kv"><span class="lbl">可用</span><span class="val">' + fmtUsdc(avail) + '</span></div>';
         }).join("");
       }
+      function renderNakedExposures(rows) {
+        var panel = $("naked-panel");
+        var box = $("naked-exposures");
+        if (!panel || !box) return;
+        if (!rows || !rows.length) {
+          panel.style.display = "none";
+          return;
+        }
+        panel.style.display = "";
+        box.innerHTML = rows.map(function (n) {
+          return '<div class="kv"><span class="lbl">' + n.pair_id + '</span><span class="val" style="color:#fc8181">' +
+            venueLabel(n.venue) + " " + n.qty + " → 待对冲 " + venueLabel(n.counterparty) + '</span></div>';
+        }).join("");
+      }
       function renderExchangePositions(rows) {
         var box = $("exchange-positions");
         if (!box) return;
@@ -449,6 +467,7 @@
           renderArbPositions(snap.positions);
           renderVenueAccounts(snap.balances);
           renderExchangePositions(snap.exchange_positions);
+          renderNakedExposures(snap.naked_exposures);
           if (snap.stats) {
             if ($("stat-pairs")) $("stat-pairs").textContent = String(snap.stats.matched_pairs || snap.pairs?.length || "—");
             if ($("stat-arb-pos")) $("stat-arb-pos").textContent = String(snap.stats.open_positions || 0);

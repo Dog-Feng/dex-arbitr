@@ -55,11 +55,20 @@ pub struct ExchangePositionRow {
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
+pub struct NakedExposureRow {
+    pub pair_id: String,
+    pub venue: String,
+    pub qty: String,
+    pub counterparty: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct LiveSnapshot {
     pub pairs: Vec<PairRow>,
     pub positions: Vec<PositionRow>,
     pub balances: Vec<VenueBalanceRow>,
     pub exchange_positions: Vec<ExchangePositionRow>,
+    pub naked_exposures: Vec<NakedExposureRow>,
     pub stats: ApiStats,
     pub monitor_only: bool,
     pub paper_trading: bool,
@@ -182,6 +191,7 @@ async fn positions(State(hub): State<Arc<ApiHub>>) -> impl IntoResponse {
             "positions": s.positions,
             "balances": s.balances,
             "exchange_positions": s.exchange_positions,
+            "naked_exposures": s.naked_exposures,
         }))
             .into_response(),
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned").into_response(),

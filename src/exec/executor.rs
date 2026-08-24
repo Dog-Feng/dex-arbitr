@@ -90,16 +90,23 @@ impl HedgeExecutor {
                 client_order_id: None,
             })
             .await?;
-        let first = fill_from_ack(&plan.first, ack.clone(), first_price);
-        let resting = ack.filled_qty <= Decimal::ZERO
+        let filled_qty = effective_filled_qty(&ack, plan.qty);
+        let first = ExecFill {
+            venue: plan.first.venue.clone(),
+            qty: filled_qty,
+            price: ack.avg_price.unwrap_or(first_price),
+            is_buy: plan.first.is_buy,
+        };
+        let resting = filled_qty <= Decimal::ZERO
             && matches!(ack.status, OrderStatus::Accepted | OrderStatus::Partial);
+        let order_id = if ack.order_id.is_empty() {
+            None
+        } else {
+            Some(ack.order_id)
+        };
         Ok(PostFirstResult {
             first,
-            order_id: if resting {
-                Some(ack.order_id)
-            } else {
-                None
-            },
+            order_id,
             resting,
         })
     }
@@ -122,7 +129,7 @@ impl HedgeExecutor {
             })
             .await?;
         if ack.filled_qty > Decimal::ZERO {
-            return Ok(Some(fill_from_ack(leg, ack, Decimal::ZERO)));
+            return Ok(Some(fill_from_ack(leg, ack, Decimal::ZERO, plan_qty)));
         }
         if matches!(ack.status, OrderStatus::Filled) {
             return Ok(Some(fill_from_ack(
@@ -132,6 +139,7 @@ impl HedgeExecutor {
                     ..ack
                 },
                 Decimal::ZERO,
+                plan_qty,
             )));
         }
         Ok(None)
@@ -204,7 +212,7 @@ impl HedgeExecutor {
                     error = %err,
                     "second leg failed; emergency close first"
                 );
-                Self::emergency_close(
+                match Self::emergency_close(
                     adapters,
                     &plan.first,
                     qty,
@@ -212,8 +220,19 @@ impl HedgeExecutor {
                     first_bbo,
                     paper,
                 )
-                .await?;
-                return Err(err);
+                .await
+                {
+                    Ok(()) => {
+                        return Err(anyhow::anyhow!(
+                            "EMERGENCY_CLOSED: second leg failed; first leg closed: {err}"
+                        ));
+                    }
+                    Err(eclose) => {
+                        return Err(anyhow::anyhow!(
+                            "NAKED_FIRST_LEG: second leg failed ({err}); emergency close failed ({eclose})"
+                        ));
+                    }
+                }
             }
         };
         Self::log_overrun(cfg, &plan.first, first_price, &first);
@@ -307,7 +326,26 @@ impl HedgeExecutor {
                 });
             }
         }
-        Ok(fill_from_ack(leg, ack, price))
+        Ok(fill_from_ack(leg, ack, price, qty))
+    }
+
+    /// 补对冲：在 counterparty 所发市价单，使 delta 回归中性。
+    pub async fn market_leg(
+        adapters: &HashMap<String, Arc<dyn ExchangePort>>,
+        pair_id: &str,
+        leg: &HedgeLeg,
+        qty: Decimal,
+        is_buy: bool,
+        reduce_only: bool,
+        books: &HashMap<(String, String), Bbo>,
+        paper: bool,
+    ) -> Result<ExecFill> {
+        let mut mleg = leg.clone();
+        mleg.is_buy = is_buy;
+        mleg.style = OrderStyle::MarketTaker;
+        let bbo = book_for(books, &mleg.venue, pair_id)?;
+        let price = market_price(&mleg, bbo);
+        Self::send_leg(adapters, &mleg, qty, price, reduce_only, paper, bbo).await
     }
 
     fn log_overrun(cfg: &AppConfig, leg: &HedgeLeg, expected: Decimal, fill: &ExecFill) {
@@ -347,15 +385,51 @@ fn market_price(leg: &HedgeLeg, bbo: &Bbo) -> Decimal {
     }
 }
 
-fn fill_from_ack(leg: &HedgeLeg, ack: OrderAck, fallback_price: Decimal) -> ExecFill {
+fn effective_filled_qty(ack: &OrderAck, plan_qty: Decimal) -> Decimal {
+    if ack.filled_qty > Decimal::ZERO {
+        ack.filled_qty
+    } else if matches!(ack.status, OrderStatus::Filled) {
+        plan_qty
+    } else {
+        Decimal::ZERO
+    }
+}
+
+fn fill_from_ack(leg: &HedgeLeg, ack: OrderAck, fallback_price: Decimal, plan_qty: Decimal) -> ExecFill {
     ExecFill {
         venue: leg.venue.clone(),
-        qty: if ack.filled_qty > Decimal::ZERO {
-            ack.filled_qty
-        } else {
-            Decimal::ZERO
-        },
+        qty: effective_filled_qty(&ack, plan_qty),
         price: ack.avg_price.unwrap_or(fallback_price),
         is_buy: leg.is_buy,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::exchange::OrderAck;
+
+    #[test]
+    fn effective_filled_qty_from_status() {
+        let ack = OrderAck {
+            order_id: "1".into(),
+            client_order_id: None,
+            filled_qty: Decimal::ZERO,
+            avg_price: None,
+            status: OrderStatus::Filled,
+        };
+        assert_eq!(effective_filled_qty(&ack, rust_decimal_macros::dec!(676)), rust_decimal_macros::dec!(676));
+    }
+
+    #[test]
+    fn effective_filled_qty_prefers_reported() {
+        let ack = OrderAck {
+            order_id: "1".into(),
+            client_order_id: None,
+            filled_qty: rust_decimal_macros::dec!(100),
+            avg_price: None,
+            status: OrderStatus::Partial,
+        };
+        assert_eq!(effective_filled_qty(&ack, rust_decimal_macros::dec!(676)), rust_decimal_macros::dec!(100));
     }
 }

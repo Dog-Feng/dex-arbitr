@@ -17,7 +17,7 @@ use crate::exec::{
     best_sequenced_spread, plan_hedge, watch_resting_limit, HedgeExecutor, HedgePlan, LimitWatch,
 };
 use crate::exchange::{make_adapter, ExchangePort};
-use crate::infra::api::{self, ApiHub, ExchangePositionRow, LiveSnapshot, PairRow, PositionRow, VenueBalanceRow};
+use crate::infra::api::{self, ApiHub, ExchangePositionRow, LiveSnapshot, NakedExposureRow, PairRow, PositionRow, VenueBalanceRow};
 use crate::infra::dashboard::{self, LivePanel};
 use crate::infra::journal::{ExecJournal, ExecRecord, now_ts};
 use crate::infra::history::{residual_net, HistoryStore};
@@ -28,6 +28,9 @@ use super::exec_worker::{
     PostFirstMsg, RunPlanMsg,
 };
 use super::positions::PositionStore;
+use super::reconcile::{
+    counterparty_hedge_is_buy, detect_naked_exposures, hedge_qty, NakedExposure,
+};
 use super::risk::{books_tradable, stable_ok};
 use super::scan::OpportunityTracker;
 use super::sizing::{mid_from_bbo, resolve_qty, BindingLeg, LegMargin};
@@ -53,6 +56,8 @@ pub struct Controller {
     venue_accounts: VenueAccountCache,
     api: Option<Arc<ApiHub>>,
     ui_pairs: HashMap<String, PairRow>,
+    naked_exposures: Vec<NakedExposure>,
+    naked_hedging: HashSet<String>,
 }
 
 struct LoggedToken {
@@ -151,10 +156,13 @@ impl Controller {
             venue_accounts: VenueAccountCache::default(),
             api,
             ui_pairs: HashMap::new(),
+            naked_exposures: Vec::new(),
+            naked_hedging: HashSet::new(),
         };
         this.bootstrap().await?;
         if this.cfg.execution.enabled {
             this.refresh_balances_now().await?;
+            this.reconcile_exchange_positions(true).await;
             this.loop_unified().await
         } else if this.cfg.scan.enabled {
             this.loop_scan().await
@@ -224,12 +232,227 @@ impl Controller {
         Ok(())
     }
 
+    async fn reconcile_exchange_positions(&mut self, on_startup: bool) {
+        let detected = detect_naked_exposures(&self.pairs, &self.venue_accounts);
+        for n in &detected {
+            if self
+                .naked_exposures
+                .iter()
+                .any(|e| e.pair_id == n.pair_id && e.venue == n.venue)
+            {
+                continue;
+            }
+            warn!(
+                pair = %n.pair_id,
+                venue = %n.venue,
+                qty = %n.qty,
+                counterparty = %n.counterparty,
+                "naked exchange exposure detected"
+            );
+            self.log_naked_journal(n, if on_startup { "startup" } else { "reconcile" });
+        }
+        self.naked_exposures = detected;
+    }
+
+    fn log_naked_journal(&self, n: &NakedExposure, reason: &str) {
+        let plan = HedgePlan {
+            pair_id: n.pair_id.clone(),
+            qty: hedge_qty(n.qty),
+            is_open: true,
+            style: self.cfg.order.style,
+            buy_market_index: 0,
+            sell_market_index: 0,
+            buy_symbol: String::new(),
+            sell_symbol: String::new(),
+            buy_venue: if n.qty.is_sign_positive() {
+                n.venue.clone()
+            } else {
+                n.counterparty.clone()
+            },
+            sell_venue: if n.qty.is_sign_positive() {
+                n.counterparty.clone()
+            } else {
+                n.venue.clone()
+            },
+            first: crate::exec::HedgeLeg {
+                venue: n.venue.clone(),
+                symbol: String::new(),
+                market_index: 0,
+                is_buy: n.qty.is_sign_positive(),
+                style: OrderStyle::MarketTaker,
+            },
+            second: crate::exec::HedgeLeg {
+                venue: n.counterparty.clone(),
+                symbol: String::new(),
+                market_index: 0,
+                is_buy: counterparty_hedge_is_buy(n.qty),
+                style: OrderStyle::MarketTaker,
+            },
+        };
+        self.log_exec(
+            &plan,
+            "naked",
+            reason,
+            &format!("venue={} qty={}", n.venue, n.qty),
+        );
+    }
+
+    fn record_naked_from_failed_hedge(&mut self, plan: &HedgePlan, first_qty: Decimal) {
+        if first_qty <= Decimal::ZERO {
+            return;
+        }
+        let signed = if plan.first.is_buy {
+            first_qty
+        } else {
+            -first_qty
+        };
+        let exposure = NakedExposure {
+            pair_id: plan.pair_id.clone(),
+            venue: plan.first.venue.clone(),
+            qty: signed,
+            counterparty: plan.second.venue.clone(),
+        };
+        if self
+            .naked_exposures
+            .iter()
+            .any(|n| n.pair_id == exposure.pair_id && n.venue == exposure.venue)
+        {
+            return;
+        }
+        warn!(
+            pair = %exposure.pair_id,
+            venue = %exposure.venue,
+            qty = %exposure.qty,
+            counterparty = %exposure.counterparty,
+            "record naked exposure after failed hedge"
+        );
+        self.log_naked_journal(&exposure, "hedge_fail");
+        self.naked_exposures.push(exposure);
+    }
+
+    async fn try_hedge_naked_exposures(&mut self) {
+        if self.cfg.system.monitor_only
+            || self.cfg.execution.paper_trading
+            || self.naked_exposures.is_empty()
+        {
+            return;
+        }
+        let candidate = self
+            .naked_exposures
+            .iter()
+            .find(|n| !self.naked_hedging.contains(&n.pair_id))
+            .cloned();
+        let Some(naked) = candidate else {
+            return;
+        };
+        let Some(pair) = self.pairs.iter().find(|p| p.pair_id == naked.pair_id) else {
+            return;
+        };
+        let Some(counter_leg) = pair
+            .legs
+            .iter()
+            .find(|l| l.venue.as_str() == naked.counterparty)
+        else {
+            return;
+        };
+        let (v0, v1) = (pair.legs[0].venue.as_str(), pair.legs[1].venue.as_str());
+        let Some(b0) = self.books.get(&(v0.to_string(), pair.pair_id.clone())) else {
+            return;
+        };
+        let Some(b1) = self.books.get(&(v1.to_string(), pair.pair_id.clone())) else {
+            return;
+        };
+        if books_tradable(&self.cfg, pair, b0, b1, hedge_qty(naked.qty)).is_err() {
+            return;
+        }
+        let qty = hedge_qty(naked.qty);
+        let is_buy = counterparty_hedge_is_buy(naked.qty);
+        let hedge_leg = crate::exec::HedgeLeg {
+            venue: naked.counterparty.clone(),
+            symbol: counter_leg.raw_symbol.clone(),
+            market_index: counter_leg.market_index,
+            is_buy,
+            style: OrderStyle::MarketTaker,
+        };
+        self.naked_hedging.insert(naked.pair_id.clone());
+        info!(
+            pair = %naked.pair_id,
+            venue = %naked.counterparty,
+            qty = %qty,
+            is_buy,
+            "attempting naked exposure hedge"
+        );
+        match HedgeExecutor::market_leg(
+            &self.adapters_by_id,
+            &naked.pair_id,
+            &hedge_leg,
+            qty,
+            is_buy,
+            false,
+            &self.books,
+            false,
+        )
+        .await
+        {
+            Ok(fill) => {
+                info!(
+                    pair = %naked.pair_id,
+                    venue = %fill.venue,
+                    qty = %fill.qty,
+                    "naked exposure hedge filled"
+                );
+                self.naked_exposures
+                    .retain(|n| n.pair_id != naked.pair_id || n.venue != naked.venue);
+                let (buy, sell) = if naked.qty.is_sign_positive() {
+                    (naked.venue.clone(), naked.counterparty.clone())
+                } else {
+                    (naked.counterparty.clone(), naked.venue.clone())
+                };
+                let entry_notional = qty
+                    * mid_from_bbo(b0, b1).unwrap_or(Decimal::ZERO);
+                self.positions.record_open(
+                    &naked.pair_id,
+                    VenueId::from(buy.as_str()),
+                    VenueId::from(sell.as_str()),
+                    qty,
+                    1,
+                    entry_notional,
+                );
+                let plan = HedgePlan {
+                    pair_id: naked.pair_id.clone(),
+                    qty,
+                    is_open: true,
+                    style: self.cfg.order.style,
+                    buy_market_index: 0,
+                    sell_market_index: 0,
+                    buy_symbol: String::new(),
+                    sell_symbol: String::new(),
+                    buy_venue: buy,
+                    sell_venue: sell,
+                    first: hedge_leg.clone(),
+                    second: hedge_leg,
+                };
+                self.log_exec(&plan, "naked_hedge", "filled", "");
+            }
+            Err(err) => {
+                warn!(
+                    pair = %naked.pair_id,
+                    error = %err,
+                    "naked exposure hedge failed"
+                );
+            }
+        }
+        self.naked_hedging.remove(&naked.pair_id);
+    }
+
     async fn maybe_refresh_balances(&mut self) {
         let due = self.balance.last_refresh.elapsed()
             >= Duration::from_secs(self.cfg.sizing.refresh_balance_secs.max(5));
         if due {
             if let Err(err) = self.refresh_balances_now().await {
                 warn!(error = %err, "balance refresh failed");
+            } else {
+                self.reconcile_exchange_positions(false).await;
             }
         }
     }
@@ -267,6 +490,7 @@ impl Controller {
     }
 
     async fn tick_execution(&mut self) {
+        self.try_hedge_naked_exposures().await;
         let close_first: Vec<usize> = self
             .pairs
             .iter()
@@ -701,12 +925,12 @@ impl Controller {
                 .await
                 {
                     Ok(Some(f)) => {
-                        first_filled = f.qty > Decimal::ZERO;
                         hedge_qty = if f.qty > Decimal::ZERO {
                             f.qty
                         } else {
                             pending.plan.qty
                         };
+                        first_filled = hedge_qty > Decimal::ZERO;
                     }
                     Ok(None) => {
                         first_filled = false;
@@ -937,8 +1161,19 @@ impl Controller {
         )
         .await
         {
-            Ok(Some(f)) if f.qty > Decimal::ZERO => Some(f.qty),
-            Ok(Some(_)) | Ok(None) => None,
+            Ok(Some(f)) => {
+                let qty = if f.qty > Decimal::ZERO {
+                    f.qty
+                } else {
+                    plan.qty
+                };
+                if qty > Decimal::ZERO {
+                    Some(qty)
+                } else {
+                    None
+                }
+            }
+            Ok(None) => None,
             Err(err) => {
                 warn!(pair = %plan.pair_id, error = %err, "poll first leg before cancel");
                 None
@@ -1025,6 +1260,16 @@ impl Controller {
                     }
                     return;
                 }
+                if !post.resting {
+                    warn!(
+                        pair = %pair_id,
+                        order_id = ?post.order_id,
+                        "first leg not resting with zero fill; release pending"
+                    );
+                    self.pending.remove(&pair_id);
+                    self.positions.release_pending(&pair_id);
+                    return;
+                }
                 if let Some(entry) = self.pending.get_mut(&pair_id) {
                     entry.order_id = post.order_id.clone();
                     entry.flight = PendingFlight::None;
@@ -1036,6 +1281,11 @@ impl Controller {
             Err(err) => {
                 warn!(pair = %pair_id, error = %err, "post first leg failed");
                 self.log_exec(&msg.plan, "post_fail", "error", &err);
+                if let Err(refresh_err) = self.refresh_balances_now().await {
+                    warn!(error = %refresh_err, "balance refresh after post fail");
+                } else {
+                    self.reconcile_exchange_positions(false).await;
+                }
                 self.pending.remove(&pair_id);
                 self.positions.release_pending(&pair_id);
             }
@@ -1062,11 +1312,20 @@ impl Controller {
                     "both_filled",
                     "",
                 );
+                self.naked_exposures
+                    .retain(|n| n.pair_id != msg.plan.pair_id);
                 self.apply_fill(&pair, &msg.plan, msg.pair_i).await;
             }
             Err(err) => {
-                warn!(pair = %msg.plan.pair_id, error = %err, "hedge second failed");
-                self.log_exec(&msg.plan, "exec_fail", "error", &err);
+                let err_s = err.to_string();
+                if err_s.contains("EMERGENCY_CLOSED") {
+                    warn!(pair = %msg.plan.pair_id, error = %err, "hedge second failed; first leg emergency closed");
+                    self.log_exec(&msg.plan, "exec_fail", "emergency_closed", &err);
+                } else {
+                    warn!(pair = %msg.plan.pair_id, error = %err, "hedge second failed; naked first leg");
+                    self.log_exec(&msg.plan, "exec_fail", "naked", &err);
+                    self.record_naked_from_failed_hedge(&msg.plan, msg.hedge_qty);
+                }
                 self.positions.release_pending(&msg.plan.pair_id);
             }
         }
@@ -1272,6 +1531,16 @@ impl Controller {
             positions,
             balances,
             exchange_positions,
+            naked_exposures: self
+                .naked_exposures
+                .iter()
+                .map(|n| NakedExposureRow {
+                    pair_id: n.pair_id.clone(),
+                    venue: n.venue.clone(),
+                    qty: n.qty.to_string(),
+                    counterparty: n.counterparty.clone(),
+                })
+                .collect(),
             stats: api::ApiStats {
                 matched_pairs: self.pairs.len(),
                 open_positions: self.positions.open_count(),

@@ -25,6 +25,7 @@ pub struct HedgeSecondMsg {
     pub pair_id: String,
     pub pair_i: usize,
     pub plan: HedgePlan,
+    pub hedge_qty: rust_decimal::Decimal,
     pub result: Result<ExecResult, String>,
 }
 
@@ -80,6 +81,7 @@ pub fn spawn_hedge_second_leg(
             pair_id: plan.pair_id.clone(),
             pair_i,
             plan,
+            hedge_qty,
             result,
         }));
     });
