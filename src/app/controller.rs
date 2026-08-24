@@ -245,8 +245,15 @@ impl Controller {
                 Some(ev) = exec_rx.recv() => {
                     self.handle_exec_event(ev).await;
                 }
+                msg = rx.recv() => {
+                    let Some((venue, pair_id, bbo)) = msg else {
+                        break;
+                    };
+                    self.books
+                        .insert((venue.as_str().to_string(), pair_id), bbo);
+                }
                 _ = tick.tick() => {
-                    while let Ok(Some((venue, pair_id, bbo))) = rx.try_recv() {
+                    while let Ok((venue, pair_id, bbo)) = rx.try_recv() {
                         self.books
                             .insert((venue.as_str().to_string(), pair_id), bbo);
                     }
@@ -277,15 +284,20 @@ impl Controller {
             self.process_pair(pi).await;
         }
         let mut active: HashSet<usize> = close_set;
-        for (pi, pair) in self.pairs.iter().enumerate() {
-            if active.contains(&pi) {
-                continue;
-            }
-            if self.pending.contains_key(&pair.pair_id) || self.hedging_pairs.contains(&pair.pair_id)
-            {
-                self.process_pair(pi).await;
-                active.insert(pi);
-            }
+        let pending_indices: Vec<usize> = self
+            .pairs
+            .iter()
+            .enumerate()
+            .filter(|(pi, p)| {
+                !active.contains(pi)
+                    && (self.pending.contains_key(&p.pair_id)
+                        || self.hedging_pairs.contains(&p.pair_id))
+            })
+            .map(|(pi, _)| pi)
+            .collect();
+        for pi in pending_indices {
+            self.process_pair(pi).await;
+            active.insert(pi);
         }
         for pi in 0..self.pairs.len() {
             if active.contains(&pi) {
