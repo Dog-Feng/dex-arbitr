@@ -39,13 +39,44 @@ pub fn net_spread(
     })
 }
 
-/// 双吃：买所走 ask + 卖所走 bid，深度不够返回 None。
+/// 决策用：对齐参考 V3。`net = raw − fee`，不预扣滑点。卖一/买一数量不够则丢掉。
+pub fn decide_spread(
+    buy: VenueId,
+    sell: VenueId,
+    buy_book: &Bbo,
+    sell_book: &Bbo,
+    fee_pct: Decimal,
+    qty: Decimal,
+) -> Option<NetSpread> {
+    if !l1_covers(buy_book, sell_book, qty) {
+        return None;
+    }
+    net_spread(buy, sell, buy_book, sell_book, fee_pct, Decimal::ZERO)
+}
+
+/// 小额只看一档：买腿 Ask1、卖腿 Bid1 数量都够。
+pub fn l1_covers(buy_book: &Bbo, sell_book: &Bbo, qty: Decimal) -> bool {
+    qty <= Decimal::ZERO || (buy_book.ask_qty >= qty && sell_book.bid_qty >= qty)
+}
+
+/// 成交后相对决策价的实际滑点（%）。买相对 Ask1，卖相对 Bid1。
+pub fn realized_slip_pct(is_buy: bool, expected: Decimal, fill: Decimal) -> Option<Decimal> {
+    if expected <= Decimal::ZERO {
+        return None;
+    }
+    if is_buy {
+        Some((fill - expected) / expected * Decimal::from(100))
+    } else {
+        Some((expected - fill) / expected * Decimal::from(100))
+    }
+}
+
+/// 双吃：买所走 ask + 卖所走 bid。仅成交后估滑点用，决策不走档。
 pub fn hedge_slip_pct(buy_book: &Bbo, sell_book: &Bbo, qty: Decimal) -> Option<Decimal> {
     Some(buy_book.buy_slip_pct(qty)? + sell_book.sell_slip_pct(qty)?)
 }
 
 /// Both directions; better net wins. Tie keeps first (x buy / y sell).
-/// `book_slip` 为 false 时（限价挂单）滑点按 0。`max_slip_pct` > 0 时超过则丢掉该方向。
 pub fn best_open_spread(
     venue_x: &VenueId,
     venue_y: &VenueId,
@@ -54,11 +85,9 @@ pub fn best_open_spread(
     fee_xy: Decimal,
     fee_yx: Decimal,
     qty: Decimal,
-    max_slip_pct: Decimal,
-    book_slip: bool,
 ) -> Option<NetSpread> {
-    let a = direction(venue_x, venue_y, book_x, book_y, fee_xy, qty, max_slip_pct, book_slip);
-    let b = direction(venue_y, venue_x, book_y, book_x, fee_yx, qty, max_slip_pct, book_slip);
+    let a = decide_spread(venue_x.clone(), venue_y.clone(), book_x, book_y, fee_xy, qty);
+    let b = decide_spread(venue_y.clone(), venue_x.clone(), book_y, book_x, fee_yx, qty);
     match (a, b) {
         (Some(l), Some(r)) => {
             if r.net_pct > l.net_pct {
@@ -70,27 +99,6 @@ pub fn best_open_spread(
         (Some(v), None) | (None, Some(v)) => Some(v),
         (None, None) => None,
     }
-}
-
-fn direction(
-    buy: &VenueId,
-    sell: &VenueId,
-    buy_book: &Bbo,
-    sell_book: &Bbo,
-    fee_pct: Decimal,
-    qty: Decimal,
-    max_slip_pct: Decimal,
-    book_slip: bool,
-) -> Option<NetSpread> {
-    let slip_pct = if book_slip {
-        hedge_slip_pct(buy_book, sell_book, qty)?
-    } else {
-        Decimal::ZERO
-    };
-    if max_slip_pct > Decimal::ZERO && slip_pct > max_slip_pct {
-        return None;
-    }
-    net_spread(buy.clone(), sell.clone(), buy_book, sell_book, fee_pct, slip_pct)
 }
 
 #[cfg(test)]
@@ -146,24 +154,23 @@ mod tests {
             dec!(0),
             dec!(0),
             dec!(0.001),
-            dec!(0),
-            true,
         )
         .unwrap();
         assert_eq!(best.buy.as_str(), "lighter");
         assert_eq!(best.sell.as_str(), "lighter_rh");
         assert!(best.net_pct > dec!(0));
         assert_eq!(best.slip_pct, dec!(0));
+        assert_eq!(best.net_pct, best.raw_pct);
     }
 
     #[test]
-    fn book_walk_slip_enters_net() {
+    fn thin_l1_drops_without_walking() {
         let cheap = Bbo {
             bid: dec!(99),
             ask: dec!(100),
-            bid_qty: dec!(1),
+            bid_qty: dec!(0.0004),
             ask_qty: dec!(0.0004),
-            bids: vec![(dec!(99), dec!(1))],
+            bids: vec![(dec!(99), dec!(0.0004)), (dec!(98), dec!(1))],
             asks: vec![(dec!(100), dec!(0.0004)), (dec!(100.2), dec!(1))],
             ts: Instant::now(),
         };
@@ -176,7 +183,7 @@ mod tests {
             asks: vec![(dec!(100.20), dec!(1))],
             ts: Instant::now(),
         };
-        let best = best_open_spread(
+        assert!(best_open_spread(
             &VenueId::from("cheap"),
             &VenueId::from("rich"),
             &cheap,
@@ -184,13 +191,19 @@ mod tests {
             dec!(0),
             dec!(0),
             dec!(0.001),
-            dec!(1),
-            true,
         )
-        .unwrap();
-        assert_eq!(best.buy.as_str(), "cheap");
-        assert_eq!(best.slip_pct, dec!(0.12));
-        assert_eq!(best.raw_pct, dec!(0.10));
-        assert_eq!(best.net_pct, dec!(-0.02));
+        .is_none());
+    }
+
+    #[test]
+    fn realized_slip_after_fill() {
+        assert_eq!(
+            realized_slip_pct(true, dec!(100), dec!(100.05)).unwrap(),
+            dec!(0.05)
+        );
+        assert_eq!(
+            realized_slip_pct(false, dec!(100), dec!(99.98)).unwrap(),
+            dec!(0.02)
+        );
     }
 }

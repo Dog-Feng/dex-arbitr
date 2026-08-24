@@ -3,6 +3,7 @@
 .env
 config/secrets.yaml
 *.log
+dex-arbitr.log.*
 .idea
 .vscode
 

@@ -16,6 +16,7 @@ Lighter 主网 ↔ Lighter Robinhood ↔ SoDEX 永续价差监控（P1）。默�
 
 1. 复制 `config/venues/lighter.example.yaml` → `lighter.yaml`，Robinhood 同理，填入手钥。
 2. 保持 `monitor_only: true`、`scan.enabled: true`。`whitelist: []` 扫三所两两交集。SoDEX 模板：`config/venues/sodex.example.yaml`。
-3. 仓库根目录编译并运行。日志在控制台和 `data/logs/`（同一套代币行）。
+3. 仓库根目录编译并运行。日志在控制台和 `data/logs/`（同一套代币行）。跨 DEX 的 `nat` 在 `data/spreads.sqlite`，重启直接用，默认 30 分钟重算。
+4. 拷回本机后可统计：`python scripts/analyze_scan_log.py dex-arbitr.log.2026-08-24`
 
 详见[部署文档](docs/部署文档.md)。私钥不要提交 git。

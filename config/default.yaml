@@ -46,18 +46,19 @@ order:
   limit_timeout_ms: 2000
 
 cost:
-  # 预估滑点按 base_qty 走多档订单簿（买 ask + 卖 bid）。
-  # 本项是上限：走深滑点超过则本轮丢掉该方向。0 = 不设上限。不再当作固定扣减。
+  # 决策不预扣滑点（小额只看卖一/买一）。成交后按实际成交价扣；超过本值记 overrun。
   default_slip_pct: "0.01"
 
 # 对齐参考项目：SQLite 记毛价差，中位数当天然价差。
-# 开仓看 净边 − max(天然, 0) ≥ T1。样本不够时只记录、不开仓。
+# 开仓看 净边 − max(天然, 0) ≥ T1。无 nat 快照时只记录、不开仓。
 history:
   enabled: true
   db_path: data/spreads.sqlite
   sample_interval_secs: 5
   window_hours: 24
   min_points: 10
+  # 有 natural_spreads 快照则启动直接用；之后隔这么久重算 24h 中位数（1800 = 30 分钟）。
+  refresh_interval_secs: 1800
   max_age_secs: 200
 
 risk:

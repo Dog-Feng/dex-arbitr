@@ -124,12 +124,11 @@ impl OpportunityTracker {
         round
     }
 
-    /// 跨 DEX：样本够了才按 residual = raw − max(nat,0) 上榜；同协议家族仍看 raw。
+    /// 跨 DEX：库里有 nat 快照（或窗口已满）才按 residual = raw − max(nat,0) 上榜；同协议仍看 raw。
     pub fn apply_cross_natural(
         round: &mut ScanRound,
         history: Option<&HistoryStore>,
         min_spread_pct: Decimal,
-        min_points: usize,
         enabled: bool,
     ) {
         if !enabled {
@@ -149,10 +148,6 @@ impl OpportunityTracker {
                 round.cross_hold += 1;
                 continue;
             };
-            if nat.points < min_points {
-                round.cross_hold += 1;
-                continue;
-            }
             o.nat_pct = Some(nat.value);
             o.residual_pct = residual_net(o.raw_pct, nat.value);
             if o.residual_pct >= min_spread_pct {

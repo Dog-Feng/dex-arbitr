@@ -77,7 +77,11 @@ impl Controller {
         }
         let history = if cfg.history.enabled {
             let store = HistoryStore::open(cfg.history.clone())?;
-            info!(path = %cfg.history.db_path, "spread history sqlite ready");
+            info!(
+                path = %cfg.history.db_path,
+                snapshots = store.snapshot_count(),
+                "spread history sqlite ready; persisted natural spreads loaded"
+            );
             Some(store)
         } else {
             None
@@ -192,7 +196,6 @@ impl Controller {
             &mut round,
             self.history.as_ref(),
             self.cfg.scan.min_spread_pct,
-            self.cfg.history.min_points,
             self.cfg.scan.cross_use_natural,
         );
         self.emit_token_lines(&round);

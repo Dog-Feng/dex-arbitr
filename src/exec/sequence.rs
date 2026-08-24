@@ -2,7 +2,10 @@ use rust_decimal::Decimal;
 use std::time::Duration;
 
 use crate::config::{AppConfig, OrderStyle};
-use crate::domain::{spread::net_spread, Bbo, NetSpread, VenueId};
+use crate::domain::{
+    spread::{decide_spread, hedge_slip_pct, realized_slip_pct},
+    Bbo, NetSpread, VenueId,
+};
 
 /// 挂单未成且价差没了 → 撤单。
 /// 已经成交（含撤单前成交）→ 另一边仍市价对冲，避免单边。
@@ -65,7 +68,7 @@ pub fn sequenced_fee(cfg: &AppConfig, buy: &VenueId, sell: &VenueId) -> Decimal 
     }
 }
 
-/// 只走市价那一腿的盘口滑点。
+/// 成交后估滑点用（走档）。决策不调用。
 pub fn sequenced_slip(
     cfg: &AppConfig,
     buy: &VenueId,
@@ -75,12 +78,28 @@ pub fn sequenced_slip(
     qty: Decimal,
 ) -> Option<Decimal> {
     if !matches!(cfg.order.style, OrderStyle::LimitThenMarket) {
-        return Some(buy_book.buy_slip_pct(qty)? + sell_book.sell_slip_pct(qty)?);
+        return hedge_slip_pct(buy_book, sell_book, qty);
     }
     match first_limit_venue(cfg, buy, sell) {
         Some((first, _)) if first == buy => sell_book.sell_slip_pct(qty),
         Some(_) => buy_book.buy_slip_pct(qty),
-        None => Some(buy_book.buy_slip_pct(qty)? + sell_book.sell_slip_pct(qty)?),
+        None => hedge_slip_pct(buy_book, sell_book, qty),
+    }
+}
+
+/// 成交后相对决策价的实际滑点。超过 `cost.default_slip_pct`（>0）则视为 overrun。
+pub fn fill_slip_overrun(
+    cfg: &AppConfig,
+    is_buy: bool,
+    expected: Decimal,
+    fill: Decimal,
+) -> Option<Decimal> {
+    let slip = realized_slip_pct(is_buy, expected, fill)?;
+    let max = cfg.cost.default_slip_pct;
+    if max > Decimal::ZERO && slip > max {
+        Some(slip)
+    } else {
+        None
     }
 }
 
@@ -92,17 +111,12 @@ pub fn sequenced_spread(
     sell_book: &Bbo,
     qty: Decimal,
 ) -> Option<NetSpread> {
-    let slip = sequenced_slip(cfg, buy, sell, buy_book, sell_book, qty)?;
-    let max_slip = cfg.cost.default_slip_pct;
-    if max_slip > Decimal::ZERO && slip > max_slip {
-        return None;
-    }
     let fee = if matches!(cfg.order.style, OrderStyle::LimitThenMarket) {
         sequenced_fee(cfg, buy, sell)
     } else {
         cfg.exec_fee(buy) + cfg.exec_fee(sell)
     };
-    net_spread(buy.clone(), sell.clone(), buy_book, sell_book, fee, slip)
+    decide_spread(buy.clone(), sell.clone(), buy_book, sell_book, fee, qty)
 }
 
 pub fn best_sequenced_spread(
@@ -179,5 +193,19 @@ mod tests {
         assert_eq!(first.as_str(), "lighter_rh");
         assert_eq!(second.as_str(), "lighter");
         assert_eq!(book(dec!(100), dec!(100.01)).ask, dec!(100.01));
+    }
+
+    #[test]
+    fn decide_uses_l1_and_no_pre_slip() {
+        let cfg = AppConfig::load_from(std::path::Path::new("config/default.yaml")).unwrap();
+        let buy = VenueId::from("lighter");
+        let sell = VenueId::from("sodex");
+        let cheap = book(dec!(100), dec!(100.00));
+        let rich = book(dec!(100.20), dec!(100.21));
+        let net = sequenced_spread(&cfg, &buy, &sell, &cheap, &rich, dec!(0.001)).unwrap();
+        assert_eq!(net.slip_pct, dec!(0));
+        assert_eq!(net.net_pct, net.raw_pct - net.fee_pct);
+        assert!(fill_slip_overrun(&cfg, true, dec!(100), dec!(100.05)).is_some());
+        assert!(fill_slip_overrun(&cfg, true, dec!(100), dec!(100.005)).is_none());
     }
 }

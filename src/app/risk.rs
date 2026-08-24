@@ -13,10 +13,10 @@ pub fn books_tradable(cfg: &AppConfig, pair: &Pair, buy: &Bbo, sell: &Bbo) -> Re
     let min_qty = cfg
         .min_book_qty(&pair.legs[0].base)
         .max(cfg.grid_for(&pair.legs[0].base).base_qty);
-    if buy.ask_depth() < min_qty
-        || buy.bid_depth() < min_qty
-        || sell.ask_depth() < min_qty
-        || sell.bid_depth() < min_qty
+    if buy.ask_qty < min_qty
+        || buy.bid_qty < min_qty
+        || sell.ask_qty < min_qty
+        || sell.bid_qty < min_qty
     {
         return Err("thin_book");
     }

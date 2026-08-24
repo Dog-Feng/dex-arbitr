@@ -130,6 +130,13 @@ pub struct HistoryConfig {
     pub window_hours: u64,
     pub min_points: usize,
     pub max_age_secs: u64,
+    /// 库里已有 `natural_spreads` 则启动直接用；之后隔这么久用窗口样本重算一次。
+    #[serde(default = "default_refresh_interval_secs")]
+    pub refresh_interval_secs: u64,
+}
+
+fn default_refresh_interval_secs() -> u64 {
+    1800
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -373,6 +380,7 @@ mod tests {
         );
         assert!(cfg.history.enabled);
         assert_eq!(cfg.history.min_points, 10);
+        assert_eq!(cfg.history.refresh_interval_secs, 1800);
         assert!(cfg.scan.enabled);
         assert_eq!(cfg.scan.min_spread_pct, dec!(0.1));
         assert_eq!(cfg.scan.watch_top, 20);
