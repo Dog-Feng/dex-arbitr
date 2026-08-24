@@ -167,8 +167,7 @@
     <div class="ex-chips">
       <span class="ex-chip"><i class="hdot ok"></i>Lighter</span>
       <span class="ex-chip"><i class="hdot ok"></i>Lighter RH</span>
-      <span class="ex-chip">SEG-GRID</span>
-      <span class="ex-chip preview-badge">静态预览</span>
+      <span class="ex-chip"><i class="hdot ok"></i>SoDEX</span>
     </div>
     <div class="header-right">
       <span class="conn online"><i class="cdot"></i>监控中</span>
@@ -182,25 +181,25 @@
   </nav>
 
   <div class="wrap">
-    <div class="static-banner">
-      参考 dex-monitor 控制台样式。数字为示意，每 2 秒抖动一次。正式数据由后端推送。
+    <div class="static-banner" id="mode-banner">
+      连接后端后显示实盘/监控状态与账户快照。
     </div>
 
     <section class="tab-panel active" id="tab-spread">
       <div class="total-row">
-        <div class="total-card"><div class="lbl">匹配对</div><div class="val">2</div><div class="sub">永续 · 白名单</div></div>
-        <div class="total-card"><div class="lbl">最优净边</div><div class="val up" id="best">+0.041%</div><div class="sub">已扣费/滑点</div></div>
-        <div class="total-card"><div class="lbl">当前格子</div><div class="val">T1 / 1</div><div class="sub">max_segments=1</div></div>
-        <div class="total-card"><div class="lbl">对锁敞口</div><div class="val">0.002</div><div class="sub">BTC</div></div>
-        <div class="total-card"><div class="lbl">今日成交</div><div class="val">6</div><div class="sub">双腿</div></div>
-        <div class="total-card"><div class="lbl">稳定币偏离</div><div class="val">1.4</div><div class="sub">bp · 1:1 计价</div></div>
+        <div class="total-card"><div class="lbl">匹配对</div><div class="val" id="stat-pairs">—</div><div class="sub">永续 · 白名单</div></div>
+        <div class="total-card"><div class="lbl">最优净边</div><div class="val up" id="best">—</div><div class="sub">已扣费/滑点</div></div>
+        <div class="total-card"><div class="lbl">套利持仓</div><div class="val" id="stat-arb-pos">0</div><div class="sub">内存对锁</div></div>
+        <div class="total-card"><div class="lbl">交易所持仓</div><div class="val" id="stat-ex-pos">0</div><div class="sub">各 DEX 原始仓</div></div>
+        <div class="total-card"><div class="lbl">今日成交</div><div class="val" id="stat-exec">—</div><div class="sub">journal</div></div>
+        <div class="total-card"><div class="lbl">模式</div><div class="val" id="stat-mode">—</div><div class="sub">monitor / live</div></div>
       </div>
 
       <div class="spread-layout">
         <div class="panel panel-table">
           <div class="panel-title">
             <span>永续匹配对 · 跨所价差</span>
-            <span class="panel-meta">共 <strong>2</strong> 个 · 更新于 <strong id="last-refresh">—</strong></span>
+            <span class="panel-meta">共 <strong id="pair-count">—</strong> 个 · 更新于 <strong id="last-refresh">—</strong></span>
           </div>
           <div class="table-scroll">
             <table>
@@ -241,18 +240,23 @@
 
         <div class="stack">
           <div class="panel">
-            <div class="panel-title">当前持仓</div>
-            <div class="ov-exname" id="pos-title">BTC-USD-PERP</div>
-            <div class="kv"><span class="lbl">多腿</span><span class="val">Lighter 0.002</span></div>
-            <div class="kv"><span class="lbl">空腿</span><span class="val">Robinhood 0.002</span></div>
-            <div class="kv"><span class="lbl">开仓均价</span><span class="val">108420 / 108465</span></div>
-            <div class="kv"><span class="lbl">浮动</span><span class="val up">+3.80</span></div>
+            <div class="panel-title">套利持仓（对锁）</div>
+            <div class="ov-exname" id="pos-title">—</div>
+            <div id="arb-pos-body">
+              <div class="kv"><span class="lbl">状态</span><span class="val mut">暂无对锁持仓</span></div>
+            </div>
           </div>
           <div class="panel">
-            <div class="panel-title">交易所</div>
-            <div class="kv"><span class="lbl">Lighter 保证金</span><span class="val">1,240 USDC</span></div>
-            <div class="kv"><span class="lbl">Robinhood 保证金</span><span class="val">980 USDG</span></div>
-            <div class="kv"><span class="lbl">WS / 上次 tick</span><span class="val">已连接 / <span id="tick">380</span>ms</span></div>
+            <div class="panel-title">交易所账户</div>
+            <div id="venue-accounts">
+              <div class="kv"><span class="lbl">—</span><span class="val mut">等待后端数据</span></div>
+            </div>
+          </div>
+          <div class="panel">
+            <div class="panel-title">交易所持仓</div>
+            <div id="exchange-positions">
+              <div class="kv"><span class="lbl">—</span><span class="val mut">暂无持仓</span></div>
+            </div>
           </div>
         </div>
       </div>
@@ -315,24 +319,160 @@
   <script>
     (function () {
       function $(id) { return document.getElementById(id); }
-      function fmt(n) { return (n >= 0 ? "+" : "") + n.toFixed(3) + "%"; }
+      function fmt(n) {
+        var x = typeof n === "number" ? n : parseFloat(String(n).replace(/[^0-9.+-]/g, ""));
+        if (isNaN(x)) return String(n);
+        return (x >= 0 ? "+" : "") + x.toFixed(3) + "%";
+      }
+      function netClass(v) {
+        var x = parseFloat(String(v).replace(/[^0-9.+-]/g, ""));
+        if (isNaN(x)) return "mut";
+        if (x >= 0.03) return "up";
+        if (x < 0) return "down";
+        return "mut";
+      }
       function flash(el, up) {
+        if (!el) return;
         el.classList.remove("cell-flash-up", "cell-flash-down");
         void el.offsetWidth;
         el.classList.add(up ? "cell-flash-up" : "cell-flash-down");
       }
       function tickClock() {
         $("clock").textContent = new Date().toLocaleString("zh-CN", { hour12: false });
-        $("last-refresh").textContent = new Date().toLocaleTimeString("zh-CN", { hour12: false });
       }
-      function jitter(id, base) {
-        var el = $(id);
-        var n = base + (Math.random() - 0.5) * 0.008;
-        var prev = parseFloat(el.textContent);
-        el.textContent = fmt(n);
-        el.className = "num " + (n >= 0.03 ? "up" : n < 0 ? "down" : "mut");
-        flash(el, n >= prev);
-        return n;
+      function statusTag(s) {
+        var cls = "sess-tag wait";
+        if (/open|filled|hold/i.test(s)) cls = /hold/i.test(s) ? "sess-tag hold" : "sess-tag open";
+        return '<span class="' + cls + '">' + s + '</span>';
+      }
+      function renderPairs(pairs) {
+        var tbody = $("pairs");
+        if (!tbody || !pairs || !pairs.length) return;
+        tbody.innerHTML = pairs.map(function (p, i) {
+          return '<tr class="' + (i === 0 ? "selected" : "") + '" data-id="' + p.pair_id + '">' +
+            "<td>" + p.pair_id + "</td>" +
+            "<td>" + p.buy + " 买 → " + p.sell + " 卖</td>" +
+            '<td class="num ' + netClass(p.raw_pct) + '">' + p.raw_pct + "</td>" +
+            '<td class="num ' + netClass(p.net_pct) + '">' + p.net_pct + "</td>" +
+            '<td class="num">' + p.grid + '</td>' +
+            '<td class="num">' + p.target_qty + ' / ' + p.actual_qty + '</td>' +
+            "<td>" + statusTag(p.status) + "</td></tr>";
+        }).join("");
+        document.querySelectorAll("#pairs tr").forEach(function (tr) {
+          tr.onclick = function () {
+            document.querySelectorAll("#pairs tr").forEach(function (r) { r.classList.remove("selected"); });
+            tr.classList.add("selected");
+            if ($("pos-title")) $("pos-title").textContent = tr.cells[0].textContent;
+          };
+        });
+      }
+      function venueLabel(id) {
+        if (id === "lighter") return "Lighter";
+        if (id === "lighter_rh") return "Lighter RH";
+        if (id === "sodex") return "SoDEX";
+        return id;
+      }
+      function fmtUsdc(v) {
+        var n = parseFloat(String(v));
+        if (isNaN(n)) return String(v || "—");
+        return n.toFixed(2) + " USDC";
+      }
+      function renderVenueAccounts(balances) {
+        var box = $("venue-accounts");
+        if (!box) return;
+        if (!balances || !balances.length) {
+          box.innerHTML = '<div class="kv"><span class="lbl">—</span><span class="val mut">无数据</span></div>';
+          return;
+        }
+        box.innerHTML = balances.map(function (b) {
+          var total = b.total || b.available || "0";
+          var avail = b.available || "0";
+          return '<div class="ov-exname">' + venueLabel(b.venue) + '</div>' +
+            '<div class="kv"><span class="lbl">总余额</span><span class="val">' + fmtUsdc(total) + '</span></div>' +
+            '<div class="kv"><span class="lbl">可用</span><span class="val">' + fmtUsdc(avail) + '</span></div>';
+        }).join("");
+      }
+      function renderExchangePositions(rows) {
+        var box = $("exchange-positions");
+        if (!box) return;
+        if (!rows || !rows.length) {
+          box.innerHTML = '<div class="kv"><span class="lbl">—</span><span class="val mut">暂无持仓</span></div>';
+          return;
+        }
+        box.innerHTML = rows.map(function (p) {
+          var entry = p.entry_price ? (" @ " + p.entry_price) : "";
+          return '<div class="kv"><span class="lbl">' + venueLabel(p.venue) + " · " + p.symbol + '</span>' +
+            '<span class="val">' + p.qty + entry + '</span></div>';
+        }).join("");
+      }
+      function renderArbPositions(positions) {
+        var body = $("arb-pos-body");
+        if (!body) return;
+        if (!positions || !positions.length) {
+          if ($("pos-title")) $("pos-title").textContent = "—";
+          body.innerHTML = '<div class="kv"><span class="lbl">状态</span><span class="val mut">暂无对锁持仓</span></div>';
+          return;
+        }
+        var p = positions[0];
+        if ($("pos-title")) $("pos-title").textContent = p.pair_id;
+        body.innerHTML =
+          '<div class="kv"><span class="lbl">方向</span><span class="val">' + p.buy + " 买 → " + p.sell + " 卖</span></div>" +
+          '<div class="kv"><span class="lbl">数量</span><span class="val">' + p.qty + '</span></div>' +
+          '<div class="kv"><span class="lbl">格子</span><span class="val">' + p.grid + '</span></div>';
+      }
+      function renderExecutions(rows) {
+        var tape = document.querySelector("#tab-tape tbody");
+        if (!tape || !rows) return;
+        tape.innerHTML = rows.map(function (r) {
+          var t = new Date(r.ts * 1000).toLocaleTimeString("zh-CN", { hour12: false });
+          return "<tr><td>" + t + "</td><td>" + r.action + "</td><td>" + r.pair_id +
+            "</td><td>" + r.buy_venue + " → " + r.sell_venue + "</td><td class=\"num\">" +
+            r.qty + "</td><td class=\"num\">" + (r.net_pct || "—") + "</td><td>" +
+            statusTag(r.result) + "</td></tr>";
+        }).join("");
+      }
+      async function apiFetch(path) {
+        var headers = {};
+        var token = localStorage.getItem("dex_api_token");
+        if (token) headers["Authorization"] = "Bearer " + token;
+        var r = await fetch(path, { headers: headers });
+        if (r.status === 401) throw new Error("unauthorized");
+        return r.json();
+      }
+      async function pull() {
+        try {
+          var snap = await apiFetch("/api/snapshot");
+          if (snap.pairs) {
+            renderPairs(snap.pairs);
+            if ($("pair-count")) $("pair-count").textContent = String(snap.pairs.length);
+          }
+          renderArbPositions(snap.positions);
+          renderVenueAccounts(snap.balances);
+          renderExchangePositions(snap.exchange_positions);
+          if (snap.stats) {
+            if ($("stat-pairs")) $("stat-pairs").textContent = String(snap.stats.matched_pairs || snap.pairs?.length || "—");
+            if ($("stat-arb-pos")) $("stat-arb-pos").textContent = String(snap.stats.open_positions || 0);
+            if ($("stat-ex-pos")) $("stat-ex-pos").textContent = String((snap.exchange_positions || []).length);
+            if (snap.stats.best_net_pct && $("best")) {
+              $("best").textContent = snap.stats.best_net_pct;
+              $("best").className = "val " + netClass(snap.stats.best_net_pct);
+            }
+          }
+          if ($("stat-mode")) {
+            $("stat-mode").textContent = snap.monitor_only ? "监控" : (snap.paper_trading ? "Paper" : "实盘");
+          }
+          $("last-refresh").textContent = new Date().toLocaleTimeString("zh-CN", { hour12: false });
+          if ($("mode-banner")) {
+            $("mode-banner").textContent =
+              snap.monitor_only ? "monitor_only · 仅监控" :
+              (snap.paper_trading ? "paper 模式 · 模拟成交" : "实盘 · exchange_bridge");
+          }
+          var exec = await apiFetch("/api/executions");
+          renderExecutions(exec.executions);
+          if ($("stat-exec")) $("stat-exec").textContent = String((exec.executions || []).length);
+        } catch (e) {
+          if ($("mode-banner")) $("mode-banner").textContent = "未连接后端 · " + (e.message || "offline");
+        }
       }
       document.querySelectorAll(".tab-btn").forEach(function (btn) {
         btn.onclick = function () {
@@ -342,22 +482,9 @@
           $("tab-" + btn.dataset.tab).classList.add("active");
         };
       });
-      document.querySelectorAll("#pairs tr").forEach(function (tr) {
-        tr.onclick = function () {
-          document.querySelectorAll("#pairs tr").forEach(function (r) { r.classList.remove("selected"); });
-          tr.classList.add("selected");
-          $("pos-title").textContent = tr.cells[0].textContent;
-        };
-      });
       tickClock();
-      setInterval(function () {
-        tickClock();
-        var btc = jitter("btc-net", 0.041);
-        jitter("eth-net", 0.009);
-        $("best").textContent = fmt(btc);
-        $("best").className = "val " + (btc >= 0 ? "up" : "down");
-        $("tick").textContent = String(280 + Math.floor(Math.random() * 180));
-      }, 2000);
+      pull();
+      setInterval(function () { tickClock(); pull(); }, 2000);
     })();
   </script>
 </body>

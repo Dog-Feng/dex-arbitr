@@ -16,16 +16,23 @@ use crate::domain::{
     Bbo, VenueId, VenueMarket,
 };
 
-use super::port::{Balance, BboTx, ExchangePort, OrderAck, OrderReq, VenuePosition};
+use super::port::{Balance, BboTx, CancelReq, ExchangePort, OrderAck, OrderReq, VenuePosition};
+use super::{bridge, venue_yaml_path};
 
 pub struct LighterAdapter {
     venue: VenueFile,
     whitelist: Vec<String>,
+    venue_path: std::path::PathBuf,
 }
 
 impl LighterAdapter {
     pub fn new(venue: VenueFile, whitelist: Vec<String>) -> Self {
-        Self { venue, whitelist }
+        let venue_path = venue_yaml_path(&venue.id);
+        Self {
+            venue,
+            whitelist,
+            venue_path,
+        }
     }
 
     fn venue_id(&self) -> VenueId {
@@ -195,16 +202,53 @@ impl ExchangePort for LighterAdapter {
         Ok(())
     }
 
-    async fn place(&self, _req: OrderReq) -> Result<OrderAck> {
-        bail!("{} live order is not wired in P1 monitor path", self.venue.id)
+    async fn place(&self, req: OrderReq) -> Result<OrderAck> {
+        if !self.venue.keys_ready() {
+            bail!("{} keys not configured", self.venue.id);
+        }
+        if !bridge::bridge_available().await {
+            bail!("missing scripts/exchange_bridge.py");
+        }
+        bridge::bridge_place(&self.venue_path, &req).await
+    }
+
+    async fn cancel(&self, req: &CancelReq) -> Result<()> {
+        if !self.venue.keys_ready() {
+            bail!("{} keys not configured", self.venue.id);
+        }
+        bridge::bridge_cancel(&self.venue_path, req).await
+    }
+
+    async fn order_status(&self, req: &CancelReq) -> Result<OrderAck> {
+        if !self.venue.keys_ready() {
+            bail!("{} keys not configured", self.venue.id);
+        }
+        bridge::bridge_order_status(
+            &self.venue_path,
+            req,
+            req.qty.unwrap_or(Decimal::ZERO),
+        )
+        .await
     }
 
     async fn positions(&self) -> Result<Vec<VenuePosition>> {
-        Ok(Vec::new())
+        if !self.venue.keys_ready() {
+            return Ok(Vec::new());
+        }
+        if !bridge::bridge_available().await {
+            return Ok(Vec::new());
+        }
+        bridge::bridge_positions(&self.venue_path).await
     }
 
     async fn balances(&self) -> Result<Vec<Balance>> {
-        Ok(Vec::new())
+        if !self.venue.keys_ready() {
+            return Ok(Vec::new());
+        }
+        if !bridge::bridge_available().await {
+            return Ok(Vec::new());
+        }
+        bridge::bridge_balances(&self.venue_path).await
     }
 }
 

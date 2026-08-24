@@ -205,6 +205,8 @@ mod tests {
             buy: VenueId::from("lighter"),
             sell: VenueId::from("lighter_rh"),
             qty: dec!(0.001),
+            grid: 1,
+            entry_notional_usdc: dec!(100),
         };
         let intent = eng.decide(
             "BTC-USD-PERP",
@@ -227,6 +229,8 @@ mod tests {
             buy: VenueId::from("lighter"),
             sell: VenueId::from("lighter_rh"),
             qty: dec!(0.001),
+            grid: 1,
+            entry_notional_usdc: dec!(100),
         };
         let mut reverse = net(dec!(0.05));
         reverse.buy = VenueId::from("lighter_rh");

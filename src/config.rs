@@ -20,8 +20,186 @@ pub struct AppConfig {
     pub risk: RiskConfig,
     #[serde(default = "default_scan")]
     pub scan: ScanConfig,
+    #[serde(default = "default_execution")]
+    pub execution: ExecutionConfig,
+    #[serde(default = "default_sizing")]
+    pub sizing: SizingConfig,
+    #[serde(default = "default_live_test")]
+    pub live_test: LiveTestConfig,
+    #[serde(default = "default_http")]
+    pub http: HttpConfig,
     #[serde(skip)]
     pub venue_fees: HashMap<String, VenueFees>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct HttpConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// 公网监听地址，例如 `0.0.0.0:8090`。
+    #[serde(default = "default_http_bind")]
+    pub bind: String,
+    #[serde(default = "default_web_root")]
+    pub web_root: String,
+    /// 非空时 `/api/*` 需 `Authorization: Bearer <token>`（对齐 internal Go API）。
+    #[serde(default)]
+    pub auth_token: Option<String>,
+}
+
+fn default_http_bind() -> String {
+    "0.0.0.0:8090".into()
+}
+
+fn default_web_root() -> String {
+    "web".into()
+}
+
+fn default_http() -> HttpConfig {
+    HttpConfig {
+        enabled: false,
+        bind: default_http_bind(),
+        web_root: default_web_root(),
+        auth_token: None,
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LiveTestConfig {
+    /// 为 true 时，主流程实盘下单受 max_qty 上限（DEX 单所验证用）。
+    /// 价差套利正常运行时应为 false，走 sizing 定仓。
+    #[serde(default)]
+    pub dex_test_mode: bool,
+    /// live-test CLI / dex_test_mode 下单时的单笔最大 base qty。
+    #[serde(default = "default_live_test_max_qty")]
+    pub max_qty: Decimal,
+    #[serde(default = "default_live_test_journal")]
+    pub journal_path: Option<String>,
+}
+
+fn default_live_test_max_qty() -> Decimal {
+    Decimal::new(1, 3) // 0.001
+}
+
+fn default_live_test_journal() -> Option<String> {
+    Some("data/executions.sqlite".into())
+}
+
+fn default_live_test() -> LiveTestConfig {
+    LiveTestConfig {
+        dex_test_mode: false,
+        max_qty: Decimal::new(1, 3),
+        journal_path: Some("data/executions.sqlite".into()),
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ExecutionConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_loop_interval_ms")]
+    pub loop_interval_ms: u64,
+    /// 无密钥或未接 REST 余额时，用 paper 模拟成交更新内存持仓。
+    #[serde(default = "default_true")]
+    pub paper_trading: bool,
+}
+
+fn default_loop_interval_ms() -> u64 {
+    100
+}
+
+fn default_execution() -> ExecutionConfig {
+    ExecutionConfig {
+        enabled: false,
+        loop_interval_ms: 100,
+        paper_trading: true,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SizingMode {
+    /// 按保证金短板 × 杠杆定仓（默认）。
+    #[default]
+    Margin,
+    /// 每笔固定 USDC 名义，用于初期小额联调。
+    Fixed,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SizingConfig {
+    #[serde(default)]
+    pub mode: SizingMode,
+    /// mode=fixed 时每笔目标名义（USDC）。
+    #[serde(default = "default_fixed_notional_usdc")]
+    pub fixed_notional_usdc: Decimal,
+    #[serde(default = "default_max_concurrent_pairs")]
+    pub max_concurrent_pairs: u32,
+    #[serde(default = "default_leverage")]
+    pub leverage_multiplier: Decimal,
+    #[serde(default = "default_min_notional")]
+    pub min_notional_usdc: Decimal,
+    #[serde(default = "default_max_notional")]
+    pub max_notional_usdc: Decimal,
+    #[serde(default = "default_depth_pct")]
+    pub depth_pct: Decimal,
+    #[serde(default = "default_refresh_balance_secs")]
+    pub refresh_balance_secs: u64,
+    /// REST 余额未接线时的回退可用 USDC（paper / 联调）。
+    pub fallback_available_usdc: Option<Decimal>,
+    /// 可用保证金使用比例（%），留 buffer 防强平/手续费。
+    #[serde(default = "default_margin_utilization_pct")]
+    pub margin_utilization_pct: Decimal,
+    /// 覆盖单所杠杆；未列出的所用 leverage_multiplier。
+    #[serde(default)]
+    pub leverage_by_venue: HashMap<String, Decimal>,
+}
+
+fn default_margin_utilization_pct() -> Decimal {
+    Decimal::from(90)
+}
+
+fn default_fixed_notional_usdc() -> Decimal {
+    Decimal::from(20)
+}
+
+fn default_max_concurrent_pairs() -> u32 {
+    5
+}
+
+fn default_leverage() -> Decimal {
+    Decimal::from(2)
+}
+
+fn default_min_notional() -> Decimal {
+    Decimal::from(20)
+}
+
+fn default_max_notional() -> Decimal {
+    Decimal::from(500)
+}
+
+fn default_depth_pct() -> Decimal {
+    Decimal::new(5, 1)
+}
+
+fn default_refresh_balance_secs() -> u64 {
+    60
+}
+
+fn default_sizing() -> SizingConfig {
+    SizingConfig {
+        mode: SizingMode::Margin,
+        fixed_notional_usdc: Decimal::from(20),
+        max_concurrent_pairs: 5,
+        leverage_multiplier: Decimal::from(2),
+        min_notional_usdc: Decimal::from(20),
+        max_notional_usdc: Decimal::from(500),
+        depth_pct: Decimal::new(5, 1),
+        refresh_balance_secs: 60,
+        fallback_available_usdc: None,
+        margin_utilization_pct: Decimal::from(90),
+        leverage_by_venue: HashMap::new(),
+    }
 }
 
 /// 对齐参考监控 V2：毛价差门槛 + 定时分析环。不改格子、不下单。
@@ -166,6 +344,9 @@ pub struct VenueFile {
     /// SoDEX：`X-API-Key` 用的是名称，不是地址。环境变量 `SODEX_API_KEY_NAME`。
     #[serde(default)]
     pub api_key_name: String,
+    /// SoDEX 主钱包地址（查余额/持仓用，与 API Key 私钥地址可能不同）。`SODEX_ACCOUNT_ADDRESS`。
+    #[serde(default, alias = "account_address")]
+    pub account_address: String,
     /// Lighter / SoDEX 私钥。SoDEX 也可用 `private_key` 或环境变量 `SODEX_PRIVATE_KEY`。
     #[serde(default, alias = "private_key")]
     pub api_key_private_key: String,
@@ -300,6 +481,15 @@ impl AppConfig {
             .map(|(_, v)| *v)
             .unwrap_or(Decimal::ZERO)
     }
+
+    pub fn leverage_for(&self, venue: &str) -> Decimal {
+        self.sizing
+            .leverage_by_venue
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(venue))
+            .map(|(_, v)| *v)
+            .unwrap_or(self.sizing.leverage_multiplier)
+    }
 }
 
 fn venue_file_name(id: &str) -> String {
@@ -333,6 +523,11 @@ fn overlay_venue_env(venue: &mut VenueFile) {
     if let Ok(v) = std::env::var("SODEX_PRIVATE_KEY") {
         if !v.trim().is_empty() {
             venue.api_key_private_key = v;
+        }
+    }
+    if let Ok(v) = std::env::var("SODEX_ACCOUNT_ADDRESS") {
+        if !v.trim().is_empty() {
+            venue.account_address = v;
         }
     }
 }
@@ -386,6 +581,10 @@ mod tests {
         assert_eq!(cfg.scan.watch_top, 20);
         assert!(cfg.scan.cross_use_natural);
         assert!(cfg.pairs.whitelist.is_empty());
+        assert!(!cfg.execution.enabled);
+        assert!(cfg.execution.paper_trading);
+        assert_eq!(cfg.sizing.max_concurrent_pairs, 5);
+        assert_eq!(cfg.sizing.leverage_multiplier, dec!(2));
         let sodex = cfg.load_venue("sodex").unwrap();
         assert_eq!(sodex.chain_id, 623);
         assert_eq!(sodex.id, "sodex");

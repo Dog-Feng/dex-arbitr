@@ -1,7 +1,9 @@
+pub mod executor;
 pub mod planner;
 pub mod sequence;
 
-pub use planner::{plan_hedge, HedgePlan};
+pub use executor::{ExecFill, ExecResult, HedgeExecutor, PostFirstResult};
+pub use planner::{plan_hedge, HedgeLeg, HedgePlan};
 pub use sequence::{
     best_sequenced_spread, fill_slip_overrun, watch_resting_limit, LimitWatch,
 };

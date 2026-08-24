@@ -1,30 +1,40 @@
 use anyhow::Result;
 use rust_decimal::Decimal;
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use crate::config::AppConfig;
+use crate::config::{AppConfig, OrderStyle};
 use crate::domain::{
-    is_cross_dex, match_all_pairs, Bbo, GridEngine, Intent, Pair, Position, VenueId, VenueMarket,
+    is_cross_dex, match_all_pairs, Bbo, GridEngine, Intent, Pair, VenueId, VenueMarket,
 };
 use crate::domain::spread::raw_spread_pct;
-use crate::exec::{plan_hedge, watch_resting_limit, LimitWatch, best_sequenced_spread, HedgePlan};
+use crate::exec::{
+    best_sequenced_spread, plan_hedge, watch_resting_limit, HedgeExecutor, HedgePlan, LimitWatch,
+};
 use crate::exchange::{make_adapter, ExchangePort};
+use crate::infra::api::{self, ApiHub, ExchangePositionRow, LiveSnapshot, PairRow, PositionRow, VenueBalanceRow};
 use crate::infra::dashboard::{self, LivePanel};
+use crate::infra::journal::{ExecJournal, ExecRecord, now_ts};
 use crate::infra::history::{residual_net, HistoryStore};
 
+use super::balance::{refresh_balances, refresh_venue_accounts, BalanceCache, VenueAccountCache};
+use super::positions::PositionStore;
 use super::risk::{books_tradable, stable_ok};
 use super::scan::OpportunityTracker;
+use super::sizing::{mid_from_bbo, resolve_qty, BindingLeg, LegMargin};
 
 pub struct Controller {
     cfg: AppConfig,
     adapters: Vec<Arc<dyn ExchangePort>>,
+    adapters_by_id: HashMap<String, Arc<dyn ExchangePort>>,
     pairs: Vec<Pair>,
     books: HashMap<(String, String), Bbo>,
-    positions: HashMap<String, Position>,
+    positions: PositionStore,
     grid: GridEngine,
     event_rx: Option<mpsc::UnboundedReceiver<(VenueId, String, Bbo)>>,
     history: Option<HistoryStore>,
@@ -32,6 +42,10 @@ pub struct Controller {
     pending: HashMap<String, PendingLimit>,
     scanner: OpportunityTracker,
     last_token_log: HashMap<String, LoggedToken>,
+    balance: BalanceCache,
+    venue_accounts: VenueAccountCache,
+    api: Option<Arc<ApiHub>>,
+    ui_pairs: HashMap<String, PairRow>,
 }
 
 struct LoggedToken {
@@ -47,11 +61,13 @@ struct LoggedToken {
 struct PendingLimit {
     plan: HedgePlan,
     since: Instant,
+    order_id: Option<String>,
 }
 
 impl Controller {
     pub async fn run(cfg: AppConfig) -> Result<()> {
         let mut adapters: Vec<Arc<dyn ExchangePort>> = Vec::new();
+        let mut adapters_by_id = HashMap::new();
         for id in &cfg.venues {
             let venue = cfg.load_venue(id)?;
             if venue.keys_ready() {
@@ -73,7 +89,9 @@ impl Controller {
             } else {
                 tracing::info!(venue = id, "no signing keys; monitor_only still works");
             }
-            adapters.push(make_adapter(venue, cfg.pairs.whitelist.clone()));
+            let adapter = make_adapter(venue, cfg.pairs.whitelist.clone());
+            adapters_by_id.insert(id.clone(), adapter.clone());
+            adapters.push(adapter);
         }
         let history = if cfg.history.enabled {
             let store = HistoryStore::open(cfg.history.clone())?;
@@ -86,12 +104,24 @@ impl Controller {
         } else {
             None
         };
+        let api = if cfg.http.enabled {
+            let hub = Arc::new(ApiHub::new(
+                cfg.live_test.journal_path.clone(),
+                PathBuf::from(&cfg.http.web_root),
+                cfg.http.auth_token.clone(),
+            ));
+            hub.clone().spawn(&cfg.http.bind);
+            Some(hub)
+        } else {
+            None
+        };
         let mut this = Self {
             cfg,
             adapters,
+            adapters_by_id,
             pairs: Vec::new(),
             books: HashMap::new(),
-            positions: HashMap::new(),
+            positions: PositionStore::default(),
             grid: GridEngine::default(),
             event_rx: None,
             history,
@@ -99,9 +129,16 @@ impl Controller {
             pending: HashMap::new(),
             scanner: OpportunityTracker::default(),
             last_token_log: HashMap::new(),
+            balance: BalanceCache::default(),
+            venue_accounts: VenueAccountCache::default(),
+            api,
+            ui_pairs: HashMap::new(),
         };
         this.bootstrap().await?;
-        if this.cfg.scan.enabled {
+        if this.cfg.execution.enabled {
+            this.refresh_balances_now().await?;
+            this.loop_unified().await
+        } else if this.cfg.scan.enabled {
             this.loop_scan().await
         } else {
             this.loop_events().await
@@ -121,6 +158,7 @@ impl Controller {
             n = self.pairs.len(),
             venues = self.adapters.len(),
             scan = self.cfg.scan.enabled,
+            execution = self.cfg.execution.enabled,
             whitelist = ?self.cfg.pairs.whitelist,
             "matched perp pairs"
         );
@@ -152,13 +190,83 @@ impl Controller {
             adapter.subscribe_bbo(&mkts, tx.clone()).await?;
         }
         self.event_rx = Some(rx);
-        if self.cfg.scan.enabled {
-            self.panel = LivePanel::new(0);
+        let panel_pairs = if self.cfg.execution.enabled || !self.cfg.scan.enabled {
+            self.pairs.len() * self.pair_stride()
         } else {
-            self.panel = LivePanel::new(self.pairs.len() * self.pair_stride());
-        }
-        self.panel.scan_mode = self.cfg.scan.enabled;
+            0
+        };
+        self.panel = LivePanel::new(panel_pairs);
+        self.panel.scan_mode = self.cfg.scan.enabled && !self.cfg.execution.enabled;
         Ok(())
+    }
+
+    async fn refresh_balances_now(&mut self) -> Result<()> {
+        self.balance = refresh_balances(&self.adapters, &self.cfg.sizing).await?;
+        self.venue_accounts = refresh_venue_accounts(&self.adapters).await?;
+        Ok(())
+    }
+
+    async fn maybe_refresh_balances(&mut self) {
+        let due = self.balance.last_refresh.elapsed()
+            >= Duration::from_secs(self.cfg.sizing.refresh_balance_secs.max(5));
+        if due {
+            if let Err(err) = self.refresh_balances_now().await {
+                warn!(error = %err, "balance refresh failed");
+            }
+        }
+    }
+
+    async fn loop_unified(&mut self) -> Result<()> {
+        let mut rx = self.event_rx.take().expect("bootstrap must run first");
+        let mut tick = tokio::time::interval(Duration::from_millis(
+            self.cfg.execution.loop_interval_ms.max(10),
+        ));
+        loop {
+            tokio::select! {
+                msg = rx.recv() => {
+                    let Some((venue, pair_id, bbo)) = msg else {
+                        break;
+                    };
+                    self.books
+                        .insert((venue.as_str().to_string(), pair_id), bbo);
+                }
+                _ = tick.tick() => {
+                    self.maybe_refresh_balances().await;
+                    self.tick_execution().await;
+                    self.panel.flush();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn tick_execution(&mut self) {
+        let close_first: Vec<usize> = self
+            .pairs
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| {
+                self.positions
+                    .get(&p.pair_id)
+                    .map(|pos| pos.qty > Decimal::ZERO)
+                    .unwrap_or(false)
+            })
+            .map(|(i, _)| i)
+            .collect();
+        let close_set: HashSet<usize> = close_first.iter().copied().collect();
+        for &pi in &close_first {
+            self.process_pair(pi).await;
+        }
+        for pi in 0..self.pairs.len() {
+            if close_set.contains(&pi) {
+                continue;
+            }
+            if !self.positions.can_open(self.cfg.sizing.max_concurrent_pairs) {
+                break;
+            }
+            self.process_pair(pi).await;
+        }
+        self.publish_api_snapshot();
     }
 
     async fn loop_scan(&mut self) -> Result<()> {
@@ -224,10 +332,7 @@ impl Controller {
             if !is_cross_dex(v0, v1) {
                 continue;
             }
-            for (buy, sell, bb, sb) in [
-                (v0, v1, b0, b1),
-                (v1, v0, b1, b0),
-            ] {
+            for (buy, sell, bb, sb) in [(v0, v1, b0, b1), (v1, v0, b1, b0)] {
                 let Some(raw) = raw_spread_pct(bb.ask, sb.bid) else {
                     continue;
                 };
@@ -317,8 +422,7 @@ impl Controller {
                         ),
                     );
                 }
-                let pair = self.pairs[pi].clone();
-                self.on_pair(&pair, pi);
+                self.process_pair(pi).await;
             }
             self.panel.flush();
         }
@@ -343,7 +447,8 @@ impl Controller {
         self.panel.set(slot + 1, lines[1].clone());
     }
 
-    fn on_pair(&mut self, pair: &Pair, pair_i: usize) {
+    async fn process_pair(&mut self, pair_i: usize) {
+        let pair = self.pairs[pair_i].clone();
         let v0 = pair.legs[0].venue.clone();
         let v1 = pair.legs[1].venue.clone();
         let Some(b0) = self.books.get(&(v0.as_str().to_string(), pair.pair_id.clone())) else {
@@ -354,7 +459,23 @@ impl Controller {
             self.panel.stats.bump_skip("wait");
             return;
         };
-        if let Err(reason) = books_tradable(&self.cfg, pair, b0, b1) {
+        let b0 = b0.clone();
+        let b1 = b1.clone();
+
+        let mid = match mid_from_bbo(&b0, &b1) {
+            Some(m) => m,
+            None => {
+                self.panel.stats.bump_skip("no_mid");
+                return;
+            }
+        };
+        let base = &pair.legs[0].base;
+        let min_probe = self
+            .cfg
+            .min_book_qty(base)
+            .max(self.cfg.grid_for(base).base_qty);
+
+        if let Err(reason) = books_tradable(&self.cfg, &pair, &b0, &b1, min_probe) {
             self.panel.stats.bump_skip(reason);
             self.set_spread(pair_i, dashboard::skip_lines(&pair.pair_id, reason));
             return;
@@ -365,20 +486,76 @@ impl Controller {
             return;
         }
 
+        let reserved = self
+            .positions
+            .reserved_margin_by_venue(|v| self.cfg.leverage_for(v));
+        let global_min = self.balance.global_min();
+        let mut params = self.cfg.grid_for(base);
+        let probe = resolve_qty(
+            &self.cfg.sizing,
+            global_min,
+            self.leg_margin(&reserved, v0.as_str()),
+            self.leg_margin(&reserved, v1.as_str()),
+            self.positions.active_slots() as u32,
+            &b0,
+            &b1,
+            mid,
+            &pair.legs[0],
+            &pair.legs[1],
+        );
+        if let Some(r) = probe {
+            params.base_qty = r.qty;
+        }
+
         let pos = self.positions.get(&pair.pair_id).cloned();
-        let params = self.cfg.grid_for(&pair.legs[0].base);
-        let Some(net) = best_sequenced_spread(
-            &self.cfg,
-            &v0,
-            &v1,
-            b0,
-            b1,
-            params.base_qty,
-        ) else {
+
+        let Some(mut net) = best_sequenced_spread(&self.cfg, &v0, &v1, &b0, &b1, params.base_qty)
+        else {
             self.panel.stats.bump_skip("no_spread");
             self.set_spread(pair_i, dashboard::skip_lines(&pair.pair_id, "no_spread"));
             return;
         };
+
+        let (buy_leg, sell_leg, buy_book, sell_book) =
+            legs_and_books(&pair, &net.buy, &net.sell, &v0, &v1, &b0, &b1);
+        if let Some(r) = resolve_qty(
+            &self.cfg.sizing,
+            global_min,
+            self.leg_margin(&reserved, buy_leg.venue.as_str()),
+            self.leg_margin(&reserved, sell_leg.venue.as_str()),
+            self.positions.active_slots() as u32,
+            buy_book,
+            sell_book,
+            mid,
+            buy_leg,
+            sell_leg,
+        ) {
+            if pos.is_none() {
+                params.base_qty = r.qty;
+                let bind = match r.binding {
+                    BindingLeg::Buy => buy_leg.venue.as_str(),
+                    BindingLeg::Sell => sell_leg.venue.as_str(),
+                };
+                info!(
+                    pair = %pair.pair_id,
+                    buy = %net.buy,
+                    sell = %net.sell,
+                    binding_venue = bind,
+                    notional_usdc = %r.notional_usdc,
+                    qty = %r.qty,
+                    "sized by min-margin leg; same qty on both venues"
+                );
+                if let Some(net2) =
+                    best_sequenced_spread(&self.cfg, &v0, &v1, &b0, &b1, r.qty)
+                {
+                    net = net2;
+                }
+            }
+        } else if pos.is_none() {
+            self.panel.stats.bump_skip("no_size");
+            self.set_spread(pair_i, dashboard::skip_lines(&pair.pair_id, "no_size"));
+            return;
+        }
 
         let mut natural = None;
         if let Some(store) = &self.history {
@@ -421,18 +598,57 @@ impl Controller {
                 .map(|s| s.window_points(&pair.pair_id, net.buy.as_str(), net.sell.as_str()))
                 .unwrap_or(0)
         });
+
         if let Some(pending) = self.pending.get(&pair.pair_id).cloned() {
-            let same_dir =
-                pending.plan.buy_venue == net.buy.as_str() && pending.plan.sell_venue == net.sell.as_str();
+            let same_dir = pending.plan.buy_venue == net.buy.as_str()
+                && pending.plan.sell_venue == net.sell.as_str();
             let still_valid = same_dir && residual >= params.initial;
+            let paper = self.cfg.execution.paper_trading;
+            let first_filled;
+            let hedge_qty;
+            if paper {
+                first_filled = pending.since.elapsed() >= Duration::from_millis(100) && still_valid;
+                hedge_qty = pending.plan.qty;
+            } else if let Some(ref oid) = pending.order_id {
+                match HedgeExecutor::poll_first_leg(
+                    &self.adapters_by_id,
+                    &pending.plan.first,
+                    pending.plan.qty,
+                    oid,
+                )
+                .await
+                {
+                    Ok(Some(f)) => {
+                        first_filled = f.qty > Decimal::ZERO;
+                        hedge_qty = if f.qty > Decimal::ZERO {
+                            f.qty
+                        } else {
+                            pending.plan.qty
+                        };
+                    }
+                    Ok(None) => {
+                        first_filled = false;
+                        hedge_qty = pending.plan.qty;
+                    }
+                    Err(err) => {
+                        warn!(pair = %pair.pair_id, error = %err, "poll first leg");
+                        first_filled = false;
+                        hedge_qty = pending.plan.qty;
+                    }
+                }
+            } else {
+                first_filled = false;
+                hedge_qty = pending.plan.qty;
+            };
             let action = watch_resting_limit(
                 still_valid,
                 pending.since.elapsed(),
                 Duration::from_millis(self.cfg.order.limit_timeout_ms),
-                false,
+                first_filled,
             );
             match action {
                 LimitWatch::StillWait => {
+                    self.record_ui_pair(&pair, &net, &params, pos.as_ref(), "limit");
                     self.set_spread(
                         pair_i,
                         dashboard::spread_lines(
@@ -452,36 +668,65 @@ impl Controller {
                     return;
                 }
                 LimitWatch::CancelSpreadGone => {
+                    if !paper {
+                        if let Some(ref oid) = pending.order_id {
+                            let _ = HedgeExecutor::cancel_resting(
+                                &self.adapters_by_id,
+                                &pending.plan.first,
+                                oid,
+                            )
+                            .await;
+                        }
+                    }
                     self.pending.remove(&pair.pair_id);
+                    self.positions.release_pending(&pair.pair_id);
                     self.panel.stats.cancel_gone += 1;
+                    self.log_exec(&pending.plan, "cancel", "spread_gone", "");
                     info!(
                         pair = %pair.pair_id,
                         first = %pending.plan.first.venue,
-                        "cancel resting limit: spread gone; if already filled, market-hedge other leg"
+                        "cancel resting limit: spread gone"
                     );
                 }
                 LimitWatch::CancelTimeout => {
+                    if !paper {
+                        if let Some(ref oid) = pending.order_id {
+                            let _ = HedgeExecutor::cancel_resting(
+                                &self.adapters_by_id,
+                                &pending.plan.first,
+                                oid,
+                            )
+                            .await;
+                        }
+                    }
                     self.pending.remove(&pair.pair_id);
+                    self.positions.release_pending(&pair.pair_id);
                     self.panel.stats.cancel_timeout += 1;
+                    self.log_exec(&pending.plan, "cancel", "timeout", "");
                     info!(
                         pair = %pair.pair_id,
                         first = %pending.plan.first.venue,
-                        "cancel resting limit: timeout; if already filled, market-hedge other leg"
+                        "cancel resting limit: timeout"
                     );
                 }
                 LimitWatch::FilledHedgeNow => {
                     self.pending.remove(&pair.pair_id);
                     self.panel.stats.late_hedge += 1;
-                    info!(
-                        pair = %pair.pair_id,
-                        second = %pending.plan.second.venue,
-                        "first leg filled; market hedge second even if spread is gone"
-                    );
+                    if !self.cfg.system.monitor_only {
+                        if paper {
+                            self.execute_plan(&pair, &pending.plan, pair_i).await;
+                        } else {
+                            self.hedge_second_live(&pair, &pending.plan, pair_i, hedge_qty)
+                                .await;
+                        }
+                    }
+                    return;
                 }
             }
         }
 
         self.panel.stats.bump_intent(label);
+        self.record_ui_pair(&pair, &net, &params, pos.as_ref(), label);
         self.set_spread(
             pair_i,
             dashboard::spread_lines(
@@ -502,19 +747,33 @@ impl Controller {
         if matches!(intent, Intent::Hold) {
             return;
         }
-        if self.pending.contains_key(&pair.pair_id) {
+        if self.pending.contains_key(&pair.pair_id) || self.positions.is_pending(&pair.pair_id) {
             return;
         }
-        let Some(plan) = plan_hedge(pair, &intent, pos.as_ref(), &self.cfg) else {
+        if matches!(intent, Intent::Open { .. }) && !self.positions.can_open(self.cfg.sizing.max_concurrent_pairs) {
+            self.panel.stats.bump_skip("slots");
+            return;
+        }
+        let Some(mut plan) = plan_hedge(&pair, &intent, pos.as_ref(), &self.cfg) else {
             return;
         };
+        if self.cfg.live_test.dex_test_mode
+            && !self.cfg.execution.paper_trading
+            && plan.qty > self.cfg.live_test.max_qty
+        {
+            plan.qty = self.cfg.live_test.max_qty;
+        }
         self.pending.insert(
             pair.pair_id.clone(),
             PendingLimit {
                 plan: plan.clone(),
                 since: Instant::now(),
+                order_id: None,
             },
         );
+        if matches!(intent, Intent::Open { .. }) {
+            self.positions.reserve_open(&pair.pair_id);
+        }
         info!(
             pair = %plan.pair_id,
             first = %plan.first.venue,
@@ -523,14 +782,324 @@ impl Controller {
             second = %plan.second.venue,
             second_style = plan.second.style.as_str(),
             qty = %plan.qty,
+            open = plan.is_open,
             "limit-then-market: post high-fee venue first"
         );
         if self.cfg.system.monitor_only {
             self.panel.stats.skip_send += 1;
             return;
         }
-        warn!("live send is disabled until signer is wired");
+        if self.cfg.execution.paper_trading {
+            return;
+        }
+        if matches!(self.cfg.order.style, OrderStyle::LimitThenMarket) {
+            match HedgeExecutor::post_first_leg(
+                &self.cfg,
+                &self.adapters_by_id,
+                &plan,
+                &self.books,
+                false,
+            )
+            .await
+            {
+                Ok(post) => {
+                    if let Some(entry) = self.pending.get_mut(&pair.pair_id) {
+                        entry.order_id = post.order_id.clone();
+                    }
+                    if !post.resting {
+                        self.pending.remove(&pair.pair_id);
+                        let qty = if post.first.qty > Decimal::ZERO {
+                            post.first.qty
+                        } else {
+                            plan.qty
+                        };
+                        self.hedge_second_live(&pair, &plan, pair_i, qty).await;
+                    }
+                }
+                Err(err) => {
+                    warn!(pair = %plan.pair_id, error = %err, "post first leg failed");
+                    self.log_exec(&plan, "post_fail", "error", &err.to_string());
+                    self.pending.remove(&pair.pair_id);
+                    self.positions.release_pending(&pair.pair_id);
+                }
+            }
+        } else {
+            self.pending.remove(&pair.pair_id);
+            self.execute_plan(&pair, &plan, pair_i).await;
+        }
     }
+
+    async fn hedge_second_live(
+        &mut self,
+        pair: &Pair,
+        plan: &HedgePlan,
+        pair_i: usize,
+        hedge_qty: Decimal,
+    ) {
+        match HedgeExecutor::hedge_second_leg(
+            &self.cfg,
+            &self.adapters_by_id,
+            plan,
+            &self.books,
+            false,
+            hedge_qty,
+        )
+        .await
+        {
+            Ok(result) => {
+                info!(
+                    pair = %plan.pair_id,
+                    first = %result.first.venue,
+                    second = %result.second.venue,
+                    qty = %result.first.qty,
+                    "hedge second leg executed"
+                );
+                self.log_exec(
+                    plan,
+                    if plan.is_open { "open" } else { "close" },
+                    "both_filled",
+                    "",
+                );
+                self.apply_fill(pair, plan, pair_i).await;
+            }
+            Err(err) => {
+                warn!(pair = %plan.pair_id, error = %err, "hedge second failed");
+                self.log_exec(plan, "exec_fail", "error", &err.to_string());
+                self.positions.release_pending(&plan.pair_id);
+            }
+        }
+    }
+
+    async fn execute_plan(&mut self, pair: &Pair, plan: &HedgePlan, pair_i: usize) {
+        let paper = self.cfg.execution.paper_trading;
+        match HedgeExecutor::run_plan(
+            &self.cfg,
+            &self.adapters_by_id,
+            plan,
+            &self.books,
+            paper,
+        )
+        .await
+        {
+            Ok(result) => {
+                info!(
+                    pair = %plan.pair_id,
+                    first = %result.first.venue,
+                    second = %result.second.venue,
+                    qty = %result.first.qty,
+                    "hedge executed"
+                );
+                self.log_exec(
+                    plan,
+                    if plan.is_open { "open" } else { "close" },
+                    "both_filled",
+                    "",
+                );
+                self.apply_fill(pair, plan, pair_i).await;
+            }
+            Err(err) => {
+                warn!(pair = %plan.pair_id, error = %err, "execute failed");
+                self.log_exec(plan, "exec_fail", "error", &err.to_string());
+                self.positions.release_pending(&plan.pair_id);
+            }
+        }
+    }
+
+    fn log_exec(&self, plan: &HedgePlan, action: &str, result: &str, detail: &str) {
+        let Some(path) = &self.cfg.live_test.journal_path else {
+            return;
+        };
+        if let Ok(j) = ExecJournal::open(path) {
+            let _ = j.append(&ExecRecord {
+                ts: now_ts(),
+                pair_id: plan.pair_id.clone(),
+                action: action.to_string(),
+                buy_venue: plan.buy_venue.clone(),
+                sell_venue: plan.sell_venue.clone(),
+                qty: plan.qty,
+                net_pct: None,
+                result: result.to_string(),
+                detail: detail.to_string(),
+            });
+        }
+    }
+
+    async fn apply_fill(&mut self, pair: &Pair, plan: &HedgePlan, pair_i: usize) {
+        let entry_notional = plan
+            .qty
+            * self
+                .books
+                .get(&(plan.buy_venue.clone(), pair.pair_id.clone()))
+                .and_then(|bb| {
+                    self.books
+                        .get(&(plan.sell_venue.clone(), pair.pair_id.clone()))
+                        .and_then(|sb| mid_from_bbo(bb, sb))
+                })
+                .unwrap_or(Decimal::ZERO);
+        if plan.is_open {
+            self.positions.record_open(
+                &plan.pair_id,
+                VenueId::from(plan.buy_venue.as_str()),
+                VenueId::from(plan.sell_venue.as_str()),
+                plan.qty,
+                1,
+                entry_notional,
+            );
+        } else {
+            self.positions.record_close(&plan.pair_id, plan.qty);
+        }
+        let pos = self.positions.get(&pair.pair_id).cloned();
+        let label = if plan.is_open { "filled_open" } else { "filled_close" };
+        self.set_spread(
+            pair_i,
+            dashboard::spread_lines(
+                &pair.pair_id,
+                plan.buy_venue.as_str(),
+                plan.sell_venue.as_str(),
+                Decimal::ZERO,
+                Decimal::ZERO,
+                Decimal::ZERO,
+                None,
+                Decimal::ZERO,
+                0,
+                self.cfg.history.min_points,
+                label,
+            ),
+        );
+        let _ = pos;
+    }
+
+    fn leg_margin(
+        &self,
+        reserved: &HashMap<String, Decimal>,
+        venue: &str,
+    ) -> LegMargin {
+        LegMargin {
+            available_usdc: self.balance.venue_available(venue),
+            leverage: self.cfg.leverage_for(venue),
+            reserved_usdc: reserved.get(venue).copied().unwrap_or(Decimal::ZERO),
+        }
+    }
+
+    fn record_ui_pair(
+        &mut self,
+        pair: &Pair,
+        net: &crate::domain::NetSpread,
+        params: &crate::domain::GridParams,
+        pos: Option<&crate::domain::Position>,
+        status: &str,
+    ) {
+        let actual = pos.map(|p| p.qty).unwrap_or(Decimal::ZERO);
+        self.ui_pairs.insert(
+            pair.pair_id.clone(),
+            PairRow {
+                pair_id: pair.pair_id.clone(),
+                buy: net.buy.to_string(),
+                sell: net.sell.to_string(),
+                raw_pct: api::fmt_pct(net.raw_pct),
+                net_pct: api::fmt_pct(net.net_pct),
+                grid: format!("T{}", pos.map(|p| p.grid).unwrap_or(0)),
+                target_qty: params.base_qty.to_string(),
+                actual_qty: actual.to_string(),
+                status: status.to_string(),
+            },
+        );
+    }
+
+    fn publish_api_snapshot(&self) {
+        let Some(hub) = &self.api else {
+            return;
+        };
+        let positions: Vec<PositionRow> = self
+            .positions
+            .all_open()
+            .into_iter()
+            .map(|p| PositionRow {
+                pair_id: p.pair_id.clone(),
+                buy: p.buy.to_string(),
+                sell: p.sell.to_string(),
+                qty: p.qty.to_string(),
+                grid: p.grid,
+                entry_notional: p.entry_notional_usdc.to_string(),
+            })
+            .collect();
+        let balances: Vec<VenueBalanceRow> = self
+            .cfg
+            .venues
+            .iter()
+            .map(|v| {
+                let acct = self.venue_accounts.get(v);
+                VenueBalanceRow {
+                    venue: v.clone(),
+                    available: acct
+                        .map(|a| a.available.to_string())
+                        .unwrap_or_else(|| self.balance.venue_available(v).to_string()),
+                    total: acct
+                        .map(|a| a.total.to_string())
+                        .unwrap_or_else(|| self.balance.venue_available(v).to_string()),
+                }
+            })
+            .collect();
+        let exchange_positions: Vec<ExchangePositionRow> = self
+            .venue_accounts
+            .venues
+            .iter()
+            .flat_map(|v| {
+                v.positions.iter().map(|p| ExchangePositionRow {
+                    venue: v.venue.clone(),
+                    symbol: p.symbol.clone(),
+                    qty: p.qty.to_string(),
+                    entry_price: p.entry_price.map(|x| x.to_string()),
+                })
+            })
+            .collect();
+        let best = self
+            .ui_pairs
+            .values()
+            .filter_map(|r| {
+                let s = r.net_pct.trim().trim_end_matches('%');
+                Decimal::from_str(s.trim_start_matches('+')).ok()
+            })
+            .max();
+        hub.publish(LiveSnapshot {
+            pairs: self.ui_pairs.values().cloned().collect(),
+            positions,
+            balances,
+            exchange_positions,
+            stats: api::ApiStats {
+                matched_pairs: self.pairs.len(),
+                open_positions: self.positions.open_count(),
+                best_net_pct: best.map(api::fmt_pct),
+            },
+            monitor_only: self.cfg.system.monitor_only,
+            paper_trading: self.cfg.execution.paper_trading,
+            updated_at: now_ts(),
+        });
+    }
+}
+
+fn legs_and_books<'a>(
+    pair: &'a Pair,
+    buy: &VenueId,
+    sell: &VenueId,
+    v0: &VenueId,
+    _v1: &VenueId,
+    b0: &'a Bbo,
+    b1: &'a Bbo,
+) -> (&'a crate::domain::VenueMarket, &'a crate::domain::VenueMarket, &'a Bbo, &'a Bbo) {
+    let buy_leg = pair
+        .legs
+        .iter()
+        .find(|l| &l.venue == buy)
+        .expect("buy leg");
+    let sell_leg = pair
+        .legs
+        .iter()
+        .find(|l| &l.venue == sell)
+        .expect("sell leg");
+    let buy_book = if buy == v0 { b0 } else { b1 };
+    let sell_book = if sell == v0 { b0 } else { b1 };
+    (buy_leg, sell_leg, buy_book, sell_book)
 }
 
 fn markets_for_venue(pairs: &[Pair], venue: &VenueId) -> Vec<VenueMarket> {

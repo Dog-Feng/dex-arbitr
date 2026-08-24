@@ -1,5 +1,5 @@
 system:
-  monitor_only: true
+  monitor_only: false
   data_freshness_ms: 3000
   stable_depeg_bps: 20
   # 文本日志按天滚动。Linux 拷回：scp user@host:/opt/dex-arbitr/data/logs/*.log .
@@ -16,8 +16,43 @@ pairs:
 
 # 对齐参考套利监控 V2：毛价差 ≥ 0.1% 记为机会，分析环扫内存盘口。
 # 不改格子、不下单。scan.enabled: false 则回到旧的单币格子监控。
-scan:
+# execution.enabled: true → 统一决策环（格子 + 定仓 + 下单），不再走纯 scan 监控。
+execution:
   enabled: true
+  loop_interval_ms: 100
+  paper_trading: false
+
+# 定仓模式：
+#   fixed  — 初期测试：每笔固定 USDC 名义（fixed_notional_usdc）
+#   margin — 稳定后：按保证金短板 × 杠杆定仓（默认）
+sizing:
+  mode: fixed
+  fixed_notional_usdc: "20"
+  max_concurrent_pairs: 1
+  leverage_multiplier: "2"
+  min_notional_usdc: "20"
+  max_notional_usdc: "100"
+  depth_pct: "50"
+  refresh_balance_secs: 60
+  margin_utilization_pct: "90"
+  # SoDEX 公开余额接口可能为空；有真实余额时以 bridge 为准
+  fallback_available_usdc: "500"
+
+live_test:
+  # true = DEX 单所小额验证（主流程下单受 max_qty 限制）；价差套利正常运行时 false
+  dex_test_mode: false
+  max_qty: "0.001"
+  journal_path: data/executions.sqlite
+
+http:
+  enabled: true
+  bind: "0.0.0.0:8090"
+  web_root: web
+  # 公网暴露时建议设置；留空则 /api 无需鉴权
+  auth_token: ""
+
+scan:
+  enabled: false
   min_spread_pct: "0.1"
   analysis_interval_ms: 50
   watch_top: 20

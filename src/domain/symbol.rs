@@ -10,6 +10,12 @@ impl VenueId {
     }
 }
 
+impl std::fmt::Display for VenueId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 impl From<&str> for VenueId {
     fn from(value: &str) -> Self {
         Self(value.to_string())

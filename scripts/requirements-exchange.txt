@@ -1,0 +1,5 @@
+lighter-python>=0.1.4
+eth-account>=0.11.0
+eth-hash[pycryptodome]>=0.7.0
+PyYAML>=6.0
+requests>=2.31.0

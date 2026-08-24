@@ -13,3 +13,8 @@ config/venues/*.yaml
 
 # 参考项目本地副本，不进本仓库
 /crypto-trading-open-main
+/_ref_extract
+/_ref_tmp
+scripts/__pycache__/
+scripts/sodex_bridge/sodex_bridge
+scripts/sodex_bridge/sodex_bridge.exe

@@ -22,6 +22,12 @@ tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 url = "2"
+axum = "0.7"
+tower-http = { version = "0.6", features = ["fs", "cors"] }
+
+[[bin]]
+name = "live-test"
+path = "src/bin/live_test.rs"
 
 [dev-dependencies]
 rust_decimal_macros = "1"

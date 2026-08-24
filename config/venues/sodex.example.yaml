@@ -4,11 +4,15 @@ id: sodex
 rest: https://mainnet-gw.sodex.dev/api/v1/perps
 ws: wss://mainnet-gw.sodex.dev/ws/perps
 chain_id: 623
+# EIP-712 签名链 ID（与 chain_id 不同）；留空则默认 286623
+eip712_chain_id: 286623
 quote: USDC
 # Tier 0：maker 0.012% / taker 0.040%。按账户档位改。
 fees:
   maker: "0.012"
   taker: "0.040"
 account_id: 0
+# 主钱包地址（SoDEX UI 显示；与 API Key 私钥地址可能不同）
+account_address: ""
 api_key_name: ""
 private_key: ""

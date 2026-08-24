@@ -3,7 +3,13 @@ use rust_decimal::Decimal;
 use crate::config::AppConfig;
 use crate::domain::{Bbo, Pair};
 
-pub fn books_tradable(cfg: &AppConfig, pair: &Pair, buy: &Bbo, sell: &Bbo) -> Result<(), &'static str> {
+pub fn books_tradable(
+    cfg: &AppConfig,
+    pair: &Pair,
+    buy: &Bbo,
+    sell: &Bbo,
+    probe_qty: Decimal,
+) -> Result<(), &'static str> {
     if !buy.is_fresh(cfg.system.data_freshness_ms) || !sell.is_fresh(cfg.system.data_freshness_ms) {
         return Err("stale");
     }
@@ -12,7 +18,7 @@ pub fn books_tradable(cfg: &AppConfig, pair: &Pair, buy: &Bbo, sell: &Bbo) -> Re
     }
     let min_qty = cfg
         .min_book_qty(&pair.legs[0].base)
-        .max(cfg.grid_for(&pair.legs[0].base).base_qty);
+        .max(probe_qty.max(cfg.grid_for(&pair.legs[0].base).base_qty));
     if buy.ask_qty < min_qty
         || buy.bid_qty < min_qty
         || sell.ask_qty < min_qty
