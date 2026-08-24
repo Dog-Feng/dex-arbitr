@@ -1,5 +1,2 @@
-lighter-python>=0.1.4
-eth-account>=0.11.0
-eth-hash[pycryptodome]>=0.7.0
-PyYAML>=6.0
-requests>=2.31.0
+# 已弃用：实盘依赖改为 Go exchange_sidecar，无需 pip。
+# 见 scripts/exchange_sidecar/README.md

@@ -465,7 +465,7 @@
           if ($("mode-banner")) {
             $("mode-banner").textContent =
               snap.monitor_only ? "monitor_only · 仅监控" :
-              (snap.paper_trading ? "paper 模式 · 模拟成交" : "实盘 · exchange_bridge");
+              (snap.paper_trading ? "paper 模式 · 模拟成交" : "实盘 · exchange_sidecar");
           }
           var exec = await apiFetch("/api/executions");
           renderExecutions(exec.executions);

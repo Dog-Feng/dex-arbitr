@@ -16,5 +16,5 @@ config/venues/*.yaml
 /_ref_extract
 /_ref_tmp
 scripts/__pycache__/
-scripts/sodex_bridge/sodex_bridge
-scripts/sodex_bridge/sodex_bridge.exe
+scripts/exchange_sidecar/exchange_sidecar
+scripts/exchange_sidecar/exchange_sidecar.exe

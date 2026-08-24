@@ -207,7 +207,7 @@ impl ExchangePort for LighterAdapter {
             bail!("{} keys not configured", self.venue.id);
         }
         if !bridge::bridge_available().await {
-            bail!("missing scripts/exchange_bridge.py");
+            bail!("missing exchange_sidecar; build: cd scripts/exchange_sidecar && go build -o exchange_sidecar .");
         }
         bridge::bridge_place(&self.venue_path, &req).await
     }

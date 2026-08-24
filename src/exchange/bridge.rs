@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::str::FromStr;
 use tokio::io::AsyncWriteExt;
@@ -11,7 +11,7 @@ use tracing::{debug, warn};
 
 use super::port::{AccountSnapshot, Balance, CancelReq, OrderAck, OrderReq, OrderStatus, VenuePosition};
 
-const BRIDGE_SCRIPT: &str = "scripts/exchange_bridge.py";
+const SIDECAR_DIR: &str = "scripts/exchange_sidecar";
 
 #[derive(Debug, Deserialize)]
 struct BridgeResp {
@@ -22,45 +22,65 @@ struct BridgeResp {
     data: Value,
 }
 
+/// 统一 Go sidecar（Lighter + SoDEX），对齐 internal/exchange/。
+fn sidecar_binary() -> PathBuf {
+    if let Ok(p) = std::env::var("DEX_EXCHANGE_SIDECAR") {
+        return PathBuf::from(p);
+    }
+    for name in ["exchange_sidecar.exe", "exchange_sidecar"] {
+        let p = Path::new(SIDECAR_DIR).join(name);
+        if p.exists() {
+            return p;
+        }
+    }
+    Path::new(SIDECAR_DIR).join(if cfg!(windows) {
+        "exchange_sidecar.exe"
+    } else {
+        "exchange_sidecar"
+    })
+}
+
 pub async fn bridge_available() -> bool {
-    Path::new(BRIDGE_SCRIPT).exists()
+    sidecar_binary().exists()
 }
 
 pub async fn bridge_call(venue_yaml: &Path, cmd: &str, params: Value) -> Result<Value> {
-    let script = Path::new(BRIDGE_SCRIPT);
-    if !script.exists() {
-        anyhow::bail!("missing {BRIDGE_SCRIPT}");
+    let bin = sidecar_binary();
+    if !bin.exists() {
+        anyhow::bail!(
+            "missing {}; build: cd scripts/exchange_sidecar && go build -o exchange_sidecar .",
+            bin.display()
+        );
     }
     let payload = json!({
         "cmd": cmd,
         "venue_yaml": venue_yaml.to_string_lossy(),
         "params": params,
     });
-    let mut child = Command::new("python")
-        .arg(script)
+    let mut child = Command::new(&bin)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .context("spawn python exchange_bridge")?;
+        .with_context(|| format!("spawn exchange sidecar {}", bin.display()))?;
     if let Some(mut stdin) = child.stdin.take() {
         stdin
             .write_all(payload.to_string().as_bytes())
             .await
-            .context("write bridge stdin")?;
+            .context("write sidecar stdin")?;
     }
-    let out = child.wait_with_output().await.context("bridge wait")?;
+    let out = child.wait_with_output().await.context("sidecar wait")?;
     let stdout = String::from_utf8_lossy(&out.stdout);
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
-        warn!(cmd, stderr = %stderr, stdout = %stdout, "exchange bridge failed");
-        anyhow::bail!("bridge {cmd} exit {}: {stderr}", out.status);
+        warn!(cmd, stderr = %stderr, stdout = %stdout, "exchange sidecar failed");
+        anyhow::bail!("sidecar {cmd} exit {}: {stderr}", out.status);
     }
-    let resp: BridgeResp = serde_json::from_str(stdout.trim()).context("parse bridge json")?;
+    let resp: BridgeResp = serde_json::from_str(stdout.trim()).context("parse sidecar json")?;
     if !resp.ok {
-        anyhow::bail!("bridge {cmd}: {}", resp.error);
+        anyhow::bail!("sidecar {cmd}: {}", resp.error);
     }
-    debug!(cmd, "bridge ok");
+    debug!(cmd, "sidecar ok");
     Ok(resp.data)
 }
 
@@ -78,12 +98,12 @@ pub async fn bridge_positions(venue_yaml: &Path) -> Result<Vec<VenuePosition>> {
 }
 
 pub async fn bridge_place(venue_yaml: &Path, req: &OrderReq) -> Result<OrderAck> {
-        let style = match req.style {
-            crate::config::OrderStyle::LimitMaker | crate::config::OrderStyle::LimitThenMarket => {
-                "limit"
-            }
-            crate::config::OrderStyle::MarketTaker => "market",
-        };
+    let style = match req.style {
+        crate::config::OrderStyle::LimitMaker | crate::config::OrderStyle::LimitThenMarket => {
+            "limit"
+        }
+        crate::config::OrderStyle::MarketTaker => "market",
+    };
     let params = json!({
         "symbol": req.symbol,
         "market_index": req.market_index,
@@ -108,7 +128,11 @@ pub async fn bridge_cancel(venue_yaml: &Path, req: &CancelReq) -> Result<()> {
     Ok(())
 }
 
-pub async fn bridge_order_status(venue_yaml: &Path, req: &CancelReq, qty: Decimal) -> Result<OrderAck> {
+pub async fn bridge_order_status(
+    venue_yaml: &Path,
+    req: &CancelReq,
+    qty: Decimal,
+) -> Result<OrderAck> {
     let params = json!({
         "order_id": req.order_id,
         "symbol": req.symbol,
@@ -187,5 +211,6 @@ fn dec(v: &Value) -> Option<Decimal> {
     if let Some(s) = v.as_str() {
         return Decimal::from_str(s).ok();
     }
-    v.as_f64().and_then(|f| Decimal::from_str(&f.to_string()).ok())
+    v.as_f64()
+        .and_then(|f| Decimal::from_str(&f.to_string()).ok())
 }
