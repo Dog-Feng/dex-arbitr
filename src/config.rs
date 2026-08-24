@@ -101,6 +101,9 @@ pub struct ExecutionConfig {
     /// 无密钥或未接 REST 余额时，用 paper 模拟成交更新内存持仓。
     #[serde(default = "default_true")]
     pub paper_trading: bool,
+    /// 本进程第二腿失败后自动在 counterparty 补市价对冲（不对启动前已有仓位操作）。
+    #[serde(default = "default_true")]
+    pub hedge_failed_legs: bool,
 }
 
 fn default_loop_interval_ms() -> u64 {
@@ -112,6 +115,7 @@ fn default_execution() -> ExecutionConfig {
         enabled: false,
         loop_interval_ms: 100,
         paper_trading: true,
+        hedge_failed_legs: true,
     }
 }
 

@@ -406,8 +406,9 @@
         }
         panel.style.display = "";
         box.innerHTML = rows.map(function (n) {
+          var tag = n.source === "bot_failure" ? "需补对冲" : "已有仓位(不自动操作)";
           return '<div class="kv"><span class="lbl">' + n.pair_id + '</span><span class="val" style="color:#fc8181">' +
-            venueLabel(n.venue) + " " + n.qty + " → 待对冲 " + venueLabel(n.counterparty) + '</span></div>';
+            venueLabel(n.venue) + " " + n.qty + " → " + venueLabel(n.counterparty) + " · " + tag + '</span></div>';
         }).join("");
       }
       function renderExchangePositions(rows) {

@@ -21,6 +21,8 @@ execution:
   enabled: true
   loop_interval_ms: 100
   paper_trading: false
+  # 仅本进程第二腿失败后补对冲；启动前已有仓位只告警、不自动下单
+  hedge_failed_legs: true
 
 # 定仓模式：
 #   fixed  — 初期测试：每笔固定 USDC 名义（fixed_notional_usdc）

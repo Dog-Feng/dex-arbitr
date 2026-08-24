@@ -60,6 +60,7 @@ pub struct NakedExposureRow {
     pub venue: String,
     pub qty: String,
     pub counterparty: String,
+    pub source: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]

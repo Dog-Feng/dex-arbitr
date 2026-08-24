@@ -29,7 +29,8 @@ use super::exec_worker::{
 };
 use super::positions::PositionStore;
 use super::reconcile::{
-    counterparty_hedge_is_buy, detect_naked_exposures, hedge_qty, NakedExposure,
+    counterparty_hedge_is_buy, detect_naked_exposures, first_leg_fill_delta, hedge_qty,
+    symbol_matches_symbol, NakedExposure, NakedSource,
 };
 use super::risk::{books_tradable, stable_ok};
 use super::scan::OpportunityTracker;
@@ -81,6 +82,8 @@ struct PendingLimit {
     since: Instant,
     order_id: Option<String>,
     flight: PendingFlight,
+    /// 挂限价前第一腿持仓，用于通过交易所仓位变化检测成交。
+    first_pos_baseline: Option<Decimal>,
 }
 
 impl Controller {
@@ -233,25 +236,27 @@ impl Controller {
     }
 
     async fn reconcile_exchange_positions(&mut self, on_startup: bool) {
-        let detected = detect_naked_exposures(&self.pairs, &self.venue_accounts);
-        for n in &detected {
-            if self
-                .naked_exposures
-                .iter()
-                .any(|e| e.pair_id == n.pair_id && e.venue == n.venue)
-            {
-                continue;
+        let foreign = detect_naked_exposures(&self.pairs, &self.venue_accounts);
+        for n in &foreign {
+            let new = !self.naked_exposures.iter().any(|e| {
+                e.pair_id == n.pair_id && e.venue == n.venue && e.source == NakedSource::Foreign
+            });
+            if new {
+                warn!(
+                    pair = %n.pair_id,
+                    venue = %n.venue,
+                    qty = %n.qty,
+                    counterparty = %n.counterparty,
+                    "foreign exchange position detected (not auto-hedging)"
+                );
+                if on_startup {
+                    self.log_naked_journal(n, "foreign_startup");
+                }
             }
-            warn!(
-                pair = %n.pair_id,
-                venue = %n.venue,
-                qty = %n.qty,
-                counterparty = %n.counterparty,
-                "naked exchange exposure detected"
-            );
-            self.log_naked_journal(n, if on_startup { "startup" } else { "reconcile" });
         }
-        self.naked_exposures = detected;
+        self.naked_exposures
+            .retain(|n| n.source == NakedSource::BotFailure);
+        self.naked_exposures.extend(foreign);
     }
 
     fn log_naked_journal(&self, n: &NakedExposure, reason: &str) {
@@ -311,6 +316,7 @@ impl Controller {
             venue: plan.first.venue.clone(),
             qty: signed,
             counterparty: plan.second.venue.clone(),
+            source: NakedSource::BotFailure,
         };
         if self
             .naked_exposures
@@ -333,6 +339,7 @@ impl Controller {
     async fn try_hedge_naked_exposures(&mut self) {
         if self.cfg.system.monitor_only
             || self.cfg.execution.paper_trading
+            || !self.cfg.execution.hedge_failed_legs
             || self.naked_exposures.is_empty()
         {
             return;
@@ -340,7 +347,12 @@ impl Controller {
         let candidate = self
             .naked_exposures
             .iter()
-            .find(|n| !self.naked_hedging.contains(&n.pair_id))
+            .find(|n| {
+                n.source == NakedSource::BotFailure
+                    && !self.naked_hedging.contains(&n.pair_id)
+                    && !self.pending.contains_key(&n.pair_id)
+                    && !self.hedging_pairs.contains(&n.pair_id)
+            })
             .cloned();
         let Some(naked) = candidate else {
             return;
@@ -399,40 +411,32 @@ impl Controller {
                     pair = %naked.pair_id,
                     venue = %fill.venue,
                     qty = %fill.qty,
-                    "naked exposure hedge filled"
+                    "bot failure naked hedge filled"
                 );
-                self.naked_exposures
-                    .retain(|n| n.pair_id != naked.pair_id || n.venue != naked.venue);
-                let (buy, sell) = if naked.qty.is_sign_positive() {
-                    (naked.venue.clone(), naked.counterparty.clone())
-                } else {
-                    (naked.counterparty.clone(), naked.venue.clone())
-                };
-                let entry_notional = qty
-                    * mid_from_bbo(b0, b1).unwrap_or(Decimal::ZERO);
-                self.positions.record_open(
-                    &naked.pair_id,
-                    VenueId::from(buy.as_str()),
-                    VenueId::from(sell.as_str()),
-                    qty,
-                    1,
-                    entry_notional,
+                self.naked_exposures.retain(|n| {
+                    n.source != NakedSource::BotFailure
+                        || n.pair_id != naked.pair_id
+                        || n.venue != naked.venue
+                });
+                self.log_exec(
+                    &HedgePlan {
+                        pair_id: naked.pair_id.clone(),
+                        qty,
+                        is_open: true,
+                        style: self.cfg.order.style,
+                        buy_market_index: 0,
+                        sell_market_index: 0,
+                        buy_symbol: String::new(),
+                        sell_symbol: String::new(),
+                        buy_venue: naked.venue.clone(),
+                        sell_venue: naked.counterparty.clone(),
+                        first: hedge_leg.clone(),
+                        second: hedge_leg,
+                    },
+                    "naked_hedge",
+                    "filled",
+                    "",
                 );
-                let plan = HedgePlan {
-                    pair_id: naked.pair_id.clone(),
-                    qty,
-                    is_open: true,
-                    style: self.cfg.order.style,
-                    buy_market_index: 0,
-                    sell_market_index: 0,
-                    buy_symbol: String::new(),
-                    sell_symbol: String::new(),
-                    buy_venue: buy,
-                    sell_venue: sell,
-                    first: hedge_leg.clone(),
-                    second: hedge_leg,
-                };
-                self.log_exec(&plan, "naked_hedge", "filled", "");
             }
             Err(err) => {
                 warn!(
@@ -490,7 +494,6 @@ impl Controller {
     }
 
     async fn tick_execution(&mut self) {
-        self.try_hedge_naked_exposures().await;
         let close_first: Vec<usize> = self
             .pairs
             .iter()
@@ -523,6 +526,7 @@ impl Controller {
             self.process_pair(pi).await;
             active.insert(pi);
         }
+        self.try_hedge_naked_exposures().await;
         for pi in 0..self.pairs.len() {
             if active.contains(&pi) {
                 continue;
@@ -915,36 +919,24 @@ impl Controller {
             if paper {
                 first_filled = pending.since.elapsed() >= Duration::from_millis(100) && still_valid;
                 hedge_qty = pending.plan.qty;
-            } else if let Some(ref oid) = pending.order_id {
-                match HedgeExecutor::poll_first_leg(
-                    &self.adapters_by_id,
-                    &pending.plan.first,
-                    pending.plan.qty,
-                    oid,
-                )
-                .await
+            } else {
+                match self
+                    .poll_first_fill(
+                        &pending.plan,
+                        pending.order_id.as_deref(),
+                        pending.first_pos_baseline,
+                    )
+                    .await
                 {
-                    Ok(Some(f)) => {
-                        hedge_qty = if f.qty > Decimal::ZERO {
-                            f.qty
-                        } else {
-                            pending.plan.qty
-                        };
-                        first_filled = hedge_qty > Decimal::ZERO;
+                    Some(qty) => {
+                        first_filled = true;
+                        hedge_qty = qty;
                     }
-                    Ok(None) => {
-                        first_filled = false;
-                        hedge_qty = pending.plan.qty;
-                    }
-                    Err(err) => {
-                        warn!(pair = %pair.pair_id, error = %err, "poll first leg");
+                    None => {
                         first_filled = false;
                         hedge_qty = pending.plan.qty;
                     }
                 }
-            } else {
-                first_filled = false;
-                hedge_qty = pending.plan.qty;
             };
             let action = watch_resting_limit(
                 still_valid,
@@ -1066,6 +1058,9 @@ impl Controller {
                 since: Instant::now(),
                 order_id: None,
                 flight: PendingFlight::None,
+                first_pos_baseline: self
+                    .snapshot_first_leg_position(&plan.first)
+                    .await,
             },
         );
         if matches!(intent, Intent::Open { .. }) {
@@ -1115,7 +1110,11 @@ impl Controller {
         }
         if let Some(ref oid) = pending.order_id {
             if let Some(qty) = self
-                .poll_first_fill(&pending.plan, oid)
+                .poll_first_fill(
+                    &pending.plan,
+                    Some(oid.as_str()),
+                    pending.first_pos_baseline,
+                )
                 .await
                 .filter(|q| *q > Decimal::ZERO)
             {
@@ -1133,7 +1132,11 @@ impl Controller {
                 warn!(pair = %pair.pair_id, error = %err, "cancel resting failed");
             }
             if let Some(qty) = self
-                .poll_first_fill(&pending.plan, oid)
+                .poll_first_fill(
+                    &pending.plan,
+                    Some(oid.as_str()),
+                    pending.first_pos_baseline,
+                )
                 .await
                 .filter(|q| *q > Decimal::ZERO)
             {
@@ -1152,33 +1155,76 @@ impl Controller {
         false
     }
 
-    async fn poll_first_fill(&self, plan: &HedgePlan, order_id: &str) -> Option<Decimal> {
-        match HedgeExecutor::poll_first_leg(
-            &self.adapters_by_id,
-            &plan.first,
-            plan.qty,
-            order_id,
-        )
-        .await
-        {
-            Ok(Some(f)) => {
-                let qty = if f.qty > Decimal::ZERO {
-                    f.qty
-                } else {
-                    plan.qty
-                };
-                if qty > Decimal::ZERO {
-                    Some(qty)
-                } else {
-                    None
+    async fn poll_first_fill(
+        &self,
+        plan: &HedgePlan,
+        order_id: Option<&str>,
+        baseline: Option<Decimal>,
+    ) -> Option<Decimal> {
+        if let Some(oid) = order_id.filter(|id| !id.is_empty()) {
+            match HedgeExecutor::poll_first_leg(
+                &self.adapters_by_id,
+                &plan.first,
+                plan.qty,
+                oid,
+            )
+            .await
+            {
+                Ok(Some(f)) => {
+                    let qty = if f.qty > Decimal::ZERO {
+                        f.qty
+                    } else {
+                        plan.qty
+                    };
+                    if qty > Decimal::ZERO {
+                        return Some(qty);
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    warn!(pair = %plan.pair_id, error = %err, "poll first leg order_status");
                 }
             }
-            Ok(None) => None,
-            Err(err) => {
-                warn!(pair = %plan.pair_id, error = %err, "poll first leg before cancel");
-                None
+        }
+        if let Some(base) = baseline {
+            let min_qty = plan.qty * Decimal::new(1, 2);
+            if let Some(qty) = self
+                .poll_first_fill_by_position(&plan.first, base, plan.qty, min_qty.max(Decimal::new(1, 6)))
+                .await
+            {
+                return Some(qty);
             }
         }
+        None
+    }
+
+    async fn poll_first_fill_by_position(
+        &self,
+        leg: &crate::exec::HedgeLeg,
+        baseline: Decimal,
+        plan_qty: Decimal,
+        min_qty: Decimal,
+    ) -> Option<Decimal> {
+        let adapter = self.adapters_by_id.get(&leg.venue)?;
+        let positions = adapter.positions().await.ok()?;
+        let current: Decimal = positions
+            .iter()
+            .filter(|p| symbol_matches_symbol(&p.symbol, &leg.symbol, &leg.symbol))
+            .map(|p| p.qty)
+            .sum();
+        first_leg_fill_delta(baseline, current, leg.is_buy, plan_qty, min_qty)
+    }
+
+    async fn snapshot_first_leg_position(&self, leg: &crate::exec::HedgeLeg) -> Option<Decimal> {
+        let adapter = self.adapters_by_id.get(&leg.venue)?;
+        let positions = adapter.positions().await.ok()?;
+        Some(
+            positions
+                .iter()
+                .filter(|p| symbol_matches_symbol(&p.symbol, &leg.symbol, &leg.symbol))
+                .map(|p| p.qty)
+                .sum(),
+        )
     }
 
     fn spawn_post_first(&self, pair: &Pair, plan: &HedgePlan, pair_i: usize) {
@@ -1270,9 +1316,17 @@ impl Controller {
                     self.positions.release_pending(&pair_id);
                     return;
                 }
+                let baseline = if post.resting {
+                    self.snapshot_first_leg_position(&msg.plan.first).await
+                } else {
+                    None
+                };
                 if let Some(entry) = self.pending.get_mut(&pair_id) {
                     entry.order_id = post.order_id.clone();
                     entry.flight = PendingFlight::None;
+                    if entry.first_pos_baseline.is_none() {
+                        entry.first_pos_baseline = baseline;
+                    }
                     if post.resting {
                         entry.since = Instant::now();
                     }
@@ -1539,6 +1593,10 @@ impl Controller {
                     venue: n.venue.clone(),
                     qty: n.qty.to_string(),
                     counterparty: n.counterparty.clone(),
+                    source: match n.source {
+                        NakedSource::Foreign => "foreign".into(),
+                        NakedSource::BotFailure => "bot_failure".into(),
+                    },
                 })
                 .collect(),
             stats: api::ApiStats {
