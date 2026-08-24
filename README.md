@@ -17,7 +17,7 @@ Lighter 主网 ↔ Lighter Robinhood ↔ SoDEX 永续价差监控与套利（P1 
 ## 快速开始
 
 1. 复制 `config/venues/lighter.example.yaml` → `lighter.yaml`，Robinhood 同理，填入手钥。
-2. 保持 `monitor_only: true`、`scan.enabled: true`。`whitelist: []` 扫三所两两交集。SoDEX 模板：`config/venues/sodex.example.yaml`。
+2. 保持 `monitor_only: true`、`scan.enabled: true`。`pairs.whitelist: []` 扫三所两两交集（条数常 >100，见 [项目说明](docs/项目说明.md) §3.2.1）。SoDEX 模板：`config/venues/sodex.example.yaml`。
 3. 若要联调决策/定仓/paper 持仓（仍不发单）：`execution.enabled: true`、`scan.enabled: false`、`monitor_only: false`、`paper_trading: true`，并设 `sizing.fallback_available_usdc`。
 4. 小额实盘：构建 `scripts/exchange_sidecar` 后 `cargo run --release --bin live-test -- account lighter`，再设 `paper_trading: false`。页面：`http://127.0.0.1:8090/`。
 5. 仓库根目录编译并运行。日志在控制台和 `data/logs/`（扫描模式同一套代币行）。跨 DEX 的 `nat` 在 `data/spreads.sqlite`，重启直接用，默认 30 分钟重算。

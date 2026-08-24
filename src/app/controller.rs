@@ -242,17 +242,14 @@ impl Controller {
         ));
         loop {
             tokio::select! {
-                msg = rx.recv() => {
-                    let Some((venue, pair_id, bbo)) = msg else {
-                        break;
-                    };
-                    self.books
-                        .insert((venue.as_str().to_string(), pair_id), bbo);
-                }
                 Some(ev) = exec_rx.recv() => {
                     self.handle_exec_event(ev).await;
                 }
                 _ = tick.tick() => {
+                    while let Ok(Some((venue, pair_id, bbo))) = rx.try_recv() {
+                        self.books
+                            .insert((venue.as_str().to_string(), pair_id), bbo);
+                    }
                     self.maybe_refresh_balances().await;
                     self.tick_execution().await;
                     self.panel.flush();
@@ -279,8 +276,19 @@ impl Controller {
         for &pi in &close_first {
             self.process_pair(pi).await;
         }
+        let mut active: HashSet<usize> = close_set;
+        for (pi, pair) in self.pairs.iter().enumerate() {
+            if active.contains(&pi) {
+                continue;
+            }
+            if self.pending.contains_key(&pair.pair_id) || self.hedging_pairs.contains(&pair.pair_id)
+            {
+                self.process_pair(pi).await;
+                active.insert(pi);
+            }
+        }
         for pi in 0..self.pairs.len() {
-            if close_set.contains(&pi) {
+            if active.contains(&pi) {
                 continue;
             }
             if !self.positions.can_open(self.cfg.sizing.max_concurrent_pairs) {
@@ -945,6 +953,12 @@ impl Controller {
         pair_i: usize,
         hedge_qty: Decimal,
     ) {
+        info!(
+            pair = %plan.pair_id,
+            second = %plan.second.venue,
+            qty = %hedge_qty,
+            "spawn hedge second leg"
+        );
         self.hedging_pairs.insert(plan.pair_id.clone());
         spawn_hedge_second_leg(
             self.exec_tx.clone(),
@@ -984,22 +998,26 @@ impl Controller {
         let pair_id = msg.pair_id.clone();
         match msg.result {
             Ok(post) => {
+                info!(
+                    pair = %pair_id,
+                    first = %msg.plan.first.venue,
+                    resting = post.resting,
+                    filled_qty = %post.first.qty,
+                    order_id = ?post.order_id,
+                    "post first leg completed"
+                );
+                if post.first.qty > Decimal::ZERO {
+                    self.pending.remove(&pair_id);
+                    if let Some(pair) = self.pairs.get(msg.pair_i).cloned() {
+                        self.spawn_hedge_second(&pair, &msg.plan, msg.pair_i, post.first.qty);
+                    }
+                    return;
+                }
                 if let Some(entry) = self.pending.get_mut(&pair_id) {
                     entry.order_id = post.order_id.clone();
                     entry.flight = PendingFlight::None;
                     if post.resting {
                         entry.since = Instant::now();
-                    }
-                }
-                if !post.resting {
-                    self.pending.remove(&pair_id);
-                    let qty = if post.first.qty > Decimal::ZERO {
-                        post.first.qty
-                    } else {
-                        msg.plan.qty
-                    };
-                    if let Some(pair) = self.pairs.get(msg.pair_i).cloned() {
-                        self.spawn_hedge_second(&pair, &msg.plan, msg.pair_i, qty);
                     }
                 }
             }
