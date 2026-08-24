@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -14,7 +15,7 @@ use crate::domain::{
 };
 use crate::domain::spread::raw_spread_pct;
 use crate::exec::{
-    best_sequenced_spread, plan_hedge, watch_resting_limit, HedgeExecutor, HedgePlan, LimitWatch,
+    best_sequenced_spread, plan_hedge, HedgeExecutor, HedgePlan, LimitMarketRun,
 };
 use crate::exchange::{make_adapter, ExchangePort};
 use crate::infra::api::{self, ApiHub, ExchangePositionRow, LiveSnapshot, NakedExposureRow, PairRow, PositionRow, VenueBalanceRow};
@@ -23,14 +24,11 @@ use crate::infra::journal::{ExecJournal, ExecRecord, now_ts};
 use crate::infra::history::{residual_net, HistoryStore};
 
 use super::balance::{refresh_balances, refresh_venue_accounts, BalanceCache, VenueAccountCache};
-use super::exec_worker::{
-    spawn_hedge_second_leg, spawn_post_first_leg, spawn_run_plan, ExecEvent, HedgeSecondMsg,
-    PostFirstMsg, RunPlanMsg,
-};
+use super::exec_worker::{spawn_limit_market, spawn_run_plan, ExecEvent, RunPlanMsg};
 use super::positions::PositionStore;
 use super::reconcile::{
-    counterparty_hedge_is_buy, detect_naked_exposures, first_leg_fill_delta, hedge_qty,
-    symbol_matches_symbol, NakedExposure, NakedSource,
+    counterparty_hedge_is_buy, detect_naked_exposures, hedge_qty, symbol_matches_symbol,
+    NakedExposure, NakedSource,
 };
 use super::risk::{books_tradable, stable_ok};
 use super::scan::OpportunityTracker;
@@ -80,10 +78,8 @@ enum PendingFlight {
 struct PendingLimit {
     plan: HedgePlan,
     since: Instant,
-    order_id: Option<String>,
     flight: PendingFlight,
-    /// 挂限价前第一腿持仓，用于通过交易所仓位变化检测成交。
-    first_pos_baseline: Option<Decimal>,
+    cancel: Arc<AtomicBool>,
 }
 
 impl Controller {
@@ -891,7 +887,24 @@ impl Controller {
                 return;
             }
             if pending.flight == PendingFlight::PostingFirst {
-                self.record_ui_pair(&pair, &net, &params, pos.as_ref(), "posting");
+                let same_dir = pending.plan.buy_venue == net.buy.as_str()
+                    && pending.plan.sell_venue == net.sell.as_str();
+                let still_valid = same_dir && residual >= params.initial;
+                if !still_valid {
+                    pending.cancel.store(true, Ordering::Relaxed);
+                    self.panel.stats.cancel_gone += 1;
+                } else if pending.since.elapsed()
+                    >= Duration::from_millis(self.cfg.order.limit_timeout_ms)
+                {
+                    pending.cancel.store(true, Ordering::Relaxed);
+                    self.panel.stats.cancel_timeout += 1;
+                }
+                let ui_label = if still_valid && !pending.cancel.load(Ordering::Relaxed) {
+                    "limit"
+                } else {
+                    "canceling"
+                };
+                self.record_ui_pair(&pair, &net, &params, pos.as_ref(), ui_label);
                 self.set_spread(
                     pair_i,
                     dashboard::spread_lines(
@@ -905,108 +918,10 @@ impl Controller {
                         residual,
                         pts,
                         min_pts,
-                        "posting",
+                        ui_label,
                     ),
                 );
                 return;
-            }
-            let same_dir = pending.plan.buy_venue == net.buy.as_str()
-                && pending.plan.sell_venue == net.sell.as_str();
-            let still_valid = same_dir && residual >= params.initial;
-            let paper = self.cfg.execution.paper_trading;
-            let first_filled;
-            let hedge_qty;
-            if paper {
-                first_filled = pending.since.elapsed() >= Duration::from_millis(100) && still_valid;
-                hedge_qty = pending.plan.qty;
-            } else {
-                match self
-                    .poll_first_fill(
-                        &pending.plan,
-                        pending.order_id.as_deref(),
-                        pending.first_pos_baseline,
-                    )
-                    .await
-                {
-                    Some(qty) => {
-                        first_filled = true;
-                        hedge_qty = qty;
-                    }
-                    None => {
-                        first_filled = false;
-                        hedge_qty = pending.plan.qty;
-                    }
-                }
-            };
-            let action = watch_resting_limit(
-                still_valid,
-                pending.since.elapsed(),
-                Duration::from_millis(self.cfg.order.limit_timeout_ms),
-                first_filled,
-            );
-            match action {
-                LimitWatch::StillWait => {
-                    self.record_ui_pair(&pair, &net, &params, pos.as_ref(), "limit");
-                    self.set_spread(
-                        pair_i,
-                        dashboard::spread_lines(
-                            &pair.pair_id,
-                            net.buy.as_str(),
-                            net.sell.as_str(),
-                            net.raw_pct,
-                            net.net_pct,
-                            net.slip_pct,
-                            natural.as_ref().map(|n| n.value),
-                            residual,
-                            pts,
-                            min_pts,
-                            "limit",
-                        ),
-                    );
-                    return;
-                }
-                LimitWatch::CancelSpreadGone => {
-                    if self
-                        .cancel_resting_or_hedge(&pair, pair_i, &pending, paper)
-                        .await
-                    {
-                        return;
-                    }
-                    self.panel.stats.cancel_gone += 1;
-                    self.log_exec(&pending.plan, "cancel", "spread_gone", "");
-                    info!(
-                        pair = %pair.pair_id,
-                        first = %pending.plan.first.venue,
-                        "cancel resting limit: spread gone"
-                    );
-                }
-                LimitWatch::CancelTimeout => {
-                    if self
-                        .cancel_resting_or_hedge(&pair, pair_i, &pending, paper)
-                        .await
-                    {
-                        return;
-                    }
-                    self.panel.stats.cancel_timeout += 1;
-                    self.log_exec(&pending.plan, "cancel", "timeout", "");
-                    info!(
-                        pair = %pair.pair_id,
-                        first = %pending.plan.first.venue,
-                        "cancel resting limit: timeout"
-                    );
-                }
-                LimitWatch::FilledHedgeNow => {
-                    self.pending.remove(&pair.pair_id);
-                    self.panel.stats.late_hedge += 1;
-                    if !self.cfg.system.monitor_only {
-                        if paper {
-                            self.spawn_execute_plan(&pair, &pending.plan, pair_i);
-                        } else {
-                            self.spawn_hedge_second(&pair, &pending.plan, pair_i, hedge_qty);
-                        }
-                    }
-                    return;
-                }
             }
         }
 
@@ -1051,16 +966,22 @@ impl Controller {
         {
             plan.qty = self.cfg.live_test.max_qty;
         }
+        let baseline = self.snapshot_first_leg_position(&plan.first).await;
+        let min_qty = pair
+            .legs
+            .iter()
+            .find(|l| l.venue.as_str() == plan.first.venue)
+            .map(|l| l.min_qty)
+            .unwrap_or(plan.qty * Decimal::new(1, 2))
+            .max(Decimal::new(1, 6));
+        let cancel = Arc::new(AtomicBool::new(false));
         self.pending.insert(
             pair.pair_id.clone(),
             PendingLimit {
                 plan: plan.clone(),
                 since: Instant::now(),
-                order_id: None,
                 flight: PendingFlight::None,
-                first_pos_baseline: self
-                    .snapshot_first_leg_position(&plan.first)
-                    .await,
+                cancel: cancel.clone(),
             },
         );
         if matches!(intent, Intent::Open { .. }) {
@@ -1088,131 +1009,16 @@ impl Controller {
             if let Some(entry) = self.pending.get_mut(&pair.pair_id) {
                 entry.flight = PendingFlight::PostingFirst;
             }
-            self.spawn_post_first(&pair, &plan, pair_i);
+            let ctx = LimitMarketRun {
+                baseline: baseline.unwrap_or(Decimal::ZERO),
+                min_qty,
+                cancel,
+            };
+            self.spawn_limit_market(&pair, &plan, pair_i, ctx);
         } else {
             self.pending.remove(&pair.pair_id);
             self.spawn_execute_plan(&pair, &plan, pair_i);
         }
-    }
-
-    /// 撤单前先查成交；已成交或撤单后成交则对冲。返回 true 表示已转去对冲。
-    async fn cancel_resting_or_hedge(
-        &mut self,
-        pair: &Pair,
-        pair_i: usize,
-        pending: &PendingLimit,
-        paper: bool,
-    ) -> bool {
-        if paper {
-            self.pending.remove(&pair.pair_id);
-            self.positions.release_pending(&pair.pair_id);
-            return false;
-        }
-        if let Some(ref oid) = pending.order_id {
-            if let Some(qty) = self
-                .poll_first_fill(
-                    &pending.plan,
-                    Some(oid.as_str()),
-                    pending.first_pos_baseline,
-                )
-                .await
-                .filter(|q| *q > Decimal::ZERO)
-            {
-                self.pending.remove(&pair.pair_id);
-                self.spawn_hedge_second(pair, &pending.plan, pair_i, qty);
-                return true;
-            }
-            if let Err(err) = HedgeExecutor::cancel_resting(
-                &self.adapters_by_id,
-                &pending.plan.first,
-                oid,
-            )
-            .await
-            {
-                warn!(pair = %pair.pair_id, error = %err, "cancel resting failed");
-            }
-            if let Some(qty) = self
-                .poll_first_fill(
-                    &pending.plan,
-                    Some(oid.as_str()),
-                    pending.first_pos_baseline,
-                )
-                .await
-                .filter(|q| *q > Decimal::ZERO)
-            {
-                warn!(
-                    pair = %pair.pair_id,
-                    qty = %qty,
-                    "first leg filled around cancel; hedging second leg"
-                );
-                self.pending.remove(&pair.pair_id);
-                self.spawn_hedge_second(pair, &pending.plan, pair_i, qty);
-                return true;
-            }
-        }
-        self.pending.remove(&pair.pair_id);
-        self.positions.release_pending(&pair.pair_id);
-        false
-    }
-
-    async fn poll_first_fill(
-        &self,
-        plan: &HedgePlan,
-        order_id: Option<&str>,
-        baseline: Option<Decimal>,
-    ) -> Option<Decimal> {
-        if let Some(oid) = order_id.filter(|id| !id.is_empty()) {
-            match HedgeExecutor::poll_first_leg(
-                &self.adapters_by_id,
-                &plan.first,
-                plan.qty,
-                oid,
-            )
-            .await
-            {
-                Ok(Some(f)) => {
-                    let qty = if f.qty > Decimal::ZERO {
-                        f.qty
-                    } else {
-                        plan.qty
-                    };
-                    if qty > Decimal::ZERO {
-                        return Some(qty);
-                    }
-                }
-                Ok(None) => {}
-                Err(err) => {
-                    warn!(pair = %plan.pair_id, error = %err, "poll first leg order_status");
-                }
-            }
-        }
-        if let Some(base) = baseline {
-            let min_qty = plan.qty * Decimal::new(1, 2);
-            if let Some(qty) = self
-                .poll_first_fill_by_position(&plan.first, base, plan.qty, min_qty.max(Decimal::new(1, 6)))
-                .await
-            {
-                return Some(qty);
-            }
-        }
-        None
-    }
-
-    async fn poll_first_fill_by_position(
-        &self,
-        leg: &crate::exec::HedgeLeg,
-        baseline: Decimal,
-        plan_qty: Decimal,
-        min_qty: Decimal,
-    ) -> Option<Decimal> {
-        let adapter = self.adapters_by_id.get(&leg.venue)?;
-        let positions = adapter.positions().await.ok()?;
-        let current: Decimal = positions
-            .iter()
-            .filter(|p| symbol_matches_symbol(&p.symbol, &leg.symbol, &leg.symbol))
-            .map(|p| p.qty)
-            .sum();
-        first_leg_fill_delta(baseline, current, leg.is_buy, plan_qty, min_qty)
     }
 
     async fn snapshot_first_leg_position(&self, leg: &crate::exec::HedgeLeg) -> Option<Decimal> {
@@ -1227,40 +1033,22 @@ impl Controller {
         )
     }
 
-    fn spawn_post_first(&self, pair: &Pair, plan: &HedgePlan, pair_i: usize) {
-        spawn_post_first_leg(
-            self.exec_tx.clone(),
-            self.cfg.clone(),
-            self.adapters_by_id.clone(),
-            self.books.clone(),
-            pair_i,
-            plan.clone(),
-        );
-        let _ = pair;
-    }
-
-    fn spawn_hedge_second(
+    fn spawn_limit_market(
         &mut self,
         pair: &Pair,
         plan: &HedgePlan,
         pair_i: usize,
-        hedge_qty: Decimal,
+        ctx: LimitMarketRun,
     ) {
-        info!(
-            pair = %plan.pair_id,
-            second = %plan.second.venue,
-            qty = %hedge_qty,
-            "spawn hedge second leg"
-        );
         self.hedging_pairs.insert(plan.pair_id.clone());
-        spawn_hedge_second_leg(
+        spawn_limit_market(
             self.exec_tx.clone(),
             self.cfg.clone(),
             self.adapters_by_id.clone(),
             self.books.clone(),
             pair_i,
             plan.clone(),
-            hedge_qty,
+            ctx,
         );
         let _ = pair;
     }
@@ -1281,73 +1069,13 @@ impl Controller {
 
     async fn handle_exec_event(&mut self, ev: ExecEvent) {
         match ev {
-            ExecEvent::PostFirst(msg) => self.on_post_first(msg).await,
-            ExecEvent::HedgeSecond(msg) => self.on_hedge_second(msg).await,
             ExecEvent::RunPlan(msg) => self.on_run_plan(msg).await,
         }
     }
 
-    async fn on_post_first(&mut self, msg: PostFirstMsg) {
-        let pair_id = msg.pair_id.clone();
-        match msg.result {
-            Ok(post) => {
-                info!(
-                    pair = %pair_id,
-                    first = %msg.plan.first.venue,
-                    resting = post.resting,
-                    filled_qty = %post.first.qty,
-                    order_id = ?post.order_id,
-                    "post first leg completed"
-                );
-                if post.first.qty > Decimal::ZERO {
-                    self.pending.remove(&pair_id);
-                    if let Some(pair) = self.pairs.get(msg.pair_i).cloned() {
-                        self.spawn_hedge_second(&pair, &msg.plan, msg.pair_i, post.first.qty);
-                    }
-                    return;
-                }
-                if !post.resting {
-                    warn!(
-                        pair = %pair_id,
-                        order_id = ?post.order_id,
-                        "first leg not resting with zero fill; release pending"
-                    );
-                    self.pending.remove(&pair_id);
-                    self.positions.release_pending(&pair_id);
-                    return;
-                }
-                let baseline = if post.resting {
-                    self.snapshot_first_leg_position(&msg.plan.first).await
-                } else {
-                    None
-                };
-                if let Some(entry) = self.pending.get_mut(&pair_id) {
-                    entry.order_id = post.order_id.clone();
-                    entry.flight = PendingFlight::None;
-                    if entry.first_pos_baseline.is_none() {
-                        entry.first_pos_baseline = baseline;
-                    }
-                    if post.resting {
-                        entry.since = Instant::now();
-                    }
-                }
-            }
-            Err(err) => {
-                warn!(pair = %pair_id, error = %err, "post first leg failed");
-                self.log_exec(&msg.plan, "post_fail", "error", &err);
-                if let Err(refresh_err) = self.refresh_balances_now().await {
-                    warn!(error = %refresh_err, "balance refresh after post fail");
-                } else {
-                    self.reconcile_exchange_positions(false).await;
-                }
-                self.pending.remove(&pair_id);
-                self.positions.release_pending(&pair_id);
-            }
-        }
-    }
-
-    async fn on_hedge_second(&mut self, msg: HedgeSecondMsg) {
+    async fn on_run_plan(&mut self, msg: RunPlanMsg) {
         self.hedging_pairs.remove(&msg.pair_id);
+        self.pending.remove(&msg.pair_id);
         let Some(pair) = self.pairs.get(msg.pair_i).cloned() else {
             return;
         };
@@ -1358,7 +1086,7 @@ impl Controller {
                     first = %result.first.venue,
                     second = %result.second.venue,
                     qty = %result.first.qty,
-                    "hedge second leg executed"
+                    "limit-then-market executed"
                 );
                 self.log_exec(
                     &msg.plan,
@@ -1373,43 +1101,19 @@ impl Controller {
             Err(err) => {
                 let err_s = err.to_string();
                 if err_s.contains("EMERGENCY_CLOSED") {
-                    warn!(pair = %msg.plan.pair_id, error = %err, "hedge second failed; first leg emergency closed");
+                    warn!(pair = %msg.plan.pair_id, error = %err, "limit-then-market: second leg failed; first emergency closed");
                     self.log_exec(&msg.plan, "exec_fail", "emergency_closed", &err);
-                } else {
-                    warn!(pair = %msg.plan.pair_id, error = %err, "hedge second failed; naked first leg");
+                } else if err_s.contains("NAKED_FIRST_LEG") {
+                    warn!(pair = %msg.plan.pair_id, error = %err, "limit-then-market: naked first leg");
                     self.log_exec(&msg.plan, "exec_fail", "naked", &err);
-                    self.record_naked_from_failed_hedge(&msg.plan, msg.hedge_qty);
+                    self.record_naked_from_failed_hedge(&msg.plan, msg.plan.qty);
+                } else if err_s.contains("limit_zero_fill") {
+                    info!(pair = %msg.plan.pair_id, "limit-then-market: zero fill after wait/cancel");
+                    self.log_exec(&msg.plan, "cancel", "zero_fill", &err);
+                } else {
+                    warn!(pair = %msg.plan.pair_id, error = %err, "limit-then-market failed");
+                    self.log_exec(&msg.plan, "exec_fail", "error", &err);
                 }
-                self.positions.release_pending(&msg.plan.pair_id);
-            }
-        }
-    }
-
-    async fn on_run_plan(&mut self, msg: RunPlanMsg) {
-        self.hedging_pairs.remove(&msg.pair_id);
-        let Some(pair) = self.pairs.get(msg.pair_i).cloned() else {
-            return;
-        };
-        match msg.result {
-            Ok(result) => {
-                info!(
-                    pair = %msg.plan.pair_id,
-                    first = %result.first.venue,
-                    second = %result.second.venue,
-                    qty = %result.first.qty,
-                    "hedge executed"
-                );
-                self.log_exec(
-                    &msg.plan,
-                    if msg.plan.is_open { "open" } else { "close" },
-                    "both_filled",
-                    "",
-                );
-                self.apply_fill(&pair, &msg.plan, msg.pair_i).await;
-            }
-            Err(err) => {
-                warn!(pair = %msg.plan.pair_id, error = %err, "execute failed");
-                self.log_exec(&msg.plan, "exec_fail", "error", &err);
                 self.positions.release_pending(&msg.plan.pair_id);
             }
         }
