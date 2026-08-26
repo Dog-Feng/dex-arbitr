@@ -755,17 +755,17 @@
             <div class="cfg-field">
               <label for="f-venue-spread">max_venue_spread_pct（%）</label>
               <input type="number" id="f-venue-spread" step="0.01" min="0"/>
-              <span class="hint">单所自身买卖点差上限。超过说明该所流动性极差或报价异常，maker 腿挂在上面会有很大滑点。推荐 0.2，0=不检查</span>
+              <span class="hint">单所自身买卖点差上限。超过说明该所流动性极差或报价异常，maker 腿挂在上面会有很大滑点。对齐参考 0.05，0=不检查</span>
             </div>
             <div class="cfg-field">
               <label for="f-stab-win">price_stability_window_secs（秒，0=关闭）</label>
               <input type="number" id="f-stab-win" step="1" min="0"/>
-              <span class="hint">价格稳定性观察窗口。窗口内极值波动超阈值则停止开仓和平仓，防止在插针行情下挂单。推荐 3</span>
+              <span class="hint">价格稳定性观察窗口。窗口内极值波动超阈值则停止开仓和平仓，防止在插针行情下挂单。对齐参考 1 秒</span>
             </div>
             <div class="cfg-field">
               <label for="f-stab-thr">price_stability_threshold_pct（%）</label>
               <input type="number" id="f-stab-thr" step="0.01" min="0"/>
-              <span class="hint">窗口内 (max−min)/min×100 超此值则停止开仓和平仓。超阈值会清空窗口重新计时，防止插针尾巴留在窗口里。推荐 0.05</span>
+              <span class="hint">窗口内 (max−min)/min×100 超此值则停止开仓和平仓。超阈值会清空窗口重新计时，防止插针尾巴留在窗口里。对齐参考 0.01%</span>
             </div>
           </div>
           <div style="padding:0 16px 14px">

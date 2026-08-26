@@ -549,15 +549,15 @@ fn default_reduce_only_probe_second() -> u32 {
 }
 
 fn default_max_venue_spread_pct() -> Decimal {
-    Decimal::new(2, 1) // 0.2%
+    Decimal::new(5, 2) // 0.05%，对齐参考 max_local_orderbook_spread_pct
 }
 
 fn default_price_stability_window_secs() -> Decimal {
-    Decimal::new(3, 0) // 3s
+    Decimal::new(1, 0) // 1s，对齐参考 price_stability_window_seconds
 }
 
 fn default_price_stability_threshold_pct() -> Decimal {
-    Decimal::new(5, 2) // 0.05%
+    Decimal::new(1, 2) // 0.01%，对齐参考 price_stability_threshold_pct
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -845,6 +845,9 @@ mod tests {
         assert_eq!(cfg.grid.scalping_trigger_segment, 10);
         assert_eq!(cfg.grid.scalping_profit_threshold_pct, dec!(0.02));
         assert_eq!(cfg.sizing.leverage_multiplier, dec!(2));
+        assert_eq!(cfg.risk.max_venue_spread_pct, dec!(0.05));
+        assert_eq!(cfg.risk.price_stability_window_secs, dec!(1));
+        assert_eq!(cfg.risk.price_stability_threshold_pct, dec!(0.01));
         let sodex = cfg.load_venue("sodex").unwrap();
         assert_eq!(sodex.chain_id, 623);
         assert_eq!(sodex.id, "sodex");

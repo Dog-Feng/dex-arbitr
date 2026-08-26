@@ -147,14 +147,14 @@ risk:
     ETH: "0.01"
   # 单所自身买卖点差上限（%）。超过说明该所报价不可信 / 流动性极差，
   # 而 maker 腿正要挂在它盘口上。对齐参考 max_local_orderbook_spread_pct。
-  max_venue_spread_pct: "0.2"
+  max_venue_spread_pct: "0.05"
   # 价格稳定性：窗口内 (max−min)/min×100 超阈值就不开不平。
   # 判据是极值而非标准差——极值对单次插针敏感，而插针正是先挂后吃最怕的：
   # 挂单在插针价上成交，对冲腿却回不来。对齐参考 passes_price_stability。
   # 超阈值会清空历史重新计时，避免价格刚稳就放行、而窗口里还留着插针尾巴。
   # 两项任一为 0 = 关闭检查。
-  price_stability_window_secs: "3"
-  price_stability_threshold_pct: "0.05"
+  price_stability_window_secs: "1"
+  price_stability_threshold_pct: "0.01"
   # reduce-only 拉闸后每小时发一次最小量探针，能开就解闸。
   # 关掉则拉闸只能靠重启清除（状态纯内存）——交易所早已恢复，机器人还在自我禁言。
   reduce_only_probe_enabled: true
