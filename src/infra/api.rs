@@ -3,18 +3,31 @@ use axum::{
     http::{header, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Json, Response},
-    routing::get,
+    routing::{get, post},
     Router,
 };
 use rust_decimal::Decimal;
 use serde::Serialize;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
 
-use crate::infra::journal::{ExecJournal, ExecRecord};
+use crate::app::control::{validate, ArbitrageControl, ArbitrageParams};
+use crate::infra::journal::ExecRecord;
+
+/// 单个已加载所的元数据，用于 `/api/venues` 响应。
+#[derive(Debug, Clone, Serialize)]
+pub struct VenueMeta {
+    pub id: String,
+    /// 人读名称（lighter → Lighter, lighter_rh → Lighter RH, sodex → SoDEX）
+    pub label: String,
+    /// 是否已配置私钥（可以真实下单）
+    pub keys_ready: bool,
+    /// 报价币
+    pub quote: String,
+}
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct PairRow {
@@ -23,6 +36,10 @@ pub struct PairRow {
     pub sell: String,
     pub raw_pct: String,
     pub net_pct: String,
+    pub fee_pct: String,
+    pub nat_pct: String,
+    pub res_pct: String,
+    pub entry_pct: String,
     pub grid: String,
     pub target_qty: String,
     pub actual_qty: String,
@@ -64,15 +81,29 @@ pub struct NakedExposureRow {
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
+pub struct VenueMatchRow {
+    pub left: String,
+    pub right: String,
+    pub n: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct LiveSnapshot {
     pub pairs: Vec<PairRow>,
     pub positions: Vec<PositionRow>,
     pub balances: Vec<VenueBalanceRow>,
     pub exchange_positions: Vec<ExchangePositionRow>,
     pub naked_exposures: Vec<NakedExposureRow>,
+    #[serde(default)]
+    pub venue_matches: Vec<VenueMatchRow>,
     pub stats: ApiStats,
     pub monitor_only: bool,
     pub paper_trading: bool,
+    /// 套利开关当前状态（供 UI 轮询用）。
+    pub arbitrage_enabled: bool,
+    /// 正在按所选 DEX 拉市场并匹配。
+    #[serde(default)]
+    pub matching: bool,
     pub updated_at: i64,
 }
 
@@ -86,22 +117,34 @@ pub struct ApiStats {
 #[derive(Clone)]
 pub struct ApiHub {
     pub state: Arc<RwLock<LiveSnapshot>>,
-    pub journal_path: Option<String>,
+    /// 本次进程的执行带。不落盘，重启即空。
+    session_execs: Arc<Mutex<Vec<ExecRecord>>>,
     pub web_root: PathBuf,
     pub auth_token: Option<String>,
+    /// 运行时套利开关与热改参数，与 Controller 共享。
+    pub control: Arc<Mutex<ArbitrageControl>>,
+    /// 进程启动时从 yaml 拷出的默认值，页面「重置」用。
+    pub yaml_defaults: ArbitrageParams,
+    /// 已加载所的元数据（只读，进程启动时固定）。
+    pub venues: Vec<VenueMeta>,
 }
 
 impl ApiHub {
     pub fn new(
-        journal_path: Option<String>,
         web_root: PathBuf,
         auth_token: Option<String>,
+        control: Arc<Mutex<ArbitrageControl>>,
+        venues: Vec<VenueMeta>,
+        yaml_defaults: ArbitrageParams,
     ) -> Self {
         Self {
             state: Arc::new(RwLock::new(LiveSnapshot::default())),
-            journal_path,
+            session_execs: Arc::new(Mutex::new(Vec::new())),
             web_root,
             auth_token,
+            control,
+            yaml_defaults,
+            venues,
         }
     }
 
@@ -111,8 +154,37 @@ impl ApiHub {
         }
     }
 
+    pub fn push_execution(&self, rec: ExecRecord) {
+        if let Ok(mut v) = self.session_execs.lock() {
+            v.insert(0, rec);
+            const MAX: usize = 200;
+            if v.len() > MAX {
+                v.truncate(MAX);
+            }
+        }
+    }
+
+    fn recent_executions(&self, limit: usize) -> Vec<ExecRecord> {
+        self.session_execs
+            .lock()
+            .map(|v| v.iter().take(limit).cloned().collect())
+            .unwrap_or_default()
+    }
+
     pub fn spawn(self: Arc<Self>, bind: &str) -> tokio::task::JoinHandle<()> {
-        let addr: SocketAddr = bind.parse().expect("invalid http.bind");
+        let mut addr: SocketAddr = bind.parse().expect("invalid http.bind");
+        let token_set = self
+            .auth_token
+            .as_deref()
+            .map(|t| !t.trim().is_empty())
+            .unwrap_or(false);
+        if !token_set && !addr.ip().is_loopback() {
+            tracing::warn!(
+                configured = %addr,
+                "http.auth_token empty; refusing public bind, falling back to 127.0.0.1"
+            );
+            addr.set_ip(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        }
         let hub = self.clone();
         tokio::spawn(async move {
             let api = Router::new()
@@ -121,6 +193,11 @@ impl ApiHub {
                 .route("/api/positions", get(positions))
                 .route("/api/executions", get(executions))
                 .route("/api/snapshot", get(snapshot))
+                .route("/api/config", get(get_config).post(post_config))
+                .route("/api/config/defaults", get(get_config_defaults))
+                .route("/api/arbitrage/start", post(arbitrage_start))
+                .route("/api/arbitrage/stop", post(arbitrage_stop))
+                .route("/api/venues", get(get_venues))
                 .route_layer(middleware::from_fn_with_state(
                     hub.clone(),
                     require_api_auth,
@@ -134,7 +211,7 @@ impl ApiHub {
                         .not_found_service(ServeFile::new(hub.web_root.join("index.html"))),
                 )
                 .layer(CorsLayer::permissive());
-            tracing::info!(%addr, "http api listening (public bind)");
+            tracing::info!(%addr, "http api listening");
             let listener = tokio::net::TcpListener::bind(addr).await.expect("bind http");
             if axum::serve(listener, app).await.is_err() {
                 tracing::warn!("http server stopped");
@@ -229,33 +306,110 @@ impl From<ExecRecord> for ExecRow {
 }
 
 async fn executions(State(hub): State<Arc<ApiHub>>) -> impl IntoResponse {
-    let path = match &hub.journal_path {
-        Some(p) => p.clone(),
-        None => {
-            return Json(serde_json::json!({ "executions": [] })).into_response();
-        }
-    };
-    match ExecJournal::open(&path) {
-        Ok(j) => match j.recent(50) {
-            Ok(rows) => {
-                let out: Vec<ExecRow> = rows.into_iter().map(Into::into).collect();
-                Json(serde_json::json!({ "executions": out })).into_response()
-            }
-            Err(err) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("journal read: {err}"),
-            )
-                .into_response(),
-        },
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("journal open: {err}"),
-        )
-            .into_response(),
-    }
+    let out: Vec<ExecRow> = hub
+        .recent_executions(50)
+        .into_iter()
+        .map(Into::into)
+        .collect();
+    Json(serde_json::json!({ "executions": out })).into_response()
+}
+
+async fn get_venues(State(hub): State<Arc<ApiHub>>) -> impl IntoResponse {
+    let active = hub
+        .control
+        .lock()
+        .map(|c| c.params.active_venues.clone())
+        .unwrap_or_default();
+    let venues: Vec<_> = hub
+        .venues
+        .iter()
+        .map(|v| {
+            serde_json::json!({
+                "id": v.id,
+                "label": v.label,
+                "keys_ready": v.keys_ready,
+                "quote": v.quote,
+                "active": active.is_empty() || active.contains(&v.id),
+            })
+        })
+        .collect();
+    Json(serde_json::json!({ "venues": venues }))
 }
 
 pub fn fmt_pct(v: Decimal) -> String {
     let sign = if v >= Decimal::ZERO { "+" } else { "" };
     format!("{sign}{:.3}%", v)
+}
+
+pub fn fmt_qty(v: Decimal) -> String {
+    format!("{:.6}", v.round_dp(6))
+}
+
+// ── Control endpoints ────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct ConfigResponse {
+    enabled: bool,
+    params: ArbitrageParams,
+}
+
+async fn get_config(State(hub): State<Arc<ApiHub>>) -> impl IntoResponse {
+    let ctrl = hub.control.lock().unwrap();
+    Json(ConfigResponse {
+        enabled: ctrl.enabled,
+        params: ctrl.params.clone(),
+    })
+}
+
+async fn get_config_defaults(State(hub): State<Arc<ApiHub>>) -> impl IntoResponse {
+    Json(ConfigResponse {
+        enabled: false,
+        params: hub.yaml_defaults.clone(),
+    })
+}
+
+async fn post_config(
+    State(hub): State<Arc<ApiHub>>,
+    Json(params): Json<ArbitrageParams>,
+) -> impl IntoResponse {
+    let v = validate(&params);
+    if !v.ok {
+        return (StatusCode::UNPROCESSABLE_ENTITY, Json(serde_json::json!({ "ok": false, "errors": v.errors }))).into_response();
+    }
+    {
+        let mut ctrl = hub.control.lock().unwrap();
+        ctrl.params = params;
+    }
+    tracing::info!("arbitrage params updated via API");
+    Json(serde_json::json!({ "ok": true })).into_response()
+}
+
+async fn arbitrage_start(State(hub): State<Arc<ApiHub>>) -> impl IntoResponse {
+    {
+        let mut ctrl = hub.control.lock().unwrap();
+        let n = ctrl.params.active_venues.len();
+        if n == 1 {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "errors": ["请至少选择两个交易所再启动"]
+                })),
+            )
+                .into_response();
+        }
+        ctrl.enabled = true;
+        ctrl.rematch = true;
+    }
+    tracing::info!("arbitrage enabled via API; pair match queued");
+    Json(serde_json::json!({ "ok": true, "enabled": true })).into_response()
+}
+
+async fn arbitrage_stop(State(hub): State<Arc<ApiHub>>) -> impl IntoResponse {
+    {
+        let mut ctrl = hub.control.lock().unwrap();
+        ctrl.enabled = false;
+    }
+    tracing::info!("arbitrage disabled via API");
+    Json(serde_json::json!({ "ok": true, "enabled": false }))
 }

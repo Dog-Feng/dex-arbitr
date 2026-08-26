@@ -12,6 +12,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ethereum/go-ethereum/crypto"
@@ -19,6 +20,7 @@ import (
 	sodexclient "github.com/sodex-tech/sodex-go-sdk-public/client"
 	"github.com/sodex-tech/sodex-go-sdk-public/common/enums"
 	ptypes "github.com/sodex-tech/sodex-go-sdk-public/perps/types"
+	sodexws "github.com/sodex-tech/sodex-go-sdk-public/ws"
 	"gopkg.in/yaml.v3"
 )
 
@@ -34,12 +36,44 @@ type sodexVenueFile struct {
 	PrivateKey     string `yaml:"private_key"`
 }
 
-func dispatchSodex(ctx context.Context, req request) (any, error) {
-	venue, err := loadSodexVenue(req.VenueYAML)
+// sodexSession 长存 SoDEX 连接：client、accountID、地址都只解析一次。
+type sodexSession struct {
+	venue     sodexVenueFile
+	client    *sodexclient.Client
+	accountID uint64
+	addr      string
+
+	wsOnce sync.Once
+	wsStop context.CancelFunc
+}
+
+func (s *sodexSession) close() {
+	if s.wsStop != nil {
+		s.wsStop()
+	}
+}
+
+func (r *registry) sodexSession(ctx context.Context, path string) (*sodexSession, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.sodex != nil {
+		return r.sodex, nil
+	}
+	venue, err := loadSodexVenue(path)
 	if err != nil {
 		return nil, err
 	}
 	client, accountID, addr, err := connect(ctx, venue)
+	if err != nil {
+		return nil, err
+	}
+	s := &sodexSession{venue: venue, client: client, accountID: accountID, addr: addr}
+	r.sodex = s
+	return s, nil
+}
+
+func dispatchSodex(ctx context.Context, reg *registry, req request) (any, error) {
+	s, err := reg.sodexSession(ctx, req.VenueYAML)
 	if err != nil {
 		return nil, err
 	}
@@ -49,16 +83,80 @@ func dispatchSodex(ctx context.Context, req request) (any, error) {
 	}
 	switch req.Cmd {
 	case "account":
-		return accountSnapshot(ctx, gatewayBase(venue.Rest), addr, accountID)
+		return accountSnapshot(ctx, gatewayBase(s.venue.Rest), s.addr, s.accountID)
 	case "place":
-		return placeOrder(ctx, client, accountID, venue, params)
+		return placeOrder(ctx, s.client, s.accountID, s.addr, s.venue, params)
 	case "cancel":
-		return cancelOrder(ctx, client, accountID, params)
+		return cancelOrder(ctx, s.client, s.accountID, params)
 	case "order_status":
-		return orderStatus(ctx, client, accountID, params)
+		return orderStatus(ctx, s.client, s.accountID, s.addr, params)
+	case "funding":
+		return s.funding(ctx)
+	case "watch":
+		s.startOrderStream()
+		return map[string]string{"status": "watching"}, nil
 	default:
 		return nil, fmt.Errorf("unknown cmd %q", req.Cmd)
 	}
+}
+
+// startOrderStream 订阅 SoDEX 私有订单流。
+//
+// 注意：官方文档明确 "User-specific streams do not require subscription
+// authorization"——账户频道无需鉴权，任何知道地址的人都能订阅。这让实现
+// 简单，但也意味着本账户的下单活动对第三方可见。
+func (s *sodexSession) startOrderStream() {
+	s.wsOnce.Do(func() {
+		ctx, cancel := context.WithCancel(context.Background())
+		s.wsStop = cancel
+		go s.runOrderStream(ctx)
+	})
+}
+
+func (s *sodexSession) runOrderStream(ctx context.Context) {
+	for ctx.Err() == nil {
+		if err := s.orderStreamOnce(ctx); err != nil && ctx.Err() == nil {
+			emitPush("sodex", map[string]any{"stream_error": err.Error()})
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(2 * time.Second):
+			}
+		}
+	}
+}
+
+func (s *sodexSession) orderStreamOnce(ctx context.Context) error {
+	c, err := sodexws.NewClient(sodexWSBase(s.venue.Rest), "perps")
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	if err := c.Connect(ctx); err != nil {
+		return err
+	}
+	// SDK 自带断线重订与 ping/pong 保活。
+	if _, err := c.Subscribe(
+		sodexws.SubscribeParams{Channel: sodexws.ChannelAccountOrderUpd, User: s.addr},
+		func(p sodexws.Push) {
+			var upd sodexws.AccountOrderUpdate
+			if json.Unmarshal(p.Data, &upd) != nil {
+				return
+			}
+			emitPush("sodex", upd)
+		},
+	); err != nil {
+		return err
+	}
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func sodexWSBase(rest string) string {
+	base := gatewayBase(rest)
+	base = strings.TrimPrefix(base, "https://")
+	base = strings.TrimPrefix(base, "http://")
+	return "wss://" + strings.TrimRight(base, "/")
 }
 
 func loadSodexVenue(path string) (sodexVenueFile, error) {
@@ -168,8 +266,8 @@ func discoverAccountID(ctx context.Context, base, addr string) (uint64, error) {
 	var envelope struct {
 		Code int `json:"code"`
 		Data struct {
-			AID        uint64 `json:"aid"`
-			AccountID  uint64 `json:"accountID"`
+			AID       uint64 `json:"aid"`
+			AccountID uint64 `json:"accountID"`
 		} `json:"data"`
 		Message string `json:"message"`
 	}
@@ -335,6 +433,62 @@ func httpGetJSON(ctx context.Context, rawURL string, dest any) error {
 	return json.Unmarshal(body, dest)
 }
 
+// funding 返回本所各市场的当期资金费率。
+//
+// 费率在 `/markets/tickers` 的 `fundingRate`（SDK 的 Ticker 有这个字段），
+// 结算周期在 `/markets/symbols` 的 `fundingInterval`——后者 SDK 的 Symbol
+// 结构体**没有**映射，只能自己拉原始 JSON。
+//
+// 周期要单独取而不是写死 3600：实测 88 个市场当前全是 3600，但这是交易所可以
+// 改的参数，而改了之后费率**数值本身看不出区别**。上层年化用周期算，静默改
+// 周期就会静默算错年化，所以以交易所返回的为准，拉不到才回落常量。
+func (s *sodexSession) funding(ctx context.Context) (map[string]any, error) {
+	tickers, err := s.client.PerpsTickers(ctx)
+	if err != nil {
+		return nil, err
+	}
+	intervals := fundingIntervals(ctx, s.venue)
+	out := make([]map[string]any, 0, len(tickers))
+	for _, t := range tickers {
+		if t.FundingRate == nil || strings.TrimSpace(*t.FundingRate) == "" {
+			continue
+		}
+		secs := sodexFundingIntervalFallback
+		if v, ok := intervals[strings.ToUpper(t.Symbol)]; ok && v > 0 {
+			secs = v
+		}
+		out = append(out, map[string]any{
+			"symbol":        t.Symbol,
+			"rate":          decimalFromString(*t.FundingRate).String(),
+			"interval_secs": secs,
+		})
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("no sodex funding rates in %d tickers", len(tickers))
+	}
+	return map[string]any{"rates": out}, nil
+}
+
+// fundingIntervals 按 symbol 取结算周期（秒）。拉不到就返回空表，让调用方
+// 回落常量——费率本身已经拿到了，不该因为周期查询失败就整个 funding 失败。
+func fundingIntervals(ctx context.Context, v sodexVenueFile) map[string]int {
+	var rows []struct {
+		Name            string `json:"name"`
+		FundingInterval any    `json:"fundingInterval"`
+	}
+	u := gatewayBase(v.Rest) + "/api/v1/perps/markets/symbols"
+	if err := httpGetJSON(ctx, u, &rows); err != nil {
+		return nil
+	}
+	out := make(map[string]int, len(rows))
+	for _, r := range rows {
+		if n := int(decimalFromString(strings.TrimSpace(fmt.Sprint(r.FundingInterval))).IntPart()); n > 0 {
+			out[strings.ToUpper(r.Name)] = n
+		}
+	}
+	return out
+}
+
 type symbolSpec struct {
 	SymbolID uint64
 	Symbol   string
@@ -368,7 +522,7 @@ func lookupSymbol(ctx context.Context, c *sodexclient.Client, symbolID uint64, s
 	return symbolSpec{}, fmt.Errorf("symbol not found id=%d name=%q", symbolID, symbolName)
 }
 
-func placeOrder(ctx context.Context, c *sodexclient.Client, accountID uint64, v sodexVenueFile, params map[string]any) (map[string]string, error) {
+func placeOrder(ctx context.Context, c *sodexclient.Client, accountID uint64, addr string, v sodexVenueFile, params map[string]any) (map[string]string, error) {
 	symbolID, err := paramUint64(params, "market_index")
 	if err != nil {
 		return nil, err
@@ -380,6 +534,9 @@ func placeOrder(ctx context.Context, c *sodexclient.Client, accountID uint64, v 
 	isBuy := paramBool(params, "is_buy")
 	reduceOnly := paramBool(params, "reduce_only")
 	style := paramString(params, "style", "market")
+	// 不驻留的单（market / aggressive_limit 都是 IOC）：下完要么成交要么
+	// 消失，成交量必须轮询回查。驻留的限价单才可以单次查询。
+	ioc := style != "limit"
 	clOrdID := paramString(params, "client_order_id", fmt.Sprintf("arb-%d", time.Now().UnixMilli()))
 	spec, err := lookupSymbol(ctx, c, symbolID, paramString(params, "symbol", ""))
 	if err != nil {
@@ -407,12 +564,33 @@ func placeOrder(ctx context.Context, c *sodexclient.Client, accountID uint64, v 
 		if err != nil {
 			return nil, err
 		}
-		price = roundToStep(price, spec.TickSize, isBuy)
+		// 取整方向必须**远离**对手价：买向下、卖向上。
+		// 反过来会把价格推过盘口，GTX(post-only) 直接拒单——上层给的挂价
+		// 已经贴在点差内侧 1 tick，且那个 tick 是从报价小数位推断的，
+		// 偏小时向上取整就会穿价。
+		price = roundToStep(price, spec.TickSize, !isBuy)
 		raw.Type = enums.OrderTypeLimit
 		raw.TimeInForce = enums.TimeInForceGTX
 		raw.Price = decimalPtr(price)
+	} else if style == "aggressive_limit" {
+		// 激进限价：市价腿失败后的兜底。限价 + IOC，吃不到就整单撤销。
+		//
+		// 取整方向和 post-only 相反——这里是**要吃单**，取整必须朝对手价
+		// 靠（买向上、卖向下），朝反方向取整会让本来能吃到的量吃不到。
+		// TimeInForce 用 IOC 而非 GTX：GTX 会把这张单变成 post-only，
+		// 越过盘口直接被拒，兜底就废了。
+		price, err := paramDecimal(params, "limit_price")
+		if err != nil {
+			return nil, err
+		}
+		price = roundToStep(price, spec.TickSize, isBuy)
+		raw.Type = enums.OrderTypeLimit
+		raw.TimeInForce = enums.TimeInForceIOC
+		raw.Price = decimalPtr(price)
 	} else {
-		protected, err := marketProtectPrice(ctx, c, spec.Symbol, side, spec.TickSize)
+		targetPx, _ := paramDecimal(params, "target_price")
+		slipPct, _ := paramDecimal(params, "slippage_pct")
+		protected, err := marketProtectPrice(ctx, c, spec.Symbol, side, spec.TickSize, targetPx, slipPct)
 		if err != nil {
 			return nil, err
 		}
@@ -428,6 +606,46 @@ func placeOrder(ctx context.Context, c *sodexclient.Client, accountID uint64, v 
 		Orders:    []*ptypes.RawOrder{raw},
 	})
 	if err != nil {
+		// 请求报错不代表订单没落地：超时/连接中断时交易所可能已经收单。
+		// 直接抛错会让上层丢掉 clOrdID，这张单就再也没人撤了。
+		// clOrdID 是本地生成的，据此回查一次即可确认。对齐参考
+		// 「WS 超时 → 撤单/REST 确认」的前提：上层必须始终握有 order_id。
+		if o, ok := findOrder(ctx, c, addr, 0, clOrdID); ok {
+			filled := o.ExecutedQty
+			// 不驻留的单再轮询确认一次：请求虽然报错，单子可能已经落地并成交。
+			if ioc {
+				if f, ap, _ := waitOrderFill(ctx, c, addr, o.OrderID, clOrdID, qty); f.GreaterThan(decimalFromString(filled)) {
+					filled = f.String()
+					if ap != "" {
+						o.Price = ap
+					}
+				}
+			}
+			outStatus := "accepted"
+			if decimalFromString(filled).GreaterThan(decimal.Zero) {
+				if decimalFromString(filled).GreaterThanOrEqual(qty) {
+					outStatus = "filled"
+				} else {
+					outStatus = "partial"
+				}
+			} else if ioc {
+				// IOC 查到了单但成交量为 0：不驻留，"accepted" 会让上层
+				// 空等一张不存在的挂单。报 unknown 交对账兜底。
+				outStatus = "unknown"
+			}
+			fmt.Fprintf(os.Stderr, "sodex place: request failed (%v) but order %s is live; reporting %s\n", err, clOrdID, outStatus)
+			avgPrice := paramString(params, "limit_price", "")
+			if ap := avgPriceFromOrder(o); ap != "" {
+				avgPrice = ap
+			}
+			return map[string]string{
+				"order_id":        strconv.FormatUint(o.OrderID, 10),
+				"client_order_id": clOrdID,
+				"filled_qty":      filled,
+				"status":          outStatus,
+				"avg_price":       avgPrice,
+			}, nil
+		}
 		return nil, err
 	}
 	if len(results) == 0 {
@@ -438,20 +656,59 @@ func placeOrder(ctx context.Context, c *sodexclient.Client, accountID uint64, v 
 	filled := "0"
 	avgPrice := paramString(params, "limit_price", "")
 	if r.OrderID > 0 || r.ClOrdID != "" {
-		if o, ok := findOrder(ctx, c, c.Address(), r.OrderID, firstNonEmpty(r.ClOrdID, clOrdID)); ok {
+		id := firstNonEmpty(r.ClOrdID, clOrdID)
+		if ioc {
+			// IOC 腿要轮询：不驻留，单次查询看到的 0 分不清
+			// 「整单撤销」还是「索引还没跟上」。
+			f, ap, _ := waitOrderFill(ctx, c, addr, r.OrderID, id, qty)
+			filled = f.String()
+			if ap != "" {
+				avgPrice = ap
+			}
+		} else if o, ok := findOrder(ctx, c, addr, r.OrderID, id); ok {
+			// 限价腿会驻留，成交检测由上层轮询负责，这里单次查询就够。
 			filled = o.ExecutedQty
 			if ap := avgPriceFromOrder(o); ap != "" {
 				avgPrice = ap
 			}
 		}
 	}
+	// 交易所明确报拒单/撤单：必须如实上报，不能吞成 accepted——
+	// 否则上层会把一张不存在的单当成活跃挂单，空等超时再去撤。
+	if strings.Contains(status, "reject") {
+		return nil, fmt.Errorf("sodex rejected order: %s", firstNonEmpty(r.Status, "rejected"))
+	}
 	outStatus := "accepted"
-	if strings.Contains(status, "fill") {
-		outStatus = "filled"
-	} else if style == "market" {
-		outStatus = "filled"
-		if filled == "" || filled == "0" {
-			filled = qty.String()
+	switch {
+	case strings.Contains(status, "fill"):
+		// 交易所说成交了，但成交量必须真查到才算。查不到就报 unknown，
+		// 让上层走仓位对账/人工介入——**绝不**用请求量顶替。对齐参考
+		// 对市价单关闭 `allow_fallback`（`_infer_fill_from_status`
+		// 遇市价单直接返回 None）。
+		if decimalFromString(filled).GreaterThan(decimal.Zero) {
+			outStatus = "filled"
+		} else {
+			outStatus = "unknown"
+		}
+	case strings.Contains(status, "cancel") || strings.Contains(status, "expire"):
+		// IOC 市价单吃不到量会整单撤销。已成交部分照实报，没有就是 canceled。
+		if decimalFromString(filled).GreaterThan(decimal.Zero) {
+			outStatus = "partial"
+		} else {
+			outStatus = "canceled"
+		}
+	case ioc:
+		// sendOrder 成功 ≠ 撮合成交。查得到就用真实成交量；查不到
+		// 报 unknown 让上层用仓位对账兜底，**绝不**用请求量顶替。
+		// 这里绝不能报 accepted：IOC 不驻留，上层会空等一张不存在的挂单。
+		if decimalFromString(filled).GreaterThan(decimal.Zero) {
+			if decimalFromString(filled).GreaterThanOrEqual(qty) {
+				outStatus = "filled"
+			} else {
+				outStatus = "partial"
+			}
+		} else {
+			outStatus = "unknown"
 		}
 	}
 	return map[string]string{
@@ -463,28 +720,53 @@ func placeOrder(ctx context.Context, c *sodexclient.Client, accountID uint64, v 
 	}, nil
 }
 
-func marketProtectPrice(ctx context.Context, c *sodexclient.Client, symbol string, side enums.OrderSide, tickSize decimal.Decimal) (decimal.Decimal, error) {
-	if symbol == "" {
-		return decimal.Zero, fmt.Errorf("symbol required for market order")
+// marketProtectPrice 算市价单的限价保护。
+//
+// 基准优先用**决策信号价**（target_price）——保护要约束「相对决策价滑了多少」；
+// 用下单时的盘口做基准等于自我实现，价格跑了照样成交。拿不到信号价才退回盘口。
+// 对齐参考 `payload["target_price"] + slippage_percent`。
+func marketProtectPrice(
+	ctx context.Context,
+	c *sodexclient.Client,
+	symbol string,
+	side enums.OrderSide,
+	tickSize decimal.Decimal,
+	targetPrice decimal.Decimal,
+	slipPct decimal.Decimal,
+) (decimal.Decimal, error) {
+	// slipPct 以百分比传入（0.1 = 0.1%），转成比例。
+	ratio := slipPct.Div(decimal.NewFromInt(100))
+	if !ratio.GreaterThan(decimal.Zero) {
+		ratio = decimal.RequireFromString("0.005")
 	}
-	book, err := c.PerpsOrderBook(ctx, symbol, 5)
-	if err != nil {
-		return decimal.Zero, err
-	}
-	ratio := decimal.RequireFromString("0.005")
-	var best decimal.Decimal
-	if side == enums.OrderSideBuy {
-		if len(book.Asks) == 0 {
-			return decimal.Zero, fmt.Errorf("no ask liquidity for %s", symbol)
+	base := targetPrice
+	if !base.GreaterThan(decimal.Zero) {
+		if symbol == "" {
+			return decimal.Zero, fmt.Errorf("symbol required for market order")
 		}
-		best = decimalFromString(book.Asks[0].Price)
-		return roundToStep(best.Mul(decimal.NewFromInt(1).Add(ratio)), tickSize, true), nil
+		book, err := c.PerpsOrderBook(ctx, symbol, 5)
+		if err != nil {
+			return decimal.Zero, err
+		}
+		if side == enums.OrderSideBuy {
+			if len(book.Asks) == 0 {
+				return decimal.Zero, fmt.Errorf("no ask liquidity for %s", symbol)
+			}
+			base = decimalFromString(book.Asks[0].Price)
+		} else {
+			if len(book.Bids) == 0 {
+				return decimal.Zero, fmt.Errorf("no bid liquidity for %s", symbol)
+			}
+			base = decimalFromString(book.Bids[0].Price)
+		}
 	}
-	if len(book.Bids) == 0 {
-		return decimal.Zero, fmt.Errorf("no bid liquidity for %s", symbol)
+	if !base.GreaterThan(decimal.Zero) {
+		return decimal.Zero, fmt.Errorf("no protect price base for %s", symbol)
 	}
-	best = decimalFromString(book.Bids[0].Price)
-	return roundToStep(best.Mul(decimal.NewFromInt(1).Sub(ratio)), tickSize, false), nil
+	if side == enums.OrderSideBuy {
+		return roundToStep(base.Mul(decimal.NewFromInt(1).Add(ratio)), tickSize, true), nil
+	}
+	return roundToStep(base.Mul(decimal.NewFromInt(1).Sub(ratio)), tickSize, false), nil
 }
 
 func roundToStep(value, step decimal.Decimal, ceil bool) decimal.Decimal {
@@ -524,9 +806,8 @@ func cancelOrder(ctx context.Context, c *sodexclient.Client, accountID uint64, p
 	return map[string]string{"order_id": orderID, "status": "canceled"}, nil
 }
 
-func orderStatus(ctx context.Context, c *sodexclient.Client, accountID uint64, params map[string]any) (map[string]string, error) {
+func orderStatus(ctx context.Context, c *sodexclient.Client, accountID uint64, addr string, params map[string]any) (map[string]string, error) {
 	_ = accountID
-	addr := c.Address()
 	orderID := paramString(params, "order_id", "")
 	qty, _ := paramDecimal(params, "qty")
 	orders, err := c.PerpsOrders(ctx, addr)
@@ -554,15 +835,11 @@ func orderStatus(ctx context.Context, c *sodexclient.Client, accountID uint64, p
 			"avg_price":  avgPriceFromOrder(o),
 		}, nil
 	}
-	fq := "0"
-	st := "filled"
-	if qty.GreaterThan(decimal.Zero) {
-		fq = qty.String()
-	}
+	// 不在活跃列表：可能是已成交/已撤，也可能是刚下单 API 尚未可见；禁止假定 filled。
 	return map[string]string{
 		"order_id":   orderID,
-		"filled_qty": fq,
-		"status":     st,
+		"filled_qty": "0",
+		"status":     "unknown",
 		"avg_price":  "",
 	}, nil
 }
@@ -590,6 +867,49 @@ func findOrder(ctx context.Context, c *sodexclient.Client, addr string, orderID 
 		}
 	}
 	return sodexclient.Order{}, false
+}
+
+// waitOrderFill 轮询订单直到查到成交量或窗口用尽。
+//
+// 对齐参考 `_wait_for_order_fill_rest`：下单响应里的数量不可信，成交量必须
+// 回查，且**单次查询不够**——撮合与订单索引之间有延迟，刚下的市价单常在
+// 第一次查询时还显示 ExecutedQty=0。单次查询会把「已成交」误判成
+// 「查不到」，上层随即当成未对冲，正是幻影成交的反向版本。
+//
+// 返回 (已确认成交量, 均价, 是否至少查到过这张单)。
+func waitOrderFill(
+	ctx context.Context,
+	c *sodexclient.Client,
+	addr string,
+	orderID uint64,
+	clOrdID string,
+	want decimal.Decimal,
+) (decimal.Decimal, string, bool) {
+	// SoDEX 不是 Lighter，走参考的通用窗口 `limit_order_timeout: 3`。
+	deadline := time.Now().Add(sodexFillWait)
+	best := decimal.Zero
+	avg := ""
+	seen := false
+	for {
+		if o, ok := findOrder(ctx, c, addr, orderID, clOrdID); ok {
+			seen = true
+			if f := decimalFromString(o.ExecutedQty); f.GreaterThan(best) {
+				best = f
+				if ap := avgPriceFromOrder(o); ap != "" {
+					avg = ap
+				}
+			}
+			// 已经吃满请求量，没必要继续等。
+			if want.GreaterThan(decimal.Zero) && best.GreaterThanOrEqual(want) {
+				return best, avg, true
+			}
+		}
+		// ctx 到期就别再空转：上层已经不等这个响应了。
+		if time.Now().After(deadline) || ctx.Err() != nil {
+			return best, avg, seen
+		}
+		fillPollSleep(deadline)
+	}
 }
 
 func avgPriceFromOrder(o sodexclient.Order) string {

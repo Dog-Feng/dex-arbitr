@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use rust_decimal::Decimal;
 
 use crate::app::balance::VenueAccountCache;
@@ -8,6 +10,7 @@ use crate::domain::{Pair, VenueMarket};
 pub struct NakedExposure {
     pub pair_id: String,
     pub venue: String,
+    /// 带符号：正 = 多头敞口，负 = 空头敞口。
     pub qty: Decimal,
     pub counterparty: String,
     /// 仅 BotFailure 来源会触发自动补对冲；Foreign 为启动前已有仓位，只告警。
@@ -20,86 +23,96 @@ pub enum NakedSource {
     BotFailure,
 }
 
-/// 从各所 account 快照检测「仅一边有仓」的单边敞口（含启动前已有仓位）。
+/// 单边敞口检测。
+///
+/// 按 **pair_id 聚合各所净持仓**，而不是逐条 `Pair` 判断：三所两两组合下同一个
+/// pair_id 有 C(3,2) 条 Pair，逐条判会把一笔单边仓位报成多条（counterparty 还各不
+/// 相同）。真正要看的是「这个币在我们交易的这些所上加总是否中性」。
+///
+/// 账户快照不完整时返回空：`positions` 为空只代表查询失败，不代表没有仓位，
+/// 拿它去判「单边」会误报甚至误触发补单。
 pub fn detect_naked_exposures(pairs: &[Pair], accounts: &VenueAccountCache) -> Vec<NakedExposure> {
-    detect_with_source(pairs, accounts, NakedSource::Foreign)
-}
-
-pub fn detect_bot_failure_exposures(
-    pairs: &[Pair],
-    accounts: &VenueAccountCache,
-) -> Vec<NakedExposure> {
-    detect_with_source(pairs, accounts, NakedSource::BotFailure)
-}
-
-fn detect_with_source(
-    pairs: &[Pair],
-    accounts: &VenueAccountCache,
-    source: NakedSource,
-) -> Vec<NakedExposure> {
+    if !accounts.all_fresh() {
+        return Vec::new();
+    }
     let mut out = Vec::new();
-    for pair in pairs {
-        let q0 = venue_position_qty(accounts, &pair.legs[0]);
-        let q1 = venue_position_qty(accounts, &pair.legs[1]);
-        if q0.is_zero() && q1.is_zero() {
+    for (pair_id, legs) in group_by_pair(pairs) {
+        let tol = legs
+            .iter()
+            .map(|(_, l)| l.min_qty)
+            .max()
+            .unwrap_or(Decimal::ZERO);
+        let held: Vec<(String, Decimal)> = legs
+            .iter()
+            .map(|(venue, leg)| (venue.clone(), venue_position_qty(accounts, leg)))
+            .collect();
+        let net: Decimal = held.iter().map(|(_, q)| *q).sum();
+        if net.abs() <= tol {
             continue;
         }
-        let tol = pair.legs[0].min_qty.max(pair.legs[1].min_qty);
-        if !q0.is_zero() && q1.is_zero() {
-            out.push(NakedExposure {
-                pair_id: pair.pair_id.clone(),
-                venue: pair.legs[0].venue.as_str().to_string(),
-                qty: q0,
-                counterparty: pair.legs[1].venue.as_str().to_string(),
-                source,
-            });
-        } else if q0.is_zero() && !q1.is_zero() {
-            out.push(NakedExposure {
-                pair_id: pair.pair_id.clone(),
-                venue: pair.legs[1].venue.as_str().to_string(),
-                qty: q1,
-                counterparty: pair.legs[0].venue.as_str().to_string(),
-                source,
-            });
-        } else if q0.is_sign_positive() == q1.is_sign_positive() {
-            // 同向：两边都多或都空，无法自动配对
-            let larger = if q0.abs() >= q1.abs() {
-                (0, q0)
-            } else {
-                (1, q1)
-            };
-            out.push(NakedExposure {
-                pair_id: pair.pair_id.clone(),
-                venue: pair.legs[larger.0].venue.as_str().to_string(),
-                qty: larger.1,
-                counterparty: pair.legs[1 - larger.0].venue.as_str().to_string(),
-                source,
-            });
-        } else {
-            let imbalance = (q0 + q1).abs();
-            if imbalance > tol {
-                let (leg_i, qty) = if q0.abs() > q1.abs() {
-                    (0, q0 + q1)
-                } else {
-                    (1, q0 + q1)
-                };
-                if !qty.is_zero() {
-                    out.push(NakedExposure {
-                        pair_id: pair.pair_id.clone(),
-                        venue: pair.legs[leg_i].venue.as_str().to_string(),
-                        qty,
-                        counterparty: pair.legs[1 - leg_i].venue.as_str().to_string(),
-                        source,
-                    });
-                }
-            }
-        }
+        // 敞口方向与净额同向、绝对值最大的那一所是主要来源。
+        let Some((venue, _)) = held
+            .iter()
+            .filter(|(_, q)| q.is_sign_positive() == net.is_sign_positive() && !q.is_zero())
+            .max_by_key(|(_, q)| q.abs())
+        else {
+            continue;
+        };
+        // 对手方：优先挑仓位为 0 的所（补上去就中性），否则任意另一所。
+        let counterparty = held
+            .iter()
+            .filter(|(v, _)| v != venue)
+            .min_by_key(|(_, q)| q.abs())
+            .map(|(v, _)| v.clone());
+        let Some(counterparty) = counterparty else {
+            continue;
+        };
+        out.push(NakedExposure {
+            pair_id,
+            venue: venue.clone(),
+            qty: net,
+            counterparty,
+            source: NakedSource::Foreign,
+        });
     }
     out
 }
 
-pub fn leg_position_qty(accounts: &VenueAccountCache, leg: &VenueMarket) -> Decimal {
-    venue_position_qty(accounts, leg)
+/// 内存持仓 vs 交易所实盘的数量偏差。返回 `(slot, pair_id, 内存量, 实盘量)`。
+///
+/// 对齐参考 `_audit_position_alignment`：只报不自动改方向，数量偏差交给
+/// `PositionStore::reconcile_qty` 单向收缩。
+pub fn audit_position_qty(
+    pair: &Pair,
+    accounts: &VenueAccountCache,
+    memory_qty: Decimal,
+) -> Option<(Decimal, Decimal)> {
+    if !accounts.all_fresh() || memory_qty <= Decimal::ZERO {
+        return None;
+    }
+    let a = venue_position_qty(accounts, &pair.legs[0]).abs();
+    let b = venue_position_qty(accounts, &pair.legs[1]).abs();
+    // 对冲仓两腿数量应当一致；取较小者作为「真正对冲上的量」。
+    let hedged = a.min(b);
+    let tol = pair.min_qty();
+    if (memory_qty - hedged).abs() <= tol {
+        return None;
+    }
+    Some((memory_qty, hedged))
+}
+
+fn group_by_pair(pairs: &[Pair]) -> Vec<(String, Vec<(String, VenueMarket)>)> {
+    let mut map: BTreeMap<String, Vec<(String, VenueMarket)>> = BTreeMap::new();
+    for pair in pairs {
+        let entry = map.entry(pair.pair_id.clone()).or_default();
+        for leg in &pair.legs {
+            let venue = leg.venue.as_str().to_string();
+            if !entry.iter().any(|(v, _)| *v == venue) {
+                entry.push((venue, leg.clone()));
+            }
+        }
+    }
+    map.into_iter().collect()
 }
 
 pub fn symbol_matches_symbol(pos_symbol: &str, leg_symbol: &str, leg_base: &str) -> bool {
@@ -122,7 +135,7 @@ pub fn first_leg_fill_delta(
     } else {
         baseline - current
     };
-    if delta >= min_qty {
+    if delta >= min_qty && delta > Decimal::ZERO {
         Some(delta.min(plan_qty))
     } else {
         None
@@ -160,68 +173,127 @@ mod tests {
     use rust_decimal_macros::dec;
     use std::time::Instant;
 
-    fn mon_pair() -> Pair {
+    fn mkt(venue: &str) -> VenueMarket {
+        VenueMarket {
+            venue: VenueId::from(venue),
+            raw_symbol: "MON".into(),
+            pair_id: "MON-USD-PERP".into(),
+            base: "MON".into(),
+            market_index: 1,
+            qty_precision: 0,
+            min_qty: dec!(1),
+        }
+    }
+
+    fn pair(a: &str, b: &str) -> Pair {
         Pair {
             pair_id: "MON-USD-PERP".into(),
-            legs: [
-                VenueMarket {
-                    venue: VenueId::from("sodex"),
-                    raw_symbol: "MON".into(),
-                    pair_id: "MON-USD-PERP".into(),
-                    base: "MON".into(),
-                    market_index: 1,
-                    qty_precision: 0,
-                    min_qty: dec!(1),
-                },
-                VenueMarket {
-                    venue: VenueId::from("lighter"),
-                    raw_symbol: "MON".into(),
-                    pair_id: "MON-USD-PERP".into(),
-                    base: "MON".into(),
-                    market_index: 2,
-                    qty_precision: 0,
-                    min_qty: dec!(1),
-                },
-            ],
+            legs: [mkt(a), mkt(b)],
+        }
+    }
+
+    fn snap(venue: &str, qty: Option<Decimal>, fresh: bool) -> VenueAccountSnapshot {
+        VenueAccountSnapshot {
+            venue: venue.into(),
+            available: dec!(100),
+            total: dec!(100),
+            positions: qty
+                .map(|q| {
+                    vec![VenueExchangePosition {
+                        symbol: "MON".into(),
+                        qty: q,
+                        entry_price: None,
+                    }]
+                })
+                .unwrap_or_default(),
+            fresh,
+        }
+    }
+
+    fn cache(venues: Vec<VenueAccountSnapshot>) -> VenueAccountCache {
+        VenueAccountCache {
+            venues,
+            last_refresh: Instant::now(),
         }
     }
 
     #[test]
     fn detects_single_venue_long() {
-        let accounts = VenueAccountCache {
-            venues: vec![VenueAccountSnapshot {
-                venue: "sodex".into(),
-                available: dec!(100),
-                total: dec!(100),
-                positions: vec![VenueExchangePosition {
-                    symbol: "MON".into(),
-                    qty: dec!(676),
-                    entry_price: None,
-                }],
-            }],
-            last_refresh: Instant::now(),
-        };
-        let naked = detect_naked_exposures(&[mon_pair()], &accounts);
+        let accounts = cache(vec![
+            snap("sodex", Some(dec!(676)), true),
+            snap("lighter", None, true),
+            snap("lighter_rh", None, true),
+        ]);
+        let naked = detect_naked_exposures(&[pair("sodex", "lighter")], &accounts);
         assert_eq!(naked.len(), 1);
         assert_eq!(naked[0].venue, "sodex");
         assert_eq!(naked[0].qty, dec!(676));
         assert_eq!(naked[0].counterparty, "lighter");
-        assert_eq!(naked[0].source, NakedSource::Foreign);
+    }
+
+    /// 三所两两组合下，一笔单边仓位只报一条，不是每条 Pair 报一次。
+    #[test]
+    fn one_exposure_per_pair_id_across_venue_combos() {
+        let accounts = cache(vec![
+            snap("sodex", Some(dec!(676)), true),
+            snap("lighter", None, true),
+            snap("lighter_rh", None, true),
+        ]);
+        let pairs = [
+            pair("lighter", "lighter_rh"),
+            pair("lighter", "sodex"),
+            pair("lighter_rh", "sodex"),
+        ];
+        let naked = detect_naked_exposures(&pairs, &accounts);
+        assert_eq!(naked.len(), 1);
+        assert_eq!(naked[0].venue, "sodex");
+    }
+
+    /// 已经对冲好的仓位不算敞口。
+    #[test]
+    fn hedged_pair_is_not_naked() {
+        let accounts = cache(vec![
+            snap("sodex", Some(dec!(676)), true),
+            snap("lighter", Some(dec!(-676)), true),
+        ]);
+        assert!(detect_naked_exposures(&[pair("sodex", "lighter")], &accounts).is_empty());
+    }
+
+    /// 快照不完整时不做判定，避免把「查不到」当成「没有仓位」。
+    #[test]
+    fn stale_snapshot_reports_nothing() {
+        let accounts = cache(vec![
+            snap("sodex", Some(dec!(676)), true),
+            snap("lighter", None, false),
+        ]);
+        assert!(detect_naked_exposures(&[pair("sodex", "lighter")], &accounts).is_empty());
     }
 
     #[test]
-    fn fill_delta_detects_buy_fill() {
+    fn audit_flags_memory_over_exchange() {
+        let accounts = cache(vec![
+            snap("sodex", Some(dec!(600)), true),
+            snap("lighter", Some(dec!(-600)), true),
+        ]);
+        let p = pair("sodex", "lighter");
+        assert_eq!(audit_position_qty(&p, &accounts, dec!(676)), Some((dec!(676), dec!(600))));
+        assert_eq!(audit_position_qty(&p, &accounts, dec!(600)), None);
+    }
+
+    #[test]
+    fn fill_delta_detects_both_sides() {
         assert_eq!(
             first_leg_fill_delta(dec!(0), dec!(32.43), true, dec!(32.43), dec!(1)),
             Some(dec!(32.43))
         );
-    }
-
-    #[test]
-    fn fill_delta_detects_sell_fill() {
         assert_eq!(
             first_leg_fill_delta(dec!(0), dec!(-0.5), false, dec!(0.5), dec!(0.01)),
             Some(dec!(0.5))
+        );
+        // 没有新成交时不能返回 0
+        assert_eq!(
+            first_leg_fill_delta(dec!(5), dec!(5), true, dec!(1), Decimal::ZERO),
+            None
         );
     }
 

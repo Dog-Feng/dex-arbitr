@@ -15,6 +15,8 @@ pub enum OrderStatus {
     Filled,
     Canceled,
     Rejected,
+    /// 不在活跃列表且无法确认成交（禁止当作 filled）。
+    Unknown,
 }
 
 #[derive(Debug, Clone)]
@@ -28,6 +30,12 @@ pub struct OrderReq {
     /// Limit maker 挂单价；市价单为 None（由桥接层按 BBO+滑点算保护价）。
     pub limit_price: Option<Decimal>,
     pub client_order_id: Option<String>,
+    /// 市价单的滑点保护基准价 = **决策那一刻的信号价**。
+    /// 对齐参考 `payload["target_price"]`：保护要约束「相对决策价滑了多少」，
+    /// 用下单时的盘口做基准等于自我实现，价格跑了照样成交。
+    pub target_price: Option<Decimal>,
+    /// 允许的滑点上限（%）。超出交易所直接拒单。
+    pub slippage_pct: Option<Decimal>,
 }
 
 #[derive(Debug, Clone)]
@@ -53,6 +61,18 @@ pub struct VenuePosition {
     pub symbol: String,
     pub qty: Decimal,
     pub entry_price: Option<Decimal>,
+}
+
+/// 单市场的当期资金费率。`symbol` 是**该所的原始符号**，跨所匹配靠
+/// `Pair` 的 base，不能直接字符串比——Lighter 给 `XAUT-USD`,SoDEX 给裸
+/// `CRV`。
+#[derive(Debug, Clone)]
+pub struct FundingRate {
+    pub symbol: String,
+    /// 每结算周期的费率，小数（0.0001 = 0.01%）。正 = 多头支付。
+    pub rate: Decimal,
+    /// 结算周期（秒），由交易所返回。不假定 1h/8h。
+    pub interval_secs: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -88,4 +108,9 @@ pub trait ExchangePort: Send + Sync {
     }
     async fn positions(&self) -> Result<Vec<VenuePosition>>;
     async fn balances(&self) -> Result<Vec<Balance>>;
+    /// 全市场当期资金费率。未接线的 venue 返回空表——上层据此**跳过**
+    /// 资金费率门，而不是把缺数据当成 0 费率放行。
+    async fn funding(&self) -> Result<Vec<FundingRate>> {
+        Ok(Vec::new())
+    }
 }

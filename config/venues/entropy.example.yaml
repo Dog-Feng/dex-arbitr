@@ -1,0 +1,18 @@
+# 复制为 entropy.yaml 后填私钥。不要提交 entropy.yaml。
+# 也可用环境变量：ENTROPY_PRIVATE_KEY / ENTROPY_ACCOUNT_ADDRESS
+#
+# Entropy 是 Hyperliquid HIP-3 部署方，dex 名 io。没有独立 API Key。
+# account_address = 主账户公钥（查余额/持仓/订单；页面右上角那个）
+# private_key     = 已授权 API 钱包（代理钱包）的私钥
+# 二者通常不是同一个地址。统一账户下 USDC 记在 spot 账本，但是永续可用保证金。
+id: entropy
+rest: https://api.hyperliquid.xyz
+ws: wss://api.hyperliquid.xyz/ws
+chain_id: 1
+quote: USDC
+# 按 Entropy 账户档位改。占位为常见 HIP-3 量级，不是官方默认档。
+fees:
+  maker: "0.015"
+  taker: "0.045"
+account_address: ""
+private_key: ""

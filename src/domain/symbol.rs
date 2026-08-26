@@ -46,6 +46,36 @@ pub struct Pair {
     pub legs: [VenueMarket; 2],
 }
 
+/// 同一 `pair_id` 在 N 所里会有 C(N,2) 条 `Pair`。持仓、挂单、持续性计时都必须按
+/// 「币 + 所对」隔离，否则三所两两组合会共用同一份状态。venue 排序后拼接，
+/// 使 buy/sell 换向仍落在同一个槽位。
+pub fn slot_key(pair_id: &str, venue_a: &str, venue_b: &str) -> String {
+    if venue_a <= venue_b {
+        format!("{pair_id}|{venue_a}|{venue_b}")
+    } else {
+        format!("{pair_id}|{venue_b}|{venue_a}")
+    }
+}
+
+impl Pair {
+    pub fn slot_key(&self) -> String {
+        slot_key(
+            &self.pair_id,
+            self.legs[0].venue.as_str(),
+            self.legs[1].venue.as_str(),
+        )
+    }
+
+    pub fn leg(&self, venue: &str) -> Option<&VenueMarket> {
+        self.legs.iter().find(|l| l.venue.as_str() == venue)
+    }
+
+    /// 两腿里 min_qty 的较大者：任何一腿低于它都下不出去。
+    pub fn min_qty(&self) -> Decimal {
+        self.legs[0].min_qty.max(self.legs[1].min_qty)
+    }
+}
+
 const STABLE_QUOTES: &[&str] = &["USDC", "USDG", "USDT", "USD", "VUSDC", "VUSDG", "VUSDT", "VUSD"];
 const STABLE_CORE: &[&str] = &["USDC", "USDG", "USDT", "USD"];
 
@@ -55,18 +85,38 @@ pub fn normalize_perp(raw: &str, market_type: &str) -> Option<(String, String)> 
     if kind == "spot" {
         return None;
     }
-    let compact = raw
+    let upper = raw
         .trim()
         .to_ascii_uppercase()
         .replace('/', "-")
         .replace('_', "-");
+    if upper.is_empty() {
+        return None;
+    }
+    // HIP-3 合约名是 `{dex}:{coin}`，如 `io:SNDK`。必须先剥前缀再抽 base，
+    // 否则 `IO:SNDK` 整段对不上 `SNDK-USDG`。
+    let compact = strip_hip3_prefix(&upper);
     if compact.is_empty() {
         return None;
     }
 
-    let base = extract_base(&compact)?;
+    let base = extract_base(compact)?;
     let pair_id = format!("{base}-USD-PERP");
     Some((base, pair_id))
+}
+
+/// 剥 HIP-3 `{dex}:` 前缀。dex 名是短字母（`io` / `xyz` / `flx`），避免误伤其它符号。
+pub fn strip_hip3_prefix(symbol: &str) -> &str {
+    let Some((dex, rest)) = symbol.split_once(':') else {
+        return symbol;
+    };
+    if rest.is_empty() {
+        return symbol;
+    }
+    if dex.len() <= 8 && dex.chars().all(|c| c.is_ascii_alphabetic()) {
+        return rest;
+    }
+    symbol
 }
 
 fn extract_base(symbol: &str) -> Option<String> {
@@ -176,6 +226,18 @@ mod tests {
     }
 
     #[test]
+    fn hip3_io_sndk_matches_rh_usdg() {
+        let a = normalize_perp("io:SNDK-USDC", "perp").unwrap();
+        let b = normalize_perp("io:SNDK", "perp").unwrap();
+        let c = normalize_perp("SNDK-USDG", "perp").unwrap();
+        assert_eq!(a, ("SNDK".into(), "SNDK-USD-PERP".into()));
+        assert_eq!(b, a);
+        assert_eq!(c.1, a.1);
+        assert_eq!(strip_hip3_prefix("IO:SNDK"), "SNDK");
+        assert_eq!(strip_hip3_prefix("SNDK-USDG"), "SNDK-USDG");
+    }
+
+    #[test]
     fn usdc_and_usdg_map_to_same_pair() {
         let a = normalize_perp("BTC-USDC", "perp").unwrap();
         let b = normalize_perp("BTCUSDG", "perp").unwrap();
@@ -212,6 +274,15 @@ mod tests {
         assert!(!is_cross_dex("lighter", "lighter_rh"));
         assert!(is_cross_dex("lighter", "sodex"));
         assert!(is_cross_dex("lighter_rh", "sodex"));
+    }
+
+    #[test]
+    fn slot_key_isolates_venue_combinations() {
+        let a = slot_key("BTC-USD-PERP", "lighter", "sodex");
+        let b = slot_key("BTC-USD-PERP", "lighter", "lighter_rh");
+        assert_ne!(a, b);
+        // 换向落同一槽位：开仓 buy/sell 互换不该被当成另一条仓位
+        assert_eq!(a, slot_key("BTC-USD-PERP", "sodex", "lighter"));
     }
 
     #[test]

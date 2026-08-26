@@ -14,6 +14,15 @@ pub struct NaturalSpread {
     pub value: Decimal,
     pub points: usize,
     pub computed_at: Instant,
+    /// 快照写入时的 unix 秒。重启后靠它判断陈旧度——不能像以前那样
+    /// 一律打成 `Instant::now()`，那会把几天前的中位数当成刚算的。
+    pub updated_ts: u64,
+}
+
+impl NaturalSpread {
+    pub fn age_secs(&self, now: u64) -> u64 {
+        now.saturating_sub(self.updated_ts)
+    }
 }
 
 pub struct HistoryStore {
@@ -21,6 +30,7 @@ pub struct HistoryStore {
     conn: Mutex<Connection>,
     last_sample: Mutex<HashMap<String, Instant>>,
     cache: Mutex<HashMap<String, NaturalSpread>>,
+    last_prune: Mutex<Instant>,
 }
 
 impl HistoryStore {
@@ -60,11 +70,45 @@ impl HistoryStore {
             conn: Mutex::new(conn),
             last_sample: Mutex::new(HashMap::new()),
             cache: Mutex::new(cache),
+            last_prune: Mutex::new(Instant::now()),
         };
+        store.prune_samples()?;
         if store.snapshot_count() == 0 {
             store.backfill_from_samples()?;
         }
         Ok(store)
+    }
+
+    /// 删掉窗口外的样本。旧实现只在查询时按窗口过滤、从不删，
+    /// 表会无限膨胀，每 30 分钟的中位数重算又要全量扫。
+    fn prune_samples(&self) -> Result<()> {
+        let cutoff = now_secs().saturating_sub(self.cfg.window_hours.max(1) * 3600);
+        let conn = self.conn.lock().expect("history db");
+        let removed = conn.execute(
+            "DELETE FROM spread_samples WHERE ts < ?1",
+            rusqlite::params![cutoff as i64],
+        )?;
+        if removed > 0 {
+            tracing::info!(removed, "pruned spread samples outside window");
+        }
+        Ok(())
+    }
+
+    fn maybe_prune(&self) {
+        let due = {
+            let mut last = self.last_prune.lock().expect("history prune");
+            if last.elapsed() < Duration::from_secs(3600) {
+                false
+            } else {
+                *last = Instant::now();
+                true
+            }
+        };
+        if due {
+            if let Err(err) = self.prune_samples() {
+                tracing::warn!(error = %err, "prune spread samples failed");
+            }
+        }
     }
 
     pub fn snapshot_count(&self) -> usize {
@@ -110,6 +154,7 @@ impl HistoryStore {
                 ],
             )?;
         }
+        self.maybe_prune();
         if self.refresh_due(&key) {
             Ok(self.refresh_natural(pair_id, buy, sell)?)
         } else {
@@ -141,8 +186,14 @@ impl HistoryStore {
         .unwrap_or(0)
     }
 
+    /// 快照比中位数窗口还老就当没有：24h 中位数用三天前的值算不出今天的基差。
     fn cached(&self, key: &str) -> Option<NaturalSpread> {
-        self.cache.lock().expect("history cache").get(key).cloned()
+        let hit = self.cache.lock().expect("history cache").get(key).cloned()?;
+        let max_age = self.cfg.window_hours.max(1) * 3600;
+        if hit.age_secs(now_secs()) > max_age {
+            return None;
+        }
+        Some(hit)
     }
 
     fn refresh_due(&self, key: &str) -> bool {
@@ -179,33 +230,56 @@ impl HistoryStore {
         Ok(())
     }
 
+    /// 当前窗口内已有样本就给中位数，不必凑满 `min_points`。只给监控页看，
+    /// 不写快照、不参与格子开仓——样本太少时中位数会跳。
+    pub fn preview_natural(&self, pair_id: &str, buy: &str, sell: &str) -> Option<NaturalSpread> {
+        if let Some(hit) = self.natural(pair_id, buy, sell) {
+            return Some(hit);
+        }
+        let mut sorted = self.window_raws(pair_id, buy, sell);
+        if sorted.is_empty() {
+            return None;
+        }
+        sorted.sort();
+        Some(NaturalSpread {
+            value: median(&sorted),
+            points: sorted.len(),
+            computed_at: Instant::now(),
+            updated_ts: now_secs(),
+        })
+    }
+
+    fn window_raws(&self, pair_id: &str, buy: &str, sell: &str) -> Vec<Decimal> {
+        let cutoff = now_secs().saturating_sub(self.cfg.window_hours.max(1) * 3600);
+        let conn = self.conn.lock().expect("history db");
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT raw_pct FROM spread_samples
+             WHERE pair_id = ?1 AND buy = ?2 AND sell = ?3 AND ts >= ?4",
+        ) else {
+            return Vec::new();
+        };
+        let Ok(rows) = stmt.query_map(rusqlite::params![pair_id, buy, sell, cutoff as i64], |row| {
+            let s: String = row.get(0)?;
+            Ok(s)
+        }) else {
+            return Vec::new();
+        };
+        let mut values = Vec::new();
+        for row in rows.flatten() {
+            if let Ok(v) = Decimal::from_str(&row) {
+                values.push(v);
+            }
+        }
+        values
+    }
+
     fn refresh_natural(
         &self,
         pair_id: &str,
         buy: &str,
         sell: &str,
     ) -> Result<Option<NaturalSpread>> {
-        let cutoff = now_secs().saturating_sub(self.cfg.window_hours.max(1) * 3600);
-        let values = {
-            let conn = self.conn.lock().expect("history db");
-            let mut stmt = conn.prepare(
-                "SELECT raw_pct FROM spread_samples
-                 WHERE pair_id = ?1 AND buy = ?2 AND sell = ?3 AND ts >= ?4",
-            )?;
-            let rows = stmt.query_map(rusqlite::params![pair_id, buy, sell, cutoff as i64], |row| {
-                let s: String = row.get(0)?;
-                Ok(s)
-            })?;
-            let mut values = Vec::new();
-            for row in rows {
-                let s = row?;
-                if let Ok(v) = Decimal::from_str(&s) {
-                    values.push(v);
-                }
-            }
-            values
-        };
-        let mut sorted = values;
+        let mut sorted = self.window_raws(pair_id, buy, sell);
         sorted.sort();
         if sorted.len() < self.cfg.min_points {
             return Ok(self.cached(&sample_key(pair_id, buy, sell)));
@@ -214,6 +288,7 @@ impl HistoryStore {
             value: median(&sorted),
             points: sorted.len(),
             computed_at: Instant::now(),
+            updated_ts: now_secs(),
         };
         self.persist_snapshot(pair_id, buy, sell, &nat)?;
         self.cache
@@ -253,7 +328,7 @@ impl HistoryStore {
 
 fn load_snapshots(conn: &Connection) -> Result<HashMap<String, NaturalSpread>> {
     let mut stmt = conn.prepare(
-        "SELECT pair_id, buy, sell, value, points FROM natural_spreads",
+        "SELECT pair_id, buy, sell, value, points, updated_ts FROM natural_spreads",
     )?;
     let rows = stmt.query_map([], |row| {
         Ok((
@@ -262,21 +337,28 @@ fn load_snapshots(conn: &Connection) -> Result<HashMap<String, NaturalSpread>> {
             row.get::<_, String>(2)?,
             row.get::<_, String>(3)?,
             row.get::<_, i64>(4)?,
+            row.get::<_, i64>(5)?,
         ))
     })?;
     let mut cache = HashMap::new();
-    let now = Instant::now();
+    let now_i = Instant::now();
+    let now_s = now_secs();
     for row in rows {
-        let (pair_id, buy, sell, value, points) = row?;
+        let (pair_id, buy, sell, value, points, updated_ts) = row?;
         let Ok(value) = Decimal::from_str(&value) else {
             continue;
         };
+        let updated_ts = updated_ts.max(0) as u64;
+        // 把 computed_at 回退到实际写入时刻，否则重启会让 refresh 计时重新起跑，
+        // 一份几天前的快照能再被当成「刚算的」用满一个 refresh_interval。
+        let age = Duration::from_secs(now_s.saturating_sub(updated_ts));
         cache.insert(
             sample_key(&pair_id, &buy, &sell),
             NaturalSpread {
                 value,
                 points: points.max(0) as usize,
-                computed_at: now,
+                computed_at: now_i.checked_sub(age).unwrap_or(now_i),
+                updated_ts,
             },
         );
     }
@@ -353,6 +435,23 @@ mod tests {
     }
 
     #[test]
+    fn preview_natural_before_min_points() {
+        let path = tmp("preview");
+        let _ = std::fs::remove_file(&path);
+        let store = HistoryStore::open(cfg(&path, 10, 300)).unwrap();
+        store
+            .maybe_sample("SNDK-USD-PERP", "lighter_rh", "entropy", dec!(0.04), dec!(0.03))
+            .unwrap();
+        assert!(store.natural("SNDK-USD-PERP", "lighter_rh", "entropy").is_none());
+        let prev = store
+            .preview_natural("SNDK-USD-PERP", "lighter_rh", "entropy")
+            .expect("preview");
+        assert_eq!(prev.value, dec!(0.04));
+        assert_eq!(prev.points, 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn sqlite_median_after_enough_points() {
         let path = tmp("enough");
         let _ = std::fs::remove_file(&path);
@@ -418,6 +517,61 @@ mod tests {
             .natural("SOL-USD-PERP", "sodex", "lighter")
             .expect("backfilled");
         assert_eq!(nat.value, dec!(0.20));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 重启后不能把陈旧快照当成刚算的：computed_at 要回退到写入时刻。
+    #[test]
+    fn reopen_backdates_snapshot_age() {
+        let path = tmp("age");
+        let _ = std::fs::remove_file(&path);
+        {
+            let store = HistoryStore::open(cfg(&path, 3, 1800)).unwrap();
+            for v in [dec!(0.02), dec!(0.04), dec!(0.03)] {
+                store
+                    .maybe_sample("ETH-USD-PERP", "sodex", "lighter", v, v)
+                    .unwrap();
+            }
+            // 手工把快照时间推回 2 小时
+            store
+                .conn
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE natural_spreads SET updated_ts = updated_ts - 7200",
+                    [],
+                )
+                .unwrap();
+        }
+        let again = HistoryStore::open(cfg(&path, 3, 1800)).unwrap();
+        let key = sample_key("ETH-USD-PERP", "sodex", "lighter");
+        assert!(
+            again.refresh_due(&key),
+            "2 小时前的快照必须立刻重算，而不是再用满 30 分钟"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 超出中位数窗口的快照当作没有。
+    #[test]
+    fn snapshot_older_than_window_is_ignored() {
+        let path = tmp("stale");
+        let _ = std::fs::remove_file(&path);
+        let store = HistoryStore::open(cfg(&path, 3, 1800)).unwrap();
+        for v in [dec!(0.02), dec!(0.04), dec!(0.03)] {
+            store
+                .maybe_sample("SOL-USD-PERP", "sodex", "lighter", v, v)
+                .unwrap();
+        }
+        {
+            let mut cache = store.cache.lock().unwrap();
+            let key = sample_key("SOL-USD-PERP", "sodex", "lighter");
+            let hit = cache.get_mut(&key).unwrap();
+            hit.updated_ts -= 25 * 3600;
+        }
+        assert!(store
+            .cached(&sample_key("SOL-USD-PERP", "sodex", "lighter"))
+            .is_none());
         let _ = std::fs::remove_file(&path);
     }
 

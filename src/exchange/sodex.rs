@@ -16,7 +16,10 @@ use crate::domain::{
     Bbo, VenueId, VenueMarket,
 };
 
-use super::port::{Balance, BboTx, CancelReq, ExchangePort, OrderAck, OrderReq, VenuePosition};
+use super::port::{
+    AccountSnapshot, Balance, BboTx, CancelReq, ExchangePort, FundingRate, OrderAck, OrderReq,
+    VenuePosition,
+};
 use super::{bridge, venue_yaml_path};
 
 pub struct SodexAdapter {
@@ -194,6 +197,19 @@ impl ExchangePort for SodexAdapter {
         .await
     }
 
+    /// 一次调用同时拿余额和持仓，避免 trait 默认实现的两次进程 + 两次 REST。
+    async fn account(&self) -> Result<AccountSnapshot> {
+        if !self.venue.keys_ready() {
+            warn!(venue = %self.id(), "account skipped: signing keys not loaded");
+            return Ok(AccountSnapshot::default());
+        }
+        if !bridge::bridge_available().await {
+            warn!(venue = %self.id(), "account skipped: exchange sidecar not found");
+            return Ok(AccountSnapshot::default());
+        }
+        bridge::bridge_account(&self.venue_path).await
+    }
+
     async fn positions(&self) -> Result<Vec<VenuePosition>> {
         if !self.venue.keys_ready() {
             return Ok(Vec::new());
@@ -212,6 +228,13 @@ impl ExchangePort for SodexAdapter {
             return Ok(Vec::new());
         }
         bridge::bridge_balances(&self.venue_path).await
+    }
+
+    async fn funding(&self) -> Result<Vec<FundingRate>> {
+        if !self.venue.keys_ready() || !bridge::bridge_available().await {
+            return Ok(Vec::new());
+        }
+        bridge::bridge_funding(&self.venue_path).await
     }
 }
 
@@ -312,7 +335,8 @@ fn ticker_bbo(tick: &WsTicker) -> Option<Bbo> {
     let ask = Decimal::from_str(tick.a.trim()).ok()?;
     let bid_qty = Decimal::from_str(tick.bid_qty.trim()).unwrap_or(Decimal::ZERO);
     let ask_qty = Decimal::from_str(tick.ask_qty.trim()).unwrap_or(Decimal::ZERO);
-    if bid <= Decimal::ZERO || ask <= Decimal::ZERO || ask < bid {
+    // 锁定盘口（ask == bid）是数据异常，和 `Bbo::valid()` 保持一致地丢掉。
+    if bid <= Decimal::ZERO || ask <= Decimal::ZERO || ask <= bid {
         return None;
     }
     Some(Bbo {

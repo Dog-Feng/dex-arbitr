@@ -1,4 +1,4 @@
-use rust_decimal::Decimal;
+use rust_decimal::{Decimal, RoundingStrategy};
 
 use crate::config::{SizingConfig, SizingMode};
 use crate::domain::{Bbo, VenueMarket};
@@ -36,12 +36,16 @@ pub struct ResolveQtyResult {
 
 /// 定仓：以 buy/sell **可开名义较小** 的一腿为准（等价于保证金短板），
 /// 再与全局每对预算、深度、精度对齐。不会 A 大 B 小各下一档。
+///
+/// 这里**不做**槽位限制——槽位是「能不能再开一条」的问题，由调用方在决定
+/// 开仓时判。放在这里会让已持仓的那条 pair 自己也拿不到定仓结果，
+/// 连平仓时的厚度校验都失去尺度。
+#[allow(clippy::too_many_arguments)]
 pub fn resolve_qty(
     cfg: &SizingConfig,
     global_min_available: Decimal,
     buy: LegMargin,
     sell: LegMargin,
-    active_pairs: u32,
     buy_book: &Bbo,
     sell_book: &Bbo,
     mid_price: Decimal,
@@ -52,9 +56,6 @@ pub fn resolve_qty(
         return None;
     }
     let slots = cfg.max_concurrent_pairs.max(1);
-    if active_pairs >= slots {
-        return None;
-    }
 
     let buy_notional = buy.free_notional(cfg.margin_utilization_pct);
     let sell_notional = sell.free_notional(cfg.margin_utilization_pct);
@@ -77,30 +78,35 @@ pub fn resolve_qty(
             if pair_cap < cfg.min_notional_usdc {
                 return None;
             }
+            // 全局额度也不够一笔最小名义时直接放弃。
+            //
+            // 不能靠后面的 `.max(min_notional)` 硬顶上去：那会让单对吃掉超过
+            // 它那一份（总额 / max_concurrent_pairs）的全局额度，配了 5 个槽位
+            // 实际却能开出远超 1/5 的仓，多对并发时把保证金撑破。
+            if global_per_pair < cfg.min_notional_usdc {
+                return None;
+            }
             let mut n = pair_cap
                 .min(global_per_pair)
                 .min(cfg.max_notional_usdc)
                 .max(cfg.min_notional_usdc);
-            if n > pair_cap {
-                n = pair_cap;
-            }
+            // `.max()` 可能把 n 抬回上限之上，两个上限都要夹回来。
+            n = n.min(pair_cap).min(global_per_pair);
             n
         }
     };
 
-    let depth_cap = buy_book
-        .ask_qty
-        .min(sell_book.bid_qty)
-        * cfg.depth_pct
-        / Decimal::from(100);
+    let depth_cap = buy_book.ask_qty.min(sell_book.bid_qty) * cfg.depth_pct / Decimal::from(100);
     if depth_cap > Decimal::ZERO {
         notional = notional.min(depth_cap * mid_price);
     }
 
     let precision = buy_leg.qty_precision.min(sell_leg.qty_precision);
     let min_qty = buy_leg.min_qty.max(sell_leg.min_qty);
-    let qty = (notional / mid_price).round_dp(precision);
-    if qty < min_qty {
+    // 必须向下取整。四舍五入会把 qty 抬到名义 / 深度 / 可用保证金上限之外
+    // ——低精度币（quantity_precision=0）超额可以接近 100%。
+    let qty = (notional / mid_price).round_dp_with_strategy(precision, RoundingStrategy::ToZero);
+    if qty < min_qty || qty <= Decimal::ZERO {
         return None;
     }
     Some(ResolveQtyResult {
@@ -108,6 +114,58 @@ pub fn resolve_qty(
         notional_usdc: notional,
         binding,
     })
+}
+
+/// 监控页单格数量。定仓成功用真实结果；定不住也按配置名义估算，避免显示 0。
+#[allow(clippy::too_many_arguments)]
+pub fn preview_segment_qty(
+    cfg: &SizingConfig,
+    max_segments: u32,
+    global_min_available: Decimal,
+    buy: LegMargin,
+    sell: LegMargin,
+    buy_book: &Bbo,
+    sell_book: &Bbo,
+    mid_price: Decimal,
+    buy_leg: &VenueMarket,
+    sell_leg: &VenueMarket,
+) -> Decimal {
+    let segs = Decimal::from(max_segments.max(1));
+    if let Some(r) = resolve_qty(
+        cfg,
+        global_min_available,
+        buy,
+        sell,
+        buy_book,
+        sell_book,
+        mid_price,
+        buy_leg,
+        sell_leg,
+    ) {
+        return r.qty / segs;
+    }
+    if mid_price <= Decimal::ZERO {
+        return Decimal::ZERO;
+    }
+    let buy_n = buy.free_notional(cfg.margin_utilization_pct);
+    let sell_n = sell.free_notional(cfg.margin_utilization_pct);
+    let pair_cap = buy_n.min(sell_n);
+    let notional = match cfg.mode {
+        SizingMode::Fixed => cfg.fixed_notional_usdc,
+        SizingMode::Margin => {
+            if pair_cap > Decimal::ZERO {
+                pair_cap.min(cfg.max_notional_usdc)
+            } else {
+                cfg.min_notional_usdc
+            }
+        }
+    };
+    if notional <= Decimal::ZERO {
+        return Decimal::ZERO;
+    }
+    let precision = buy_leg.qty_precision.min(sell_leg.qty_precision);
+    let qty = (notional / mid_price).round_dp_with_strategy(precision, RoundingStrategy::ToZero);
+    qty / segs
 }
 
 pub fn mid_from_bbo(b0: &Bbo, b1: &Bbo) -> Option<Decimal> {
@@ -185,7 +243,6 @@ mod tests {
             dec!(100),
             margin(dec!(200), dec!(0)),
             margin(dec!(100), dec!(0)),
-            0,
             &b,
             &b,
             dec!(100_000),
@@ -208,7 +265,6 @@ mod tests {
             dec!(100),
             margin(dec!(500), dec!(0)),
             margin(dec!(100), dec!(0)),
-            0,
             &b,
             &b,
             dec!(100_000),
@@ -218,6 +274,61 @@ mod tests {
         .unwrap();
         assert_eq!(r.qty, dec!(0.002));
         assert_eq!(r.binding, BindingLeg::Sell);
+    }
+
+    /// 槽位分配是硬上限：配了 N 个槽位，单对拿到的名义不能超过总额/N。
+    /// `.max(min_notional)` 曾经能把它顶破——5 个槽位却开出 1/5 以上的仓。
+    #[test]
+    fn margin_mode_never_exceeds_global_slot_share() {
+        let b = book(dec!(100_000), dec!(100_000), dec!(10));
+        let buy_leg = leg("lighter", dec!(0.00001), 5);
+        let sell_leg = leg("sodex", dec!(0.00001), 5);
+        let mut c = cfg();
+        c.max_concurrent_pairs = 5;
+        c.min_notional_usdc = dec!(100);
+        // 全局 300 × 杠杆 2 / 5 槽 = 每对 120，正好高于 min_notional。
+        let r = resolve_qty(
+            &c,
+            dec!(300),
+            margin(dec!(10_000), dec!(0)),
+            margin(dec!(10_000), dec!(0)),
+            &b,
+            &b,
+            dec!(100_000),
+            &buy_leg,
+            &sell_leg,
+        )
+        .unwrap();
+        assert!(
+            r.notional_usdc <= dec!(120),
+            "notional {} exceeded per-slot share 120",
+            r.notional_usdc
+        );
+    }
+
+    /// 全局额度连一笔最小名义都不够时必须放弃，而不是靠 `.max()` 硬顶上去。
+    #[test]
+    fn margin_mode_skips_when_slot_share_below_min() {
+        let b = book(dec!(100_000), dec!(100_000), dec!(10));
+        let buy_leg = leg("lighter", dec!(0.00001), 5);
+        let sell_leg = leg("sodex", dec!(0.00001), 5);
+        let mut c = cfg();
+        c.max_concurrent_pairs = 5;
+        c.min_notional_usdc = dec!(100);
+        // 全局 100 × 2 / 5 = 每对 40 < min_notional 100。两腿保证金充裕，
+        // 所以只有全局这道门能拦住它。
+        assert!(resolve_qty(
+            &c,
+            dec!(100),
+            margin(dec!(10_000), dec!(0)),
+            margin(dec!(10_000), dec!(0)),
+            &b,
+            &b,
+            dec!(100_000),
+            &buy_leg,
+            &sell_leg,
+        )
+        .is_none());
     }
 
     #[test]
@@ -230,7 +341,6 @@ mod tests {
             dec!(500),
             margin(dec!(500), dec!(0)),
             margin(dec!(100), dec!(80)),
-            0,
             &b,
             &b,
             dec!(100_000),
@@ -254,7 +364,6 @@ mod tests {
             dec!(500),
             margin(dec!(500), dec!(0)),
             margin(dec!(500), dec!(0)),
-            0,
             &b,
             &b,
             dec!(100_000),
@@ -279,7 +388,6 @@ mod tests {
             dec!(5),
             margin(dec!(5), dec!(0)),
             margin(dec!(5), dec!(0)),
-            0,
             &b,
             &b,
             dec!(100_000),
@@ -287,6 +395,78 @@ mod tests {
             &sell_leg,
         )
         .is_none());
+    }
+
+    #[test]
+    fn preview_qty_uses_configured_notional_when_cap_too_small() {
+        let mut cfg = cfg();
+        cfg.mode = SizingMode::Fixed;
+        cfg.fixed_notional_usdc = dec!(100);
+        let b = book(dec!(1000), dec!(1000), dec!(10));
+        let buy_leg = leg("lighter", dec!(0.0001), 4);
+        let sell_leg = leg("sodex", dec!(0.0001), 4);
+        let q = preview_segment_qty(
+            &cfg,
+            2,
+            dec!(5),
+            margin(dec!(5), dec!(0)),
+            margin(dec!(5), dec!(0)),
+            &b,
+            &b,
+            dec!(1000),
+            &buy_leg,
+            &sell_leg,
+        );
+        // 100 / 1000 / 2 格 = 0.05
+        assert_eq!(q, dec!(0.05));
+    }
+
+    /// 精度为 0 的币：20 USDC 名义 / 39 单价 = 0.51，四舍五入会变成 1
+    /// （名义 39，接近目标的 2 倍）。必须向下取整，取不到就不开。
+    #[test]
+    fn floors_qty_instead_of_rounding_up() {
+        let mut cfg = cfg();
+        cfg.mode = SizingMode::Fixed;
+        cfg.fixed_notional_usdc = dec!(20);
+        let b = book(dec!(39), dec!(39), dec!(1000));
+        let a_leg = leg("a", dec!(1), 0);
+        let b_leg = leg("b", dec!(1), 0);
+        assert!(resolve_qty(
+            &cfg,
+            dec!(500),
+            margin(dec!(500), dec!(0)),
+            margin(dec!(500), dec!(0)),
+            &b,
+            &b,
+            dec!(39),
+            &a_leg,
+            &b_leg,
+        )
+        .is_none());
+    }
+
+    /// 深度上限不能被取整突破。
+    #[test]
+    fn never_exceeds_depth_cap() {
+        let cfg = cfg();
+        let b = book(dec!(100), dec!(100), dec!(0.19));
+        let a_leg = leg("a", dec!(0.001), 2);
+        let b_leg = leg("b", dec!(0.001), 2);
+        let r = resolve_qty(
+            &cfg,
+            dec!(10_000),
+            margin(dec!(10_000), dec!(0)),
+            margin(dec!(10_000), dec!(0)),
+            &b,
+            &b,
+            dec!(100),
+            &a_leg,
+            &b_leg,
+        )
+        .unwrap();
+        // depth_cap = 0.19 × 50% = 0.095 → 向下取到 0.09
+        assert_eq!(r.qty, dec!(0.09));
+        assert!(r.qty <= dec!(0.095));
     }
 
     #[test]
@@ -299,7 +479,6 @@ mod tests {
             dec!(10_000),
             margin(dec!(10_000), dec!(0)),
             margin(dec!(10_000), dec!(0)),
-            0,
             &b,
             &b,
             dec!(100),

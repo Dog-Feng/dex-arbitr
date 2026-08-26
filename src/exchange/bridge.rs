@@ -2,37 +2,103 @@ use anyhow::{Context, Result};
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
-use tokio::process::Command;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStdin, Command};
+use tokio::sync::{broadcast, oneshot};
 use tracing::{debug, warn};
 
-use super::port::{AccountSnapshot, Balance, CancelReq, OrderAck, OrderReq, OrderStatus, VenuePosition};
+use super::port::{
+    AccountSnapshot, Balance, CancelReq, FundingRate, OrderAck, OrderReq, OrderStatus,
+    VenuePosition,
+};
 
 const SIDECAR_DIR: &str = "scripts/exchange_sidecar";
-const DEFAULT_SIDECAR_TIMEOUT: Duration = Duration::from_secs(45);
+/// 写操作（place / cancel）。
+///
+/// 必须盖住 sidecar 侧最长的成交确认窗口，否则这边先超时、那边还在轮询，
+/// 得到的就是「下单其实成交了但本地当没成交」——幻影成交的反向版本。
+/// sidecar 的 Lighter 市价腿窗口是 60s（对齐参考的
+/// `lighter_market_order_timeout`），其 requestTimeout 为 75s，这里再留
+/// 一点余量。想收紧就用 `DEX_SIDECAR_TIMEOUT_SECS` 覆盖。
+const WRITE_SIDECAR_TIMEOUT: Duration = Duration::from_secs(80);
+/// 只读查询：幂等，不能拖住决策环。
+const QUERY_SIDECAR_TIMEOUT: Duration = Duration::from_secs(12);
 
-fn sidecar_timeout() -> Duration {
-    std::env::var("DEX_SIDECAR_TIMEOUT_SECS")
+fn sidecar_timeout(cmd: &str) -> Duration {
+    if let Some(secs) = std::env::var("DEX_SIDECAR_TIMEOUT_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
-        .map(Duration::from_secs)
-        .unwrap_or(DEFAULT_SIDECAR_TIMEOUT)
+    {
+        return Duration::from_secs(secs);
+    }
+    match cmd {
+        "place" | "cancel" => WRITE_SIDECAR_TIMEOUT,
+        _ => QUERY_SIDECAR_TIMEOUT,
+    }
+}
+
+/// sidecar 主动推送的订单更新（私有 WS 订单流）。
+#[derive(Debug, Clone)]
+pub struct OrderPush {
+    pub venue: String,
+    pub data: Value,
 }
 
 #[derive(Debug, Deserialize)]
 struct BridgeResp {
+    #[serde(default)]
+    id: i64,
+    #[serde(default)]
     ok: bool,
     #[serde(default)]
     error: String,
     #[serde(default)]
     data: Value,
+    /// 非空表示这是主动推送而不是响应。
+    #[serde(default)]
+    push: String,
+    #[serde(default)]
+    venue: String,
 }
 
-/// 统一 Go sidecar（Lighter + SoDEX），对齐 internal/exchange/。
+type Pending = Arc<Mutex<HashMap<i64, oneshot::Sender<Result<Value, String>>>>>;
+
+/// 常驻 sidecar 连接。进程、认证、市场元数据全程复用。
+///
+/// 旧实现每次调用起一个进程：光进程启动 33ms，加上全新 TLS 握手和重新
+/// 认证，单次 200~800ms。成交检测靠轮询，每轮都要付这个开销，
+/// 「第一腿成交 → 第二腿下单」窗口因此远超 1 秒。
+struct Sidecar {
+    stdin: tokio::sync::Mutex<ChildStdin>,
+    pending: Pending,
+    next_id: AtomicI64,
+    pushes: broadcast::Sender<OrderPush>,
+    /// 读循环发现进程退出后置位。下一次调用据此重建。
+    dead: Arc<AtomicBool>,
+    _child: Child,
+}
+
+impl Sidecar {
+    fn is_dead(&self) -> bool {
+        self.dead.load(Ordering::Relaxed)
+    }
+}
+
+/// 当前活跃连接。子进程挂掉后置 None，下次调用重建。
+///
+/// 不能用 `OnceLock`：它只初始化一次，进程死了就永久失效——持仓期间
+/// 遇上就意味着平仓指令再也发不出去，仓位一直裸着没人管。
+static SIDECAR: Mutex<Option<Arc<Sidecar>>> = Mutex::new(None);
+/// 已启动过 WS 订单流的 venue。重启后要重新订阅，否则成交检测退化成纯轮询。
+static WATCHED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
 fn sidecar_binary() -> PathBuf {
     if let Ok(p) = std::env::var("DEX_EXCHANGE_SIDECAR") {
         return PathBuf::from(p);
@@ -54,63 +120,207 @@ pub async fn bridge_available() -> bool {
     sidecar_binary().exists()
 }
 
-pub async fn bridge_call(venue_yaml: &Path, cmd: &str, params: Value) -> Result<Value> {
+/// 订阅 sidecar 的订单推送。成交检测用它取代 REST 轮询。
+///
+/// 注意：sidecar 重启后 `pushes` 是新的 channel，旧 receiver 会收到
+/// `RecvError::Closed`。调用方应在收到错误后重新订阅。
+pub fn subscribe_order_pushes() -> Option<broadcast::Receiver<OrderPush>> {
+    sidecar().ok().map(|s| s.pushes.subscribe())
+}
+
+/// 取当前连接；没有或已死就重建。
+fn sidecar() -> Result<Arc<Sidecar>, String> {
+    let mut guard = SIDECAR
+        .lock()
+        .map_err(|_| "sidecar registry poisoned".to_string())?;
+    if let Some(sc) = guard.as_ref() {
+        if !sc.is_dead() {
+            return Ok(sc.clone());
+        }
+        warn!("exchange sidecar died; restarting");
+    }
+    let sc = spawn_sidecar()?;
+    *guard = Some(sc.clone());
+    drop(guard);
+
+    // 重启后补订阅：WS 流在新进程里是空的。
+    let watched: Vec<PathBuf> = WATCHED.lock().map(|w| w.clone()).unwrap_or_default();
+    if !watched.is_empty() {
+        let sc2 = sc.clone();
+        tokio::spawn(async move {
+            for path in watched {
+                if let Err(err) = call_on(&sc2, &path, "watch", json!({})).await {
+                    warn!(venue = %path.display(), error = %err, "resubscribe order stream failed");
+                } else {
+                    tracing::info!(venue = %path.display(), "order stream resubscribed");
+                }
+            }
+        });
+    }
+    Ok(sc)
+}
+
+fn spawn_sidecar() -> Result<Arc<Sidecar>, String> {
     let bin = sidecar_binary();
     if !bin.exists() {
-        anyhow::bail!(
+        return Err(format!(
             "missing {}; build: cd scripts/exchange_sidecar && go build -o exchange_sidecar .",
             bin.display()
-        );
+        ));
     }
-    let payload = json!({
-        "cmd": cmd,
-        "venue_yaml": venue_yaml.to_string_lossy(),
-        "params": params,
-    });
     let mut child = Command::new(&bin)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .kill_on_drop(true)
         .spawn()
-        .with_context(|| format!("spawn exchange sidecar {}", bin.display()))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(payload.to_string().as_bytes())
-            .await
-            .context("write sidecar stdin")?;
-    }
-    let wait = async move {
-        child
-            .wait_with_output()
-            .await
-            .context("sidecar wait")
-    };
-    let out = match tokio::time::timeout(sidecar_timeout(), wait).await {
-        Ok(r) => r?,
-        Err(_) => {
-            warn!(
-                cmd,
-                timeout_secs = sidecar_timeout().as_secs(),
-                "exchange sidecar timed out"
-            );
-            anyhow::bail!(
-                "sidecar {cmd} timed out after {}s",
-                sidecar_timeout().as_secs()
-            );
+        .map_err(|e| format!("spawn exchange sidecar {}: {e}", bin.display()))?;
+
+    let stdin = child.stdin.take().ok_or("sidecar stdin unavailable")?;
+    let stdout = child.stdout.take().ok_or("sidecar stdout unavailable")?;
+    let stderr = child.stderr.take();
+
+    let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+    let (pushes, _) = broadcast::channel(1024);
+    let dead = Arc::new(AtomicBool::new(false));
+
+    // 读循环：按 id 把响应投递回等待方，push 广播给订阅者。
+    let reader_pending = pending.clone();
+    let reader_pushes = pushes.clone();
+    let reader_dead = dead.clone();
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(stdout).lines();
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) => {
+                    let line = line.trim().to_string();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let resp: BridgeResp = match serde_json::from_str(&line) {
+                        Ok(r) => r,
+                        Err(err) => {
+                            warn!(error = %err, line = %line, "sidecar: bad json line");
+                            continue;
+                        }
+                    };
+                    if !resp.push.is_empty() {
+                        let _ = reader_pushes.send(OrderPush {
+                            venue: resp.venue,
+                            data: resp.data,
+                        });
+                        continue;
+                    }
+                    let tx = reader_pending.lock().ok().and_then(|mut m| m.remove(&resp.id));
+                    if let Some(tx) = tx {
+                        let out = if resp.ok {
+                            Ok(resp.data)
+                        } else {
+                            Err(resp.error)
+                        };
+                        let _ = tx.send(out);
+                    }
+                }
+                Ok(None) => break,
+                Err(err) => {
+                    warn!(error = %err, "sidecar stdout closed");
+                    break;
+                }
+            }
         }
-    };
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        warn!(cmd, stderr = %stderr, stdout = %stdout, "exchange sidecar failed");
-        anyhow::bail!("sidecar {cmd} exit {}: {stderr}", out.status);
+        // 进程没了：标记死亡（下次调用会重建），并唤醒所有等待方，
+        // 避免它们卡到超时。
+        reader_dead.store(true, Ordering::Relaxed);
+        if let Ok(mut m) = reader_pending.lock() {
+            for (_, tx) in m.drain() {
+                let _ = tx.send(Err("sidecar process exited".into()));
+            }
+        }
+        tracing::error!("exchange sidecar reader stopped; will restart on next call");
+    });
+
+    if let Some(stderr) = stderr {
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if !line.trim().is_empty() {
+                    warn!(target: "sidecar", "{line}");
+                }
+            }
+        });
     }
-    let resp: BridgeResp = serde_json::from_str(stdout.trim()).context("parse sidecar json")?;
-    if !resp.ok {
-        anyhow::bail!("sidecar {cmd}: {}", resp.error);
+
+    Ok(Arc::new(Sidecar {
+        stdin: tokio::sync::Mutex::new(stdin),
+        pending,
+        next_id: AtomicI64::new(1),
+        pushes,
+        dead,
+        _child: child,
+    }))
+}
+
+pub async fn bridge_call(venue_yaml: &Path, cmd: &str, params: Value) -> Result<Value> {
+    let sc = sidecar().map_err(|e| anyhow::anyhow!("{e}"))?;
+    call_on(&sc, venue_yaml, cmd, params).await
+}
+
+async fn call_on(sc: &Arc<Sidecar>, venue_yaml: &Path, cmd: &str, params: Value) -> Result<Value> {
+    let id = sc.next_id.fetch_add(1, Ordering::Relaxed);
+    let payload = json!({
+        "id": id,
+        "cmd": cmd,
+        "venue_yaml": venue_yaml.to_string_lossy(),
+        "params": params,
+    });
+
+    let (tx, rx) = oneshot::channel();
+    sc.pending
+        .lock()
+        .map_err(|_| anyhow::anyhow!("sidecar pending lock poisoned"))?
+        .insert(id, tx);
+
+    let mut line = payload.to_string();
+    line.push('\n');
+    {
+        let mut stdin = sc.stdin.lock().await;
+        if let Err(err) = stdin.write_all(line.as_bytes()).await {
+            sc.pending.lock().ok().and_then(|mut m| m.remove(&id));
+            sc.dead.store(true, Ordering::Relaxed);
+            return Err(err).context("write sidecar stdin");
+        }
+        if let Err(err) = stdin.flush().await {
+            sc.pending.lock().ok().and_then(|mut m| m.remove(&id));
+            sc.dead.store(true, Ordering::Relaxed);
+            return Err(err).context("flush sidecar stdin");
+        }
     }
-    debug!(cmd, "sidecar ok");
-    Ok(resp.data)
+
+    let timeout = sidecar_timeout(cmd);
+    match tokio::time::timeout(timeout, rx).await {
+        Ok(Ok(Ok(data))) => {
+            debug!(cmd, "sidecar ok");
+            Ok(data)
+        }
+        Ok(Ok(Err(err))) => anyhow::bail!("sidecar {cmd}: {err}"),
+        Ok(Err(_)) => anyhow::bail!("sidecar {cmd}: response channel dropped"),
+        Err(_) => {
+            sc.pending.lock().ok().and_then(|mut m| m.remove(&id));
+            warn!(cmd, timeout_secs = timeout.as_secs(), "exchange sidecar timed out");
+            anyhow::bail!("sidecar {cmd} timed out after {}s", timeout.as_secs());
+        }
+    }
+}
+
+/// 启动该 venue 的私有 WS 订单流。幂等，并登记以便 sidecar 重启后自动补订阅。
+pub async fn bridge_watch(venue_yaml: &Path) -> Result<()> {
+    if let Ok(mut w) = WATCHED.lock() {
+        if !w.iter().any(|p| p == venue_yaml) {
+            w.push(venue_yaml.to_path_buf());
+        }
+    }
+    bridge_call(venue_yaml, "watch", json!({})).await?;
+    Ok(())
 }
 
 pub async fn bridge_account(venue_yaml: &Path) -> Result<AccountSnapshot> {
@@ -120,6 +330,34 @@ pub async fn bridge_account(venue_yaml: &Path) -> Result<AccountSnapshot> {
 
 pub async fn bridge_balances(venue_yaml: &Path) -> Result<Vec<Balance>> {
     Ok(bridge_account(venue_yaml).await?.balances)
+}
+
+pub async fn bridge_funding(venue_yaml: &Path) -> Result<Vec<FundingRate>> {
+    let data = bridge_call(venue_yaml, "funding", json!({})).await?;
+    Ok(parse_funding(&data))
+}
+
+fn parse_funding(data: &Value) -> Vec<FundingRate> {
+    data.get("rates")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|r| {
+                    // interval_secs 缺失/为 0 时丢掉这一行：年化系数除以它，
+                    // 0 会让整条记录变成无意义的数。宁缺勿错。
+                    let interval = r.get("interval_secs").and_then(|v| v.as_u64())?;
+                    if interval == 0 {
+                        return None;
+                    }
+                    Some(FundingRate {
+                        symbol: r.get("symbol")?.as_str()?.to_string(),
+                        rate: dec(r.get("rate")?)?,
+                        interval_secs: interval as u32,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 pub async fn bridge_positions(venue_yaml: &Path) -> Result<Vec<VenuePosition>> {
@@ -132,6 +370,10 @@ pub async fn bridge_place(venue_yaml: &Path, req: &OrderReq) -> Result<OrderAck>
             "limit"
         }
         crate::config::OrderStyle::MarketTaker => "market",
+        // 独立的 style，**不能**并进 "limit"：sidecar 对 "limit" 走单次回查
+        // （限价单会驻留，查一次就够），而 IOC 不驻留，单次查询多半看到 0，
+        // 分不清「整单撤销」还是「索引没跟上」。走自己的分支才能拿到轮询确认。
+        crate::config::OrderStyle::AggressiveLimit => "aggressive_limit",
     };
     let params = json!({
         "symbol": req.symbol,
@@ -142,6 +384,9 @@ pub async fn bridge_place(venue_yaml: &Path, req: &OrderReq) -> Result<OrderAck>
         "style": style,
         "limit_price": req.limit_price.map(|p| p.to_string()),
         "client_order_id": req.client_order_id,
+        // 市价单滑点保护：基准是决策信号价，超出交易所拒单。
+        "target_price": req.target_price.map(|p| p.to_string()),
+        "slippage_pct": req.slippage_pct.map(|p| p.to_string()),
     });
     let data = bridge_call(venue_yaml, "place", params).await?;
     parse_order_ack(&data)
@@ -210,12 +455,14 @@ fn parse_account(data: &Value) -> AccountSnapshot {
 }
 
 fn parse_order_ack(data: &Value) -> Result<OrderAck> {
-    let status = match data.get("status").and_then(|v| v.as_str()).unwrap_or("filled") {
+    let status = match data.get("status").and_then(|v| v.as_str()).unwrap_or("unknown") {
         "accepted" => OrderStatus::Accepted,
         "partial" => OrderStatus::Partial,
+        "filled" => OrderStatus::Filled,
         "canceled" => OrderStatus::Canceled,
         "rejected" => OrderStatus::Rejected,
-        _ => OrderStatus::Filled,
+        "unknown" | "not_found" => OrderStatus::Unknown,
+        _ => OrderStatus::Unknown,
     };
     Ok(OrderAck {
         order_id: data

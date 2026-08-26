@@ -2,9 +2,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::Result;
 use rust_decimal::Decimal;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::config::SizingConfig;
 use crate::exchange::{Balance, ExchangePort};
@@ -24,6 +23,9 @@ pub struct VenueAccountSnapshot {
     pub available: Decimal,
     pub total: Decimal,
     pub positions: Vec<VenueExchangePosition>,
+    /// account() 调用失败时为 false：此时 positions 为空只代表「不知道」，
+    /// 不能当成「该所没有仓位」。
+    pub fresh: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -44,6 +46,11 @@ impl Default for VenueAccountCache {
 impl VenueAccountCache {
     pub fn get(&self, venue: &str) -> Option<&VenueAccountSnapshot> {
         self.venues.iter().find(|v| v.venue == venue)
+    }
+
+    /// 是否所有所都拿到了真实快照。没拿全就不要做单边敞口判定。
+    pub fn all_fresh(&self) -> bool {
+        !self.venues.is_empty() && self.venues.iter().all(|v| v.fresh)
     }
 }
 
@@ -77,66 +84,72 @@ impl BalanceCache {
     }
 }
 
-pub async fn refresh_balances(
+/// 一次 `account()` 同时产出余额和持仓快照。
+///
+/// 旧实现分别调 `balances()` 和 `positions()`，而 trait 默认的 `account()` 又是
+/// 二者相加，等于每所 3 次 sidecar 进程 + 3 次全量 REST。
+///
+/// fallback 逐所生效：某一所拿不到余额时只给那一所兜底，而不是「所有所都为空」
+/// 才兜。否则单所失败会让涉及该所的全部 pair 永久 `no_size`。
+pub async fn refresh_accounts(
     adapters: &[Arc<dyn ExchangePort>],
     cfg: &SizingConfig,
-) -> Result<BalanceCache> {
+) -> (BalanceCache, VenueAccountCache) {
     let mut by_venue = HashMap::new();
-    for adapter in adapters {
-        let id = adapter.id().as_str().to_string();
-        let bals = adapter.balances().await?;
-        let avail = stable_available(&bals);
-        if avail > Decimal::ZERO {
-            by_venue.insert(id.clone(), avail);
-        }
-    }
-    if by_venue.is_empty() {
-        if let Some(fallback) = cfg.fallback_available_usdc {
-            for adapter in adapters {
-                by_venue.insert(adapter.id().as_str().to_string(), fallback);
-            }
-        }
-    }
-    debug!(venues = ?by_venue, "balance refresh");
-    Ok(BalanceCache {
-        by_venue,
-        last_refresh: Instant::now(),
-    })
-}
-
-pub async fn refresh_venue_accounts(
-    adapters: &[Arc<dyn ExchangePort>],
-) -> Result<VenueAccountCache> {
     let mut venues = Vec::new();
     for adapter in adapters {
         let id = adapter.id().as_str().to_string();
-        let snap = match adapter.account().await {
-            Ok(s) => s,
-            Err(_) => continue,
+        let (snap, fresh) = match adapter.account().await {
+            Ok(s) => (s, true),
+            Err(err) => {
+                warn!(venue = %id, error = %err, "account refresh failed");
+                (Default::default(), false)
+            }
         };
-        let available = stable_available(&snap.balances);
+        let mut available = stable_available(&snap.balances);
         let total = stable_total(&snap.balances);
-        let positions = snap
-            .positions
-            .into_iter()
-            .map(|p| VenueExchangePosition {
-                symbol: p.symbol,
-                qty: p.qty,
-                entry_price: p.entry_price,
-            })
-            .collect();
+        if available <= Decimal::ZERO {
+            if let Some(fallback) = cfg.fallback_available_usdc {
+                warn!(
+                    venue = %id,
+                    fallback = %fallback,
+                    fresh,
+                    "no stable balance reported; using sizing.fallback_available_usdc"
+                );
+                available = fallback;
+            }
+        }
+        if available > Decimal::ZERO {
+            by_venue.insert(id.clone(), available);
+        }
         venues.push(VenueAccountSnapshot {
             venue: id,
             available,
-            total,
-            positions,
+            total: total.max(available),
+            positions: snap
+                .positions
+                .into_iter()
+                .map(|p| VenueExchangePosition {
+                    symbol: p.symbol,
+                    qty: p.qty,
+                    entry_price: p.entry_price,
+                })
+                .collect(),
+            fresh,
         });
     }
-    debug!(n = venues.len(), "venue account refresh");
-    Ok(VenueAccountCache {
-        venues,
-        last_refresh: Instant::now(),
-    })
+    debug!(venues = ?by_venue, "balance refresh");
+    let now = Instant::now();
+    (
+        BalanceCache {
+            by_venue,
+            last_refresh: now,
+        },
+        VenueAccountCache {
+            venues,
+            last_refresh: now,
+        },
+    )
 }
 
 fn stable_total(bals: &[Balance]) -> Decimal {

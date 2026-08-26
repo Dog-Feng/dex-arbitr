@@ -14,6 +14,12 @@ pub struct IntentStats {
     pub skip_spread: u64,
     pub skip_depeg: u64,
     pub skip_wait: u64,
+    /// 单所自身点差过宽（报价不可信 / 流动性差）。
+    pub skip_wide: u64,
+    /// 定仓算不出可下数量（保证金 / 深度 / 精度不够）。
+    pub skip_size: u64,
+    /// 拿不到第一腿 baseline 持仓，放弃本轮实盘执行。
+    pub skip_baseline: u64,
     pub cancel_gone: u64,
     pub cancel_timeout: u64,
     pub late_hedge: u64,
@@ -23,7 +29,7 @@ impl IntentStats {
     pub fn bump_intent(&mut self, label: &str) {
         match label {
             "open" => self.open += 1,
-            "close" => self.close += 1,
+            "close" | "scalp_tp" => self.close += 1,
             _ => self.hold += 1,
         }
     }
@@ -35,6 +41,9 @@ impl IntentStats {
             "invalid_bbo" => self.skip_invalid += 1,
             "no_spread" => self.skip_spread += 1,
             "depeg" => self.skip_depeg += 1,
+            "wide_book" => self.skip_wide += 1,
+            "no_size" | "no_min_qty" => self.skip_size += 1,
+            "no_baseline" => self.skip_baseline += 1,
             _ => self.skip_wait += 1,
         }
     }
@@ -46,13 +55,15 @@ impl IntentStats {
                 self.hold, self.open, self.close, self.skip_send
             ),
             format!(
-                "filter  stale={}  thin={}  spread={}  cancel_gone={}  cancel_to={}  late_hedge={}",
+                "filter  stale={}  thin={}  wide={}  spread={}  size={}  base={}  cancel_gone={}  cancel_to={}",
                 self.skip_stale,
                 self.skip_thin,
+                self.skip_wide,
                 self.skip_spread,
+                self.skip_size,
+                self.skip_baseline,
                 self.cancel_gone,
                 self.cancel_timeout,
-                self.late_hedge
             ),
         ]
     }
@@ -115,6 +126,10 @@ impl LivePanel {
         if let Some(slot) = self.rows.get_mut(idx) {
             *slot = line;
         }
+    }
+
+    pub fn resize(&mut self, rows: usize) {
+        self.rows.resize(rows, String::new());
     }
 
     pub fn flush(&mut self) {

@@ -3,9 +3,10 @@
 //! ```text
 //! cargo run --bin live-test -- account lighter
 //! cargo run --bin live-test -- balance sodex
-//! cargo run --bin live-test -- market lighter BTC buy 0.001
-//! cargo run --bin live-test -- limit lighter BTC sell 0.001 95000
-//! cargo run --bin live-test -- cancel lighter BTC <order_id>
+//! cargo run --bin live-test -- market entropy SNDK buy 0.007
+//! cargo run --bin live-test -- aggressive entropy SNDK buy 0.007 1480
+//! cargo run --bin live-test -- limit entropy SNDK buy 0.007 1000
+//! cargo run --bin live-test -- cancel entropy SNDK <order_id>
 //! cargo run --bin live-test -- recap
 //! ```
 
@@ -23,7 +24,7 @@ use std::sync::Arc;
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: live-test <account|balance|positions|market|limit|cancel|recap> ...");
+        eprintln!("usage: live-test <account|balance|positions|market|limit|aggressive|cancel|recap> ...");
         std::process::exit(1);
     }
     let cfg = AppConfig::load()?;
@@ -68,7 +69,7 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        "market" | "limit" => {
+        "market" | "limit" | "aggressive" => {
             let symbol = args.get(3).context("symbol")?;
             let side = args.get(4).context("buy|sell")?;
             let qty = Decimal::from_str(args.get(5).context("qty")?)?;
@@ -79,12 +80,12 @@ async fn main() -> Result<()> {
                 .find(|x| x.base.eq_ignore_ascii_case(symbol) || x.raw_symbol.eq_ignore_ascii_case(symbol))
                 .with_context(|| format!("symbol {symbol} not found"))?;
             let is_buy = side.eq_ignore_ascii_case("buy");
-            let style = if cmd == "limit" {
-                OrderStyle::LimitMaker
-            } else {
-                OrderStyle::MarketTaker
+            let style = match cmd {
+                "limit" => OrderStyle::LimitMaker,
+                "aggressive" => OrderStyle::AggressiveLimit,
+                _ => OrderStyle::MarketTaker,
             };
-            let limit_price = if cmd == "limit" {
+            let limit_price = if cmd == "limit" || cmd == "aggressive" {
                 Some(Decimal::from_str(
                     args.get(6).context("limit price")?,
                 )?)
@@ -101,11 +102,14 @@ async fn main() -> Result<()> {
                 style,
                 limit_price,
                 client_order_id: Some(format!("lt-{}", now_ts())),
+                // 手工验证工具：不设保护价，交给 sidecar 的默认保护。
+                target_price: None,
+                slippage_pct: None,
             })
             .await?;
             println!(
-                "placed order_id={} filled_qty={} status={:?}",
-                ack.order_id, ack.filled_qty, ack.status
+                "placed order_id={} filled_qty={} status={:?} avg={:?}",
+                ack.order_id, ack.filled_qty, ack.status, ack.avg_price
             );
             log_journal(&cfg, symbol, "test_order", venue_id, "", qty, "ok", &ack.order_id)?;
         }
@@ -146,12 +150,12 @@ async fn load_adapter(cfg: &AppConfig, venue_id: &str) -> Result<Arc<dyn Exchang
 }
 
 fn cap_qty(cfg: &AppConfig, qty: Decimal) -> Result<()> {
-    if qty > cfg.live_test.max_qty {
-        anyhow::bail!(
-            "qty {} exceeds live_test.max_qty {}",
-            qty,
-            cfg.live_test.max_qty
-        );
+    let cap = std::env::var("DEX_LIVE_TEST_MAX_QTY")
+        .ok()
+        .and_then(|s| Decimal::from_str(s.trim()).ok())
+        .unwrap_or(cfg.live_test.max_qty);
+    if qty > cap {
+        anyhow::bail!("qty {qty} exceeds live_test.max_qty {cap} (override with DEX_LIVE_TEST_MAX_QTY)");
     }
     Ok(())
 }

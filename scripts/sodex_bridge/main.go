@@ -589,15 +589,11 @@ func orderStatus(ctx context.Context, c *sodexclient.Client, accountID uint64, p
 			"avg_price":  avgPriceFromOrder(o),
 		}, nil
 	}
-	fq := "0"
-	st := "filled"
-	if qty.GreaterThan(decimal.Zero) {
-		fq = qty.String()
-	}
+	// 不在活跃列表：可能是已成交/已撤，也可能是刚下单 API 尚未可见；禁止假定 filled。
 	return map[string]string{
 		"order_id":   orderID,
-		"filled_qty": fq,
-		"status":     st,
+		"filled_qty": "0",
+		"status":     "unknown",
 		"avg_price":  "",
 	}, nil
 }

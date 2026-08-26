@@ -1,0 +1,725 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>参考项目 · 终端实时监控（布局原型）</title>
+<style>
+  :root {
+    --bg: #0c0c0c;
+    --panel: #111111;
+    --border: #8a8a8a;
+    --border-dim: #3a3a3a;
+    --text: #d8d8d8;
+    --muted: #7a7a7a;
+    --white: #f2f2f2;
+    --cyan: #4ecdc4;
+    --green: #6ee7b7;
+    --yellow: #f5c542;
+    --red: #ff6b6b;
+    --magenta: #d8a0ff;
+    --blue: #7ab8ff;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font: 12px/1.35 "Cascadia Mono", "Sarasa Mono SC", "Consolas", "Noto Sans Mono CJK SC", monospace;
+    overflow: hidden;
+  }
+  .screen {
+    height: 100%;
+    display: grid;
+    grid-template-rows: auto 1fr;
+  }
+  .chrome {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 6px 10px;
+    border-bottom: 1px solid var(--border-dim);
+    background: #151515;
+    color: var(--muted);
+    font-size: 11px;
+  }
+  .chrome strong { color: var(--white); font-weight: 600; }
+  .modes { display: flex; gap: 4px; margin-left: auto; }
+  .modes button {
+    background: transparent;
+    color: var(--muted);
+    border: 1px solid var(--border-dim);
+    padding: 3px 8px;
+    cursor: pointer;
+    font: inherit;
+  }
+  .modes button.active {
+    color: var(--bg);
+    background: var(--cyan);
+    border-color: var(--cyan);
+  }
+  .layout {
+    height: 100%;
+    min-height: 0;
+    padding: 4px;
+    display: none;
+    gap: 4px;
+  }
+  .layout.active { display: grid; }
+  #layout-grid {
+    grid-template-rows: 118px minmax(0, 2fr) 168px;
+  }
+  #layout-v3 {
+    grid-template-rows: 118px minmax(0, 2fr) 280px;
+  }
+  #layout-monitor {
+    grid-template-rows: 118px minmax(0, 2fr) 280px;
+  }
+  .header {
+    display: grid;
+    grid-template-columns: 2fr 1fr 2fr;
+    gap: 4px;
+    min-height: 0;
+  }
+  .body { min-height: 0; display: grid; gap: 4px; }
+  #layout-grid .body { grid-template-rows: 2fr 1fr; }
+  #layout-v3 .body { grid-template-rows: 3fr 2fr 2fr; }
+  #layout-monitor .body { grid-template-rows: 5fr 1fr; }
+  .row { display: grid; gap: 4px; min-height: 0; }
+  .holdings { grid-template-columns: 5fr 3fr; }
+  .split { grid-template-columns: 1fr 1fr; }
+  .panel {
+    border: 1px solid var(--border);
+    background: var(--panel);
+    min-width: 0;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  .panel.cyan { border-color: var(--cyan); }
+  .panel.green { border-color: var(--green); }
+  .panel.yellow { border-color: var(--yellow); }
+  .panel.blue { border-color: var(--blue); }
+  .title {
+    color: var(--white);
+    font-weight: 700;
+    padding: 3px 8px 2px;
+    border-bottom: 1px solid var(--border-dim);
+    flex: 0 0 auto;
+  }
+  .panel.cyan .title { color: var(--cyan); }
+  .panel.green .title { color: var(--green); }
+  .body-scroll { flex: 1; overflow: auto; padding: 4px 8px 6px; }
+  .kv { color: var(--cyan); }
+  .ok { color: var(--green); }
+  .warn { color: var(--yellow); }
+  .bad { color: var(--red); }
+  .dim { color: var(--muted); }
+  .mag { color: var(--magenta); }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    white-space: nowrap;
+  }
+  th {
+    color: var(--white);
+    font-weight: 700;
+    text-align: left;
+    padding: 3px 6px;
+    border-bottom: 1px solid var(--border-dim);
+  }
+  td {
+    padding: 2px 6px;
+    border-bottom: 1px solid #222;
+  }
+  .gridlines th, .gridlines td {
+    border: 1px solid var(--border-dim);
+  }
+  .r { text-align: right; }
+  .c { text-align: center; }
+  .buy { color: var(--green); }
+  .sell { color: var(--red); }
+  .token { color: var(--cyan); }
+  .scroller { min-height: 0; }
+  .note {
+    padding: 8px 10px 0;
+    color: var(--muted);
+    font-size: 11px;
+  }
+</style>
+</head>
+<body>
+<div class="screen">
+  <div class="chrome">
+    <strong>参考项目终端 UI 原型</strong>
+    <span>对齐 Rich Live · UIManager · 全屏 screen=True</span>
+    <span>顶部汇总表 · 中部主数据 · 底部成交滚动</span>
+    <div class="modes">
+      <button class="active" data-mode="grid">分段网格</button>
+      <button data-mode="v3">V3 基础</button>
+      <button data-mode="monitor">监控 V2</button>
+    </div>
+  </div>
+
+  <!-- ========== 分段网格（main_unified.py） ========== -->
+  <div class="layout active" id="layout-grid">
+    <div class="header">
+      <section class="panel">
+        <div class="title">系统状态</div>
+        <div class="body-scroll">
+          套利执行终端 V3<br/>
+          <span class="dim">（分段网格 / 执行控制台）</span><br/>
+          <span class="kv">运行模式:</span> <span class="ok">⚡ 实盘模式（执行真实订单）</span><br/>
+          <span class="kv">运行时间:</span> 2h 14m 08s<br/>
+          <span class="kv">交易所:</span> lighter, paradex, edgex, backpack<br/>
+          <span class="kv">监控代币:</span> 12 个<br/>
+          <span class="kv">💰 活跃套利机会:</span> <span class="warn">3 个</span><br/>
+          <span class="kv">🔄 WS重连:</span> <span class="ok">无</span>
+        </div>
+      </section>
+      <section class="panel">
+        <div class="title">性能</div>
+        <div class="body-scroll">
+          ⚡ 性能指标<br/>
+          <span class="kv">队列积压:</span> 订单簿=2 Ticker=0 分析=0<br/>
+          <span class="kv">队列峰值:</span> 订单簿=18 Ticker=4<br/>
+          <span class="kv">分析延迟:</span> <span class="ok">12.4ms</span><br/>
+          <span class="kv">处理量:</span> 订单簿=18420 Ticker=910<br/>
+          <span class="kv">UI抽样:</span> 1.0秒/次<br/>
+          <span class="kv">网络流量:</span> 接收=42.10 MB 发送=1.02 MB
+        </div>
+      </section>
+      <section class="panel">
+        <div class="title">🛡️ 全局风险控制</div>
+        <div class="body-scroll">
+          <span class="kv">✅ 状态:</span> <span class="ok">正常运行</span><br/>
+          <span class="kv">🌐 网络:</span> <span class="ok">正常</span><br/>
+          <span class="kv">🔧 维护:</span> <span class="ok">无</span><br/>
+          <span class="kv">💰 余额:</span> <span class="ok">充足</span><br/>
+          <span class="kv">⏸️ 错误避让:</span> <span class="ok">无</span><br/>
+          <span class="kv">🏦 余额明细:</span> LIGHTER=1284.2 PARADEX=980.5 EDGEX=640.0<br/>
+          <span class="kv">📊 今日交易:</span> 14/200 <span class="ok">(7%)</span>
+        </div>
+      </section>
+    </div>
+
+    <div class="body">
+      <section class="panel">
+        <div class="title">实时订单簿价格 + 资金费率</div>
+        <div class="body-scroll">
+          <table class="gridlines">
+            <thead>
+              <tr>
+                <th>交易对</th>
+                <th>LIGHTER 买1/卖1</th>
+                <th>LIGHTER 费率</th>
+                <th>PARADEX 买1/卖1</th>
+                <th>PARADEX 费率</th>
+                <th>EDGEX 买1/卖1</th>
+                <th>EDGEX 费率</th>
+                <th class="r">价差%</th>
+                <th class="r">费率差(年化)</th>
+                <th class="c">同向</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>BTC-USDC-PERP</td>
+                <td>$68,412.5×0.42 / $68,418.0×0.31</td>
+                <td>0.0100%/109.5%</td>
+                <td>$68,390.0×0.18 / $68,402.2×0.22</td>
+                <td>0.0080%/87.6%</td>
+                <td>$68,401.0×0.50 / $68,409.4×0.40</td>
+                <td>0.0120%/131.4%</td>
+                <td class="r ok">P→L +0.041%</td>
+                <td class="r">21.9%</td>
+                <td class="c">否</td>
+              </tr>
+              <tr>
+                <td>ETH-USDC-PERP</td>
+                <td>$3,412.20×2.10 / $3,412.80×1.80</td>
+                <td>0.0060%/65.7%</td>
+                <td>$3,410.10×1.40 / $3,411.40×1.20</td>
+                <td>0.0040%/43.8%</td>
+                <td>$3,411.00×3.00 / $3,412.10×2.20</td>
+                <td>0.0070%/76.7%</td>
+                <td class="r ok">P→L +0.052%</td>
+                <td class="r">21.9%</td>
+                <td class="c">否</td>
+              </tr>
+              <tr>
+                <td>SOL-USDC-PERP</td>
+                <td>$178.42×40.0 / $178.48×28.0</td>
+                <td>0.0020%/21.9%</td>
+                <td>$178.20×22.0 / $178.31×18.0</td>
+                <td>0.0150%/164.3%</td>
+                <td>$178.33×50.0 / $178.40×44.0</td>
+                <td>0.0030%/32.9%</td>
+                <td class="r ok">P→L +0.096%</td>
+                <td class="r warn">142.4%</td>
+                <td class="c">否</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <div class="row holdings">
+        <section class="panel cyan">
+          <div class="title">📦 套利对持仓明细</div>
+          <div class="body-scroll">
+            <table>
+              <thead>
+                <tr>
+                  <th>套利对</th>
+                  <th>买-交易所</th>
+                  <th class="c">买-方向</th>
+                  <th>买-代币</th>
+                  <th class="r">买-数量</th>
+                  <th class="r">买-均价</th>
+                  <th>卖-交易所</th>
+                  <th class="c">卖-方向</th>
+                  <th>卖-代币</th>
+                  <th class="r">卖-数量</th>
+                  <th class="r">卖-均价</th>
+                  <th class="r">价差(开/平)</th>
+                  <th class="c">级别</th>
+                  <th class="c">次数(开/平)</th>
+                  <th>状态</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td class="token">ETH-USDC-PERP</td>
+                  <td class="buy">paradex</td>
+                  <td class="c">LONG</td>
+                  <td>ETH-USDC-PERP</td>
+                  <td class="r warn">0.090</td>
+                  <td class="r token">3410.10</td>
+                  <td class="buy">lighter</td>
+                  <td class="c">SHORT</td>
+                  <td>ETH-USDC-PERP</td>
+                  <td class="r warn">0.090</td>
+                  <td class="r token">3412.80</td>
+                  <td class="r">+0.079 / +0.021</td>
+                  <td class="c ok">T2</td>
+                  <td class="c">3/1</td>
+                  <td>持仓中 · 等待回落减仓</td>
+                </tr>
+                <tr>
+                  <td class="token">SOL-USDC-PERP</td>
+                  <td class="buy">paradex</td>
+                  <td class="c">LONG</td>
+                  <td>SOL-USDC-PERP</td>
+                  <td class="r warn">1.700</td>
+                  <td class="r token">178.20</td>
+                  <td class="buy">lighter</td>
+                  <td class="c">SHORT</td>
+                  <td>SOL-USDC-PERP</td>
+                  <td class="r warn">1.700</td>
+                  <td class="r token">178.48</td>
+                  <td class="r">+0.157 / +0.041</td>
+                  <td class="c ok">T1</td>
+                  <td class="c">1/0</td>
+                  <td>持仓中</td>
+                </tr>
+              </tbody>
+            </table>
+            <div class="note">下方可叠「🧮 持仓校验」：状态 / 决策 / 交易所 / 差异 / 时间</div>
+          </div>
+        </section>
+        <section class="panel green">
+          <div class="title">🏦 交易所总持仓 &amp; 总价值</div>
+          <div class="body-scroll" style="display:grid;grid-template-columns:1.7fr 1fr;gap:8px;">
+            <table>
+              <thead>
+                <tr>
+                  <th>交易所</th>
+                  <th>代币</th>
+                  <th class="c">方向</th>
+                  <th class="r">总持仓</th>
+                  <th class="r">入场价</th>
+                  <th class="c">校验</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr><td></td><td class="token"><strong>ETH</strong></td><td></td><td></td><td></td><td></td></tr>
+                <tr><td class="ok">paradex</td><td>ETH-USDC-PERP</td><td class="c">LONG</td><td class="r warn">0.090</td><td class="r token">3410.10</td><td class="c ok">✓</td></tr>
+                <tr><td class="ok">lighter</td><td>ETH-USDC-PERP</td><td class="c">SHORT</td><td class="r warn">0.090</td><td class="r token">3412.80</td><td class="c ok">✓</td></tr>
+                <tr><td></td><td class="token"><strong>SOL</strong></td><td></td><td></td><td></td><td></td></tr>
+                <tr><td class="ok">paradex</td><td>SOL-USDC-PERP</td><td class="c">LONG</td><td class="r warn">1.700</td><td class="r token">178.20</td><td class="c ok">✓</td></tr>
+                <tr><td class="ok">lighter</td><td>SOL-USDC-PERP</td><td class="c">SHORT</td><td class="r warn">1.700</td><td class="r token">178.48</td><td class="c ok">✓</td></tr>
+              </tbody>
+            </table>
+            <table>
+              <thead>
+                <tr><th>交易所</th><th class="r">总价值(USDC)</th></tr>
+              </thead>
+              <tbody>
+                <tr><td class="ok">lighter</td><td class="r">1,284.20</td></tr>
+                <tr><td class="ok">paradex</td><td class="r">980.50</td></tr>
+                <tr><td class="ok">edgex</td><td class="r">640.00</td></tr>
+                <tr><td class="ok">backpack</td><td class="r">210.00</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+      </div>
+    </div>
+
+    <section class="panel blue scroller">
+      <div class="title">📊 成交记录 (4)</div>
+      <div class="body-scroll">
+        <table>
+          <thead>
+            <tr>
+              <th>时间</th><th>交易对</th><th>类型</th><th class="r">数量</th>
+              <th class="r">买入价格</th><th class="r">卖出价格</th><th class="r">真实价差%</th>
+              <th>买入交易所</th><th>卖出交易所</th><th>状态</th><th>错误</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td class="dim">21:18:04</td><td class="token">ETH</td><td class="mag">开仓</td>
+              <td class="r warn">0.030</td><td class="r buy">3410.10</td><td class="r sell">3412.80</td>
+              <td class="r token">+0.079%</td><td class="buy">paradex</td><td class="sell">lighter</td>
+              <td class="ok">成功</td><td></td>
+            </tr>
+            <tr>
+              <td class="dim">21:18:44</td><td class="token">ETH</td><td class="mag">加仓</td>
+              <td class="r warn">0.030</td><td class="r buy">3408.20</td><td class="r sell">3411.60</td>
+              <td class="r token">+0.100%</td><td class="buy">paradex</td><td class="sell">lighter</td>
+              <td class="ok">成功</td><td></td>
+            </tr>
+            <tr>
+              <td class="dim">21:22:11</td><td class="token">SOL</td><td class="mag">开仓</td>
+              <td class="r warn">1.700</td><td class="r buy">178.20</td><td class="r sell">178.48</td>
+              <td class="r token">+0.157%</td><td class="buy">paradex</td><td class="sell">lighter</td>
+              <td class="ok">成功</td><td></td>
+            </tr>
+            <tr>
+              <td class="dim">21:24:02</td><td class="token">ETH</td><td class="mag">减仓</td>
+              <td class="r warn">0.030</td><td class="r buy">3411.90</td><td class="r sell">3412.40</td>
+              <td class="r token">+0.015%</td><td class="buy">lighter</td><td class="sell">paradex</td>
+              <td class="ok">成功</td><td></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+
+  <!-- ========== V3 基础（run_arbitrage_execution_v3.py） ========== -->
+  <div class="layout" id="layout-v3">
+    <div class="header">
+      <section class="panel">
+        <div class="title">系统状态</div>
+        <div class="body-scroll">
+          套利执行终端 V3<br/>
+          <span class="dim">（基础模式 / 传统套利）</span><br/>
+          <span class="kv">运行模式:</span> <span class="warn">🔍 监控模式（不执行真实订单）</span><br/>
+          <span class="kv">运行时间:</span> 48m 12s<br/>
+          <span class="kv">交易所:</span> lighter, paradex, edgex<br/>
+          <span class="kv">监控代币:</span> 8 个<br/>
+          <span class="kv">💰 活跃套利机会:</span> <span class="warn">1 个</span><br/>
+          <span class="kv">🔄 WS重连:</span> <span class="ok">无</span>
+        </div>
+      </section>
+      <section class="panel">
+        <div class="title">性能</div>
+        <div class="body-scroll">
+          ⚡ 性能指标<br/>
+          <span class="kv">队列积压:</span> 订单簿=0 Ticker=0 分析=0<br/>
+          <span class="kv">分析延迟:</span> <span class="ok">8.1ms</span><br/>
+          <span class="kv">UI抽样:</span> 1.0秒/次
+        </div>
+      </section>
+      <section class="panel">
+        <div class="title">🛡️ 全局风险控制</div>
+        <div class="body-scroll">
+          <span class="kv">✅ 状态:</span> <span class="ok">正常运行</span><br/>
+          <span class="kv">🌐 网络:</span> <span class="ok">正常</span><br/>
+          <span class="kv">💰 余额:</span> <span class="ok">充足</span><br/>
+          <span class="kv">📊 今日交易:</span> 2/50 <span class="ok">(4%)</span>
+        </div>
+      </section>
+    </div>
+
+    <div class="body">
+      <section class="panel">
+        <div class="title">实时订单簿价格 + 资金费率</div>
+        <div class="body-scroll">
+          <table class="gridlines">
+            <thead>
+              <tr>
+                <th>交易对</th>
+                <th>LIGHTER 买1/卖1</th>
+                <th>LIGHTER 费率</th>
+                <th>PARADEX 买1/卖1</th>
+                <th>PARADEX 费率</th>
+                <th class="r">价差%</th>
+                <th class="r">费率差(年化)</th>
+                <th class="c">同向</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>BTC-USDC-PERP</td>
+                <td>$68,412.5×0.42 / $68,418.0×0.31</td>
+                <td>0.0100%/109.5%</td>
+                <td>$68,390.0×0.18 / $68,402.2×0.22</td>
+                <td>0.0080%/87.6%</td>
+                <td class="r ok">P→L +0.041%</td>
+                <td class="r">21.9%</td>
+                <td class="c">否</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <div class="row split">
+        <section class="panel green">
+          <div class="title">💰 持仓信息</div>
+          <div class="body-scroll">
+            <table>
+              <thead>
+                <tr>
+                  <th>交易对</th><th>买入交易所</th><th>卖出交易所</th>
+                  <th class="r">买入数量</th><th class="r">卖出数量</th>
+                  <th class="r">买入价格</th><th class="r">卖出价格</th>
+                  <th class="r">开仓价差%</th><th>开仓时间</th><th>模式</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td class="token">BTC</td>
+                  <td class="buy">paradex</td><td class="sell">lighter</td>
+                  <td class="r">0.0015</td><td class="r">0.0015</td>
+                  <td class="r buy">68390.0</td><td class="r sell">68418.0</td>
+                  <td class="r warn">+0.041%</td>
+                  <td class="dim">21:02:11</td>
+                  <td class="mag">spread</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+        <section class="panel" style="border-color:var(--blue)">
+          <div class="title">💳 账户余额</div>
+          <div class="body-scroll">
+            <table>
+              <thead>
+                <tr><th>交易所</th><th>币种</th><th>可用</th><th>已用</th><th>总计</th><th>来源</th></tr>
+              </thead>
+              <tbody>
+                <tr><td class="token">lighter</td><td>USDC</td><td class="ok">1284.20</td><td class="warn">120.00</td><td>1404.20</td><td class="mag">ws</td></tr>
+                <tr><td class="token">paradex</td><td>USDC</td><td class="ok">980.50</td><td class="warn">80.00</td><td>1060.50</td><td class="mag">ws</td></tr>
+                <tr><td class="token">edgex</td><td>USDC</td><td class="ok">640.00</td><td>0.00</td><td>640.00</td><td class="mag">rest</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+      </div>
+
+      <div class="row split">
+        <section class="panel">
+          <div class="title">🏆 套利机会 Top 1</div>
+          <div class="body-scroll">
+            <table>
+              <thead>
+                <tr>
+                  <th>代币</th><th>买入交易所</th><th>卖出交易所</th><th>买价/卖价</th>
+                  <th class="r">价差%</th><th class="r">费率差(年化)</th>
+                  <th>触发条件</th><th>持续时间</th><th class="r">出现次数</th><th>同向</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td>BTC</td><td>paradex</td><td>lighter</td>
+                  <td>68,390.0(0.18) / 68,418.0(0.31)</td>
+                  <td class="r ok">+0.041%</td><td class="r">21.9%</td>
+                  <td>价差套利-condition1</td><td>00:00:12</td><td class="r">3</td><td>否</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+        <section class="panel yellow">
+          <div class="title">📋 执行记录（最近20条）</div>
+          <div class="body-scroll">
+            <table>
+              <thead>
+                <tr>
+                  <th>时间</th><th>交易对</th><th>类型</th><th class="r">数量</th>
+                  <th class="r">买入价格</th><th class="r">卖出价格</th><th class="r">真实价差%</th>
+                  <th>买入交易所</th><th>卖出交易所</th><th>状态</th><th>错误</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td class="dim">21:02:11</td><td class="token">BTC</td><td class="mag">开仓</td>
+                  <td class="r">0.0015</td><td class="r buy">68390.0</td><td class="r sell">68418.0</td>
+                  <td class="r token">+0.041%</td><td class="buy">paradex</td><td class="sell">lighter</td>
+                  <td class="ok">成功</td><td></td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+      </div>
+    </div>
+
+    <section class="panel blue scroller">
+      <div class="title">📊 成交记录 (1)</div>
+      <div class="body-scroll dim">与执行记录同源；V3 底部滚动区预留约 24 行。</div>
+    </section>
+  </div>
+
+  <!-- ========== 监控 V2（run_arbitrage_monitor_v2.py） ========== -->
+  <div class="layout" id="layout-monitor">
+    <div class="header">
+      <section class="panel">
+        <div class="title">系统状态</div>
+        <div class="body-scroll">
+          🔍 套利监控系统 V2<br/>
+          <span class="kv">运行模式:</span> <span class="token">🔎 纯监控（仅数据展示）</span><br/>
+          <span class="kv">运行时间:</span> 6h 02m<br/>
+          <span class="kv">交易所:</span> lighter, paradex, edgex, backpack<br/>
+          <span class="kv">监控代币:</span> 24 个<br/>
+          <span class="kv">💰 活跃套利机会:</span> <span class="warn">7 个</span><br/>
+          <span class="kv">🔄 WS重连:</span> <span class="warn">PARADEX=2</span>
+        </div>
+      </section>
+      <section class="panel">
+        <div class="title">性能</div>
+        <div class="body-scroll">
+          ⚡ 性能指标<br/>
+          <span class="kv">队列积压:</span> 订单簿=4 Ticker=1 分析=0<br/>
+          <span class="kv">分析延迟:</span> <span class="ok">9.6ms</span><br/>
+          <span class="kv">UI抽样:</span> 1.0秒/次
+        </div>
+      </section>
+      <section class="panel">
+        <div class="title">🛡️ 全局风险控制</div>
+        <div class="body-scroll">
+          <span class="kv">✅ 状态:</span> <span class="ok">正常运行</span><br/>
+          <span class="dim">监控模式不交易，风控面板仍显示网络/余额。</span>
+        </div>
+      </section>
+    </div>
+
+    <div class="body">
+      <section class="panel">
+        <div class="title">实时订单簿价格 + 资金费率</div>
+        <div class="body-scroll">
+          <table class="gridlines">
+            <thead>
+              <tr>
+                <th>交易对</th>
+                <th>LIGHTER 买1/卖1</th>
+                <th>LIGHTER 费率</th>
+                <th>PARADEX 买1/卖1</th>
+                <th>PARADEX 费率</th>
+                <th class="r">价差%</th>
+                <th class="r">费率差(年化)</th>
+                <th class="c">同向</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>BTC-USDC-PERP</td>
+                <td>$68,412.5×0.42 / $68,418.0×0.31</td>
+                <td>0.0100%/109.5%</td>
+                <td>$68,390.0×0.18 / $68,402.2×0.22</td>
+                <td>0.0080%/87.6%</td>
+                <td class="r ok">P→L +0.041%</td>
+                <td class="r">21.9%</td>
+                <td class="c">否</td>
+              </tr>
+              <tr>
+                <td>ETH-USDC-PERP</td>
+                <td>$3,412.20×2.10 / $3,412.80×1.80</td>
+                <td>0.0060%/65.7%</td>
+                <td>$3,410.10×1.40 / $3,411.40×1.20</td>
+                <td>0.0040%/43.8%</td>
+                <td class="r ok">P→L +0.052%</td>
+                <td class="r">21.9%</td>
+                <td class="c">否</td>
+              </tr>
+              <tr>
+                <td>SOL-USDC-PERP</td>
+                <td>$178.42×40.0 / $178.48×28.0</td>
+                <td>0.0020%/21.9%</td>
+                <td>$178.20×22.0 / $178.31×18.0</td>
+                <td>0.0150%/164.3%</td>
+                <td class="r ok">P→L +0.096%</td>
+                <td class="r warn">142.4%</td>
+                <td class="c">否</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="title">🏆 套利机会 Top 3</div>
+        <div class="body-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>代币</th><th>买入交易所</th><th>卖出交易所</th><th>买价/卖价</th>
+                <th class="r">价差%</th><th class="r">费率差(年化)</th>
+                <th>持续时间</th><th class="r">出现次数</th><th>同向</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>SOL</td><td>paradex</td><td>lighter</td>
+                <td>178.20(22.0) / 178.48(28.0)</td>
+                <td class="r ok">+0.157%</td><td class="r warn">142.4%</td>
+                <td>00:01:04</td><td class="r">11</td><td>否</td>
+              </tr>
+              <tr>
+                <td>ETH</td><td>paradex</td><td>lighter</td>
+                <td>3,410.10(1.40) / 3,412.80(1.80)</td>
+                <td class="r ok">+0.079%</td><td class="r">21.9%</td>
+                <td>00:00:22</td><td class="r">6</td><td>否</td>
+              </tr>
+              <tr>
+                <td>BTC</td><td>paradex</td><td>lighter</td>
+                <td>68,390.0(0.18) / 68,418.0(0.31)</td>
+                <td class="r ok">+0.041%</td><td class="r">21.9%</td>
+                <td>00:00:08</td><td class="r">4</td><td>否</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+
+    <section class="panel blue scroller">
+      <div class="title">📊 成交记录 (0)</div>
+      <div class="body-scroll warn">暂无成交记录（等待首次交易执行）</div>
+    </section>
+  </div>
+</div>
+<script>
+  const buttons = document.querySelectorAll(".modes button");
+  const layouts = {
+    grid: document.getElementById("layout-grid"),
+    v3: document.getElementById("layout-v3"),
+    monitor: document.getElementById("layout-monitor"),
+  };
+  buttons.forEach((btn) => {
+    btn.addEventListener("click", () => {
+      buttons.forEach((b) => b.classList.remove("active"));
+      btn.classList.add("active");
+      Object.values(layouts).forEach((el) => el.classList.remove("active"));
+      layouts[btn.dataset.mode].classList.add("active");
+    });
+  });
+</script>
+</body>
+</html>

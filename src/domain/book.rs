@@ -1,5 +1,27 @@
 use rust_decimal::Decimal;
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
+
+/// `(venue, pair_id)` → 最新盘口。
+pub type BookMap = HashMap<(String, String), Bbo>;
+
+/// 共享盘口。执行 task 直接读最新盘口，不再克隆整张表当快照——
+/// 挂单价必须用「此刻」的盘口算，否则重试和限价定价都是在拿旧价下单。
+pub type Books = Arc<RwLock<BookMap>>;
+
+pub fn new_books() -> Books {
+    Arc::new(RwLock::new(BookMap::new()))
+}
+
+/// 读一条盘口的副本。锁只在克隆期间持有，不跨 await。
+pub fn read_book(books: &Books, venue: &str, pair_id: &str) -> Option<Bbo> {
+    books
+        .read()
+        .ok()?
+        .get(&(venue.to_string(), pair_id.to_string()))
+        .cloned()
+}
 
 #[derive(Debug, Clone)]
 pub struct Bbo {
@@ -19,8 +41,26 @@ impl Bbo {
         self.ts.elapsed().as_millis() as u64 <= freshness_ms
     }
 
+    /// 对齐参考 `SpreadCalculator` 的盘口校验：要求 Bid < Ask。
+    /// 锁定盘口（ask == bid）是数据异常，不当合法报价。
     pub fn valid(&self) -> bool {
-        self.bid > Decimal::ZERO && self.ask > Decimal::ZERO && self.ask >= self.bid
+        self.bid > Decimal::ZERO && self.ask > Decimal::ZERO && self.ask > self.bid
+    }
+
+    /// 本所自身买卖点差（%）。过宽说明该所报价不可信 / 流动性极差，
+    /// 而「先挂后吃」的 maker 腿恰恰要挂在这个所的盘口上。
+    pub fn own_spread_pct(&self) -> Option<Decimal> {
+        if self.ask <= Decimal::ZERO {
+            return None;
+        }
+        Some((self.ask - self.bid) / self.ask * Decimal::from(100))
+    }
+
+    /// 最小报价变动单位。两所 WS 都按市场价格精度推字符串，所以取
+    /// bid/ask 的小数位即为 tick。用于把 maker 单挂进点差内侧。
+    pub fn price_tick(&self) -> Decimal {
+        let scale = self.bid.scale().max(self.ask.scale());
+        Decimal::new(1, scale)
     }
 
     pub fn bid_depth(&self) -> Decimal {
@@ -124,6 +164,19 @@ mod tests {
         let sell = b.sell_slip_pct(dec!(0.001)).unwrap();
         // vwap = (0.0004*100 + 0.0006*99) / 0.001 = 99.4; slip = 0.6/100*100
         assert_eq!(sell, dec!(0.6));
+    }
+
+    #[test]
+    fn locked_book_is_invalid() {
+        let b = book(vec![(dec!(100), dec!(1))], vec![(dec!(100), dec!(1))]);
+        assert!(!b.valid());
+    }
+
+    #[test]
+    fn tick_from_quote_scale() {
+        let b = book(vec![(dec!(100.01), dec!(1))], vec![(dec!(100.05), dec!(1))]);
+        assert_eq!(b.price_tick(), dec!(0.01));
+        assert_eq!(b.own_spread_pct().unwrap().round_dp(4), dec!(0.0400));
     }
 
     #[test]

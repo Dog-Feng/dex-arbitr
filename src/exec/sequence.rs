@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use crate::config::{AppConfig, OrderStyle};
 use crate::domain::{
-    spread::{decide_spread, hedge_slip_pct, realized_slip_pct},
+    spread::{decide_spread, realized_slip_pct},
     Bbo, NetSpread, VenueId,
 };
 
@@ -68,25 +68,6 @@ pub fn sequenced_fee(cfg: &AppConfig, buy: &VenueId, sell: &VenueId) -> Decimal 
     }
 }
 
-/// 成交后估滑点用（走档）。决策不调用。
-pub fn sequenced_slip(
-    cfg: &AppConfig,
-    buy: &VenueId,
-    sell: &VenueId,
-    buy_book: &Bbo,
-    sell_book: &Bbo,
-    qty: Decimal,
-) -> Option<Decimal> {
-    if !matches!(cfg.order.style, OrderStyle::LimitThenMarket) {
-        return hedge_slip_pct(buy_book, sell_book, qty);
-    }
-    match first_limit_venue(cfg, buy, sell) {
-        Some((first, _)) if first == buy => sell_book.sell_slip_pct(qty),
-        Some(_) => buy_book.buy_slip_pct(qty),
-        None => hedge_slip_pct(buy_book, sell_book, qty),
-    }
-}
-
 /// 成交后相对决策价的实际滑点。超过 `cost.default_slip_pct`（>0）则视为 overrun。
 pub fn fill_slip_overrun(
     cfg: &AppConfig,
@@ -117,6 +98,22 @@ pub fn sequenced_spread(
         cfg.exec_fee(buy) + cfg.exec_fee(sell)
     };
     decide_spread(buy.clone(), sell.clone(), buy_book, sell_book, fee, qty)
+}
+
+/// 平仓视角净边：买回原 sell 所（吃它 Ask1）、卖回原 buy 所（吃它 Bid1），
+/// 用**当前**盘口重算，手续费按平仓那一次的先挂后吃计。
+///
+/// 对齐参考 `build_closing_spread_from_orderbooks`：不能把开仓价差取负，也不能
+/// 只调换 price_buy / price_sell 字段。正常返回负数——现在平仓要吐回一部分价差。
+pub fn closing_sequenced_spread(
+    cfg: &AppConfig,
+    pos_buy: &VenueId,
+    pos_sell: &VenueId,
+    pos_buy_book: &Bbo,
+    pos_sell_book: &Bbo,
+    qty: Decimal,
+) -> Option<NetSpread> {
+    sequenced_spread(cfg, pos_sell, pos_buy, pos_sell_book, pos_buy_book, qty)
 }
 
 pub fn best_sequenced_spread(
@@ -207,5 +204,56 @@ mod tests {
         assert_eq!(net.net_pct, net.raw_pct - net.fee_pct);
         assert!(fill_slip_overrun(&cfg, true, dec!(100), dec!(100.05)).is_some());
         assert!(fill_slip_overrun(&cfg, true, dec!(100), dec!(100.005)).is_none());
+    }
+
+    /// 平仓视角必须用「原 sell 所的 Ask」和「原 buy 所的 Bid」，
+    /// 结果不等于开仓价差取负。
+    #[test]
+    fn closing_view_reads_the_other_side_of_both_books() {
+        let cfg = AppConfig::load_from(std::path::Path::new("config/default.yaml")).unwrap();
+        let buy = VenueId::from("lighter");
+        let sell = VenueId::from("sodex");
+        let buy_book = book(dec!(100.00), dec!(100.02));
+        let sell_book = book(dec!(100.20), dec!(100.24));
+
+        let open = sequenced_spread(&cfg, &buy, &sell, &buy_book, &sell_book, dec!(0.001)).unwrap();
+        // 开仓：(100.20 − 100.02) / 100.02
+        assert_eq!(open.raw_pct.round_dp(4), dec!(0.1800));
+
+        let close =
+            closing_sequenced_spread(&cfg, &buy, &sell, &buy_book, &sell_book, dec!(0.001)).unwrap();
+        // 平仓：(100.00 − 100.24) / 100.24，与 −0.18% 不同
+        assert_eq!(close.raw_pct.round_dp(4), dec!(-0.2394));
+        assert_eq!(close.buy.as_str(), "sodex");
+        assert_eq!(close.sell.as_str(), "lighter");
+        assert_ne!(close.raw_pct, -open.raw_pct);
+    }
+
+    /// 盘口薄到撑不住本笔平仓量时，带 qty 的平仓视角返回 None。
+    /// 上层据此丢掉格子/剥头皮平仓意图（对齐参考）。价差本身仍用 qty=0 算。
+    #[test]
+    fn closing_view_with_qty_is_blocked_by_thin_book() {
+        let cfg = AppConfig::load_from(std::path::Path::new("config/default.yaml")).unwrap();
+        let buy = VenueId::from("lighter");
+        let sell = VenueId::from("sodex");
+        // 两边都只有 0.0001 的一档量，持仓 0.5
+        let thin = Bbo {
+            bid: dec!(100.00),
+            ask: dec!(100.02),
+            bid_qty: dec!(0.0001),
+            ask_qty: dec!(0.0001),
+            bids: vec![(dec!(100.00), dec!(0.0001))],
+            asks: vec![(dec!(100.02), dec!(0.0001))],
+            ts: Instant::now(),
+        };
+        let held = dec!(0.5);
+        assert!(
+            closing_sequenced_spread(&cfg, &buy, &sell, &thin, &thin, held).is_none(),
+            "带 qty 时厚度不足会吞掉平仓视角"
+        );
+        assert!(
+            closing_sequenced_spread(&cfg, &buy, &sell, &thin, &thin, Decimal::ZERO).is_some(),
+            "qty=0 仍能算出平仓净边，供格子判断该不该减"
+        );
     }
 }

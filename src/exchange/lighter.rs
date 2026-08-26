@@ -16,7 +16,10 @@ use crate::domain::{
     Bbo, VenueId, VenueMarket,
 };
 
-use super::port::{Balance, BboTx, CancelReq, ExchangePort, OrderAck, OrderReq, VenuePosition};
+use super::port::{
+    AccountSnapshot, Balance, BboTx, CancelReq, ExchangePort, FundingRate, OrderAck, OrderReq,
+    VenuePosition,
+};
 use super::{bridge, venue_yaml_path};
 
 pub struct LighterAdapter {
@@ -231,6 +234,20 @@ impl ExchangePort for LighterAdapter {
         .await
     }
 
+    /// 一次调用同时拿余额和持仓。trait 默认实现是 balances() + positions()，
+    /// 那等于两次进程 + 两次全量 REST。
+    async fn account(&self) -> Result<AccountSnapshot> {
+        if !self.venue.keys_ready() {
+            warn!(venue = %self.id(), "account skipped: signing keys not loaded");
+            return Ok(AccountSnapshot::default());
+        }
+        if !bridge::bridge_available().await {
+            warn!(venue = %self.id(), "account skipped: exchange sidecar not found");
+            return Ok(AccountSnapshot::default());
+        }
+        bridge::bridge_account(&self.venue_path).await
+    }
+
     async fn positions(&self) -> Result<Vec<VenuePosition>> {
         if !self.venue.keys_ready() {
             return Ok(Vec::new());
@@ -249,6 +266,13 @@ impl ExchangePort for LighterAdapter {
             return Ok(Vec::new());
         }
         bridge::bridge_balances(&self.venue_path).await
+    }
+
+    async fn funding(&self) -> Result<Vec<FundingRate>> {
+        if !self.venue.keys_ready() || !bridge::bridge_available().await {
+            return Ok(Vec::new());
+        }
+        bridge::bridge_funding(&self.venue_path).await
     }
 }
 
