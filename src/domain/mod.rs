@@ -10,7 +10,7 @@ pub use funding::{
     allows_open as funding_allows_open, funding_view, unfavorable_for_position, FundingExit,
     FundingView, VenueFunding,
 };
-pub use grid::{CloseReason, CloseView, GridEngine, GridParams, Intent};
+pub use grid::{CloseReason, CloseView, GridEngine, GridParams, Intent, PersistenceMode};
 pub use position::Position;
 pub use spread::NetSpread;
 pub use symbol::{

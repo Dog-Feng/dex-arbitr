@@ -9,12 +9,23 @@ use crate::domain::{
 
 /// 挂单未成且价差没了 → 撤单。
 /// 已经成交（含撤单前成交）→ 另一边仍市价对冲，避免单边。
+///
+/// `timeout` 只应覆盖**本轮**挂单等待，由执行器自己计。看门狗若按整轮计划
+/// 起点计时并置全局 cancel，会把 `limit_retry_count` 后面几轮一并掐掉。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LimitWatch {
     StillWait,
     CancelSpreadGone,
     CancelTimeout,
     FilledHedgeNow,
+}
+
+/// 开仓挂单还够不够：方向没反，且毛价差仍在格子持有区（≥ T0）。
+///
+/// 开仓门槛是 T1 + 持续性；挂上之后不能再用 T1 一 tick 就撤——价差在 T1
+/// 附近抖动时会刚挂就被撕掉，页面上看不见 resting 单。
+pub fn resting_open_spread_ok(raw_pct: Decimal, same_dir: bool, t0: Decimal) -> bool {
+    same_dir && raw_pct >= t0
 }
 
 pub fn watch_resting_limit(
@@ -167,6 +178,17 @@ mod tests {
             watch_resting_limit(true, Duration::from_secs(5), Duration::from_secs(2), false),
             LimitWatch::CancelTimeout
         );
+    }
+
+    #[test]
+    fn resting_open_uses_t0_hysteresis_not_t1() {
+        let t1 = dec!(0.015);
+        let t0 = t1 * dec!(0.4);
+        assert!(resting_open_spread_ok(dec!(0.016), true, t0));
+        // 刚开仓后 raw 掉到 T1 以下、T0 以上：单子继续挂。
+        assert!(resting_open_spread_ok(dec!(0.010), true, t0));
+        assert!(!resting_open_spread_ok(dec!(0.005), true, t0));
+        assert!(!resting_open_spread_ok(dec!(0.020), false, t0));
     }
 
     fn book(bid: Decimal, ask: Decimal) -> Bbo {

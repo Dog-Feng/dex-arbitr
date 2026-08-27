@@ -1,12 +1,12 @@
 use anyhow::{Context, Result};
 use rust_decimal::Decimal;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::domain::{GridParams, VenueId};
+use crate::domain::{GridParams, PersistenceMode, VenueId};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
@@ -51,7 +51,7 @@ fn default_http_bind() -> String {
 }
 
 fn default_web_root() -> String {
-    "web".into()
+    "web/dist".into()
 }
 
 fn default_http() -> HttpConfig {
@@ -119,31 +119,12 @@ fn default_execution() -> ExecutionConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SizingMode {
-    /// 按保证金短板 × 杠杆定仓（默认）。
-    #[default]
-    Margin,
-    /// 每笔固定 USDC 名义，用于初期小额联调。
-    Fixed,
-}
-
 #[derive(Debug, Clone, Deserialize)]
 pub struct SizingConfig {
-    #[serde(default)]
-    pub mode: SizingMode,
-    /// mode=fixed 时每笔目标名义（USDC）。
-    #[serde(default = "default_fixed_notional_usdc")]
-    pub fixed_notional_usdc: Decimal,
     #[serde(default = "default_max_concurrent_pairs")]
     pub max_concurrent_pairs: u32,
     #[serde(default = "default_leverage")]
     pub leverage_multiplier: Decimal,
-    #[serde(default = "default_min_notional")]
-    pub min_notional_usdc: Decimal,
-    #[serde(default = "default_max_notional")]
-    pub max_notional_usdc: Decimal,
     #[serde(default = "default_depth_pct")]
     pub depth_pct: Decimal,
     #[serde(default = "default_refresh_balance_secs")]
@@ -162,10 +143,6 @@ fn default_margin_utilization_pct() -> Decimal {
     Decimal::from(90)
 }
 
-fn default_fixed_notional_usdc() -> Decimal {
-    Decimal::from(20)
-}
-
 fn default_max_concurrent_pairs() -> u32 {
     5
 }
@@ -174,16 +151,8 @@ fn default_leverage() -> Decimal {
     Decimal::from(2)
 }
 
-fn default_min_notional() -> Decimal {
-    Decimal::from(20)
-}
-
-fn default_max_notional() -> Decimal {
-    Decimal::from(500)
-}
-
 fn default_depth_pct() -> Decimal {
-    Decimal::new(5, 1)
+    Decimal::from(50)
 }
 
 fn default_refresh_balance_secs() -> u64 {
@@ -192,13 +161,9 @@ fn default_refresh_balance_secs() -> u64 {
 
 fn default_sizing() -> SizingConfig {
     SizingConfig {
-        mode: SizingMode::Margin,
-        fixed_notional_usdc: Decimal::from(20),
         max_concurrent_pairs: 5,
         leverage_multiplier: Decimal::from(2),
-        min_notional_usdc: Decimal::from(20),
-        max_notional_usdc: Decimal::from(500),
-        depth_pct: Decimal::new(5, 1),
+        depth_pct: Decimal::from(50),
         refresh_balance_secs: 60,
         fallback_available_usdc: None,
         margin_utilization_pct: Decimal::from(90),
@@ -244,7 +209,6 @@ fn default_scan() -> ScanConfig {
 pub struct SystemConfig {
     pub monitor_only: bool,
     pub data_freshness_ms: u64,
-    pub stable_depeg_bps: u32,
     /// 文本日志目录。按天滚动 `dex-arbitr.YYYY-MM-DD.log`。空 = 只打 stderr。
     #[serde(default = "default_log_dir")]
     pub log_dir: String,
@@ -256,52 +220,131 @@ fn default_log_dir() -> String {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct PairsConfig {
-    pub whitelist: Vec<String>,
+    pub defaults: PairDefaults,
+    #[serde(default)]
+    pub enabled: Vec<PairSetting>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct GridConfig {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PairDefaults {
+    pub max_segments: u32,
     pub initial_spread_threshold: Decimal,
     pub grid_step: Decimal,
-    pub max_segments: u32,
-    pub persistence_ms: u64,
-    pub base_qty: HashMap<String, Decimal>,
-    /// 保留字段：参考统一引擎没有往返净利止损，热路径不读。默认 0。
-    #[serde(default = "default_close_stop_loss")]
-    pub close_stop_loss_pct: Decimal,
-    /// T0 = T1 × 该系数，第一格的平仓阈值。对齐参考 `_build_grid_thresholds`
-    /// 的 `t0 = initial * 0.4`。
-    #[serde(default = "default_t0_ratio")]
     pub t0_ratio: Decimal,
-    /// 单笔最大开/平仓量（拆单）。0 = 不拆，一次下完该加或该减的量。
     #[serde(default)]
     pub split_order_size: Decimal,
-    /// 对齐参考 `scalping_enabled`。默认关。
     #[serde(default)]
     pub scalping_enabled: bool,
-    /// 开仓视角格子 ≥ 该值进入剥头皮。默认 10，对齐参考 yaml。
     #[serde(default = "default_scalping_trigger_segment")]
     pub scalping_trigger_segment: u32,
-    /// 剥头皮止盈阈值（%）。建仓均毛价差 − 当前剩余毛价差。
     #[serde(default = "default_scalping_profit_threshold")]
     pub scalping_profit_threshold_pct: Decimal,
 }
 
-fn default_close_stop_loss() -> Decimal {
-    Decimal::ZERO
+impl Default for PairDefaults {
+    fn default() -> Self {
+        Self {
+            max_segments: 3,
+            initial_spread_threshold: Decimal::new(5, 2),
+            grid_step: Decimal::new(5, 2),
+            t0_ratio: Decimal::new(4, 1),
+            split_order_size: Decimal::ZERO,
+            scalping_enabled: false,
+            scalping_trigger_segment: default_scalping_trigger_segment(),
+            scalping_profit_threshold_pct: default_scalping_profit_threshold(),
+        }
+    }
 }
 
-/// 对齐参考 `t0 = initial * 0.4`。
-fn default_t0_ratio() -> Decimal {
-    Decimal::new(4, 1) // 0.4
+/// 逐所对覆盖。`venues` 两个 id，顺序无关。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PairOverride {
+    pub venues: Vec<String>,
+    #[serde(default)]
+    pub max_segments: Option<u32>,
+    #[serde(default)]
+    pub initial_spread_threshold: Option<Decimal>,
+    #[serde(default)]
+    pub grid_step: Option<Decimal>,
+    #[serde(default)]
+    pub t0_ratio: Option<Decimal>,
+    #[serde(default)]
+    pub split_order_size: Option<Decimal>,
+    #[serde(default)]
+    pub scalping_enabled: Option<bool>,
+    #[serde(default)]
+    pub scalping_trigger_segment: Option<u32>,
+    #[serde(default)]
+    pub scalping_profit_threshold_pct: Option<Decimal>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PairSetting {
+    pub symbol: String,
+    /// 每格币数。必填，无默认。
+    pub base_qty: Decimal,
+    #[serde(default)]
+    pub max_segments: Option<u32>,
+    #[serde(default)]
+    pub initial_spread_threshold: Option<Decimal>,
+    #[serde(default)]
+    pub grid_step: Option<Decimal>,
+    #[serde(default)]
+    pub t0_ratio: Option<Decimal>,
+    #[serde(default)]
+    pub split_order_size: Option<Decimal>,
+    #[serde(default)]
+    pub scalping_enabled: Option<bool>,
+    #[serde(default)]
+    pub scalping_trigger_segment: Option<u32>,
+    #[serde(default)]
+    pub scalping_profit_threshold_pct: Option<Decimal>,
+    #[serde(default)]
+    pub overrides: Vec<PairOverride>,
+}
+
+impl PairSetting {
+    pub fn override_for(&self, a: &str, b: &str) -> Option<&PairOverride> {
+        self.overrides.iter().find(|o| {
+            o.venues.len() == 2
+                && ((o.venues[0].eq_ignore_ascii_case(a) && o.venues[1].eq_ignore_ascii_case(b))
+                    || (o.venues[0].eq_ignore_ascii_case(b) && o.venues[1].eq_ignore_ascii_case(a)))
+        })
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GridConfig {
+    /// `window` = 原连续毫秒窗口；`bucket` = 参考宽松/严格秒桶。缺省 bucket。
+    #[serde(default = "default_persistence_mode")]
+    pub persistence_mode: String,
+    pub persistence_ms: u64,
+    /// 秒桶连续满足秒数。对齐参考：`<= 1` 时达标即放行。
+    #[serde(default = "default_spread_persistence_seconds")]
+    pub spread_persistence_seconds: u32,
+    /// `true` = 严格（窗口内每笔达标）；`false` = 宽松（每秒至少一次）。
+    #[serde(default = "default_strict_persistence_check")]
+    pub strict_persistence_check: bool,
 }
 
 fn default_scalping_trigger_segment() -> u32 {
-    10
+    2
 }
 
 fn default_scalping_profit_threshold() -> Decimal {
     Decimal::new(2, 2) // 0.02%
+}
+
+fn default_persistence_mode() -> String {
+    "bucket".into()
+}
+
+fn default_spread_persistence_seconds() -> u32 {
+    1
+}
+
+fn default_strict_persistence_check() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -657,30 +700,58 @@ impl AppConfig {
         Ok(venue)
     }
 
-    /// `min_qty`：该所对两腿 min_qty 的较大者（`Pair::min_qty()`）。拆单靠它
-    /// 避免切出下不出去的尾巴。传 0 表示不约束（monitor/paper 路径）。
-    pub fn grid_for(&self, base: &str, min_qty: Decimal) -> GridParams {
-        let qty = self
-            .grid
-            .base_qty
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(base))
-            .map(|(_, v)| *v)
-            .unwrap_or(Decimal::ZERO);
-        GridParams {
-            initial: self.grid.initial_spread_threshold,
-            step: self.grid.grid_step,
-            max_segments: self.grid.max_segments,
-            persistence: Duration::from_millis(self.grid.persistence_ms),
-            base_qty: qty,
-            close_stop_loss: self.grid.close_stop_loss_pct,
-            t0_ratio: self.grid.t0_ratio,
-            split_order_size: self.grid.split_order_size,
-            min_qty,
-            scalping_enabled: self.grid.scalping_enabled,
-            scalping_trigger_segment: self.grid.scalping_trigger_segment,
-            scalping_profit_threshold: self.grid.scalping_profit_threshold_pct,
+    /// `min_qty`：该所对两腿 min_qty 的较大者。拆单靠它避免切出下不出去的尾巴。
+    /// 找不到配置返回 `None`，调用方跳过该对。
+    pub fn grid_for(
+        &self,
+        symbol: &str,
+        venue_a: &str,
+        venue_b: &str,
+        min_qty: Decimal,
+    ) -> Option<GridParams> {
+        let s = self.pair_setting(symbol)?;
+        let d = &self.pairs.defaults;
+        let ov = s.override_for(venue_a, venue_b);
+
+        macro_rules! pick {
+            ($field:ident, $def:expr) => {
+                ov.and_then(|o| o.$field).or(s.$field).unwrap_or($def)
+            };
         }
+
+        Some(GridParams {
+            base_qty: s.base_qty,
+            initial: pick!(initial_spread_threshold, d.initial_spread_threshold),
+            step: pick!(grid_step, d.grid_step),
+            max_segments: pick!(max_segments, d.max_segments),
+            t0_ratio: pick!(t0_ratio, d.t0_ratio),
+            split_order_size: pick!(split_order_size, d.split_order_size),
+            scalping_enabled: pick!(scalping_enabled, d.scalping_enabled),
+            scalping_trigger_segment: pick!(
+                scalping_trigger_segment,
+                d.scalping_trigger_segment
+            ),
+            scalping_profit_threshold: pick!(
+                scalping_profit_threshold_pct,
+                d.scalping_profit_threshold_pct
+            ),
+            min_qty,
+            persistence: Duration::from_millis(self.grid.persistence_ms),
+            persistence_mode: if self.grid.persistence_mode.eq_ignore_ascii_case("window") {
+                PersistenceMode::Window
+            } else {
+                PersistenceMode::Bucket
+            },
+            spread_persistence_seconds: self.grid.spread_persistence_seconds,
+            strict_persistence_check: self.grid.strict_persistence_check,
+        })
+    }
+
+    pub fn pair_setting(&self, symbol: &str) -> Option<&PairSetting> {
+        self.pairs
+            .enabled
+            .iter()
+            .find(|p| p.symbol.eq_ignore_ascii_case(symbol))
     }
 
     /// 某个所对上「先挂后吃」一次的手续费。
@@ -822,7 +893,21 @@ mod tests {
         let cfg = AppConfig::load_from(Path::new("config/default.yaml")).unwrap();
         assert_eq!(cfg.system.log_dir, "data/logs");
         assert_eq!(cfg.venues, ["lighter", "lighter_rh", "sodex", "entropy"]);
-        assert_eq!(cfg.grid_for("BTC", Decimal::ZERO).base_qty, dec!(0.001));
+        let btc = cfg.grid_for("BTC", "lighter", "sodex", Decimal::ZERO).unwrap();
+        assert_eq!(btc.base_qty, dec!(0.001));
+        let cheap = cfg.grid_for("BTC", "lighter", "entropy", Decimal::ZERO).unwrap();
+        assert_eq!(cheap.step, dec!(0.02));
+        assert_eq!(cheap.max_segments, 6);
+        assert!(cheap.scalping_enabled);
+        let expensive = cfg.grid_for("BTC", "sodex", "lighter_rh", Decimal::ZERO).unwrap();
+        assert_eq!(expensive.step, dec!(0.05));
+        assert_eq!(
+            cfg.grid_for("BTC", "entropy", "lighter", Decimal::ZERO)
+                .unwrap()
+                .step,
+            cheap.step,
+            "venue order must not change override match"
+        );
         let venue = cfg.load_venue("lighter_rh").unwrap();
         assert_eq!(venue.chain_id, 466324);
         assert_eq!(venue.quote, "USDG");
@@ -841,9 +926,12 @@ mod tests {
         assert_eq!(cfg.history.refresh_interval_secs, 1800);
         assert_eq!(cfg.scan.min_spread_pct, dec!(0.1));
         assert!(cfg.scan.cross_use_natural);
-        assert_eq!(cfg.grid.close_stop_loss_pct, Decimal::ZERO);
-        assert_eq!(cfg.grid.scalping_trigger_segment, 10);
-        assert_eq!(cfg.grid.scalping_profit_threshold_pct, dec!(0.02));
+        assert_eq!(cfg.grid.persistence_ms, 1000);
+        assert_eq!(cfg.grid.persistence_mode, "bucket");
+        assert_eq!(cfg.grid.spread_persistence_seconds, 1);
+        assert!(cfg.grid.strict_persistence_check);
+        assert_eq!(cfg.pairs.defaults.scalping_trigger_segment, 2);
+        assert_eq!(cfg.pairs.defaults.scalping_profit_threshold_pct, dec!(0.02));
         assert_eq!(cfg.sizing.leverage_multiplier, dec!(2));
         assert_eq!(cfg.risk.max_venue_spread_pct, dec!(0.05));
         assert_eq!(cfg.risk.price_stability_window_secs, dec!(1));

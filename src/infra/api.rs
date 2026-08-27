@@ -104,7 +104,26 @@ pub struct LiveSnapshot {
     /// 正在按所选 DEX 拉市场并匹配。
     #[serde(default)]
     pub matching: bool,
+    /// 启动时加载的交集全集（不订阅、不进决策）。
+    #[serde(default)]
+    pub available: Vec<AvailableSymbol>,
     pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct AvailableSymbol {
+    pub pair_id: String,
+    pub symbol: String,
+    pub venue_pairs: Vec<AvailableVenuePair>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct AvailableVenuePair {
+    pub venues: Vec<String>,
+    pub min_qty: String,
+    pub qty_precision: u32,
+    pub round_trip_fee_pct: String,
+    pub mid: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -198,6 +217,7 @@ impl ApiHub {
                 .route("/api/arbitrage/start", post(arbitrage_start))
                 .route("/api/arbitrage/stop", post(arbitrage_stop))
                 .route("/api/venues", get(get_venues))
+                .route("/api/pairs/available", get(available_pairs))
                 .route_layer(middleware::from_fn_with_state(
                     hub.clone(),
                     require_api_auth,
@@ -287,6 +307,9 @@ struct ExecRow {
     net_pct: Option<String>,
     result: String,
     detail: String,
+    grid_from: Option<u32>,
+    grid_to: Option<u32>,
+    pnl_pct: Option<String>,
 }
 
 impl From<ExecRecord> for ExecRow {
@@ -297,10 +320,13 @@ impl From<ExecRecord> for ExecRow {
             action: r.action,
             buy_venue: r.buy_venue,
             sell_venue: r.sell_venue,
-            qty: r.qty.to_string(),
-            net_pct: r.net_pct.map(|v| v.to_string()),
+            qty: fmt_qty(r.qty),
+            net_pct: r.net_pct.map(|v| format!("{:.6}", v.round_dp(6))),
             result: r.result,
             detail: r.detail,
+            grid_from: r.grid_from,
+            grid_to: r.grid_to,
+            pnl_pct: r.pnl_pct.map(|v| format!("{:.6}", v.round_dp(6))),
         }
     }
 }
@@ -312,6 +338,13 @@ async fn executions(State(hub): State<Arc<ApiHub>>) -> impl IntoResponse {
         .map(Into::into)
         .collect();
     Json(serde_json::json!({ "executions": out })).into_response()
+}
+
+async fn available_pairs(State(hub): State<Arc<ApiHub>>) -> impl IntoResponse {
+    match hub.state.read() {
+        Ok(s) => Json(serde_json::json!({ "pairs": s.available })).into_response(),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned").into_response(),
+    }
 }
 
 async fn get_venues(State(hub): State<Arc<ApiHub>>) -> impl IntoResponse {
@@ -329,7 +362,7 @@ async fn get_venues(State(hub): State<Arc<ApiHub>>) -> impl IntoResponse {
                 "label": v.label,
                 "keys_ready": v.keys_ready,
                 "quote": v.quote,
-                "active": active.is_empty() || active.contains(&v.id),
+                "active": active.contains(&v.id),
             })
         })
         .collect();
@@ -354,7 +387,7 @@ struct ConfigResponse {
 }
 
 async fn get_config(State(hub): State<Arc<ApiHub>>) -> impl IntoResponse {
-    let ctrl = hub.control.lock().unwrap();
+    let ctrl = hub.control.lock().unwrap_or_else(|e| e.into_inner());
     Json(ConfigResponse {
         enabled: ctrl.enabled,
         params: ctrl.params.clone(),
@@ -377,7 +410,7 @@ async fn post_config(
         return (StatusCode::UNPROCESSABLE_ENTITY, Json(serde_json::json!({ "ok": false, "errors": v.errors }))).into_response();
     }
     {
-        let mut ctrl = hub.control.lock().unwrap();
+        let mut ctrl = hub.control.lock().unwrap_or_else(|e| e.into_inner());
         ctrl.params = params;
     }
     tracing::info!("arbitrage params updated via API");
@@ -386,14 +419,24 @@ async fn post_config(
 
 async fn arbitrage_start(State(hub): State<Arc<ApiHub>>) -> impl IntoResponse {
     {
-        let mut ctrl = hub.control.lock().unwrap();
+        let mut ctrl = hub.control.lock().unwrap_or_else(|e| e.into_inner());
         let n = ctrl.params.active_venues.len();
-        if n == 1 {
+        if n < 2 {
             return (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 Json(serde_json::json!({
                     "ok": false,
                     "errors": ["请至少选择两个交易所再启动"]
+                })),
+            )
+                .into_response();
+        }
+        if ctrl.params.pairs.is_empty() {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "errors": ["请至少填写一个交易对和每格数量再启动"]
                 })),
             )
                 .into_response();
@@ -407,7 +450,7 @@ async fn arbitrage_start(State(hub): State<Arc<ApiHub>>) -> impl IntoResponse {
 
 async fn arbitrage_stop(State(hub): State<Arc<ApiHub>>) -> impl IntoResponse {
     {
-        let mut ctrl = hub.control.lock().unwrap();
+        let mut ctrl = hub.control.lock().unwrap_or_else(|e| e.into_inner());
         ctrl.enabled = false;
     }
     tracing::info!("arbitrage disabled via API");

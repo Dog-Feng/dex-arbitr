@@ -81,6 +81,19 @@ func fillPollSleep(deadline time.Time) {
 	time.Sleep(nap)
 }
 
+// 事件驱动路径上的密轮询：WS 没带到成交量时，REST 兜底也不要再睡 2s。
+func tightFillPoll(deadline time.Time) {
+	remain := time.Until(deadline)
+	if remain <= 0 {
+		return
+	}
+	nap := 80 * time.Millisecond
+	if remain < nap {
+		nap = remain
+	}
+	time.Sleep(nap)
+}
+
 // 资金费率的结算周期（秒）。两个所都是**小时结算**，返回的费率也都已经是
 // 「每小时实收值」，所以上层年化统一乘 24 × 365。
 //

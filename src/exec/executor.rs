@@ -29,12 +29,32 @@ pub struct ExecResult {
     pub second: ExecFill,
     /// 撤不掉、可能稍后成交的第一腿挂单。非 None 时必须上报人工介入。
     pub orphan_order: Option<String>,
+    /// 第一腿比第二腿多成交的量（> 0 表示存在未对冲的单边敞口）。
+    pub unhedged_qty: Decimal,
 }
 
 impl ExecResult {
     /// 真正对冲上的量：两腿的较小者。持仓回写必须用它，不能用计划量。
     pub fn hedged_qty(&self) -> Decimal {
         self.first.qty.min(self.second.qty)
+    }
+
+    pub fn finished(first: ExecFill, second: ExecFill, orphan_order: Option<String>) -> Self {
+        let unhedged_qty = (first.qty - second.qty).max(Decimal::ZERO);
+        if unhedged_qty > Decimal::ZERO {
+            warn!(
+                first_qty = %first.qty,
+                second_qty = %second.qty,
+                unhedged = %unhedged_qty,
+                "second leg partially filled; leaving one-sided exposure"
+            );
+        }
+        Self {
+            first,
+            second,
+            orphan_order,
+            unhedged_qty,
+        }
     }
 }
 
@@ -347,11 +367,7 @@ impl HedgeExecutor {
         };
         Self::log_overrun(cfg, &plan.first, first_price, &first);
         Self::log_overrun(cfg, &plan.second, second_price, &second);
-        Ok(ExecResult {
-            first,
-            second,
-            orphan_order: None,
-        })
+        Ok(ExecResult::finished(first, second, None))
     }
 
     /// 激进限价兜底：市价腿失败后，用**放大后的**滑点当限价挂一张 IOC。
@@ -472,11 +488,7 @@ impl HedgeExecutor {
         };
         Self::log_overrun(cfg, &plan.first, p0, &first);
         Self::log_overrun(cfg, &plan.second, p1, &second);
-        Ok(ExecResult {
-            first,
-            second,
-            orphan_order: None,
-        })
+        Ok(ExecResult::finished(first, second, None))
     }
 
     pub(crate) async fn emergency_close(
@@ -696,8 +708,18 @@ fn market_price(leg: &HedgeLeg, bbo: &Bbo) -> Decimal {
 }
 
 /// 第二腿是否「结果不明」。不明时禁止紧急平仓——见 `Cause::SecondLegUnknown`。
+///
+/// 除 sidecar 显式返回 SECOND_LEG_UNKNOWN 外，网络层超时和连接失败同样不可知：
+/// 交易所可能已收到并成交，此时 emergency_close 反而造出裸仓。
 pub(crate) fn is_unverifiable(err: &anyhow::Error) -> bool {
-    err.to_string().contains("SECOND_LEG_UNKNOWN")
+    let s = err.to_string();
+    s.contains("SECOND_LEG_UNKNOWN")
+        || s.contains("sidecar place timed out")
+        || s.contains("sidecar process exited")
+        || s.contains("connection reset")
+        || s.contains("connection refused")
+        || s.contains("broken pipe")
+        || s.contains("timed out")
 }
 
 fn effective_filled_qty(ack: &OrderAck) -> Decimal {
@@ -862,21 +884,22 @@ mod tests {
 
     #[test]
     fn hedged_qty_is_the_smaller_leg() {
-        let r = ExecResult {
-            first: ExecFill {
+        let r = ExecResult::finished(
+            ExecFill {
                 venue: "a".into(),
-                qty: dec!(0.6),
+                qty: dec!(1.0),
                 price: dec!(1),
                 is_buy: true,
             },
-            second: ExecFill {
+            ExecFill {
                 venue: "b".into(),
-                qty: dec!(0.5),
+                qty: dec!(0.6),
                 price: dec!(1),
                 is_buy: false,
             },
-            orphan_order: None,
-        };
-        assert_eq!(r.hedged_qty(), dec!(0.5));
+            None,
+        );
+        assert_eq!(r.hedged_qty(), dec!(0.6));
+        assert_eq!(r.unhedged_qty, dec!(0.4));
     }
 }

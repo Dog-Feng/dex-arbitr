@@ -35,6 +35,14 @@ pub struct HedgePlan {
     pub decision_net_pct: Decimal,
     /// 决策那一刻的毛价差。成交价拿不到时当建仓 raw，剥头皮止盈用。
     pub decision_raw_pct: Decimal,
+    /// 开仓时定仓所得单格数量，固化到 Position.base_qty。
+    /// 平仓计划此字段为 ZERO（平仓不需要重新定仓）。
+    pub base_qty: Decimal,
+    /// 成交前 / 后格子，执行带「格子步」用。
+    pub grid_from: u32,
+    pub grid_to: u32,
+    /// 仅平仓：决策时的往返净利 %。
+    pub pnl_pct: Option<Decimal>,
     pub first: HedgeLeg,
     pub second: HedgeLeg,
 }
@@ -90,6 +98,10 @@ fn build(
         sell_venue: sell.as_str().to_string(),
         decision_net_pct: Decimal::ZERO,
         decision_raw_pct: Decimal::ZERO,
+        base_qty: Decimal::ZERO, // 由 controller 从配置填入
+        grid_from: 0,
+        grid_to: 0,
+        pnl_pct: None,
         first,
         second,
     })
@@ -180,6 +192,7 @@ mod tests {
             entry_notional_usdc: dec!(100),
             entry_net_pct: dec!(0.05),
             entry_raw_pct: dec!(0.05),
+            base_qty: dec!(0.001),
             opened_at: std::time::Instant::now(),
         };
         let plan = plan_hedge(

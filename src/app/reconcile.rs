@@ -21,6 +21,9 @@ pub struct NakedExposure {
 pub enum NakedSource {
     Foreign,
     BotFailure,
+    /// 第二腿结果不可知：不触发自动补对冲，必须人工核查后再 resume。
+    /// 自动补对冲会在第二腿实际已成交的情况下制造双倍敞口。
+    SecondLegUnknown,
 }
 
 /// 单边敞口检测。

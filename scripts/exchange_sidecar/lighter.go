@@ -63,6 +63,11 @@ type lighterSession struct {
 	// 私有 WS 订单流。ws 非 nil 表示已启动监听。
 	wsOnce sync.Once
 	wsStop context.CancelFunc
+
+	// WS 推送的成交量，按 client_order_index / order_index 索引。
+	// waitMarketFill 命中后立刻返回，不必再等 REST 持仓快照（原先 2s 一轮）。
+	fillMu sync.Mutex
+	fills  map[string]decimal.Decimal
 }
 
 func (s *lighterSession) close() {
@@ -104,13 +109,13 @@ func (s *lighterSession) connect(ctx context.Context) error {
 	if s.txClient != nil {
 		return nil
 	}
-	httpAPI := lighterhttp.NewClient(s.baseURL)
-	txClient, err := lighterclient.NewTxClient(httpAPI, s.venue.APIKeyPrivateKey, s.venue.AccountIndex, s.venue.APIKeyIndex, s.venue.ChainID)
+	// 传 nil 作为 HTTP 客户端：nonce 由我们自己管理（reserveNonce），
+	// 绝不让 SDK 在签名路径上偷偷发请求，也不调 Check()。
+	// Check() 内部走 /api/v1/apikeys，在某些网络环境下会阻塞 10+ 秒，
+	// 而且对下单没有任何保护意义——参数错了 sendTx 会直接报错。
+	txClient, err := lighterclient.NewTxClient(nil, s.venue.APIKeyPrivateKey, s.venue.AccountIndex, s.venue.APIKeyIndex, s.venue.ChainID)
 	if err != nil {
 		return fmt.Errorf("create lighter signer: %w", err)
-	}
-	if err := txClient.Check(); err != nil {
-		return fmt.Errorf("validate lighter api key: %w", err)
 	}
 	s.txClient = txClient
 	return nil
@@ -259,8 +264,11 @@ func (s *lighterSession) marketPositionSize(ctx context.Context, marketIndex int
 	return total, nil
 }
 
-// waitMarketFill 轮询持仓 delta，返回**已确认**的成交量。
-// 返回 0 表示在等待窗口内没有观察到任何成交。
+// waitMarketFill 确认市价腿真实成交量。
+//
+// 优先看私有 WS（account_all_orders 推送到就认），REST 持仓 delta 兜底。
+// 轮询间隔 100ms：旧实现复刻参考的 2s sleep，市价其实已经成交，本地却要
+// 再等一轮才返回——日志上就是「第一腿成交后 3–4 秒第二腿才成功」。
 func (s *lighterSession) waitMarketFill(
 	ctx context.Context,
 	marketIndex int,
@@ -268,10 +276,23 @@ func (s *lighterSession) waitMarketFill(
 	baseline decimal.Decimal,
 	isBuy bool,
 	want decimal.Decimal,
+	orderID string,
 ) decimal.Decimal {
 	deadline := time.Now().Add(lighterFillWait)
 	best := decimal.Zero
+	sizeDec := 4
+	if d, err := s.marketDecimals(ctx, marketIndex); err == nil {
+		sizeDec = d.sizeDec
+	}
 	for {
+		if orderID != "" {
+			if f, ok := s.wsFilled(orderID, want, sizeDec); ok && f.GreaterThan(best) {
+				best = f
+				if best.GreaterThanOrEqual(want) {
+					return want
+				}
+			}
+		}
 		if cur, err := s.marketPositionSize(ctx, marketIndex, symbol); err == nil {
 			delta := cur.Sub(baseline)
 			if !isBuy {
@@ -284,12 +305,78 @@ func (s *lighterSession) waitMarketFill(
 				return want
 			}
 		}
-		// ctx 到期就别再空转：上层已经不等这个响应了。
 		if time.Now().After(deadline) || ctx.Err() != nil {
 			return best
 		}
-		fillPollSleep(deadline)
+		remain := time.Until(deadline)
+		nap := 100 * time.Millisecond
+		if remain < nap {
+			nap = remain
+		}
+		if nap <= 0 {
+			return best
+		}
+		time.Sleep(nap)
 	}
+}
+
+func (s *lighterSession) noteWsFills(msg map[string]any) {
+	orders := rawList(firstValue(msg, "orders"))
+	if len(orders) == 0 {
+		if firstValue(msg, "client_order_index", "order_index", "filled_base_amount") != nil {
+			orders = []map[string]any{msg}
+		}
+	}
+	if len(orders) == 0 {
+		return
+	}
+	s.fillMu.Lock()
+	defer s.fillMu.Unlock()
+	if s.fills == nil {
+		s.fills = make(map[string]decimal.Decimal)
+	}
+	for _, raw := range orders {
+		filled := decimalValue(firstValue(raw, "filled_base_amount", "filled_amount"))
+		if !filled.GreaterThan(decimal.Zero) {
+			continue
+		}
+		for _, key := range []string{
+			stringValue(firstValue(raw, "client_order_index", "client_order_id")),
+			stringValue(firstValue(raw, "order_index", "order_id")),
+		} {
+			if key != "" && key != "0" {
+				if prev, ok := s.fills[key]; !ok || filled.GreaterThan(prev) {
+					s.fills[key] = filled
+				}
+			}
+		}
+	}
+}
+
+func (s *lighterSession) wsFilled(orderID string, want decimal.Decimal, sizeDec int) (decimal.Decimal, bool) {
+	s.fillMu.Lock()
+	defer s.fillMu.Unlock()
+	raw, ok := s.fills[orderID]
+	if !ok || !raw.GreaterThan(decimal.Zero) {
+		return decimal.Zero, false
+	}
+	filled := normalizeWsFilled(raw, want, sizeDec)
+	if !filled.GreaterThan(decimal.Zero) {
+		return decimal.Zero, false
+	}
+	return filled, true
+}
+
+// WS 有的所回报人类可读数量，有的回报 size_decimals 缩放整数。
+// 只在「整数且明显比 want 大一个数量级」时才除回去，避免把 1.5 ETH 误当成整数缩放。
+func normalizeWsFilled(raw, want decimal.Decimal, sizeDec int) decimal.Decimal {
+	if sizeDec <= 0 || !raw.GreaterThan(decimal.Zero) {
+		return raw
+	}
+	if raw.Equal(raw.Truncate(0)) && want.GreaterThan(decimal.Zero) && raw.GreaterThan(want.Mul(decimal.NewFromInt(50))) {
+		return raw.Div(decimal.New(1, int32(sizeDec)))
+	}
+	return raw
 }
 
 func (s *lighterSession) marketDecimals(ctx context.Context, marketIndex int) (marketDecimals, error) {
@@ -385,6 +472,7 @@ func (s *lighterSession) orderStreamOnce(ctx context.Context, venueID string) er
 		if !strings.Contains(kind, "order") {
 			continue
 		}
+		s.noteWsFills(msg)
 		// 原样透传给 Rust，由它按 client_order_index 匹配挂单。
 		emitPush(venueID, msg)
 	}
@@ -427,7 +515,10 @@ func (s *lighterSession) place(ctx context.Context, params map[string]any) (map[
 	coidStr := paramString(params, "client_order_id", fmt.Sprintf("%d", time.Now().UnixMilli()))
 	coid, err := strconv.ParseInt(coidStr, 10, 64)
 	if err != nil || coid <= 0 {
-		coid = time.Now().UnixMilli()
+		// client_order_id 无法解析为正 int64（如 UUID 字符串）时明确报错，
+		// 而非静默替换为时间戳——替换后 OrderAck 返回的 id 与请求不符，
+		// 导致 order_status/cancel 找不到订单。
+		return nil, fmt.Errorf("lighter requires a positive int64 client_order_id, got %q (parse error: %v)", coidStr, err)
 	}
 
 	orderType := uint8(txtypes.LimitOrder)
@@ -582,7 +673,7 @@ func (s *lighterSession) place(ctx context.Context, params map[string]any) (map[
 		// IOC 腿：撤不了也查不到活跃单（不驻留），只能看持仓 delta。
 		// 有成交就必须上报，否则上层按「未下单」记账 → 裸仓。
 		if haveBaseline {
-			filled := s.waitMarketFill(ctx, marketIndex, paramString(params, "symbol", ""), baseline, isBuy, qty)
+			filled := s.waitMarketFill(ctx, marketIndex, paramString(params, "symbol", ""), baseline, isBuy, qty, coidStr)
 			if filled.GreaterThan(decimal.Zero) {
 				status := "filled"
 				if filled.LessThan(qty) {
@@ -617,7 +708,7 @@ func (s *lighterSession) place(ctx context.Context, params map[string]any) (map[
 	if !haveBaseline {
 		return nil, errors.New("market fill unverifiable: no baseline")
 	}
-	filled := s.waitMarketFill(ctx, marketIndex, paramString(params, "symbol", ""), baseline, isBuy, qty)
+	filled := s.waitMarketFill(ctx, marketIndex, paramString(params, "symbol", ""), baseline, isBuy, qty, coidStr)
 	status := "filled"
 	switch {
 	case filled.LessThanOrEqual(decimal.Zero):

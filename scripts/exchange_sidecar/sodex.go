@@ -1,4 +1,4 @@
-// SoDEX handlers（对齐 scripts/sodex_bridge + internal/exchange/sodex.go）
+// SoDEX handlers（基于官方 sodex-go-sdk-public）
 package main
 
 import (
@@ -45,6 +45,14 @@ type sodexSession struct {
 
 	wsOnce sync.Once
 	wsStop context.CancelFunc
+
+	fillMu sync.Mutex
+	fills  map[string]sodexFillNote
+}
+
+type sodexFillNote struct {
+	qty decimal.Decimal
+	px  string
 }
 
 func (s *sodexSession) close() {
@@ -85,7 +93,7 @@ func dispatchSodex(ctx context.Context, reg *registry, req request) (any, error)
 	case "account":
 		return accountSnapshot(ctx, gatewayBase(s.venue.Rest), s.addr, s.accountID)
 	case "place":
-		return placeOrder(ctx, s.client, s.accountID, s.addr, s.venue, params)
+		return placeOrder(ctx, s, params)
 	case "cancel":
 		return cancelOrder(ctx, s.client, s.accountID, params)
 	case "order_status":
@@ -143,6 +151,7 @@ func (s *sodexSession) orderStreamOnce(ctx context.Context) error {
 			if json.Unmarshal(p.Data, &upd) != nil {
 				return
 			}
+			s.noteOrderUpdate(upd)
 			emitPush("sodex", upd)
 		},
 	); err != nil {
@@ -522,7 +531,10 @@ func lookupSymbol(ctx context.Context, c *sodexclient.Client, symbolID uint64, s
 	return symbolSpec{}, fmt.Errorf("symbol not found id=%d name=%q", symbolID, symbolName)
 }
 
-func placeOrder(ctx context.Context, c *sodexclient.Client, accountID uint64, addr string, v sodexVenueFile, params map[string]any) (map[string]string, error) {
+func placeOrder(ctx context.Context, s *sodexSession, params map[string]any) (map[string]string, error) {
+	c := s.client
+	accountID := s.accountID
+	addr := s.addr
 	symbolID, err := paramUint64(params, "market_index")
 	if err != nil {
 		return nil, err
@@ -614,7 +626,7 @@ func placeOrder(ctx context.Context, c *sodexclient.Client, accountID uint64, ad
 			filled := o.ExecutedQty
 			// 不驻留的单再轮询确认一次：请求虽然报错，单子可能已经落地并成交。
 			if ioc {
-				if f, ap, _ := waitOrderFill(ctx, c, addr, o.OrderID, clOrdID, qty); f.GreaterThan(decimalFromString(filled)) {
+				if f, ap, _ := waitOrderFill(ctx, s, c, addr, o.OrderID, clOrdID, qty); f.GreaterThan(decimalFromString(filled)) {
 					filled = f.String()
 					if ap != "" {
 						o.Price = ap
@@ -660,7 +672,7 @@ func placeOrder(ctx context.Context, c *sodexclient.Client, accountID uint64, ad
 		if ioc {
 			// IOC 腿要轮询：不驻留，单次查询看到的 0 分不清
 			// 「整单撤销」还是「索引还没跟上」。
-			f, ap, _ := waitOrderFill(ctx, c, addr, r.OrderID, id, qty)
+			f, ap, _ := waitOrderFill(ctx, s, c, addr, r.OrderID, id, qty)
 			filled = f.String()
 			if ap != "" {
 				avgPrice = ap
@@ -877,20 +889,74 @@ func findOrder(ctx context.Context, c *sodexclient.Client, addr string, orderID 
 // 「查不到」，上层随即当成未对冲，正是幻影成交的反向版本。
 //
 // 返回 (已确认成交量, 均价, 是否至少查到过这张单)。
+func (s *sodexSession) noteOrderUpdate(upd sodexws.AccountOrderUpdate) {
+	qty := decimalFromString(upd.FilledQty)
+	if !qty.GreaterThan(decimal.Zero) {
+		return
+	}
+	px := upd.LastPrice
+	if px == "" {
+		px = upd.Price
+	}
+	s.fillMu.Lock()
+	defer s.fillMu.Unlock()
+	if s.fills == nil {
+		s.fills = make(map[string]sodexFillNote)
+	}
+	note := sodexFillNote{qty: qty, px: px}
+	for _, k := range []string{upd.ClOrdID, strconv.FormatInt(upd.OrderID, 10)} {
+		if k == "" || k == "0" {
+			continue
+		}
+		if prev, ok := s.fills[k]; ok && prev.qty.GreaterThan(qty) {
+			continue
+		}
+		s.fills[k] = note
+	}
+}
+
+func (s *sodexSession) wsFill(orderID uint64, clOrdID string) (decimal.Decimal, string, bool) {
+	s.fillMu.Lock()
+	defer s.fillMu.Unlock()
+	for _, k := range []string{clOrdID, strconv.FormatUint(orderID, 10)} {
+		if k == "" || k == "0" {
+			continue
+		}
+		if n, ok := s.fills[k]; ok && n.qty.GreaterThan(decimal.Zero) {
+			return n.qty, n.px, true
+		}
+	}
+	return decimal.Zero, "", false
+}
+
 func waitOrderFill(
 	ctx context.Context,
+	s *sodexSession,
 	c *sodexclient.Client,
 	addr string,
 	orderID uint64,
 	clOrdID string,
 	want decimal.Decimal,
 ) (decimal.Decimal, string, bool) {
-	// SoDEX 不是 Lighter，走参考的通用窗口 `limit_order_timeout: 3`。
 	deadline := time.Now().Add(sodexFillWait)
 	best := decimal.Zero
 	avg := ""
 	seen := false
 	for {
+		if s != nil {
+			if f, px, ok := s.wsFill(orderID, clOrdID); ok {
+				seen = true
+				if f.GreaterThan(best) {
+					best = f
+					if px != "" {
+						avg = px
+					}
+				}
+				if want.GreaterThan(decimal.Zero) && best.GreaterThanOrEqual(want) {
+					return best, avg, true
+				}
+			}
+		}
 		if o, ok := findOrder(ctx, c, addr, orderID, clOrdID); ok {
 			seen = true
 			if f := decimalFromString(o.ExecutedQty); f.GreaterThan(best) {
@@ -899,16 +965,14 @@ func waitOrderFill(
 					avg = ap
 				}
 			}
-			// 已经吃满请求量，没必要继续等。
 			if want.GreaterThan(decimal.Zero) && best.GreaterThanOrEqual(want) {
 				return best, avg, true
 			}
 		}
-		// ctx 到期就别再空转：上层已经不等这个响应了。
 		if time.Now().After(deadline) || ctx.Err() != nil {
 			return best, avg, seen
 		}
-		fillPollSleep(deadline)
+		tightFillPoll(deadline)
 	}
 }
 

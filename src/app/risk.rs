@@ -3,19 +3,20 @@ use rust_decimal::Decimal;
 use crate::config::AppConfig;
 use crate::domain::{Bbo, Pair};
 
-/// 数据质量门槛：新鲜度、合法 BBO、单所自身点差。**不含深度**。
-///
-/// 有持仓时入口只用这一层。格子/剥头皮平仓的一档厚度在作出 Close 之后
-/// 按本笔 qty 校验，不够就丢掉平仓意图（对齐参考）。
-pub fn books_quality_ok(cfg: &AppConfig, buy: &Bbo, sell: &Bbo) -> Result<(), &'static str> {
+/// 新鲜度 + 合法 BBO。
+pub fn books_fresh_ok(cfg: &AppConfig, buy: &Bbo, sell: &Bbo) -> Result<(), &'static str> {
     if !buy.is_fresh(cfg.system.data_freshness_ms) || !sell.is_fresh(cfg.system.data_freshness_ms) {
         return Err("stale");
     }
     if !buy.valid() || !sell.valid() {
         return Err("invalid_bbo");
     }
-    // 单所自身买卖点差门槛（对齐参考 `_passes_local_orderbook_spread`）。
-    // 点差过宽 = 该所报价不可信 / 流动性极差，而 maker 腿正要挂在它盘口上。
+    Ok(())
+}
+
+/// 单所自身买卖点差门槛（对齐参考 `_passes_local_orderbook_spread`）。
+/// 加格、减格入口都走：点差过宽时两边都不下。
+pub fn books_own_spread_ok(cfg: &AppConfig, buy: &Bbo, sell: &Bbo) -> Result<(), &'static str> {
     let max_own = cfg.risk.max_venue_spread_pct;
     if max_own > Decimal::ZERO {
         for book in [buy, sell] {
@@ -27,6 +28,13 @@ pub fn books_quality_ok(cfg: &AppConfig, buy: &Bbo, sell: &Bbo) -> Result<(), &'
         }
     }
     Ok(())
+}
+
+/// 数据质量门槛：新鲜度、合法 BBO、单所自身点差。**不含深度**。
+/// 空仓开仓、有仓加/减格入口都走这一层。
+pub fn books_quality_ok(cfg: &AppConfig, buy: &Bbo, sell: &Bbo) -> Result<(), &'static str> {
+    books_fresh_ok(cfg, buy, sell)?;
+    books_own_spread_ok(cfg, buy, sell)
 }
 
 /// 开仓门槛：数据质量 + 一档深度。
@@ -44,7 +52,16 @@ pub fn books_tradable(
     let base = &pair.legs[0].base;
     let min_qty = cfg
         .min_book_qty(base)
-        .max(cfg.grid_for(base, pair.min_qty()).base_qty)
+        .max(
+            cfg.grid_for(
+                base,
+                pair.legs[0].venue.as_str(),
+                pair.legs[1].venue.as_str(),
+                pair.min_qty(),
+            )
+            .map(|p| p.base_qty)
+            .unwrap_or(Decimal::ZERO),
+        )
         .max(probe_qty)
         .max(pair.min_qty());
     if min_qty <= Decimal::ZERO {
@@ -58,18 +75,6 @@ pub fn books_tradable(
         return Err("thin_book");
     }
     Ok(())
-}
-
-/// P1: stables treated 1:1. Hook stays so a later feed can trip the fuse.
-pub fn stable_ok(cfg: &AppConfig, usdc_usdg: Decimal) -> bool {
-    let one = Decimal::ONE;
-    let max = Decimal::from(cfg.system.stable_depeg_bps) / Decimal::from(10_000);
-    let dev = if usdc_usdg > one {
-        usdc_usdg - one
-    } else {
-        one - usdc_usdg
-    };
-    dev <= max
 }
 
 #[cfg(test)]
@@ -120,6 +125,8 @@ mod tests {
             Err("wide_book")
         );
         assert!(books_tradable(&cfg(), &pair(), &good, &good, dec!(0.001)).is_ok());
+        assert_eq!(books_quality_ok(&cfg(), &good, &wide), Err("wide_book"));
+        assert_eq!(books_own_spread_ok(&cfg(), &good, &wide), Err("wide_book"));
     }
 
     /// probe_qty 为 0（配置里没写这个币）时仍要按两腿 min_qty 校验厚度。

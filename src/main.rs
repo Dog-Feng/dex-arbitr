@@ -19,7 +19,7 @@ async fn main() -> Result<()> {
         venues = ?cfg.venues,
         scan = cfg.scan.enabled,
         min_raw = %cfg.scan.min_spread_pct,
-        whitelist = ?cfg.pairs.whitelist,
+        enabled = ?cfg.pairs.enabled.iter().map(|p| p.symbol.as_str()).collect::<Vec<_>>(),
         log_dir = %cfg.system.log_dir,
         "dex-arbitr P1 start"
     );

@@ -487,6 +487,16 @@ fn dec(v: &Value) -> Option<Decimal> {
     if let Some(s) = v.as_str() {
         return Decimal::from_str(s).ok();
     }
-    v.as_f64()
-        .and_then(|f| Decimal::from_str(&f.to_string()).ok())
+    // JSON number 路径：先尝试从原始 JSON 表示解析，避免 f64 中间格式丢精度。
+    // serde_json 在 arbitrary_precision 特性下保留原始字符串；
+    // 没开启时退回 f64，通过 to_string() 重建字符串后解析——精度损失仍限于
+    // f64 的 15-17 有效位，对价格和数量已够用但不完美。
+    if let Some(n) = v.as_number() {
+        // 优先用原始 JSON 数值字符串（arbitrary_precision 模式下可用）
+        let s = n.to_string();
+        if let Ok(d) = Decimal::from_str(&s) {
+            return Some(d);
+        }
+    }
+    None
 }

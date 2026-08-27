@@ -47,13 +47,13 @@ match venue.id.as_str() {
 | `qty_precision` | 数量小数位 |
 | `min_qty` | 最小下单量 |
 
-`qty_precision` 和 `min_qty` 必须真实：定仓向下取整用前者，分批平仓的尾巴判断用后者（`src/domain/grid.rs:67`）。填错会让仓位平不干净。
+`qty_precision` 和 `min_qty` 必须真实：容量校验和配置页精度检查用前者，分批平仓的尾巴判断用后者（`src/domain/grid.rs`）。填错会让仓位平不干净。
 
 **符号归一**在 `src/domain/symbol.rs`。新所若用第三种计价符号（如 `BTC-PERP`），要在这里加映射，否则配不成 Pair。稳定币按 1:1 折算。
 
 ### 1.3 `Bbo`
 
-`bid`／`ask`／`bid_qty`／`ask_qty`／`bids`／`asks`／`ts: Instant`。`ts` 是新鲜度门输入，必须是**收到推送的时刻**，不能用交易所时间戳（时钟偏移会让新鲜度门失效）。深度 `bids/asks` 可只给一档，但一档数量必须准——定仓的深度上限靠它。
+`bid`／`ask`／`bid_qty`／`ask_qty`／`bids`／`asks`／`ts: Instant`。`ts` 是新鲜度门输入，必须是**收到推送的时刻**，不能用交易所时间戳（时钟偏移会让新鲜度门失效）。深度 `bids/asks` 可只给一档，但一档数量必须准——容量校验的深度上限靠它。
 
 ---
 

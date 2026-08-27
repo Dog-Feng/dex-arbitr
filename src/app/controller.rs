@@ -12,17 +12,17 @@ use tracing::{debug, info, warn};
 use crate::config::{AppConfig, OrderStyle};
 use crate::domain::spread::raw_spread_pct;
 use crate::domain::{
-    is_cross_dex, match_all_pairs, new_books, read_book, whitelist_allows, Bbo, Books, CloseReason,
+    is_cross_dex, match_all_pairs, new_books, read_book, Bbo, Books, CloseReason,
     CloseView, GridEngine, Intent, Pair, VenueId, VenueMarket,
 };
 use crate::exchange::{make_adapter, ExchangePort};
 use crate::exec::{
-    best_sequenced_spread, closing_sequenced_spread, plan_hedge, sequence::sequenced_spread,
-    watch_resting_limit, Adapters, ExecResult, HedgeExecutor, HedgePlan, LimitMarketRun, LimitWatch,
+    best_sequenced_spread, closing_sequenced_spread, plan_hedge, resting_open_spread_ok,
+    sequenced_fee, sequenced_spread, Adapters, ExecResult, HedgeExecutor, HedgePlan, LimitMarketRun,
 };
 use crate::infra::api::{
-    self, ApiHub, ExchangePositionRow, LiveSnapshot, NakedExposureRow, PairRow, PositionRow,
-    VenueBalanceRow, VenueMatchRow,
+    self, ApiHub, AvailableSymbol, AvailableVenuePair, ExchangePositionRow, LiveSnapshot,
+    NakedExposureRow, PairRow, PositionRow, VenueBalanceRow, VenueMatchRow,
 };
 use crate::infra::dashboard::{self, LivePanel};
 use crate::infra::history::{residual_net, HistoryStore, NaturalSpread};
@@ -45,16 +45,20 @@ use super::reconcile::{
 use super::intervention::{Cause, Gate, InterventionGuard, SINGLE_LEG_STREAK_LIMIT};
 use super::probe;
 use super::reduce_only::{is_reduce_only_error, probe_due, ReduceOnlyGuard};
-use super::risk::{books_quality_ok, books_tradable, stable_ok};
+use super::risk::{books_quality_ok, books_tradable};
 use super::scan::OpportunityTracker;
 use super::stability::{Action as StabilityAction, StabilityTracker};
-use super::sizing::{mid_from_bbo, preview_segment_qty, resolve_qty, BindingLeg, LegMargin};
+use super::sizing::{check_capacity, mid_from_bbo, LegMargin};
 
 pub struct Controller {
     cfg: AppConfig,
     adapters: Vec<Arc<dyn ExchangePort>>,
     adapters_by_id: Adapters,
     pairs: Vec<Pair>,
+    /// 点「启动套利」后按所选所 + 用户填写的 symbol 匹配出的所对。启动进程时为空。
+    available_pairs: Vec<Pair>,
+    /// 各所完整永续列表（SoDEX 订 allBookTicker 建别名用）。
+    listed_markets: HashMap<String, Vec<VenueMarket>>,
     books: Books,
     positions: PositionStore,
     grid: GridEngine,
@@ -105,6 +109,8 @@ pub struct Controller {
     balance_low: HashSet<String>,
     /// 上次把内存盘口推到 HTTP 快照的时间。事件环按 WS 更新，但推页面要节流。
     last_snap_at: Instant,
+    /// 残仓低于 min_qty 的起始时刻。连续 5 分钟才报灰尘仓介入。
+    dust_since: HashMap<String, Instant>,
 }
 
 struct LoggedToken {
@@ -206,6 +212,8 @@ impl Controller {
             adapters,
             adapters_by_id,
             pairs: Vec::new(),
+            available_pairs: Vec::new(),
+            listed_markets: HashMap::new(),
             books: new_books(),
             positions: PositionStore::default(),
             grid: GridEngine::default(),
@@ -244,6 +252,7 @@ impl Controller {
             balance_critical: HashSet::new(),
             balance_low: HashSet::new(),
             last_snap_at: Instant::now(),
+            dust_since: HashMap::new(),
         };
         this.bootstrap().await?;
         this.publish_api_snapshot();
@@ -263,10 +272,10 @@ impl Controller {
         );
         info!(venues = ?this.balance.by_venue, "account balances loaded");
         this.publish_api_snapshot();
-        // 无 HTTP 面板时没有「启动套利」按钮，按 yaml 里的所立刻匹配。
+        // 无 HTTP 面板时没有「启动套利」按钮，立刻按 yaml 启用的交易对激活。
         if this.control.is_none() {
-            if let Err(err) = this.apply_venue_match(this.cfg.venues.clone()).await {
-                warn!(error = %err, "startup pair match failed");
+            if let Err(err) = this.activate_pairs().await {
+                warn!(error = %err, "startup pair activate failed");
             }
             this.publish_api_snapshot();
         }
@@ -374,23 +383,21 @@ impl Controller {
             return None;
         }
         ctrl.rematch = false;
-        let venues = if ctrl.params.active_venues.is_empty() {
-            self.cfg.venues.clone()
-        } else {
-            ctrl.params.active_venues.clone()
-        };
-        Some(venues)
+        if ctrl.params.active_venues.len() < 2 {
+            return None;
+        }
+        Some(ctrl.params.active_venues.clone())
     }
 
     async fn rematch_if_requested(&mut self) {
         self.sync_page_config();
-        let Some(venues) = self.take_rematch() else {
+        let Some(_venues) = self.take_rematch() else {
             return;
         };
         self.matching = true;
         self.ui_pairs.clear();
         self.publish_api_snapshot();
-        let result = self.apply_venue_match(venues).await;
+        let result = self.activate_pairs().await;
         self.matching = false;
         if let Err(err) = result {
             warn!(error = %err, "match pairs for selected venues failed");
@@ -412,47 +419,179 @@ impl Controller {
         });
     }
 
-    /// 按所选 DEX 拉永续列表、两两匹配，并为尚未订阅的所拉起盘口。
-    async fn apply_venue_match(&mut self, venues: Vec<String>) -> Result<()> {
-        self.sync_page_config();
-        let mut listed: Vec<(String, Vec<VenueMarket>)> = Vec::new();
-        for id in &venues {
+    /// 仅在启动套利时调用：对所选所 `list_perps`，再按用户填写的 symbol 过滤。
+    async fn load_available_pairs(&mut self, venue_ids: &[String]) -> Result<()> {
+        let mut listed: Vec<Vec<VenueMarket>> = Vec::new();
+        self.listed_markets.clear();
+        for id in venue_ids {
             let Some(adapter) = self.adapters_by_id.get(id).cloned() else {
-                warn!(venue = %id, "active venue not loaded; skip");
                 continue;
             };
-            listed.push((id.clone(), adapter.list_perps().await?));
-        }
-        let listed_all = listed.clone();
-        let wl = self.cfg.pairs.whitelist.clone();
-        if !wl.is_empty() {
-            for (_, mkts) in &mut listed {
-                mkts.retain(|m| whitelist_allows(&m.base, &wl));
+            match adapter.list_perps().await {
+                Ok(m) => {
+                    listed.push(m.clone());
+                    self.listed_markets.insert(id.clone(), m);
+                }
+                Err(e) => warn!(venue = %id, error = %e, "list_perps failed; venue excluded"),
             }
         }
         if listed.len() < 2 {
-            anyhow::bail!("need at least two selected venues to match pairs");
+            anyhow::bail!("need at least two venues with market data");
         }
-        let books: Vec<Vec<VenueMarket>> = listed.iter().map(|(_, b)| b.clone()).collect();
-        let matched = match_all_pairs(&books);
-        self.pairs = self.merge_kept_pairs(matched);
+        let wanted: HashSet<String> = self
+            .cfg
+            .pairs
+            .enabled
+            .iter()
+            .map(|p| p.symbol.to_ascii_uppercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if wanted.is_empty() {
+            self.available_pairs.clear();
+            info!("no enabled symbols; skip pair matching");
+            return Ok(());
+        }
+        self.available_pairs = match_all_pairs(&listed)
+            .into_iter()
+            .filter(|p| wanted.contains(&p.legs[0].base.to_ascii_uppercase()))
+            .collect();
+        info!(
+            n = self.available_pairs.len(),
+            venues = ?venue_ids,
+            symbols = ?wanted,
+            "available pairs loaded for selected venues"
+        );
+        Ok(())
+    }
+
+    /// 页面点启动或 rematch 时执行。只订阅选中且配置合法的对。
+    async fn activate_pairs(&mut self) -> Result<()> {
+        self.sync_page_config();
+        let active_venues = self
+            .live_params()
+            .map(|lp| lp.active_venues.clone())
+            .unwrap_or_else(|| self.cfg.venues.clone());
+        if active_venues.len() < 2 {
+            anyhow::bail!("need at least two selected venues");
+        }
+        self.load_available_pairs(&active_venues).await?;
+
+        let selected: Vec<Pair> = self
+            .available_pairs
+            .iter()
+            .filter(|p| {
+                let v0 = p.legs[0].venue.as_str();
+                let v1 = p.legs[1].venue.as_str();
+                active_venues.iter().any(|v| v == v0)
+                    && active_venues.iter().any(|v| v == v1)
+            })
+            .filter(|p| self.cfg.pair_setting(&p.legs[0].base).is_some())
+            .filter(|p| self.validate_pair_qty(p))
+            .cloned()
+            .collect();
+        for s in &self.cfg.pairs.enabled {
+            let hit = selected
+                .iter()
+                .any(|p| p.legs[0].base.eq_ignore_ascii_case(&s.symbol));
+            if !hit {
+                warn!(
+                    symbol = %s.symbol,
+                    "no matching venue pair among selected exchanges; skipped"
+                );
+            }
+        }
+
+        self.pairs = self.merge_kept_pairs(selected);
+        self.subscribe_for_active().await?;
+        let panel_rows = if self.cfg.execution.enabled || !self.cfg.scan.enabled {
+            self.pairs.len() * self.pair_stride()
+        } else {
+            0
+        };
+        self.panel.resize(panel_rows);
+        self.seed_matched_pairs();
+        info!(
+            n = self.pairs.len(),
+            available = self.available_pairs.len(),
+            scan = self.cfg.scan.enabled,
+            execution = self.cfg.execution.enabled,
+            enabled = ?self.cfg.pairs.enabled.iter().map(|p| p.symbol.as_str()).collect::<Vec<_>>(),
+            "activated perp pairs"
+        );
+        self.log_effective_thresholds();
+        for row in self.venue_match_rows() {
+            info!(
+                left = %row.left,
+                right = %row.right,
+                n = row.n,
+                "venue pair intersection"
+            );
+        }
+        self.start_private_streams(&active_venues).await;
+        Ok(())
+    }
+
+    fn validate_pair_qty(&self, pair: &Pair) -> bool {
+        let symbol = &pair.legs[0].base;
+        let Some(s) = self.cfg.pair_setting(symbol) else {
+            return false;
+        };
+        let min_qty = pair.min_qty();
+        let precision = pair
+            .legs
+            .iter()
+            .map(|l| l.qty_precision)
+            .min()
+            .unwrap_or(8);
+        if s.base_qty < min_qty {
+            tracing::error!(
+                pair = %pair.pair_id,
+                venue_a = pair.legs[0].venue.as_str(),
+                venue_b = pair.legs[1].venue.as_str(),
+                base_qty = %s.base_qty,
+                min_qty = %min_qty,
+                "configured base_qty below venue minimum; pair skipped"
+            );
+            return false;
+        }
+        if s.base_qty != s.base_qty.round_dp(precision) {
+            tracing::error!(
+                pair = %pair.pair_id,
+                base_qty = %s.base_qty,
+                precision,
+                "configured base_qty violates venue precision; pair skipped"
+            );
+            return false;
+        }
+        true
+    }
+
+    async fn subscribe_for_active(&mut self) -> Result<()> {
         let tx = self
             .bbo_tx
             .clone()
             .ok_or_else(|| anyhow::anyhow!("bbo channel missing"))?;
-        for (id, mkts) in &listed {
+        let mut by_venue: HashMap<String, Vec<VenueMarket>> = HashMap::new();
+        for pair in &self.pairs {
+            for leg in &pair.legs {
+                by_venue
+                    .entry(leg.venue.as_str().to_string())
+                    .or_default()
+                    .push(leg.clone());
+            }
+        }
+        for (id, mkts) in &by_venue {
             let Some(adapter) = self.adapters_by_id.get(id).cloned() else {
                 continue;
             };
-            // SoDEX 订的是全市场 allBookTicker：用完整列表建别名，只订一次。
             if id == "sodex" {
                 if self.subscribed.contains(id) {
                     continue;
                 }
-                let all = listed_all
-                    .iter()
-                    .find(|(vid, _)| vid == id)
-                    .map(|(_, m)| m.as_slice())
+                let all = self
+                    .listed_markets
+                    .get(id)
+                    .map(|m| m.as_slice())
                     .unwrap_or(mkts);
                 adapter.subscribe_bbo(all, tx.clone()).await?;
                 self.subscribed.insert(id.clone());
@@ -469,31 +608,24 @@ impl Controller {
             adapter.subscribe_bbo(&fresh, tx.clone()).await?;
             self.subscribed.insert(id.clone());
         }
-        let panel_rows = if self.cfg.execution.enabled || !self.cfg.scan.enabled {
-            self.pairs.len() * self.pair_stride()
-        } else {
-            0
-        };
-        self.panel.resize(panel_rows);
-        self.seed_matched_pairs();
-        info!(
-            n = self.pairs.len(),
-            venues = ?listed.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
-            scan = self.cfg.scan.enabled,
-            execution = self.cfg.execution.enabled,
-            whitelist = ?self.cfg.pairs.whitelist,
-            "matched perp pairs"
-        );
-        self.log_effective_thresholds();
-        for row in self.venue_match_rows() {
-            info!(
-                left = %row.left,
-                right = %row.right,
-                n = row.n,
-                "venue pair intersection"
-            );
-        }
         Ok(())
+    }
+
+    async fn start_private_streams(&self, venues: &[String]) {
+        if self.cfg.system.monitor_only || self.cfg.execution.paper_trading {
+            return;
+        }
+        for id in venues {
+            let path = crate::exchange::venue_yaml_path(id);
+            match crate::exchange::bridge_watch(&path).await {
+                Ok(()) => info!(venue = id, "private order stream started"),
+                Err(err) => warn!(
+                    venue = id,
+                    error = %err,
+                    "private order stream unavailable; falling back to REST polling"
+                ),
+            }
+        }
     }
 
     fn merge_kept_pairs(&self, mut new_pairs: Vec<Pair>) -> Vec<Pair> {
@@ -535,28 +667,58 @@ impl Controller {
     }
 
     /// 开仓用配置的 T1 对比毛价差，不按所对费率抬高。
-    /// T1 低于某所对平仓费时打 warn：格子仍会开，但往返可能覆盖不了手续费。
+    /// T1 低于某所对往返费时打 warn：格子仍会开，但往返可能覆盖不了手续费。
     fn log_effective_thresholds(&self) {
-        let t1 = self.cfg.grid.initial_spread_threshold;
-        info!(t1 = %t1, "entry uses configured T1 on raw spread");
         let mut seen = HashSet::new();
         for pair in &self.pairs {
             let a = &pair.legs[0].venue;
             let b = &pair.legs[1].venue;
-            if !seen.insert((a.as_str().to_string(), b.as_str().to_string())) {
+            let Some(params) = self.grid_params(pair) else {
+                continue;
+            };
+            if !seen.insert((
+                pair.legs[0].base.clone(),
+                a.as_str().to_string(),
+                b.as_str().to_string(),
+            )) {
                 continue;
             }
-            let fee = self.cfg.round_leg_fee(a, b);
-            if t1 < fee {
+            let round_trip = sequenced_fee(&self.cfg, a, b) * Decimal::from(2);
+            info!(
+                symbol = %pair.legs[0].base,
+                left = a.as_str(),
+                right = b.as_str(),
+                t1 = %params.initial,
+                step = %params.step,
+                round_trip_fee = %round_trip,
+                "entry uses configured T1 on raw spread"
+            );
+            if params.initial < round_trip {
                 warn!(
+                    symbol = %pair.legs[0].base,
                     left = a.as_str(),
                     right = b.as_str(),
-                    t1 = %t1,
-                    exit_fee = %fee,
-                    "T1 is below this venue pair's exit fee; opens may not cover round-trip"
+                    t1 = %params.initial,
+                    round_trip_fee = %round_trip,
+                    "T1 is below this venue pair's round-trip fee; opens may not cover costs"
                 );
             }
         }
+    }
+
+    fn grid_params(&self, pair: &Pair) -> Option<crate::domain::GridParams> {
+        self.cfg.grid_for(
+            &pair.legs[0].base,
+            pair.legs[0].venue.as_str(),
+            pair.legs[1].venue.as_str(),
+            pair.min_qty(),
+        )
+    }
+
+    fn position_mid(&self, pos: &crate::domain::Position) -> Option<Decimal> {
+        let bb = self.book(pos.buy.as_str(), &pos.pair_id)?;
+        let sb = self.book(pos.sell.as_str(), &pos.pair_id)?;
+        mid_from_bbo(&bb, &sb)
     }
 
     fn book(&self, venue: &str, pair_id: &str) -> Option<Bbo> {
@@ -1196,13 +1358,16 @@ impl Controller {
             self.watch_pending_slot(pair_i, &pair, &slot);
             return;
         }
+        // 两腿市价没有 pending，只有 hedging。不能空 return：否则监控行停在
+        // 「开仓」且价差/持仓整行冻住，直到成交回调。
         if self.hedging.contains(&slot) {
+            self.paint_inflight_slot(pair_i, &pair, &slot);
             return;
         }
 
         // 活跃所过滤：只有两腿都在 active_venues 里的 pair 才能开仓。
         // 平仓不受此限——已有持仓的 pair 不管所是否还在列表里都继续平。
-        // 注意：空列表 = 全部所都活跃（默认行为）。
+        // 空列表 = 未选所，不开新仓（页面默认不勾 DEX）。
         let has_pos = self
             .positions
             .get(&slot)
@@ -1210,14 +1375,14 @@ impl Controller {
             .unwrap_or(false);
         if !has_pos {
             if let Some(lp) = self.live_params() {
-                if !lp.active_venues.is_empty() {
-                    let v0 = pair.legs[0].venue.as_str();
-                    let v1 = pair.legs[1].venue.as_str();
-                    if !lp.active_venues.iter().any(|v| v == v0)
-                        || !lp.active_venues.iter().any(|v| v == v1)
-                    {
-                        return;
-                    }
+                let v0 = pair.legs[0].venue.as_str();
+                let v1 = pair.legs[1].venue.as_str();
+                if lp.active_venues.len() < 2
+                    || !lp.active_venues.iter().any(|v| v == v0)
+                    || !lp.active_venues.iter().any(|v| v == v1)
+                {
+                    self.grid.forget(&slot);
+                    return;
                 }
             }
         }
@@ -1230,16 +1395,19 @@ impl Controller {
             (None, None) => {
                 self.panel.stats.bump_skip("wait");
                 self.mark_ui_status(&slot, "等盘口");
+                self.grid.forget(&slot);
                 return;
             }
             (None, Some(_)) => {
                 self.panel.stats.bump_skip("wait");
                 self.mark_ui_status(&slot, &format!("等盘口 {}", v0.as_str()));
+                self.grid.forget(&slot);
                 return;
             }
             (Some(_), None) => {
                 self.panel.stats.bump_skip("wait");
                 self.mark_ui_status(&slot, &format!("等盘口 {}", v1.as_str()));
+                self.grid.forget(&slot);
                 return;
             }
             (Some(_), Some(_)) => {}
@@ -1250,36 +1418,43 @@ impl Controller {
         let Some(mid) = mid_from_bbo(&b0, &b1) else {
             self.panel.stats.bump_skip("no_mid");
             self.mark_ui_status(&slot, "无中价");
+            self.grid.forget(&slot);
             return;
         };
         let base = pair.legs[0].base.clone();
         let pos = self.positions.get(&slot).cloned();
 
-        // 有仓：入口只查数据质量。格子/剥头皮平仓的一档厚度在作出 Close
-        // 之后按**本笔 qty** 校验，不够就丢掉平仓意图（对齐参考）。
+        let Some(mut params) = self.cfg.grid_for(
+            &base,
+            v0.as_str(),
+            v1.as_str(),
+            pair.min_qty(),
+        ) else {
+            self.mark_ui_status(&slot, "未配置");
+            return;
+        };
+        // `base_qty` 是**单格**数量。有仓时用 Position 里冻结的尺，
+        // 绝不能拿总持仓量覆盖，否则 3 格会被算成 1 格。
+        if let Some(p) = pos.as_ref().filter(|p| p.base_qty > Decimal::ZERO) {
+            params.base_qty = p.base_qty;
+        }
+
+        // 有仓：新鲜度 + 合法 BBO + 本地点差。点差过宽时加格、减格都不做。
+        // 格子/剥头皮的一档厚度在作出 Close 之后按本笔 qty 校验。
         // 空仓：数据质量 + 一档深度都要过。
         let gate = if pos.is_some() {
             books_quality_ok(&self.cfg, &b0, &b1)
         } else {
-            let probe = self
-                .cfg
-                .min_book_qty(&base)
-                .max(self.cfg.grid_for(&base, pair.min_qty()).base_qty);
+            let probe = self.cfg.min_book_qty(&base).max(params.base_qty);
             books_tradable(&self.cfg, &pair, &b0, &b1, probe)
         };
         if let Err(reason) = gate {
             self.panel.stats.bump_skip(reason);
             self.set_spread(pair_i, dashboard::skip_lines(&pair.pair_id, reason));
             self.paint_skip_with_books(&slot, &pair, &v0, &v1, &b0, &b1, pos.as_ref(), reason);
+            self.grid.forget(&slot);
             return;
         }
-        if !stable_ok(&self.cfg, Decimal::ONE) {
-            self.panel.stats.bump_skip("depeg");
-            self.set_spread(pair_i, dashboard::skip_lines(&pair.pair_id, "depeg"));
-            self.paint_skip_with_books(&slot, &pair, &v0, &v1, &b0, &b1, pos.as_ref(), "depeg");
-            return;
-        }
-
         // 稳定性采样：**每轮都要记**，无论后面是否走到检查。
         // 漏采样会让窗口永远攒不满，检查退化成「一直 Collecting」全程不放行。
         // 两腿各自的中价（参考项目买卖腿分开判波动，不能合并成一个数）。
@@ -1292,11 +1467,6 @@ impl Controller {
             self.cfg.risk.price_stability_window_secs,
         );
 
-        // `base_qty` 是**单格**数量，多格逻辑靠它把持仓量换算成格数
-        // （`segments_held = qty / base_qty`）。有仓时绝不能拿总持仓量覆盖它，
-        // 否则 3 格仓位会被算成 1 格，按格减仓直接失效。
-        let mut params = self.cfg.grid_for(&base, pair.min_qty());
-
         // 有仓 → 锁定持仓方向；空仓 → 双向取优。
         // 有仓时绝不能再取双向最优：方向一翻，显示和判定都会跳到反方向。
         // 开仓视角对持仓不带 qty 做一档校验（加仓量要到决策后才知道）。
@@ -1307,97 +1477,13 @@ impl Controller {
             }
             None => best_sequenced_spread(&self.cfg, &v0, &v1, &b0, &b1, params.base_qty),
         };
-        let Some(mut net) = net else {
+        let Some(net) = net else {
             self.panel.stats.bump_skip("no_spread");
             self.set_spread(pair_i, dashboard::skip_lines(&pair.pair_id, "no_spread"));
             self.mark_ui_status(&slot, "无价差");
+            self.grid.forget(&slot);
             return;
         };
-
-        if pos.is_none() {
-            let reserved = self
-                .positions
-                .reserved_margin_by_venue(|v| self.cfg.leverage_for(v));
-            let global_min = self.balance.global_min();
-            let (buy_leg, sell_leg) = (
-                pair.leg(net.buy.as_str()).cloned(),
-                pair.leg(net.sell.as_str()).cloned(),
-            );
-            let (Some(buy_leg), Some(sell_leg)) = (buy_leg, sell_leg) else {
-                return;
-            };
-            let (buy_book, sell_book) = books_for_direction(&net.buy, &v0, &b0, &b1);
-            let Some(r) = resolve_qty(
-                &self.cfg.sizing,
-                global_min,
-                self.leg_margin(&reserved, buy_leg.venue.as_str()),
-                self.leg_margin(&reserved, sell_leg.venue.as_str()),
-                buy_book,
-                sell_book,
-                mid,
-                &buy_leg,
-                &sell_leg,
-            ) else {
-                self.panel.stats.bump_skip("no_size");
-                self.set_spread(pair_i, dashboard::skip_lines(&pair.pair_id, "no_size"));
-                self.fill_monitor_row(
-                    &slot,
-                    &pair,
-                    &net,
-                    pos.as_ref(),
-                    "定仓不足",
-                    &b0,
-                    &b1,
-                    Some(mid),
-                );
-                return;
-            };
-            // `resolve_qty` 给的是保证金/深度允许的**总量**上限。多格下
-            // 实际下单量 = base_qty × segments，所以单格量要按最大格数摊分，
-            // 否则开满 max_segments 格会把保证金上限撑破 max_segments 倍。
-            let segs = Decimal::from(params.max_segments.max(1));
-            params.base_qty = r.qty / segs;
-            let bind = match r.binding {
-                BindingLeg::Buy => buy_leg.venue.as_str(),
-                BindingLeg::Sell => sell_leg.venue.as_str(),
-            };
-            info!(
-                pair = %pair.pair_id,
-                buy = %net.buy,
-                sell = %net.sell,
-                binding_venue = bind,
-                notional_usdc = %r.notional_usdc,
-                total_qty = %r.qty,
-                per_segment_qty = %params.base_qty,
-                max_segments = params.max_segments,
-                "sized by min-margin leg; same qty on both venues"
-            );
-            // 用真实 qty 复核一档厚度。**锁在刚才定仓的那个方向**上重算，
-            // 不能再取双向最优：换了方向，qty 就是按另一对盘口算出来的。
-            let Some(net2) = sequenced_spread(
-                &self.cfg,
-                &net.buy,
-                &net.sell,
-                buy_book,
-                sell_book,
-                r.qty,
-            ) else {
-                self.panel.stats.bump_skip("thin_book");
-                self.set_spread(pair_i, dashboard::skip_lines(&pair.pair_id, "thin_book"));
-                self.fill_monitor_row(
-                    &slot,
-                    &pair,
-                    &net,
-                    pos.as_ref(),
-                    "深度不足",
-                    &b0,
-                    &b1,
-                    Some(mid),
-                );
-                return;
-            };
-            net = net2;
-        }
 
         let cross = is_cross_dex(net.buy.as_str(), net.sell.as_str());
         let natural = self.sample_and_natural(&pair, &net, cross);
@@ -1419,6 +1505,16 @@ impl Controller {
             })
         });
 
+        if pos
+            .as_ref()
+            .is_some_and(|p| p.qty > Decimal::ZERO && params.base_qty <= Decimal::ZERO)
+        {
+            warn!(
+                pair = %pair.pair_id,
+                "held position has no segment size; cannot add or reduce grids"
+            );
+        }
+
         let mut intent = self.grid.decide(
             &slot,
             &net,
@@ -1428,16 +1524,74 @@ impl Controller {
             Instant::now(),
         );
 
+        // 容量校验只拦 Open：Close 绝不能被保证金/深度拦住，否则仓位平不掉。
+        // 空仓开仓与加仓走同一条路径。本地点差在入口 `books_quality_ok` 已查过。
+        if let Intent::Open { qty, buy, sell, .. } = &intent {
+            let reserved = self.positions.reserved_margin_by_venue(
+                |v| self.cfg.leverage_for(v),
+                |p| self.position_mid(p),
+            );
+            let (bb, sb) = books_for_direction(buy, &v0, &b0, &b1);
+            if let Err(reason) = check_capacity(
+                &self.cfg.sizing,
+                *qty,
+                self.leg_margin(&reserved, buy.as_str()),
+                self.leg_margin(&reserved, sell.as_str()),
+                bb,
+                sb,
+                mid,
+            ) {
+                self.panel.stats.bump_skip(reason);
+                self.set_spread(pair_i, dashboard::skip_lines(&pair.pair_id, reason));
+                self.fill_monitor_row(
+                    &slot,
+                    &pair,
+                    &net,
+                    pos.as_ref(),
+                    &skip_reason_label(reason),
+                    &b0,
+                    &b1,
+                    Some(mid),
+                );
+                return;
+            }
+            if sequenced_spread(&self.cfg, buy, sell, bb, sb, *qty).is_none() {
+                self.panel.stats.bump_skip("thin_book");
+                self.set_spread(pair_i, dashboard::skip_lines(&pair.pair_id, "thin_book"));
+                self.fill_monitor_row(
+                    &slot,
+                    &pair,
+                    &net,
+                    pos.as_ref(),
+                    "深度不足",
+                    &b0,
+                    &b1,
+                    Some(mid),
+                );
+                return;
+            }
+        }
+
         // 资金费率维度。价差看的是「进出能不能赚」,费率看的是「持着要不要
         // 付钱」——两个所的费率不对称时，一个价差本来够的仓会被费率吃穿。
         //
         // 放在这里（grid 决策之后）而不是塞进 `GridEngine`：费率不是格子状态，
         // 它对开仓是**否决权**、对持仓是**独立退出理由**,不该和格子判据搅在一起。
+        let want_open = matches!(intent, Intent::Open { .. });
         intent = self.apply_funding(&slot, &pair, &net, pos.as_ref(), intent);
-        intent = self.apply_risk_limits(&pair, &net, pos.as_ref(), intent);
+        let funding_blocked = want_open && matches!(intent, Intent::Hold);
+        let (next, risk_skip) = self.apply_risk_limits(&pair, &net, pos.as_ref(), intent);
+        intent = next;
         if matches!(intent, Intent::Open { .. }) && !self.arbitrage_enabled() {
             intent = Intent::Hold;
         }
+        let open_skip = risk_skip.or(if funding_blocked {
+            Some("费率不利")
+        } else if want_open && matches!(intent, Intent::Hold) && !self.arbitrage_enabled() {
+            Some("未启动")
+        } else {
+            None
+        });
 
         // 对齐参考：一档撑不住本笔平仓量 → 丢掉格子/剥头皮平仓意图。
         // 费率/超时/余额清仓不走这条（风控离场，不是网格平仓）。
@@ -1494,13 +1648,14 @@ impl Controller {
         let nat_value = self.ui_nat(&pair, &net, natural.as_ref());
 
         self.panel.stats.bump_intent(label);
+        let ui = open_skip.unwrap_or_else(|| ui_intent_label(&intent, label));
         self.record_ui_pair(
             &slot,
             &pair,
             &net,
             &params,
             pos.as_ref(),
-            label,
+            ui,
             residual,
             nat_value,
         );
@@ -1517,45 +1672,60 @@ impl Controller {
                 residual,
                 pts,
                 min_pts,
-                label,
+                ui,
             ),
         );
 
         if matches!(intent, Intent::Hold) {
+            self.maybe_mark_dust(&slot, &pair, pos.as_ref(), &params);
             return;
         }
 
-        // 价格稳定性（对齐参考 `passes_price_stability`）：先挂后吃最怕插针——
-        // 挂单在插针价上成交，对冲腿却回不来。开仓和平仓独立判定。
-        let stab_action = if matches!(intent, Intent::Close { .. }) {
-            StabilityAction::Close
-        } else {
-            StabilityAction::Open
-        };
-        let state = self.stability.check(
-            &slot,
-            stab_action,
-            Instant::now(),
-            self.cfg.risk.price_stability_window_secs,
-            self.cfg.risk.price_stability_threshold_pct,
-        );
-        if !state.passed() {
-            let reason = state.skip_label();
-            if self.stability.changed(&slot, stab_action, state) {
-                let vol = self
-                    .stability
-                    .volatility(&slot, Instant::now(), self.cfg.risk.price_stability_window_secs);
-                info!(
-                    pair = %pair.pair_id,
-                    action = ?stab_action,
-                    volatility_pct = ?vol.map(|v| v.round_dp(4)),
-                    threshold_pct = %self.cfg.risk.price_stability_threshold_pct,
-                    "stability gate blocked action"
-                );
+        // 价格稳定性：先挂后吃最怕插针。加格、减格都要过（开仓/平仓独立记窗口）。
+        // 超时/余额/费率清仓不走这条，否则插针期会把亏损仓锁死。
+        let forced_exit = matches!(
+            &intent,
+            Intent::Close {
+                reason: CloseReason::HoldTimeout
+                    | CloseReason::BalanceFloor
+                    | CloseReason::FundingStopLoss,
+                ..
             }
-            self.panel.stats.bump_skip(reason);
-            self.set_spread(pair_i, dashboard::skip_lines(&pair.pair_id, reason));
-            return;
+        );
+        if !forced_exit {
+            let stab_action = if matches!(intent, Intent::Close { .. }) {
+                StabilityAction::Close
+            } else {
+                StabilityAction::Open
+            };
+            let state = self.stability.check(
+                &slot,
+                stab_action,
+                Instant::now(),
+                self.cfg.risk.price_stability_window_secs,
+                self.cfg.risk.price_stability_threshold_pct,
+            );
+            if !state.passed() {
+                let reason = state.skip_label();
+                if self.stability.changed(&slot, stab_action, state) {
+                    let vol = self.stability.volatility(
+                        &slot,
+                        Instant::now(),
+                        self.cfg.risk.price_stability_window_secs,
+                    );
+                    info!(
+                        pair = %pair.pair_id,
+                        action = ?stab_action,
+                        volatility_pct = ?vol.map(|v| v.round_dp(4)),
+                        threshold_pct = %self.cfg.risk.price_stability_threshold_pct,
+                        "stability gate blocked action"
+                    );
+                }
+                self.panel.stats.bump_skip(reason);
+                self.set_spread(pair_i, dashboard::skip_lines(&pair.pair_id, reason));
+                self.paint_skip_with_books(&slot, &pair, &v0, &v1, &b0, &b1, pos.as_ref(), reason);
+                return;
+            }
         }
 
         if let Intent::Open { grid, qty, .. } = &intent {
@@ -1583,10 +1753,12 @@ impl Controller {
             );
         }
         if self.positions.is_pending(&slot) {
+            self.mark_ui_status(&slot, "开仓中");
             return;
         }
         if self.execution_in_flight() {
             self.panel.stats.bump_skip("in_flight");
+            self.paint_skip_with_books(&slot, &pair, &v0, &v1, &b0, &b1, pos.as_ref(), "in_flight");
             return;
         }
         // 人工介入等待：开仓和平仓**都挡**（对齐参考 `should_block` 在开仓
@@ -1630,6 +1802,9 @@ impl Controller {
                     waited_secs = waited.as_secs(),
                     "pair waiting for manual intervention; open and close both skipped"
                 );
+                self.paint_skip_with_books(
+                    &slot, &pair, &v0, &v1, &b0, &b1, pos.as_ref(), "intervention",
+                );
                 return;
             }
         }
@@ -1637,6 +1812,7 @@ impl Controller {
         // 锁死在交易所里，比开不了仓危险得多（对齐参考：closes 始终允许）。
         if matches!(intent, Intent::Open { .. }) && self.reduce_only.is_blocked(&pair.pair_id) {
             self.panel.stats.bump_skip("reduce_only");
+            self.paint_skip_with_books(&slot, &pair, &v0, &v1, &b0, &b1, pos.as_ref(), "reduce_only");
             return;
         }
         if matches!(intent, Intent::Open { .. })
@@ -1644,14 +1820,43 @@ impl Controller {
             && !self.positions.can_open(self.cfg.sizing.max_concurrent_pairs)
         {
             self.panel.stats.bump_skip("slots");
+            self.paint_skip_with_books(&slot, &pair, &v0, &v1, &b0, &b1, pos.as_ref(), "slots");
             return;
         }
 
         let Some(mut plan) = plan_hedge(&pair, &intent, pos.as_ref(), &self.cfg) else {
+            self.paint_skip_with_books(&slot, &pair, &v0, &v1, &b0, &b1, pos.as_ref(), "no_plan");
             return;
         };
         plan.decision_net_pct = net.net_pct;
         plan.decision_raw_pct = net.raw_pct;
+        // 固化开仓时的单格数量，供 Position.base_qty 使用。平仓时 params.base_qty
+        // 由持仓自身携带，不需要从 plan 传入，所以只在 is_open 时写有意义的值。
+        if plan.is_open {
+            plan.base_qty = params.base_qty;
+        }
+        match &intent {
+            Intent::Open { grid, .. } => {
+                plan.grid_from = pos
+                    .as_ref()
+                    .map(|p| self.grid.segments_held(p.qty, params.base_qty))
+                    .unwrap_or(0);
+                plan.grid_to = *grid;
+            }
+            Intent::Close {
+                grid,
+                round_trip_pct,
+                ..
+            } => {
+                plan.grid_from = pos
+                    .as_ref()
+                    .map(|p| self.grid.segments_held(p.qty, params.base_qty))
+                    .unwrap_or(0);
+                plan.grid_to = *grid;
+                plan.pnl_pct = Some(*round_trip_pct);
+            }
+            Intent::Hold => {}
+        }
         if self.cfg.live_test.dex_test_mode
             && !self.cfg.execution.paper_trading
             && plan.qty > self.cfg.live_test.max_qty
@@ -1674,6 +1879,9 @@ impl Controller {
         // 而 pending 只在执行回调里清理，于是第一个 open 信号就把整个决策环卡死。
         if self.cfg.system.monitor_only {
             self.panel.stats.skip_send += 1;
+            self.paint_skip_with_books(
+                &slot, &pair, &v0, &v1, &b0, &b1, pos.as_ref(), "monitor_only",
+            );
             return;
         }
 
@@ -1696,6 +1904,8 @@ impl Controller {
 
         // 实盘：baseline 必须是查询成功的真实持仓。取不到就放弃本轮——
         // 用 0 兜底会把该所既有仓位误判成第一腿成交，直接发出裸的第二腿。
+        // 查询期间事件环会卡住；先把「开仓中」推给页面，避免整行还停在上一拍。
+        self.publish_api_snapshot();
         let baseline = match self.snapshot_first_leg_position(&plan.first).await {
             Some(v) => v,
             None => {
@@ -1705,6 +1915,9 @@ impl Controller {
                     "cannot read first leg baseline position; skipping this round"
                 );
                 self.panel.stats.bump_skip("no_baseline");
+                self.paint_skip_with_books(
+                    &slot, &pair, &v0, &v1, &b0, &b1, pos.as_ref(), "no_baseline",
+                );
                 return;
             }
         };
@@ -1853,7 +2066,7 @@ impl Controller {
         net: &crate::domain::NetSpread,
         pos: Option<&crate::domain::Position>,
         intent: Intent,
-    ) -> Intent {
+    ) -> (Intent, Option<&'static str>) {
         // ── 强制平仓维度 ──
         let lp = self.live_params();
         let max_position_hours = lp.as_ref().map(|p| p.max_position_hours).unwrap_or(self.cfg.risk.max_position_hours);
@@ -1866,12 +2079,15 @@ impl Controller {
                         limit_hours = max_position_hours,
                         "持仓超时，强制平仓"
                     );
-                    return Intent::Close {
-                        qty: p.qty,
-                        grid: p.grid,
-                        reason: CloseReason::HoldTimeout,
-                        round_trip_pct: net.net_pct,
-                    };
+                    return (
+                        Intent::Close {
+                            qty: p.qty,
+                            grid: p.grid,
+                            reason: CloseReason::HoldTimeout,
+                            round_trip_pct: net.net_pct,
+                        },
+                        None,
+                    );
                 }
                 // 余额跌破清仓线：任何一腿告急就平——对冲仓两条腿共命，
                 // 一腿被强平另一腿立刻裸奔。
@@ -1883,18 +2099,21 @@ impl Controller {
                         buy = %p.buy, sell = %p.sell,
                         "余额低于清仓线，强制平仓"
                     );
-                    return Intent::Close {
-                        qty: p.qty,
-                        grid: p.grid,
-                        reason: CloseReason::BalanceFloor,
-                        round_trip_pct: net.net_pct,
-                    };
+                    return (
+                        Intent::Close {
+                            qty: p.qty,
+                            grid: p.grid,
+                            reason: CloseReason::BalanceFloor,
+                            round_trip_pct: net.net_pct,
+                        },
+                        None,
+                    );
                 }
             }
         }
 
         let Intent::Open { qty, buy, sell, .. } = &intent else {
-            return intent;
+            return (intent, None);
         };
         let (qty, buy, sell) = (*qty, buy.clone(), sell.clone());
 
@@ -1911,7 +2130,7 @@ impl Controller {
                     .unwrap_or(0);
                 self.panel.stats.bump_skip("backoff");
                 debug!(pair = %pair.pair_id, venue = v, wait_secs = wait, "跳过开仓：错误退避中");
-                return Intent::Hold;
+                return (Intent::Hold, Some("退避中"));
             }
         }
         if !self.daily.allows(
@@ -1925,12 +2144,12 @@ impl Controller {
                 used = self.daily.count(),
                 "跳过开仓：当日开仓次数已达上限"
             );
-            return Intent::Hold;
+            return (Intent::Hold, Some("日限额"));
         }
         // 余额低于告警线就停开（清仓线在上面已经触发强制平仓）。
         if self.balance_low.contains(buy.as_str()) || self.balance_low.contains(sell.as_str()) {
             self.panel.stats.bump_skip("balance_low");
-            return Intent::Hold;
+            return (Intent::Hold, Some("余额不足"));
         }
 
         // 名义敞口上限：跨币种可比，BTC/ETH/DOGE 一个数管住。
@@ -1960,15 +2179,16 @@ impl Controller {
         ) {
             self.panel.stats.bump_skip("notional_limit");
             debug!(pair = %pair.pair_id, %reason, "跳过开仓：名义敞口上限");
-            return Intent::Hold;
+            return (Intent::Hold, Some("名义上限"));
         }
-        intent
+        (intent, None)
     }
 
-    /// 挂单监视：价差跌破门槛或超时 → 置 cancel 标志，后台执行 task 会看到并撤单。
+    /// 挂单监视：开仓单价差跌出持有区 → 置 cancel，后台执行 task 撤单。
     ///
     /// 平仓单**不**因价差变化撤——平仓要走完，否则会一直留着单腿风险。
-    /// 盘口读不到时只按超时判：不能因为暂时看不到价差就一直不撤。
+    /// 单轮超时由执行器自己管；这里若按整轮计划起点超时并置 cancel，
+    /// `limit_retry_count` 的后续重挂会被直接跳过。
     fn watch_pending_slot(&mut self, pair_i: usize, pair: &Pair, slot: &str) {
         let Some(pending) = self.pending.get(slot).cloned() else {
             return;
@@ -1986,46 +2206,50 @@ impl Controller {
             self.pending.remove(slot);
             self.hedging.remove(slot);
             self.positions.release_pending(slot);
+            // 与普通 exec_fail 一样重新攒持续性，避免看门狗刚清完立刻再开。
+            self.grid.forget(slot);
             self.log_plan_record(&pending.plan, "exec_fail", "watchdog_timeout", "");
             return;
         }
         let already = pending.cancel.load(Ordering::Relaxed);
-        let timeout = Duration::from_millis(self.cfg.order.limit_timeout_ms);
 
         let spread = self.pending_spread(pair, &pending);
+        let t0 = self
+            .grid_params(pair)
+            .map(|p| p.initial * p.t0_ratio)
+            .unwrap_or(Decimal::ZERO);
         let spread_ok = match (&spread, pending.plan.is_open) {
             // 平仓单：价差怎么变都要走完
             (_, false) => true,
             (Some((net, _residual)), true) => {
                 let same_dir = pending.plan.buy_venue == net.buy.as_str()
                     && pending.plan.sell_venue == net.sell.as_str();
-                same_dir && net.raw_pct >= self.cfg.grid.initial_spread_threshold
+                resting_open_spread_ok(net.raw_pct, same_dir, t0)
             }
-            // 开仓单但读不到盘口：不当成「价差没了」，交给超时处理
+            // 开仓单但读不到盘口：不当成「价差没了」，交给执行器本轮超时
             (None, true) => true,
         };
 
         let ui = if already {
-            "canceling"
+            "撤单中"
+        } else if !spread_ok {
+            pending.cancel.store(true, Ordering::Release);
+            self.panel.stats.cancel_gone += 1;
+            let raw = spread.as_ref().map(|(n, _)| n.raw_pct);
+            info!(
+                pair = %pair.pair_id,
+                raw = raw.map(|v| v.round_dp(4)).unwrap_or_default().to_string(),
+                t0 = %t0.round_dp(4),
+                "resting limit: spread gone, requesting cancel"
+            );
+            "撤单中"
         } else {
-            match watch_resting_limit(spread_ok, pending.since.elapsed(), timeout, false) {
-                LimitWatch::CancelSpreadGone => {
-                    pending.cancel.store(true, Ordering::Relaxed);
-                    self.panel.stats.cancel_gone += 1;
-                    info!(pair = %pair.pair_id, "resting limit: spread gone, requesting cancel");
-                    "canceling"
-                }
-                LimitWatch::CancelTimeout => {
-                    pending.cancel.store(true, Ordering::Relaxed);
-                    self.panel.stats.cancel_timeout += 1;
-                    info!(pair = %pair.pair_id, "resting limit: timeout, requesting cancel");
-                    "canceling"
-                }
-                _ => "limit",
-            }
+            "挂单中"
         };
 
-        let params = self.cfg.grid_for(&pair.legs[0].base, pair.min_qty());
+        let Some(params) = self.grid_params(pair) else {
+            return;
+        };
         if let Some((net, residual)) = spread {
             self.record_ui_pair(slot, pair, &net, &params, None, ui, residual, None);
             self.set_spread(
@@ -2049,8 +2273,77 @@ impl Controller {
         }
     }
 
+    /// 两腿市价对冲进行中：继续用当前盘口刷监控行，状态标成开仓中/平仓中。
+    fn paint_inflight_slot(&mut self, pair_i: usize, pair: &Pair, slot: &str) {
+        let pos = self.positions.get(slot).cloned();
+        let status = if self.positions.is_pending(slot) {
+            "开仓中"
+        } else if pos.as_ref().is_some_and(|p| p.qty > Decimal::ZERO) {
+            "平仓中"
+        } else {
+            "下单中"
+        };
+        let v0 = pair.legs[0].venue.clone();
+        let v1 = pair.legs[1].venue.clone();
+        let (Some(b0), Some(b1)) = (
+            self.book(v0.as_str(), &pair.pair_id),
+            self.book(v1.as_str(), &pair.pair_id),
+        ) else {
+            self.mark_ui_status(slot, status);
+            return;
+        };
+        let net = match pos.as_ref().filter(|p| p.qty > Decimal::ZERO) {
+            Some(p) => {
+                let (bb, sb) = books_for_direction(&p.buy, &v0, &b0, &b1);
+                sequenced_spread(&self.cfg, &p.buy, &p.sell, bb, sb, Decimal::ZERO)
+            }
+            None => best_sequenced_spread(&self.cfg, &v0, &v1, &b0, &b1, Decimal::ZERO),
+        };
+        let Some(net) = net else {
+            self.mark_ui_status(slot, status);
+            return;
+        };
+        self.fill_monitor_row(
+            slot,
+            pair,
+            &net,
+            pos.as_ref(),
+            status,
+            &b0,
+            &b1,
+            mid_from_bbo(&b0, &b1),
+        );
+        let cross = is_cross_dex(net.buy.as_str(), net.sell.as_str());
+        let official = self.sample_and_natural(pair, &net, cross);
+        let nat_value = self.ui_nat(pair, &net, official.as_ref());
+        let residual = if cross {
+            match nat_value {
+                Some(n) => residual_net(net.net_pct, n),
+                None => net.net_pct,
+            }
+        } else {
+            net.net_pct
+        };
+        self.set_spread(
+            pair_i,
+            dashboard::spread_lines(
+                &pair.pair_id,
+                net.buy.as_str(),
+                net.sell.as_str(),
+                net.raw_pct,
+                net.net_pct,
+                net.slip_pct,
+                nat_value,
+                residual,
+                official.as_ref().map(|n| n.points).unwrap_or(0),
+                self.cfg.history.min_points,
+                status,
+            ),
+        );
+    }
+
     /// 挂单期间按**计划的方向**算净边（不双向取优）。
-    /// residual 只给监控行展示；开仓挂单是否还够看毛价差 vs T1。
+    /// residual 只给监控行展示；开仓挂单是否还够看毛价差 vs T0（不是 T1）。
     fn pending_spread(
         &self,
         pair: &Pair,
@@ -2193,19 +2486,7 @@ impl Controller {
                     self.positions.release_pending(&msg.slot);
                     return;
                 }
-                if result.orphan_order.is_some() {
-                    // 两腿都对冲上了，但第一腿还留着一张撤不掉的单。仓位记账是
-                    // 对的，可那张单随时可能成交出第三条腿——先停手。
-                    let oid = result.orphan_order.clone().unwrap_or_default();
-                    self.mark_intervention(
-                        &msg.plan,
-                        Cause::OrphanOrder,
-                        format!(
-                            "hedge ok but order {oid} on {} could not be canceled",
-                            msg.plan.first.venue
-                        ),
-                    );
-                } else {
+                if result.orphan_order.is_none() {
                     // 两腿干净成交：连击归零（对齐参考在成功路径上重置计数）。
                     self.intervention.clear_streak(&msg.plan.pair_id);
                 }
@@ -2218,6 +2499,25 @@ impl Controller {
                 self.naked_exposures
                     .retain(|n| n.pair_id != msg.plan.pair_id);
                 self.apply_fill(&pair, &msg.plan, &result, msg.pair_i);
+                // 第二腿少成交的部分是真实单边敞口。必须排在 retain 之后，
+                // 否则刚登记就被这一行清掉。
+                if result.unhedged_qty > Decimal::ZERO {
+                    self.record_naked_from_failed_hedge(&msg.plan, result.unhedged_qty);
+                }
+                // 两腿都对冲上了，但第一腿还留着一张撤不掉的单。仓位记账是
+                // 对的，可那张单随时可能成交出第三条腿——先停手。
+                // 必须排在 `apply_fill` 之后：挂起要记的是本笔成交后的格数。
+                if let Some(oid) = result.orphan_order.clone() {
+                    self.mark_intervention(
+                        &msg.slot,
+                        &msg.plan,
+                        Cause::OrphanOrder,
+                        format!(
+                            "hedge ok but order {oid} on {} could not be canceled",
+                            msg.plan.first.venue
+                        ),
+                    );
+                }
             }
             Err(err) => {
                 // 交易所说「只能减仓」：拉闸挡开仓。要先于下面的分类判断，
@@ -2273,6 +2573,7 @@ impl Controller {
                     let n = self.intervention.note_single_leg(&msg.plan.pair_id);
                     if n >= SINGLE_LEG_STREAK_LIMIT {
                         self.mark_intervention(
+                            &msg.slot,
                             &msg.plan,
                             Cause::SingleLegStreak,
                             format!("{n} consecutive single-leg fills (all recovered, but link looks broken)"),
@@ -2291,6 +2592,7 @@ impl Controller {
                     self.record_naked_from_failed_hedge(&msg.plan, msg.plan.qty);
                     // 裸腿且紧急平仓也失败：真实仓位不明，必须停手。
                     self.mark_intervention(
+                        &msg.slot,
                         &msg.plan,
                         Cause::NakedLegUnrecoverable,
                         format!("naked leg on {} and emergency close failed", msg.plan.first.venue),
@@ -2304,8 +2606,33 @@ impl Controller {
                     self.log_plan_record(&msg.plan, "exec_fail", "second_leg_unknown", &err);
                     // 第一腿确实成交了，第二腿成没成不知道。按裸腿登记以便对账
                     // 能看见它，但绝不自动补——补错方向会变成双倍敞口。
-                    self.record_naked_from_failed_hedge(&msg.plan, msg.plan.qty);
+                    // 用 SecondLegUnknown source 与 BotFailure 区分，
+                    // try_hedge_naked_exposures 只处理 BotFailure，不碰这类。
+                    let signed = if msg.plan.first.is_buy {
+                        msg.plan.qty
+                    } else {
+                        -msg.plan.qty
+                    };
+                    let exposure = crate::app::reconcile::NakedExposure {
+                        pair_id: msg.plan.pair_id.clone(),
+                        venue: msg.plan.first.venue.clone(),
+                        qty: signed,
+                        counterparty: msg.plan.second.venue.clone(),
+                        source: NakedSource::SecondLegUnknown,
+                    };
+                    if !self.naked_exposures.iter().any(|n| {
+                        n.pair_id == exposure.pair_id && n.venue == exposure.venue
+                    }) {
+                        warn!(
+                            pair = %exposure.pair_id,
+                            venue = %exposure.venue,
+                            qty = %exposure.qty,
+                            "second leg unknown — manual check required before resuming"
+                        );
+                        self.naked_exposures.push(exposure);
+                    }
                     self.mark_intervention(
+                        &msg.slot,
                         &msg.plan,
                         Cause::SecondLegUnknown,
                         format!(
@@ -2329,6 +2656,7 @@ impl Controller {
                     // 撤不掉的挂单可能稍后成交，届时会凭空多出一条腿。
                     // 在搞清楚它到底成没成之前不能继续交易这个币。
                     self.mark_intervention(
+                        &msg.slot,
                         &msg.plan,
                         Cause::OrphanOrder,
                         format!("uncancelable resting order on {}", msg.plan.first.venue),
@@ -2342,15 +2670,31 @@ impl Controller {
     }
 
     fn log_plan_record(&self, plan: &HedgePlan, action: &str, result: &str, detail: &str) {
-        self.log_record(
-            &plan.pair_id,
-            &plan.buy_venue,
-            &plan.sell_venue,
-            plan.qty,
-            action,
-            result,
-            detail,
-        );
+        let Some(hub) = &self.api else {
+            return;
+        };
+        hub.push_execution(ExecRecord {
+            ts: now_ts(),
+            pair_id: plan.pair_id.clone(),
+            action: action.to_string(),
+            buy_venue: plan.buy_venue.clone(),
+            sell_venue: plan.sell_venue.clone(),
+            qty: plan.qty,
+            net_pct: if plan.is_open && action == "open" {
+                Some(plan.decision_net_pct)
+            } else {
+                None
+            },
+            result: result.to_string(),
+            detail: detail.to_string(),
+            grid_from: Some(plan.grid_from),
+            grid_to: Some(plan.grid_to),
+            pnl_pct: if !plan.is_open && action == "close" {
+                plan.pnl_pct
+            } else {
+                None
+            },
+        });
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2358,12 +2702,34 @@ impl Controller {
     ///
     /// 只在**首次**挂起时打 ERROR + 写 journal；重复触发不重置计时，否则
     /// 反复报错会把 30 分钟自动解除无限推后，等于永久锁死这个币。
-    fn mark_intervention(&mut self, plan: &HedgePlan, cause: Cause, detail: String) {
+    /// 挂起时点的持仓格数，供 `should_block` 的「格数变化 → 解除」用。
+    ///
+    /// 空仓或单格量未知时返回 `None`：解除判定要求挂起时和当前都是 `Some`，
+    /// 拿不准就只走 30 分钟超时，不猜。
+    fn current_grid_level(&self, slot: &str) -> Option<u32> {
+        let pos = self.positions.get(slot)?;
+        if pos.base_qty <= Decimal::ZERO {
+            return None;
+        }
+        Some(self.grid.segments_held(pos.qty, pos.base_qty))
+    }
+
+    /// 挂起一个币对等待人工介入。
+    ///
+    /// `slot` 用来读**记账完成后**的格数——调用点必须在 `apply_fill` 之后，
+    /// 否则记下的是成交前的旧格数，下一轮 `should_block` 会把这次成交本身
+    /// 造成的格数变化当成「行情换区间」，刚挂起就自动解除。
+    fn mark_intervention(&mut self, slot: &str, plan: &HedgePlan, cause: Cause, detail: String) {
+        self.mark_intervention_for(&plan.pair_id, slot, cause, detail);
+    }
+
+    fn mark_intervention_for(&mut self, pair_id: &str, slot: &str, cause: Cause, detail: String) {
+        let grid_level = self.current_grid_level(slot);
         let first = self.intervention.mark(
-            &plan.pair_id,
+            pair_id,
             cause,
             detail.clone(),
-            None,
+            grid_level,
             Instant::now(),
         );
         if !first {
@@ -2371,13 +2737,52 @@ impl Controller {
         }
         let mins = super::intervention::AUTO_RESUME.as_secs() / 60;
         tracing::error!(
-            pair = %plan.pair_id,
+            pair = %pair_id,
             cause = cause.as_str(),
             detail = %detail,
+            grid_level = ?grid_level,
             auto_resume_mins = mins,
             "MANUAL INTERVENTION REQUIRED: pausing this pair (opens and closes both blocked)"
         );
-        self.log_plan_record(plan, "intervention", cause.as_str(), &detail);
+        self.log_record(
+            pair_id,
+            "",
+            "",
+            Decimal::ZERO,
+            "intervention",
+            cause.as_str(),
+            &detail,
+        );
+    }
+
+    fn maybe_mark_dust(
+        &mut self,
+        slot: &str,
+        pair: &Pair,
+        pos: Option<&crate::domain::Position>,
+        params: &crate::domain::GridParams,
+    ) {
+        let Some(p) = pos.filter(|p| p.qty > Decimal::ZERO) else {
+            self.dust_since.remove(slot);
+            return;
+        };
+        let dust = params.min_qty > Decimal::ZERO && p.qty < params.min_qty;
+        if !dust {
+            self.dust_since.remove(slot);
+            return;
+        }
+        let since = *self
+            .dust_since
+            .entry(slot.to_string())
+            .or_insert_with(Instant::now);
+        if since.elapsed() > Duration::from_secs(300) {
+            self.mark_intervention_for(
+                &pair.pair_id,
+                slot,
+                Cause::NakedBelowMinQty,
+                format!("residual {} below min_qty {}", p.qty, params.min_qty),
+            );
+        }
     }
 
     fn log_record(
@@ -2403,6 +2808,9 @@ impl Controller {
             net_pct: None,
             result: result.to_string(),
             detail: detail.to_string(),
+            grid_from: None,
+            grid_to: None,
+            pnl_pct: None,
         });
     }
 
@@ -2421,16 +2829,26 @@ impl Controller {
                             .and_then(|sb| mid_from_bbo(&bb, &sb))
                     })
                     .unwrap_or(Decimal::ZERO);
+            let prev = self.positions.get(&plan.slot);
+            let ruler = prev
+                .map(|p| p.base_qty)
+                .filter(|q| *q > Decimal::ZERO)
+                .unwrap_or(plan.base_qty);
+            let grid = self
+                .grid
+                .segments_held(prev.map(|p| p.qty).unwrap_or(Decimal::ZERO) + qty, ruler)
+                .max(1);
             self.positions.record_open(
                 &plan.slot,
                 &pair.pair_id,
                 VenueId::from(plan.buy_venue.as_str()),
                 VenueId::from(plan.sell_venue.as_str()),
                 qty,
-                1,
+                grid,
                 notional,
                 entry_net,
                 entry_raw,
+                plan.base_qty,
             );
             // 计入当日配额。记在**成交**而不是下单，配额才对应真实开仓次数：
             // 下单被拒/撤单不该吃额度。平仓永远不计——配额是节流开仓的，
@@ -2439,6 +2857,7 @@ impl Controller {
             info!(
                 pair = %pair.pair_id,
                 qty = %qty,
+                grid,
                 notional_usdc = %notional.round_dp(2),
                 entry_net_pct = %entry_net.round_dp(4),
                 "position opened"
@@ -2565,28 +2984,20 @@ impl Controller {
             }
             None => best_sequenced_spread(&self.cfg, v0, v1, b0, b1, Decimal::ZERO),
         };
-        let label = match reason {
-            "thin_book" => "深度不足",
-            "stale" => "盘口过期",
-            "wide_book" => "点差过宽",
-            "invalid_bbo" => "盘口非法",
-            "no_min_qty" => "无最小量",
-            "depeg" => "脱锚",
-            other => other,
-        };
+        let label = skip_reason_label(reason);
         if let Some(net) = net {
             self.fill_monitor_row(
                 slot,
                 pair,
                 &net,
                 pos,
-                label,
+                &label,
                 b0,
                 b1,
                 mid_from_bbo(b0, b1),
             );
         } else {
-            self.mark_ui_status(slot, label);
+            self.mark_ui_status(slot, &label);
         }
     }
 
@@ -2614,32 +3025,16 @@ impl Controller {
         net: &crate::domain::NetSpread,
         pos: Option<&crate::domain::Position>,
         status: &str,
-        b0: &Bbo,
-        b1: &Bbo,
-        mid: Option<Decimal>,
+        _b0: &Bbo,
+        _b1: &Bbo,
+        _mid: Option<Decimal>,
     ) {
-        let mut params = self.cfg.grid_for(&pair.legs[0].base, pair.min_qty());
-        if let Some(mid) = mid {
-            if let (Some(buy_leg), Some(sell_leg)) =
-                (pair.leg(net.buy.as_str()), pair.leg(net.sell.as_str()))
-            {
-                let reserved = self
-                    .positions
-                    .reserved_margin_by_venue(|v| self.cfg.leverage_for(v));
-                let (bb, sb) = books_for_direction(&net.buy, &pair.legs[0].venue, b0, b1);
-                params.base_qty = preview_segment_qty(
-                    &self.cfg.sizing,
-                    params.max_segments,
-                    self.balance.global_min(),
-                    self.leg_margin(&reserved, buy_leg.venue.as_str()),
-                    self.leg_margin(&reserved, sell_leg.venue.as_str()),
-                    bb,
-                    sb,
-                    mid,
-                    buy_leg,
-                    sell_leg,
-                );
-            }
+        let Some(mut params) = self.grid_params(pair) else {
+            self.mark_ui_status(slot, "未配置");
+            return;
+        };
+        if let Some(p) = pos.filter(|p| p.base_qty > Decimal::ZERO) {
+            params.base_qty = p.base_qty;
         }
         let cross = is_cross_dex(net.buy.as_str(), net.sell.as_str());
         let official = self.sample_and_natural(pair, net, cross);
@@ -2668,6 +3063,15 @@ impl Controller {
     ) {
         let actual = pos.map(|p| p.qty).unwrap_or(Decimal::ZERO);
         let entry = params.initial;
+        let grid_n = pos
+            .map(|p| {
+                if p.base_qty > Decimal::ZERO {
+                    self.grid.segments_held(p.qty, p.base_qty)
+                } else {
+                    p.grid
+                }
+            })
+            .unwrap_or(0);
         self.ui_pairs.insert(
             slot.to_string(),
             PairRow {
@@ -2680,12 +3084,43 @@ impl Controller {
                 nat_pct: nat.map(api::fmt_pct).unwrap_or_else(|| "—".into()),
                 res_pct: api::fmt_pct(residual),
                 entry_pct: api::fmt_pct(entry),
-                grid: format!("T{}", pos.map(|p| p.grid).unwrap_or(0)),
+                grid: format!("T{grid_n}"),
                 target_qty: api::fmt_qty(params.base_qty),
                 actual_qty: api::fmt_qty(actual),
                 status: status.to_string(),
             },
         );
+    }
+
+    fn available_pairs_payload(&self) -> Vec<AvailableSymbol> {
+        use std::collections::BTreeMap;
+        let mut by_symbol: BTreeMap<String, AvailableSymbol> = BTreeMap::new();
+        for pair in &self.available_pairs {
+            let symbol = pair.legs[0].base.clone();
+            let v0 = pair.legs[0].venue.as_str();
+            let v1 = pair.legs[1].venue.as_str();
+            let fee = sequenced_fee(&self.cfg, &pair.legs[0].venue, &pair.legs[1].venue);
+            let mid = match (
+                self.book(v0, &pair.pair_id),
+                self.book(v1, &pair.pair_id),
+            ) {
+                (Some(a), Some(b)) => mid_from_bbo(&a, &b).map(|m| m.to_string()),
+                _ => None,
+            };
+            let entry = by_symbol.entry(symbol.clone()).or_insert_with(|| AvailableSymbol {
+                pair_id: pair.pair_id.clone(),
+                symbol: symbol.clone(),
+                venue_pairs: Vec::new(),
+            });
+            entry.venue_pairs.push(AvailableVenuePair {
+                venues: vec![v0.to_string(), v1.to_string()],
+                min_qty: pair.min_qty().to_string(),
+                qty_precision: pair.legs.iter().map(|l| l.qty_precision).min().unwrap_or(8),
+                round_trip_fee_pct: (fee * Decimal::from(2)).to_string(),
+                mid,
+            });
+        }
+        by_symbol.into_values().collect()
     }
 
     fn publish_api_snapshot_throttled(&mut self, min_interval: Duration) {
@@ -2774,6 +3209,7 @@ impl Controller {
                     source: match n.source {
                         NakedSource::Foreign => "foreign".into(),
                         NakedSource::BotFailure => "bot_failure".into(),
+                        NakedSource::SecondLegUnknown => "second_leg_unknown".into(),
                     },
                 })
                 .collect(),
@@ -2792,8 +3228,37 @@ impl Controller {
                 .map(|c| c.enabled)
                 .unwrap_or(self.cfg.execution.enabled),
             matching: self.matching,
+            available: self.available_pairs_payload(),
             updated_at: now_ts(),
         });
+    }
+}
+
+fn skip_reason_label(reason: &str) -> String {
+    match reason {
+        "thin_book" => "深度不足".into(),
+        "stale" => "盘口过期".into(),
+        "wide_book" => "点差过宽".into(),
+        "invalid_bbo" => "盘口非法".into(),
+        "no_min_qty" => "无最小量".into(),
+        "no_margin" | "no_capacity" => "保证金不足".into(),
+        "no_mid" => "无中价".into(),
+        "no_size" => "数量无效".into(),
+        "stability_collecting" => "等稳定".into(),
+        "stability_volatile" => "波动过大".into(),
+        "in_flight" => "排队".into(),
+        "intervention" => "人工介入".into(),
+        "reduce_only" => "只减仓".into(),
+        "slots" => "槽位满".into(),
+        "no_baseline" => "无底仓".into(),
+        "no_plan" => "无法规划".into(),
+        "monitor_only" => "监控".into(),
+        "balance_low" => "余额不足".into(),
+        "backoff" => "退避中".into(),
+        "daily_quota" => "日限额".into(),
+        "notional_limit" => "名义上限".into(),
+        "funding" => "费率不利".into(),
+        other => other.to_string(),
     }
 }
 
@@ -2815,19 +3280,6 @@ fn books_for_direction<'a>(
     }
 }
 
-fn markets_for_venue(pairs: &[Pair], venue: &VenueId) -> Vec<VenueMarket> {
-    let mut seen = HashSet::new();
-    let mut out = Vec::new();
-    for pair in pairs {
-        for leg in &pair.legs {
-            if &leg.venue == venue && seen.insert(leg.pair_id.clone()) {
-                out.push(leg.clone());
-            }
-        }
-    }
-    out
-}
-
 fn intent_label(intent: &Intent) -> &'static str {
     match intent {
         Intent::Open { .. } => "open",
@@ -2837,5 +3289,18 @@ fn intent_label(intent: &Intent) -> &'static str {
         } => "scalp_tp",
         Intent::Close { .. } => "close",
         Intent::Hold => "hold",
+    }
+}
+
+fn ui_intent_label(intent: &Intent, stats_label: &str) -> &'static str {
+    match intent {
+        Intent::Open { .. } => "开仓中",
+        Intent::Close {
+            reason: CloseReason::ScalpTakeProfit,
+            ..
+        } => "剥头皮",
+        Intent::Close { .. } => "平仓中",
+        Intent::Hold if stats_label == "scalp" => "剥头皮",
+        Intent::Hold => "持有",
     }
 }

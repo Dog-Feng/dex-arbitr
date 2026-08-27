@@ -16,6 +16,12 @@ pub struct ExecRecord {
     pub net_pct: Option<Decimal>,
     pub result: String,
     pub detail: String,
+    /// 成交前格子。开仓从 0，减仓从当前格。
+    pub grid_from: Option<u32>,
+    /// 成交后格子。
+    pub grid_to: Option<u32>,
+    /// 仅关仓/减格：往返净利 %。开仓为空。
+    pub pnl_pct: Option<Decimal>,
 }
 
 pub struct ExecJournal {
@@ -82,6 +88,9 @@ impl ExecJournal {
                     .and_then(|s| Decimal::from_str(&s).ok()),
                 result: row.get(7)?,
                 detail: row.get(8)?,
+                grid_from: None,
+                grid_to: None,
+                pnl_pct: None,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)

@@ -18,6 +18,9 @@ config/venues/*.yaml
 scripts/__pycache__/
 scripts/exchange_sidecar/exchange_sidecar
 scripts/exchange_sidecar/exchange_sidecar.exe
-scripts/sodex_bridge/sodex_bridge.exe
+scripts/exchange_sidecar/exchange-sidecar.exe
 *.exe.bak*
-*~
+web/node_modules
+web/dist
+
+

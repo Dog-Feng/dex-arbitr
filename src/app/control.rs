@@ -12,7 +12,17 @@ use std::collections::HashMap;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
-use crate::config::{AppConfig, OrderStyle, SizingMode};
+use crate::config::{AppConfig, OrderStyle, PairDefaults, PairSetting};
+
+fn default_page_persist_mode() -> String {
+    "bucket".into()
+}
+fn default_page_persist_secs() -> u32 {
+    1
+}
+fn default_page_persist_strict() -> bool {
+    true
+}
 
 /// default.yaml 里**全部**可在 UI 热改的参数。
 /// 字段名与 YAML 路径一一对应，方便前端展示与编辑。
@@ -26,11 +36,12 @@ pub struct ArbitrageParams {
     // ═══ system ═══
     pub monitor_only: bool,
     pub data_freshness_ms: u64,
-    pub stable_depeg_bps: u32,
 
     // ═══ pairs ═══
     #[serde(default)]
-    pub whitelist: Vec<String>,
+    pub pair_defaults: PairDefaults,
+    #[serde(default)]
+    pub pairs: Vec<PairSetting>,
 
     // ═══ execution ═══
     pub paper_trading: bool,
@@ -38,12 +49,8 @@ pub struct ArbitrageParams {
     pub hedge_failed_legs: bool,
 
     // ═══ sizing ═══
-    pub sizing_mode: String,            // "fixed" | "margin"
-    pub fixed_notional_usdc: Decimal,
     pub max_concurrent_pairs: u32,
     pub leverage_multiplier: Decimal,
-    pub min_notional_usdc: Decimal,
-    pub max_notional_usdc: Decimal,
     pub depth_pct: Decimal,
     pub refresh_balance_secs: u64,
     pub margin_utilization_pct: Decimal,
@@ -57,25 +64,14 @@ pub struct ArbitrageParams {
     pub cross_use_natural: bool,
     pub scan_log_interval_secs: u64,
 
-    // ═══ grid ═══
-    pub initial_spread_threshold: Decimal,
-    pub t0_ratio: Decimal,
-    pub grid_step: Decimal,
-    pub max_segments: u32,
-    pub split_order_size: Decimal,
-    /// 保留字段，热路径不读。页面不再展示。
-    #[serde(default)]
-    pub close_stop_loss_pct: Decimal,
+    // ═══ grid persistence（阈值在 pair_defaults / pairs）═══
     pub persistence_ms: u64,
-    #[serde(default)]
-    pub scalping_enabled: bool,
-    #[serde(default)]
-    pub scalping_trigger_segment: u32,
-    #[serde(default)]
-    pub scalping_profit_threshold_pct: Decimal,
-    /// 逐币默认数量，如 {"BTC":"0.001","ETH":"0.02"}
-    #[serde(default)]
-    pub base_qty: HashMap<String, Decimal>,
+    #[serde(default = "default_page_persist_mode")]
+    pub persistence_mode: String,
+    #[serde(default = "default_page_persist_secs")]
+    pub spread_persistence_seconds: u32,
+    #[serde(default = "default_page_persist_strict")]
+    pub strict_persistence_check: bool,
 
     // ═══ order ═══
     pub order_style: String,            // "limit_then_market" | "market_taker" | "limit_maker"
@@ -134,27 +130,21 @@ pub struct ArbitrageParams {
 impl ArbitrageParams {
     pub fn from_config(cfg: &AppConfig) -> Self {
         Self {
-            active_venues: cfg.venues.clone(),
+            // 页面默认不勾 DEX；yaml `venues` 只决定连哪些适配器。
+            active_venues: Vec::new(),
 
             monitor_only: cfg.system.monitor_only,
             data_freshness_ms: cfg.system.data_freshness_ms,
-            stable_depeg_bps: cfg.system.stable_depeg_bps,
 
-            whitelist: cfg.pairs.whitelist.clone(),
+            pair_defaults: cfg.pairs.defaults.clone(),
+            pairs: cfg.pairs.enabled.clone(),
 
             paper_trading: cfg.execution.paper_trading,
             loop_interval_ms: cfg.execution.loop_interval_ms,
             hedge_failed_legs: cfg.execution.hedge_failed_legs,
 
-            sizing_mode: match cfg.sizing.mode {
-                SizingMode::Fixed => "fixed".into(),
-                SizingMode::Margin => "margin".into(),
-            },
-            fixed_notional_usdc: cfg.sizing.fixed_notional_usdc,
             max_concurrent_pairs: cfg.sizing.max_concurrent_pairs,
             leverage_multiplier: cfg.sizing.leverage_multiplier,
-            min_notional_usdc: cfg.sizing.min_notional_usdc,
-            max_notional_usdc: cfg.sizing.max_notional_usdc,
             depth_pct: cfg.sizing.depth_pct,
             refresh_balance_secs: cfg.sizing.refresh_balance_secs,
             margin_utilization_pct: cfg.sizing.margin_utilization_pct,
@@ -167,17 +157,10 @@ impl ArbitrageParams {
             cross_use_natural: cfg.scan.cross_use_natural,
             scan_log_interval_secs: cfg.scan.log_interval_secs,
 
-            initial_spread_threshold: cfg.grid.initial_spread_threshold,
-            t0_ratio: cfg.grid.t0_ratio,
-            grid_step: cfg.grid.grid_step,
-            max_segments: cfg.grid.max_segments,
-            split_order_size: cfg.grid.split_order_size,
-            close_stop_loss_pct: cfg.grid.close_stop_loss_pct,
             persistence_ms: cfg.grid.persistence_ms,
-            scalping_enabled: cfg.grid.scalping_enabled,
-            scalping_trigger_segment: cfg.grid.scalping_trigger_segment,
-            scalping_profit_threshold_pct: cfg.grid.scalping_profit_threshold_pct,
-            base_qty: cfg.grid.base_qty.clone(),
+            persistence_mode: cfg.grid.persistence_mode.clone(),
+            spread_persistence_seconds: cfg.grid.spread_persistence_seconds,
+            strict_persistence_check: cfg.grid.strict_persistence_check,
 
             order_style: cfg.order.style.as_str().into(),
             limit_timeout_ms: cfg.order.limit_timeout_ms,
@@ -227,23 +210,16 @@ impl ArbitrageParams {
     pub fn apply_to(&self, cfg: &mut AppConfig) {
         cfg.system.monitor_only = self.monitor_only;
         cfg.system.data_freshness_ms = self.data_freshness_ms;
-        cfg.system.stable_depeg_bps = self.stable_depeg_bps;
 
-        cfg.pairs.whitelist = self.whitelist.clone();
+        cfg.pairs.defaults = self.pair_defaults.clone();
+        cfg.pairs.enabled = self.pairs.clone();
 
         cfg.execution.paper_trading = self.paper_trading;
         cfg.execution.loop_interval_ms = self.loop_interval_ms;
         cfg.execution.hedge_failed_legs = self.hedge_failed_legs;
 
-        cfg.sizing.mode = match self.sizing_mode.as_str() {
-            "margin" => SizingMode::Margin,
-            _ => SizingMode::Fixed,
-        };
-        cfg.sizing.fixed_notional_usdc = self.fixed_notional_usdc;
         cfg.sizing.max_concurrent_pairs = self.max_concurrent_pairs;
         cfg.sizing.leverage_multiplier = self.leverage_multiplier;
-        cfg.sizing.min_notional_usdc = self.min_notional_usdc;
-        cfg.sizing.max_notional_usdc = self.max_notional_usdc;
         cfg.sizing.depth_pct = self.depth_pct;
         cfg.sizing.refresh_balance_secs = self.refresh_balance_secs;
         cfg.sizing.margin_utilization_pct = self.margin_utilization_pct;
@@ -260,17 +236,14 @@ impl ArbitrageParams {
         cfg.scan.cross_use_natural = self.cross_use_natural;
         cfg.scan.log_interval_secs = self.scan_log_interval_secs;
 
-        cfg.grid.initial_spread_threshold = self.initial_spread_threshold;
-        cfg.grid.t0_ratio = self.t0_ratio;
-        cfg.grid.grid_step = self.grid_step;
-        cfg.grid.max_segments = self.max_segments;
-        cfg.grid.split_order_size = self.split_order_size;
-        cfg.grid.close_stop_loss_pct = self.close_stop_loss_pct;
         cfg.grid.persistence_ms = self.persistence_ms;
-        cfg.grid.scalping_enabled = self.scalping_enabled;
-        cfg.grid.scalping_trigger_segment = self.scalping_trigger_segment;
-        cfg.grid.scalping_profit_threshold_pct = self.scalping_profit_threshold_pct;
-        cfg.grid.base_qty = self.base_qty.clone();
+        cfg.grid.persistence_mode = if self.persistence_mode.eq_ignore_ascii_case("window") {
+            "window".into()
+        } else {
+            "bucket".into()
+        };
+        cfg.grid.spread_persistence_seconds = self.spread_persistence_seconds;
+        cfg.grid.strict_persistence_check = self.strict_persistence_check;
 
         cfg.order.style = OrderStyle::from_page(&self.order_style);
         cfg.order.limit_timeout_ms = self.limit_timeout_ms;
@@ -318,29 +291,44 @@ pub struct ValidationResult {
 pub fn validate(p: &ArbitrageParams) -> ValidationResult {
     let mut errors = Vec::new();
 
-    if p.initial_spread_threshold <= Decimal::ZERO {
-        errors.push("initial_spread_threshold 必须 > 0".into());
+    if p.pair_defaults.initial_spread_threshold <= Decimal::ZERO {
+        errors.push("pair_defaults.initial_spread_threshold 必须 > 0".into());
     }
-    if p.grid_step < Decimal::ZERO {
-        errors.push("grid_step 不能为负".into());
+    if p.pair_defaults.grid_step < Decimal::ZERO {
+        errors.push("pair_defaults.grid_step 不能为负".into());
     }
-    if p.max_segments == 0 {
-        errors.push("max_segments 必须 >= 1".into());
+    if p.pair_defaults.max_segments == 0 {
+        errors.push("pair_defaults.max_segments 必须 >= 1".into());
     }
     if p.max_concurrent_pairs == 0 {
         errors.push("max_concurrent_pairs 必须 >= 1".into());
     }
-    if p.min_notional_usdc > p.max_notional_usdc && p.max_notional_usdc > Decimal::ZERO {
-        errors.push("min_notional_usdc 不能大于 max_notional_usdc".into());
-    }
-    if p.close_stop_loss_pct < Decimal::ZERO {
-        errors.push("close_stop_loss_pct 不能为负".into());
-    }
-    if p.scalping_enabled && p.scalping_trigger_segment == 0 {
+    if p.pair_defaults.scalping_enabled && p.pair_defaults.scalping_trigger_segment == 0 {
         errors.push("scalping_trigger_segment 必须 >= 1".into());
     }
-    if p.scalping_profit_threshold_pct < Decimal::ZERO {
+    if p.pair_defaults.scalping_profit_threshold_pct < Decimal::ZERO {
         errors.push("scalping_profit_threshold_pct 不能为负".into());
+    }
+    for s in &p.pairs {
+        if s.symbol.trim().is_empty() {
+            errors.push("pairs.symbol 不能为空".into());
+        }
+        if s.base_qty <= Decimal::ZERO {
+            errors.push(format!("{} base_qty 必须 > 0", s.symbol));
+        }
+        if s.max_segments == Some(0) {
+            errors.push(format!("{} max_segments 必须 >= 1", s.symbol));
+        }
+        if s.initial_spread_threshold.is_some_and(|v| v <= Decimal::ZERO) {
+            errors.push(format!("{} initial_spread_threshold 必须 > 0", s.symbol));
+        }
+        if s.grid_step.is_some_and(|v| v < Decimal::ZERO) {
+            errors.push(format!("{} grid_step 不能为负", s.symbol));
+        }
+    }
+    let persist_mode = p.persistence_mode.to_ascii_lowercase();
+    if persist_mode != "bucket" && persist_mode != "window" {
+        errors.push("persistence_mode 必须是 bucket 或 window".into());
     }
     if p.funding_annual_threshold_pct < Decimal::ZERO {
         errors.push("funding_annual_threshold_pct 不能为负".into());
@@ -383,26 +371,40 @@ mod tests {
     fn apply_to_overrides_yaml_grid_and_sizing() {
         let mut cfg = AppConfig::load_from(Path::new("config/default.yaml")).unwrap();
         let mut p = ArbitrageParams::from_config(&cfg);
-        p.fixed_notional_usdc = dec!(80);
-        p.sizing_mode = "fixed".into();
-        p.initial_spread_threshold = dec!(0.08);
-        p.max_segments = 5;
+        p.pair_defaults.initial_spread_threshold = dec!(0.08);
+        p.pair_defaults.max_segments = 5;
         p.paper_trading = true;
-        p.whitelist = vec!["SNDK".into()];
+        p.pairs = vec![crate::config::PairSetting {
+            symbol: "SNDK".into(),
+            base_qty: dec!(0.01),
+            max_segments: None,
+            initial_spread_threshold: None,
+            grid_step: None,
+            t0_ratio: None,
+            split_order_size: None,
+            scalping_enabled: None,
+            scalping_trigger_segment: None,
+            scalping_profit_threshold_pct: None,
+            overrides: vec![],
+        }];
         p.apply_to(&mut cfg);
-        assert_eq!(cfg.sizing.fixed_notional_usdc, dec!(80));
-        assert_eq!(cfg.sizing.mode, SizingMode::Fixed);
-        assert_eq!(cfg.grid.initial_spread_threshold, dec!(0.08));
-        assert_eq!(cfg.grid.max_segments, 5);
-        assert_eq!(cfg.grid.close_stop_loss_pct, Decimal::ZERO);
-        p.scalping_enabled = true;
-        p.scalping_trigger_segment = 10;
-        p.scalping_profit_threshold_pct = dec!(0.02);
+        assert_eq!(cfg.pairs.defaults.initial_spread_threshold, dec!(0.08));
+        assert_eq!(cfg.pairs.defaults.max_segments, 5);
+        p.pair_defaults.scalping_enabled = true;
+        p.pair_defaults.scalping_trigger_segment = 2;
+        p.pair_defaults.scalping_profit_threshold_pct = dec!(0.02);
         p.apply_to(&mut cfg);
-        assert!(cfg.grid.scalping_enabled);
-        assert_eq!(cfg.grid.scalping_trigger_segment, 10);
-        assert_eq!(cfg.grid.scalping_profit_threshold_pct, dec!(0.02));
+        assert!(cfg.pairs.defaults.scalping_enabled);
+        assert_eq!(cfg.pairs.defaults.scalping_trigger_segment, 2);
         assert!(cfg.execution.paper_trading);
-        assert_eq!(cfg.pairs.whitelist, ["SNDK"]);
+        assert_eq!(cfg.pairs.enabled[0].symbol, "SNDK");
+    }
+
+    #[test]
+    fn from_config_does_not_preselect_venues() {
+        let cfg = AppConfig::load_from(Path::new("config/default.yaml")).unwrap();
+        let p = ArbitrageParams::from_config(&cfg);
+        assert!(p.active_venues.is_empty());
+        assert!(!cfg.venues.is_empty());
     }
 }

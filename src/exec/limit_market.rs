@@ -1,11 +1,13 @@
 //! 对齐参考 `execute_limit_market_mode`：单任务内完成
-//! 第一腿限价 → 等成交（order_status + 仓位 delta）→ 不足则撤单重挂 →
-//! 第二腿市价 → 失败回滚。
+//! 第一腿限价 → **挂单所私有 WS 成交推送**立刻发第二腿市价（REST 兜底）→
+//! 不足则撤单重挂 → 第二腿失败回滚。
 //!
 //! 三个关键不变量：
 //! 1. 任何退出路径上，第一腿都不能留下状态不明的挂单（撤不掉就上报 orphan 并停止重试）。
 //! 2. 第二腿的量严格等于第一腿累计实际成交量。
 //! 3. 累计成交量低于第二腿最小下单量时，反向平掉第一腿而不是发一张注定被拒的单。
+//!
+//! 先挂后吃两边对称：谁先挂限价，谁的成交推送驱动另一所市价，不绑死 entropy 或 lighter。
 
 use anyhow::{bail, Result};
 use rust_decimal::Decimal;
@@ -25,39 +27,252 @@ const POLL_INTERVAL_MS: u64 = 50;
 const CANCEL_RACE_MS: u64 = 500;
 /// 刚 post 后 sidecar/交易所可能尚未把挂单列入活跃订单。
 const POST_SETTLE_MS: u64 = 400;
-/// WS 推送到达后，等这么久让 REST 侧状态跟上再去查。
-const WS_SETTLE_MS: u64 = 60;
 
-/// 从 sidecar 的订单推送里判断「这条是不是我等的那张单，且已有成交」。
+fn json_id_eq(v: Option<&serde_json::Value>, order_id: &str) -> bool {
+    match v {
+        Some(serde_json::Value::String(s)) => s == order_id,
+        Some(serde_json::Value::Number(n)) => n.to_string() == order_id,
+        _ => false,
+    }
+}
+
+fn json_decimal(v: Option<&serde_json::Value>) -> Option<Decimal> {
+    match v {
+        Some(serde_json::Value::String(s)) => s.parse().ok(),
+        Some(serde_json::Value::Number(n)) => n.to_string().parse().ok(),
+        _ => None,
+    }
+}
+
+/// 从 sidecar 的订单推送里判断「这条是不是我等的那张单」。
 ///
-/// 两个所的字段名不同：
+/// 字段名因所而异：
 /// - SoDEX `AccountOrderUpdate`：`c`=ClOrdID, `i`=OrderID, `z`=累计成交量
 /// - Lighter `account_all_orders`：`client_order_index` / `order_index` / `filled_base_amount`
-///
-/// 只做「是否值得立刻去查一次」的判断，真实成交量仍以 order_status 为准——
-/// 推送可能乱序或漏，不能直接拿它记账。
+/// - Entropy/HL `orderUpdates` / `userFills`：嵌套 `order.oid` / `fills[].oid`
 fn push_matches_order(data: &serde_json::Value, order_id: &str) -> bool {
     if order_id.is_empty() {
         return false;
     }
-    let hit = |v: Option<&serde_json::Value>| -> bool {
-        match v {
-            Some(serde_json::Value::String(s)) => s == order_id,
-            Some(serde_json::Value::Number(n)) => n.to_string() == order_id,
-            _ => false,
-        }
-    };
-    // 顶层字段（SoDEX 直接反序列化后的形状 / Lighter 扁平推送）
-    for key in ["c", "i", "client_order_index", "order_index", "client_order_id", "order_id"] {
-        if hit(data.get(key)) {
+    for key in [
+        "c",
+        "i",
+        "oid",
+        "client_order_index",
+        "order_index",
+        "client_order_id",
+        "order_id",
+    ] {
+        if json_id_eq(data.get(key), order_id) {
             return true;
         }
     }
-    // Lighter 的 orders 数组推送
-    if let Some(arr) = data.get("orders").and_then(|v| v.as_array()) {
-        return arr.iter().any(|o| push_matches_order(o, order_id));
+    if let Some(order) = data.get("order") {
+        if push_matches_order(order, order_id) {
+            return true;
+        }
+    }
+    for key in ["orders", "fills", "data"] {
+        match data.get(key) {
+            Some(serde_json::Value::Array(arr)) => {
+                if arr.iter().any(|o| push_matches_order(o, order_id)) {
+                    return true;
+                }
+            }
+            Some(inner) => {
+                if push_matches_order(inner, order_id) {
+                    return true;
+                }
+            }
+            None => {}
+        }
     }
     false
+}
+
+fn venue_matches_first(push_venue: &str, first_venue: &str) -> bool {
+    push_venue.is_empty() || push_venue.eq_ignore_ascii_case(first_venue)
+}
+
+/// 推送数量必须和挂单目标一个量级。Lighter 偶发用 size_decimals 整数上报，
+/// 107 vs 0.0107 这种不能当成交量，否则会按错单位去对冲。
+fn plausible_ws_fill(qty: Decimal, target: Decimal) -> Option<Decimal> {
+    if qty <= Decimal::ZERO {
+        return None;
+    }
+    if target <= Decimal::ZERO {
+        return Some(qty);
+    }
+    let cap = (target * Decimal::from(2)).max(target + Decimal::new(1, 6));
+    if qty > cap {
+        return None;
+    }
+    Some(qty)
+}
+
+/// 从推送里直接抽出成交量/均价。有量就立刻对冲，不再等 REST。
+/// Entropy / Lighter / SoDEX 都走这里——谁先挂，谁的成交推送触发另一腿市价。
+///
+/// 快照（`userFills.isSnapshot`）不记账——那是历史回放，不是这笔挂单刚成交。
+fn fill_from_push(data: &serde_json::Value, order_id: &str) -> Option<(Decimal, Option<Decimal>)> {
+    if order_id.is_empty() {
+        return None;
+    }
+    if let Some(channel) = data.get("channel").and_then(|c| c.as_str()) {
+        if channel.eq_ignore_ascii_case("orderUpdates") {
+            return entropy_order_update_fill(data.get("data").unwrap_or(data), order_id);
+        }
+        if channel.eq_ignore_ascii_case("userFills") {
+            let inner = data.get("data").unwrap_or(data);
+            if inner.get("isSnapshot").and_then(|v| v.as_bool()) == Some(true) {
+                return None;
+            }
+            return entropy_user_fills(inner, order_id);
+        }
+    }
+    let mut best: Option<(Decimal, Option<Decimal>)> = None;
+    walk_generic_fills(data, order_id, &mut best);
+    best
+}
+
+fn walk_generic_fills(
+    data: &serde_json::Value,
+    order_id: &str,
+    best: &mut Option<(Decimal, Option<Decimal>)>,
+) {
+    if node_id_matches(data, order_id) {
+        if let Some(qty) = node_filled_qty(data) {
+            let px = json_decimal(data.get("ap"))
+                .or_else(|| json_decimal(data.get("L")))
+                .or_else(|| json_decimal(data.get("p")))
+                .or_else(|| json_decimal(data.get("price")))
+                .or_else(|| json_decimal(data.get("avg_price")));
+            match best {
+                Some((q, _)) if *q >= qty => {}
+                _ => *best = Some((qty, px)),
+            }
+        }
+    }
+    if let Some(order) = data.get("order") {
+        walk_generic_fills(order, order_id, best);
+    }
+    for key in ["orders", "fills", "data"] {
+        match data.get(key) {
+            Some(serde_json::Value::Array(arr)) => {
+                for item in arr {
+                    walk_generic_fills(item, order_id, best);
+                }
+            }
+            Some(inner) => walk_generic_fills(inner, order_id, best),
+            None => {}
+        }
+    }
+}
+
+fn node_id_matches(data: &serde_json::Value, order_id: &str) -> bool {
+    [
+        "c",
+        "i",
+        "oid",
+        "client_order_index",
+        "order_index",
+        "client_order_id",
+        "order_id",
+    ]
+    .iter()
+    .any(|k| json_id_eq(data.get(k), order_id))
+}
+
+fn node_filled_qty(data: &serde_json::Value) -> Option<Decimal> {
+    json_decimal(data.get("z"))
+        .or_else(|| json_decimal(data.get("filled_base_amount")))
+        .or_else(|| json_decimal(data.get("filled_amount")))
+        .or_else(|| json_decimal(data.get("filled_qty")))
+        .or_else(|| json_decimal(data.get("filledQty")))
+        .filter(|q| *q > Decimal::ZERO)
+}
+
+fn entropy_order_update_fill(
+    data: &serde_json::Value,
+    order_id: &str,
+) -> Option<(Decimal, Option<Decimal>)> {
+    let items: Box<dyn Iterator<Item = &serde_json::Value>> = match data {
+        serde_json::Value::Array(arr) => Box::new(arr.iter()),
+        other => Box::new(std::iter::once(other)),
+    };
+    for item in items {
+        let order = item.get("order").unwrap_or(item);
+        if !json_id_eq(order.get("oid"), order_id) && !json_id_eq(item.get("oid"), order_id) {
+            continue;
+        }
+        let status = item
+            .get("status")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if status == "open" || status == "new" || status == "resting" {
+            continue;
+        }
+        let orig = json_decimal(order.get("origSz")).unwrap_or(Decimal::ZERO);
+        let rem = json_decimal(order.get("sz")).unwrap_or(Decimal::ZERO);
+        let filled = if orig > Decimal::ZERO {
+            (orig - rem).max(Decimal::ZERO)
+        } else {
+            Decimal::ZERO
+        };
+        let qty = if status == "filled" && orig > Decimal::ZERO {
+            orig
+        } else {
+            filled
+        };
+        if qty <= Decimal::ZERO && !status.contains("fill") {
+            continue;
+        }
+        if qty <= Decimal::ZERO {
+            continue;
+        }
+        let px = json_decimal(order.get("limitPx"))
+            .or_else(|| json_decimal(item.get("avgPx")))
+            .or_else(|| json_decimal(order.get("px")));
+        return Some((qty, px));
+    }
+    None
+}
+
+fn entropy_user_fills(
+    data: &serde_json::Value,
+    order_id: &str,
+) -> Option<(Decimal, Option<Decimal>)> {
+    let fills = data
+        .get("fills")
+        .and_then(|v| v.as_array())
+        .or_else(|| data.as_array())?;
+    let mut qty = Decimal::ZERO;
+    let mut notional = Decimal::ZERO;
+    let mut priced = Decimal::ZERO;
+    for f in fills {
+        if !json_id_eq(f.get("oid"), order_id) {
+            continue;
+        }
+        let sz = json_decimal(f.get("sz")).unwrap_or(Decimal::ZERO);
+        if sz <= Decimal::ZERO {
+            continue;
+        }
+        qty += sz;
+        if let Some(px) = json_decimal(f.get("px")) {
+            notional += px * sz;
+            priced += sz;
+        }
+    }
+    if qty <= Decimal::ZERO {
+        return None;
+    }
+    let avg = if priced > Decimal::ZERO {
+        Some(notional / priced)
+    } else {
+        None
+    };
+    Some((qty, avg))
 }
 
 pub struct LimitMarketRun {
@@ -95,7 +310,7 @@ impl HedgeExecutor {
         let mut first_priced = Decimal::ZERO;
 
         for attempt in 1..=attempts {
-            if ctx.cancel.load(Ordering::Relaxed) {
+            if ctx.cancel.load(Ordering::Acquire) {
                 info!(pair = %plan.pair_id, attempt, "limit_market: cancel requested; stop posting");
                 break;
             }
@@ -212,6 +427,7 @@ impl HedgeExecutor {
         baseline: Decimal,
         attempt: u32,
     ) -> Result<AttemptOutcome> {
+        let mut pushes = crate::exchange::subscribe_order_pushes();
         let post = Self::post_first_leg(cfg, adapters, plan, books, false).await?;
         let posted_at = Instant::now();
         let order_id = post.order_id.clone().filter(|s| !s.is_empty());
@@ -246,11 +462,9 @@ impl HedgeExecutor {
         let mut filled = Decimal::ZERO;
         let mut fill_price: Option<Decimal> = None;
 
-        // 事件驱动优先：私有 WS 推到这张单的更新就立刻去查，不等下一次轮询。
-        // 对齐参考 `order_monitor` 的 WS-first + REST 兜底：推送可能乱序或漏，
-        // 所以仍保留 50ms 轮询，但正常路径由推送唤醒，延迟从「轮询间隔 + 2 次
-        // sidecar 往返」降到「一次推送 + 一次查询」。
-        let mut pushes = crate::exchange::subscribe_order_pushes();
+        // 事件驱动优先：私有 WS 推到这张单的成交就立刻对冲第二腿。
+        // 订阅必须在挂单之前，否则下单往返期间的成交推送会丢掉。
+        // 推送里没有足额成交量时，下一轮循环开头的 REST detect 兜底。
         let want_id = order_id.clone().unwrap_or_default();
 
         while Instant::now() < deadline {
@@ -283,16 +497,53 @@ impl HedgeExecutor {
                     let woke = tokio::time::timeout(nap, async {
                         loop {
                             match rx.recv().await {
-                                Ok(p) if push_matches_order(&p.data, &want_id) => return true,
+                                Ok(p)
+                                    if venue_matches_first(&p.venue, &plan.first.venue)
+                                        && push_matches_order(&p.data, &want_id) =>
+                                {
+                                    return Some(p.data)
+                                }
                                 Ok(_) => continue,
-                                Err(_) => return false,
+                                // 慢消费者会丢消息；丢掉的成交靠 REST 轮询补，
+                                // 不能把 channel 当成死掉。
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                                    continue
+                                }
+                                Err(_) => return None,
                             }
                         }
                     })
                     .await;
-                    if matches!(woke, Ok(true)) {
-                        // 推送说这张单动了：给 REST 一点点时间对齐，然后立刻查。
-                        sleep(Duration::from_millis(WS_SETTLE_MS)).await;
+                    if let Ok(Some(data)) = woke {
+                        // 只有足额才按推送量立刻对冲。部分成交可能只是
+                        // userFills 的一截增量，写进 filled 会把累计冲掉。
+                        if let Some((qty, px)) = fill_from_push(&data, &want_id) {
+                            match plausible_ws_fill(qty, plan.qty) {
+                                Some(qty) if qty >= plan.qty => {
+                                    info!(
+                                        pair = %plan.pair_id,
+                                        first = %plan.first.venue,
+                                        second = %plan.second.venue,
+                                        order_id = %want_id,
+                                        filled = %qty,
+                                        "limit_market: first leg fill from ws push; hedging now"
+                                    );
+                                    filled = qty;
+                                    fill_price = px.or(fill_price);
+                                    break;
+                                }
+                                Some(_) => {}
+                                None => {
+                                    warn!(
+                                        pair = %plan.pair_id,
+                                        first = %plan.first.venue,
+                                        filled = %qty,
+                                        target = %plan.qty,
+                                        "limit_market: ws fill qty implausible; waiting REST"
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
                 None => sleep(nap).await,
@@ -543,5 +794,90 @@ mod tests {
         assert!(!push_matches_order(&json!({"c": "arb-999"}), "arb-123"));
         // 空 order_id 永远不匹配，否则会被任意推送唤醒
         assert!(!push_matches_order(&json!({"c": "arb-123"}), ""));
+    }
+
+    #[test]
+    fn lighter_and_sodex_ws_fill_triggers_without_rest() {
+        use serde_json::json;
+
+        let lighter = json!({
+            "type": "account_all_orders",
+            "orders": [{
+                "client_order_index": "555",
+                "order_index": "999",
+                "filled_base_amount": "0.0107",
+                "price": "1553.19"
+            }]
+        });
+        assert!(push_matches_order(&lighter, "555"));
+        let (qty, px) = fill_from_push(&lighter, "555").expect("lighter filled");
+        assert_eq!(qty, dec!(0.0107));
+        assert_eq!(px, Some(dec!(1553.19)));
+        assert_eq!(plausible_ws_fill(qty, dec!(0.0107)), Some(dec!(0.0107)));
+        // 缩放整数不能当成交量
+        assert!(plausible_ws_fill(dec!(107), dec!(0.0107)).is_none());
+
+        let sodex = json!({"c": "arb-123", "i": 42, "z": "0.5", "L": "100.2"});
+        let (qty, px) = fill_from_push(&sodex, "arb-123").expect("sodex filled");
+        assert_eq!(qty, dec!(0.5));
+        assert_eq!(px, Some(dec!(100.2)));
+    }
+
+    #[test]
+    fn entropy_ws_fill_triggers_without_rest() {
+        use serde_json::json;
+
+        let oid = "527974206188";
+        let updates = json!({
+            "channel": "orderUpdates",
+            "data": [{
+                "status": "filled",
+                "order": {
+                    "oid": 527974206188_u64,
+                    "origSz": "0.0107",
+                    "sz": "0",
+                    "limitPx": "1552.7"
+                }
+            }]
+        });
+        assert!(push_matches_order(&updates, oid));
+        let (qty, px) = fill_from_push(&updates, oid).expect("filled qty from orderUpdates");
+        assert_eq!(qty, dec!(0.0107));
+        assert_eq!(px, Some(dec!(1552.7)));
+
+        let fills = json!({
+            "channel": "userFills",
+            "data": {
+                "isSnapshot": false,
+                "fills": [{
+                    "oid": 527974206188_u64,
+                    "sz": "0.0107",
+                    "px": "1552.7"
+                }]
+            }
+        });
+        assert!(push_matches_order(&fills, oid));
+        let (qty, px) = fill_from_push(&fills, oid).expect("filled qty from userFills");
+        assert_eq!(qty, dec!(0.0107));
+        assert_eq!(px, Some(dec!(1552.7)));
+
+        let snapshot = json!({
+            "channel": "userFills",
+            "data": {
+                "isSnapshot": true,
+                "fills": [{"oid": 527974206188_u64, "sz": "0.0107", "px": "1552.7"}]
+            }
+        });
+        assert!(fill_from_push(&snapshot, oid).is_none());
+
+        let open = json!({
+            "channel": "orderUpdates",
+            "data": [{
+                "status": "open",
+                "order": {"oid": 527974206188_u64, "origSz": "0.0107", "sz": "0.0107"}
+            }]
+        });
+        assert!(push_matches_order(&open, oid));
+        assert!(fill_from_push(&open, oid).is_none());
     }
 }

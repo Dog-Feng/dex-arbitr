@@ -1,12 +1,12 @@
 system:
   # HTTP 开着时本文件只给页面反显默认值；点启动/保存后策略跟页面走。
   # HTTP 关着时本文件就是运行时配置（纯后端测试）。
-  monitor_only: true
+  monitor_only: false
   data_freshness_ms: 3000
-  stable_depeg_bps: 20
   # 文本日志按天滚动。Linux 拷回：scp user@host:/opt/dex-arbitr/data/logs/*.log .
   log_dir: data/logs
 
+# 进程连接这些适配器。页面默认不勾选；点「启动套利」时再选手动参与的所。
 venues:
   - lighter
   - lighter_rh
@@ -14,8 +14,43 @@ venues:
   - entropy
 
 pairs:
-  # 空 = 各所两两交集全部进入扫描。要只盯少数币时写成 [BTC, ETH]。
-  whitelist: []
+  defaults:
+    max_segments: 3
+    initial_spread_threshold: "0.05"
+    grid_step: "0.05"
+    t0_ratio: "0.4"
+    split_order_size: "0"
+    scalping_enabled: false
+    scalping_trigger_segment: 2
+    scalping_profit_threshold_pct: "0.02"
+  # HTTP 开着时这里只是页面初始行，启动进程不会去各所拉市场。
+  # 点「启动套利」后按用户填写的 symbol + 所选所再匹配。空列表 = 只监控不交易。
+  enabled:
+    - symbol: BTC
+      base_qty: "0.001"
+      max_segments: 3
+      initial_spread_threshold: "0.05"
+      grid_step: "0.05"
+      overrides:
+        - venues: [lighter, entropy]
+          initial_spread_threshold: "0.02"
+          grid_step: "0.02"
+          max_segments: 6
+          scalping_enabled: true
+          scalping_trigger_segment: 2
+    - symbol: ETH
+      base_qty: "0.02"
+
+# 定仓已取消。这里只校验「按配置的每格数量开得起吗」。
+# depth_pct：单笔下单量不得超过一档量的这个比例。
+sizing:
+  max_concurrent_pairs: 1
+  leverage_multiplier: "5"
+  depth_pct: "50"
+  refresh_balance_secs: 60
+  margin_utilization_pct: "90"
+  # SoDEX 公开余额接口可能为空；有真实余额时以 bridge 为准
+  fallback_available_usdc: "500"
 
 # 对齐参考套利监控 V2：毛价差 ≥ 0.1% 记为机会，分析环扫内存盘口。
 # 不改格子、不下单。scan.enabled: false 则回到旧的单币格子监控。
@@ -26,22 +61,6 @@ execution:
   paper_trading: false
   # 仅本进程第二腿失败后补对冲；启动前已有仓位只告警、不自动下单
   hedge_failed_legs: true
-
-# 定仓模式：
-#   fixed  — 初期测试：每笔固定 USDC 名义（fixed_notional_usdc）
-#   margin — 稳定后：按保证金短板 × 杠杆定仓（默认）
-sizing:
-  mode: fixed
-  fixed_notional_usdc: "100"
-  max_concurrent_pairs: 1
-  leverage_multiplier: "2"
-  min_notional_usdc: "20"
-  max_notional_usdc: "100"
-  depth_pct: "50"
-  refresh_balance_secs: 60
-  margin_utilization_pct: "90"
-  # SoDEX 公开余额接口可能为空；有真实余额时以 bridge 为准
-  fallback_available_usdc: "500"
 
 live_test:
   # true = DEX 单所小额验证（主流程下单受 max_qty 限制）；价差套利正常运行时 false
@@ -54,7 +73,7 @@ http:
   # auth_token 为空时程序会拒绝对外监听，自动回落到 127.0.0.1
   # （/api/positions 会暴露余额、持仓、裸敞口）。要公网访问就设 token。
   bind: "127.0.0.1:8090"
-  web_root: web
+  web_root: web/dist
   auth_token: ""
 
 scan:
@@ -68,40 +87,12 @@ scan:
   log_interval_secs: 30
 
 grid:
-  # T1：第一格开仓阈值。第 n 格 = T1 + (n-1) × grid_step
-  # 单位是百分比，0.03 = 0.03%。开仓对比毛价差 raw，不按所对费率抬高。
-  initial_spread_threshold: "0.03"
-  # ── 分段网格（对齐参考项目 _build_grid_thresholds）──
-  # 开仓阈值 = [T1, T1+step, T1+2*step, ...]，共 max_segments 个
-  # 平仓阈值 = [T0, T1, T2, ...]，其中 T0 = T1 × t0_ratio
-  # 即：涨到 Tn 加仓到 n 格；回落跌破 T(n-1) 才减一格（滞后，防抖动来回开平）
-  #
-  # 格子开/平都看**毛价差**，不扣手续费、不扣天然基差。按当前费率每轮开平
-  # 往返约 0.034%，而 T1→T0 只收敛 0.018%，理论上每轮净亏约 0.016%。
-  # 这是对齐参考项目的刻意选择，见 docs/平仓判据备选方案B.md。
-  # 实盘请统计 journal 里 close 记录的 round_trip_pct 分布再决定是否切换。
-  t0_ratio: "0.4"
-  grid_step: "0.03"
-  max_segments: 3
-  # 单笔最大开/平仓量（拆单）。0 = 一次下完该加或该减的量。
-  # 吃不满或价差涨到更高格时，下一轮只要 raw 还够就会继续补到目标格。
-  split_order_size: "0"
-  # 往返净利止损：参考统一引擎没有。热路径已关掉，此字段保留但忽略。
-  close_stop_loss_pct: "0"
+  # 阈值已下沉到 pairs.defaults / enabled / overrides。这里只留持续性。
+  # window = persistence_ms 连续窗口；bucket = 参考秒桶（默认）。
   persistence_ms: 1000
-  # ── 剥头皮（对齐参考 scalping_enabled / SEG-SCALP）──
-  # 默认关。打开后，开仓视角格子（按 T1/step **不封顶**）≥ 触发格时，
-  # 该槽进入剥头皮：仍可按毛价差补仓，但关掉格子滞后减仓，改成
-  # 「价差收敛且建仓均毛价差 − 当前剩余毛价差 ≥ 止盈阈值」才减到目标格。
-  # 触发格可以大于 max_segments（参考 yaml 常写 10）。仓位归零才退出。
-  # forget 成交清持续性，不清剥头皮状态。
-  scalping_enabled: false
-  scalping_trigger_segment: 10
-  scalping_profit_threshold_pct: "0.02"
-  # 单格数量的回退值。定仓成功时会用 resolve_qty 的结果 / max_segments 覆盖
-  base_qty:
-    BTC: "0.001"
-    ETH: "0.02"
+  persistence_mode: window
+  spread_persistence_seconds: 1
+  strict_persistence_check: true
 
 # limit_then_market：吃单费率高的一所先挂限价，成交后再对另一所市价。
 # 挂着期间价差不够了就撤；若已经成交，另一边仍市价对冲，避免单边。
@@ -183,8 +174,8 @@ risk:
   # 小额实盘账户一启动就被判「余额严重不足」并全量清仓，所以这里默认 0。
   # warn：低于此值停止该所开仓（仓位不动）。
   # close：低于此值主动平掉该所全部仓位。close 必须小于 warn。
-  min_balance_warn_usdc: "0"
-  min_balance_close_usdc: "0"
+  min_balance_warn_usdc: "25"
+  min_balance_close_usdc: "20"
   # ── 持仓名义敞口上限（USDC，建仓名义）──
   # 口径说明：参考项目用币本位（max_single_token_position），但币本位跨币种
   # 不可比（10 BTC 是天量，10 DOGE 是零头），且「所有币数量之和」没有物理

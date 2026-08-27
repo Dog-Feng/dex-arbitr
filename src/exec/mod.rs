@@ -9,6 +9,6 @@ pub use executor::{
 pub use limit_market::LimitMarketRun;
 pub use planner::{plan_hedge, HedgeLeg, HedgePlan};
 pub use sequence::{
-    best_sequenced_spread, closing_sequenced_spread, fill_slip_overrun, sequenced_fee,
-    watch_resting_limit, LimitWatch,
+    best_sequenced_spread, closing_sequenced_spread, fill_slip_overrun, resting_open_spread_ok,
+    sequenced_fee, sequenced_spread, watch_resting_limit, LimitWatch,
 };

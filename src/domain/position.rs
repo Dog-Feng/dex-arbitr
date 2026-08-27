@@ -18,6 +18,9 @@ pub struct Position {
     pub entry_net_pct: Decimal,
     /// 建仓均毛价差（不扣费）。剥头皮止盈用：`entry_raw − 当前剩余毛价差`。
     pub entry_raw_pct: Decimal,
+    /// 开仓时定仓所得单格数量。用于 `GridEngine::segments_held` 的整个持仓
+    /// 周期，不随后续保证金/盘口变化重算，避免 base_qty 漂移导致格数误判。
+    pub base_qty: Decimal,
     /// 首次建仓时刻，持仓时长上限用。
     ///
     /// 补仓**不刷新**它：刷新会让一条被反复加仓的仓位永远不超时，而超时

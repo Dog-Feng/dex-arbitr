@@ -101,7 +101,8 @@ async fn main() -> Result<()> {
                 reduce_only: args.iter().any(|a| a == "--reduce-only"),
                 style,
                 limit_price,
-                client_order_id: Some(format!("lt-{}", now_ts())),
+                // Lighter 要求正 int64 client_order_index；`lt-` 前缀会被 sidecar 拒单。
+                client_order_id: Some(now_ts().to_string()),
                 // 手工验证工具：不设保护价，交给 sidecar 的默认保护。
                 target_price: None,
                 slippage_pct: None,
@@ -146,7 +147,7 @@ async fn load_adapter(cfg: &AppConfig, venue_id: &str) -> Result<Arc<dyn Exchang
         anyhow::bail!("missing {}", path.display());
     }
     let venue = cfg.load_venue(venue_id)?;
-    Ok(make_adapter(venue, cfg.pairs.whitelist.clone()))
+    Ok(make_adapter(venue, Vec::new()))
 }
 
 fn cap_qty(cfg: &AppConfig, qty: Decimal) -> Result<()> {
@@ -186,5 +187,8 @@ fn log_journal(
         net_pct: None,
         result: result.to_string(),
         detail: detail.to_string(),
+        grid_from: None,
+        grid_to: None,
+        pnl_pct: None,
     })
 }

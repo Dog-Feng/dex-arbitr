@@ -38,4 +38,4 @@ stdout：
 
 与 `dex-arbitr` 同机、同仓库根目录运行；Rust 默认查找 `scripts/exchange_sidecar/exchange_sidecar`。
 
-旧组件 `scripts/exchange_bridge.py`、`scripts/sodex_bridge` 已弃用，请只用本 sidecar。
+旧组件 `scripts/exchange_bridge.py` 已弃用，请只用本 sidecar。

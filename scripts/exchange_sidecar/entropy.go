@@ -58,6 +58,24 @@ type entropySession struct {
 
 	wsOnce sync.Once
 	wsStop context.CancelFunc
+
+	fillMu sync.Mutex
+	fills  map[string]entropyFillNote
+}
+
+type entropyFillNote struct {
+	// orderUpdates 是累计成交；userFills 是增量。两边都会推同一笔，
+	// 不能加在一起，否则市价腿确认会变成 2 倍。认两者的较大值。
+	fromOrder decimal.Decimal
+	fromFills decimal.Decimal
+	px        string
+}
+
+func (n entropyFillNote) qty() decimal.Decimal {
+	if n.fromOrder.GreaterThan(n.fromFills) {
+		return n.fromOrder
+	}
+	return n.fromFills
 }
 
 func (s *entropySession) close() {
@@ -825,6 +843,9 @@ func (s *entropySession) waitOrderFill(ctx context.Context, oid int64, cloid str
 		if ctx.Err() != nil {
 			break
 		}
+		if f, px, hit := s.wsFill(oid, cloid); hit && qty.GreaterThan(decimal.Zero) && f.GreaterThanOrEqual(qty) {
+			return f, px, "filled"
+		}
 		if v, found := s.lookupOrder(ctx, oid, cloid); found {
 			last, ok = v, true
 			st := strings.ToLower(v.status)
@@ -833,7 +854,14 @@ func (s *entropySession) waitOrderFill(ctx context.Context, oid int64, cloid str
 				return filled, avg, status
 			}
 		}
-		fillPollSleep(deadline)
+		tightFillPoll(deadline)
+	}
+	if f, px, hit := s.wsFill(oid, cloid); hit && f.GreaterThan(decimal.Zero) {
+		st := "partial"
+		if qty.GreaterThan(decimal.Zero) && f.GreaterThanOrEqual(qty) {
+			st = "filled"
+		}
+		return f, px, st
 	}
 	if ok {
 		filled, avg, status := last.filledAndStatus(qty, true)
@@ -956,6 +984,148 @@ func (s *entropySession) infoJSON(ctx context.Context, payload any, dest any) er
 	return json.Unmarshal(raw, dest)
 }
 
+func (s *entropySession) noteWsMsg(msg []byte) {
+	var env struct {
+		Channel string          `json:"channel"`
+		Data    json.RawMessage `json:"data"`
+	}
+	if json.Unmarshal(msg, &env) != nil {
+		return
+	}
+	switch env.Channel {
+	case "orderUpdates":
+		var items []struct {
+			Status string `json:"status"`
+			Order  struct {
+				Oid     int64  `json:"oid"`
+				OrigSz  string `json:"origSz"`
+				Sz      string `json:"sz"`
+				LimitPx string `json:"limitPx"`
+				Cloid   string `json:"cloid"`
+			} `json:"order"`
+		}
+		if json.Unmarshal(env.Data, &items) != nil {
+			var one struct {
+				Status string `json:"status"`
+				Order  struct {
+					Oid     int64  `json:"oid"`
+					OrigSz  string `json:"origSz"`
+					Sz      string `json:"sz"`
+					LimitPx string `json:"limitPx"`
+					Cloid   string `json:"cloid"`
+				} `json:"order"`
+			}
+			if json.Unmarshal(env.Data, &one) != nil {
+				return
+			}
+			items = []struct {
+				Status string `json:"status"`
+				Order  struct {
+					Oid     int64  `json:"oid"`
+					OrigSz  string `json:"origSz"`
+					Sz      string `json:"sz"`
+					LimitPx string `json:"limitPx"`
+					Cloid   string `json:"cloid"`
+				} `json:"order"`
+			}{one}
+		}
+		for _, it := range items {
+			st := strings.ToLower(it.Status)
+			if st == "open" || st == "new" || st == "resting" {
+				continue
+			}
+			orig := decimalFromString(it.Order.OrigSz)
+			rem := decimalFromString(it.Order.Sz)
+			filled := orig.Sub(rem)
+			if filled.LessThan(decimal.Zero) {
+				filled = decimal.Zero
+			}
+			if st == "filled" && orig.GreaterThan(decimal.Zero) {
+				filled = orig
+			}
+			s.setFill(strconv.FormatInt(it.Order.Oid, 10), it.Order.Cloid, filled, it.Order.LimitPx)
+		}
+	case "userFills":
+		var inner struct {
+			IsSnapshot bool `json:"isSnapshot"`
+			Fills      []struct {
+				Oid   int64  `json:"oid"`
+				Sz    string `json:"sz"`
+				Px    string `json:"px"`
+				Cloid string `json:"cloid"`
+			} `json:"fills"`
+		}
+		if json.Unmarshal(env.Data, &inner) != nil || inner.IsSnapshot {
+			return
+		}
+		for _, f := range inner.Fills {
+			s.addFill(strconv.FormatInt(f.Oid, 10), f.Cloid, decimalFromString(f.Sz), f.Px)
+		}
+	}
+}
+
+func (s *entropySession) setFill(oid, cloid string, qty decimal.Decimal, px string) {
+	if !qty.GreaterThan(decimal.Zero) {
+		return
+	}
+	s.fillMu.Lock()
+	defer s.fillMu.Unlock()
+	if s.fills == nil {
+		s.fills = make(map[string]entropyFillNote)
+	}
+	for _, k := range []string{oid, cloid} {
+		if k == "" || k == "0" {
+			continue
+		}
+		n := s.fills[k]
+		if qty.GreaterThan(n.fromOrder) {
+			n.fromOrder = qty
+		}
+		if px != "" {
+			n.px = px
+		}
+		s.fills[k] = n
+	}
+}
+
+func (s *entropySession) addFill(oid, cloid string, qty decimal.Decimal, px string) {
+	if !qty.GreaterThan(decimal.Zero) {
+		return
+	}
+	s.fillMu.Lock()
+	defer s.fillMu.Unlock()
+	if s.fills == nil {
+		s.fills = make(map[string]entropyFillNote)
+	}
+	for _, k := range []string{oid, cloid} {
+		if k == "" || k == "0" {
+			continue
+		}
+		n := s.fills[k]
+		n.fromFills = n.fromFills.Add(qty)
+		if px != "" {
+			n.px = px
+		}
+		s.fills[k] = n
+	}
+}
+
+func (s *entropySession) wsFill(oid int64, cloid string) (decimal.Decimal, string, bool) {
+	s.fillMu.Lock()
+	defer s.fillMu.Unlock()
+	for _, k := range []string{strconv.FormatInt(oid, 10), cloid} {
+		if k == "" || k == "0" {
+			continue
+		}
+		if n, ok := s.fills[k]; ok {
+			if q := n.qty(); q.GreaterThan(decimal.Zero) {
+				return q, n.px, true
+			}
+		}
+	}
+	return decimal.Zero, "", false
+}
+
 func (s *entropySession) startOrderStream() {
 	s.wsOnce.Do(func() {
 		ctx, cancel := context.WithCancel(context.Background())
@@ -1028,6 +1198,7 @@ func (s *entropySession) orderStreamOnce(ctx context.Context) error {
 			continue
 		}
 		if env.Channel == "orderUpdates" || env.Channel == "userFills" {
+			s.noteWsMsg(msg)
 			emitPush("entropy", json.RawMessage(msg))
 		}
 	}

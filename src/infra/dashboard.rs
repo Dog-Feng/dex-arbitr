@@ -12,7 +12,6 @@ pub struct IntentStats {
     pub skip_thin: u64,
     pub skip_invalid: u64,
     pub skip_spread: u64,
-    pub skip_depeg: u64,
     pub skip_wait: u64,
     /// 单所自身点差过宽（报价不可信 / 流动性差）。
     pub skip_wide: u64,
@@ -40,9 +39,8 @@ impl IntentStats {
             "thin_book" => self.skip_thin += 1,
             "invalid_bbo" => self.skip_invalid += 1,
             "no_spread" => self.skip_spread += 1,
-            "depeg" => self.skip_depeg += 1,
             "wide_book" => self.skip_wide += 1,
-            "no_size" | "no_min_qty" => self.skip_size += 1,
+            "no_size" | "no_min_qty" | "no_margin" | "no_capacity" => self.skip_size += 1,
             "no_baseline" => self.skip_baseline += 1,
             _ => self.skip_wait += 1,
         }
