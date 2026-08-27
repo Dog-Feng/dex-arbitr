@@ -15,8 +15,8 @@
     <Field label="margin_utilization_pct" hint="可用余额最多用到多少">
       <n-input :value="String(p.margin_utilization_pct)" @update:value="p.margin_utilization_pct = $event" />
     </Field>
-    <Field label="refresh_balance_secs" hint="余额刷新间隔">
-      <n-input-number v-model:value="p.refresh_balance_secs" :min="10" :step="10" />
+    <Field label="refresh_balance_secs" hint="余额和交易所持仓刷新间隔（秒）">
+      <n-input-number v-model:value="p.refresh_balance_secs" :min="1" :step="1" />
     </Field>
     <Field label="fallback_available_usdc" hint="余额接口为空时的回退值">
       <n-input :value="String(p.fallback_available_usdc)" @update:value="p.fallback_available_usdc = $event" />

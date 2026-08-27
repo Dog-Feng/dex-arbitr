@@ -195,6 +195,7 @@ export interface ExecRow {
   detail: string;
   grid_from?: number | null;
   grid_to?: number | null;
+  pnl_usdc?: string | null;
   pnl_pct?: string | null;
 }
 

@@ -7,6 +7,8 @@
 //! cargo run --bin live-test -- aggressive entropy SNDK buy 0.007 1480
 //! cargo run --bin live-test -- limit entropy SNDK buy 0.007 1000
 //! cargo run --bin live-test -- cancel entropy SNDK <order_id>
+//! cargo run --bin live-test -- fill-pnl entropy SNDK
+//! cargo run --bin live-test -- fill-pnl lighter BTC
 //! cargo run --bin live-test -- recap
 //! ```
 
@@ -24,7 +26,7 @@ use std::sync::Arc;
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: live-test <account|balance|positions|market|limit|aggressive|cancel|recap> ...");
+        eprintln!("usage: live-test <account|balance|positions|markets|fill-pnl|market|limit|aggressive|cancel|recap> ...");
         std::process::exit(1);
     }
     let cfg = AppConfig::load()?;
@@ -65,8 +67,45 @@ async fn main() -> Result<()> {
             }
             if cmd == "positions" || cmd == "account" {
                 for p in &snap.positions {
-                    println!("{} qty={} entry={:?}", p.symbol, p.qty, p.entry_price);
+                    println!(
+                        "{} qty={} entry={:?} realized={:?}",
+                        p.symbol, p.qty, p.entry_price, p.realized_pnl
+                    );
                 }
+            }
+        }
+        "markets" => {
+            let markets = adapter.list_perps().await?;
+            for m in markets {
+                println!(
+                    "{} raw={} idx={} min_qty={} qty_prec={}",
+                    m.base, m.raw_symbol, m.market_index, m.min_qty, m.qty_precision
+                );
+            }
+        }
+        "fill-pnl" => {
+            let symbol = args.get(3).cloned().unwrap_or_default();
+            let order_id = args.get(4).cloned().filter(|s| !s.is_empty());
+            let targets: Vec<String> = if symbol.is_empty() {
+                adapter
+                    .account()
+                    .await?
+                    .positions
+                    .into_iter()
+                    .map(|p| p.symbol)
+                    .collect()
+            } else {
+                vec![symbol]
+            };
+            if targets.is_empty() {
+                anyhow::bail!("no open positions; pass a symbol: live-test fill-pnl {venue_id} SYMBOL [order_id]");
+            }
+            for sym in targets {
+                let pnl = adapter.fill_realized_pnl(&sym, order_id.as_deref()).await?;
+                println!(
+                    "symbol={sym} order_id={:?} found={} per_fill={} realized_pnl={}",
+                    order_id, pnl.found, pnl.per_fill, pnl.realized_pnl
+                );
             }
         }
         "market" | "limit" | "aggressive" => {
@@ -190,5 +229,6 @@ fn log_journal(
         grid_from: None,
         grid_to: None,
         pnl_pct: None,
+        pnl_usdc: None,
     })
 }

@@ -18,8 +18,10 @@ config/venues/*.yaml
 scripts/__pycache__/
 scripts/exchange_sidecar/exchange_sidecar
 scripts/exchange_sidecar/exchange_sidecar.exe
+scripts/exchange_sidecar/exchange_sidecar.exe~
 scripts/exchange_sidecar/exchange-sidecar.exe
 *.exe.bak*
+*.exe~
 web/node_modules
 web/dist
 

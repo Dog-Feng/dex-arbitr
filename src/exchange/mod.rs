@@ -13,8 +13,8 @@ pub use bridge::{bridge_available, bridge_call, bridge_watch, subscribe_order_pu
 pub use entropy::EntropyAdapter;
 pub use lighter::LighterAdapter;
 pub use port::{
-    AccountSnapshot, Balance, CancelReq, ExchangePort, FundingRate, OrderAck, OrderReq, OrderStatus,
-    VenuePosition,
+    AccountSnapshot, Balance, CancelReq, ExchangePort, FillPnl, FundingRate, OrderAck, OrderReq,
+    OrderStatus, VenuePosition,
 };
 pub use sodex::SodexAdapter;
 

@@ -11,7 +11,7 @@ import { h } from "vue";
 import { NTag } from "naive-ui";
 import type { DataTableColumns } from "naive-ui";
 import type { ExecRow } from "../types";
-import { netCls, statusKind } from "../format";
+import { statusKind } from "../format";
 
 defineProps<{ rows: ExecRow[] }>();
 
@@ -34,11 +34,20 @@ function qtyText(v: unknown): string {
 }
 
 function pnlText(r: ExecRow): string {
-  if (r.action !== "close" || r.pnl_pct == null || r.pnl_pct === "") return "—";
-  const n = parseFloat(r.pnl_pct);
+  if (r.action !== "close" || r.pnl_usdc == null || r.pnl_usdc === "") return "—";
+  const n = parseFloat(r.pnl_usdc);
   if (Number.isNaN(n)) return "—";
-  const body = n.toFixed(2);
-  return n > 0 ? `+${body}%` : `${body}%`;
+  const body = Math.abs(n).toFixed(2);
+  if (n > 0) return `+${body}`;
+  if (n < 0) return `-${body}`;
+  return "0.00";
+}
+
+function pnlCls(r: ExecRow): string {
+  if (r.action !== "close" || r.pnl_usdc == null || r.pnl_usdc === "") return "mu";
+  const n = parseFloat(r.pnl_usdc);
+  if (Number.isNaN(n) || n === 0) return "mu";
+  return n > 0 ? "up" : "dn";
 }
 
 const cols: DataTableColumns<ExecRow> = [
@@ -73,7 +82,7 @@ const cols: DataTableColumns<ExecRow> = [
     title: "盈亏",
     key: "pnl",
     width: 100,
-    render: (r) => h("span", { class: `tabular ${netCls(r.action === "close" ? r.pnl_pct : null)}` }, pnlText(r)),
+    render: (r) => h("span", { class: `tabular ${pnlCls(r)}` }, pnlText(r)),
   },
   {
     title: "结果",

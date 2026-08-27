@@ -147,6 +147,8 @@ func dispatchLighter(ctx context.Context, reg *registry, venueID string, req req
 		// 启动私有订单流。幂等：重复调用只会启动一次。
 		s.startOrderStream(venueID)
 		return map[string]string{"status": "watching"}, nil
+	case "fill_pnl":
+		return s.fillPnl(ctx, params)
 	default:
 		return nil, fmt.Errorf("unknown cmd %q", req.Cmd)
 	}
@@ -218,6 +220,9 @@ func (s *lighterSession) account(ctx context.Context) (map[string]any, error) {
 		}
 		if avg := stringValue(raw["avg_entry_price"]); avg != "" {
 			entry["entry_price"] = avg
+		}
+		if rpnl := stringValue(firstValue(raw, "realized_pnl", "realizedPnl")); rpnl != "" {
+			entry["realized_pnl"] = rpnl
 		}
 		positions = append(positions, entry)
 	}
@@ -1095,4 +1100,163 @@ func (s *lighterSession) funding(ctx context.Context) (map[string]any, error) {
 		return nil, fmt.Errorf("no lighter funding rates in %d rows", len(rows))
 	}
 	return map[string]any{"rates": out}, nil
+}
+
+// fillPnl：全平后持仓 realized_pnl 会回到 0，不能当本笔盈亏。
+// 改走 /api/v1/trades（该 order 的成交），用所方带回的 entry_quote / size_before，
+// 或成交上若有 pnl 字段就直接用。
+func (s *lighterSession) fillPnl(ctx context.Context, params map[string]any) (map[string]any, error) {
+	oid := paramString(params, "order_id", "")
+	want := paramString(params, "symbol", "")
+	if oid != "" {
+		all, err := s.fetchAccountTrades(ctx)
+		if err != nil {
+			return nil, err
+		}
+		var trades []map[string]any
+		for _, t := range all {
+			if tradeMatchesOrder(t, oid) {
+				trades = append(trades, t)
+			}
+		}
+		sum := decimal.Zero
+		found := false
+		for _, t := range trades {
+			if v, ok := tradeExplicitPnl(t, s.venue.AccountIndex); ok {
+				found = true
+				sum = sum.Add(v)
+				continue
+			}
+			if v, ok := tradeRealizedFromEntry(t, s.venue.AccountIndex); ok {
+				found = true
+				sum = sum.Add(v)
+			}
+		}
+		out := fillPnlResult(sum, true, found)
+		if paramString(params, "debug", "") == "1" {
+			out["trade_count"] = len(trades)
+			out["all_count"] = len(all)
+			if len(trades) > 0 {
+				out["sample"] = trades[0]
+			} else if len(all) > 0 {
+				out["sample"] = all[0]
+			}
+		}
+		return out, nil
+	}
+	result, err := s.get(ctx, "/api/v1/account", url.Values{
+		"by":    {"index"},
+		"value": {strconv.FormatInt(s.venue.AccountIndex, 10)},
+	}, nil)
+	if err != nil {
+		return nil, err
+	}
+	accounts := rawList(result["accounts"])
+	if len(accounts) == 0 {
+		return fillPnlResult(decimal.Zero, false, false), nil
+	}
+	for _, raw := range rawList(accounts[0]["positions"]) {
+		sym := stringValue(raw["symbol"])
+		if !symbolMatch(sym, want) {
+			continue
+		}
+		pnl := decimalValue(firstValue(raw, "realized_pnl", "realizedPnl"))
+		return fillPnlResult(pnl, false, true), nil
+	}
+	return fillPnlResult(decimal.Zero, false, false), nil
+}
+
+func (s *lighterSession) fetchAccountTrades(ctx context.Context) ([]map[string]any, error) {
+	token, err := s.txClient.GetAuthToken(time.Now().Add(10 * time.Minute))
+	if err != nil {
+		return nil, fmt.Errorf("lighter auth token: %w", err)
+	}
+	q := url.Values{
+		"account_index": {strconv.FormatInt(s.venue.AccountIndex, 10)},
+		"sort_by":       {"timestamp"},
+		"sort_dir":      {"desc"},
+		"limit":         {"50"},
+		"auth":          {token},
+	}
+	result, err := s.get(ctx, "/api/v1/trades", q, http.Header{"authorization": {token}})
+	if err != nil {
+		return nil, err
+	}
+	return rawList(result["trades"]), nil
+}
+
+func tradeMatchesOrder(t map[string]any, orderID string) bool {
+	for _, k := range []string{
+		"ask_id", "bid_id", "ask_id_str", "bid_id_str",
+		"ask_client_id", "bid_client_id", "ask_client_id_str", "bid_client_id_str",
+	} {
+		v := firstValue(t, k)
+		if v == nil {
+			continue
+		}
+		if strings.TrimSpace(fmt.Sprint(v)) == orderID {
+			return true
+		}
+	}
+	return false
+}
+
+func tradeExplicitPnl(t map[string]any, accountIndex int64) (decimal.Decimal, bool) {
+	for _, k := range []string{
+		"account_pnl", "realized_pnl", "closed_pnl", "pnl",
+		"ask_account_pnl", "bid_account_pnl",
+	} {
+		if _, ok := t[k]; !ok {
+			continue
+		}
+		// ask/bid 字段只认自己那一侧
+		if k == "ask_account_pnl" && int64(intOr(t["ask_account_id"], 0)) != accountIndex {
+			continue
+		}
+		if k == "bid_account_pnl" && int64(intOr(t["bid_account_id"], 0)) != accountIndex {
+			continue
+		}
+		return decimalValue(t[k]), true
+	}
+	return decimal.Zero, false
+}
+
+func tradeRealizedFromEntry(t map[string]any, accountIndex int64) (decimal.Decimal, bool) {
+	bidID := int64(intOr(firstValue(t, "bid_account_id", "bid_account_index"), 0))
+	askID := int64(intOr(firstValue(t, "ask_account_id", "ask_account_index"), 0))
+	weBid := bidID == accountIndex
+	weAsk := askID == accountIndex
+	if !weBid && !weAsk {
+		return decimal.Zero, false
+	}
+	isMakerAsk := false
+	switch v := t["is_maker_ask"].(type) {
+	case bool:
+		isMakerAsk = v
+	}
+	weMaker := (weAsk && isMakerAsk) || (weBid && !isMakerAsk)
+	role := "taker"
+	if weMaker {
+		role = "maker"
+	}
+	sizeBefore := decimalValue(firstValue(t, role+"_position_size_before"))
+	entryQuote := decimalValue(firstValue(t, role+"_entry_quote_before"))
+	px := decimalValue(t["price"])
+	sz := decimalValue(t["size"])
+	if !sz.GreaterThan(decimal.Zero) || !px.GreaterThan(decimal.Zero) {
+		return decimal.Zero, false
+	}
+	if !sizeBefore.GreaterThan(decimal.Zero) || !entryQuote.GreaterThan(decimal.Zero) {
+		// 开仓或加仓：没有已实现。
+		return decimal.Zero, true
+	}
+	entryPx := entryQuote.Div(sizeBefore)
+	closed := sz
+	if sizeBefore.LessThan(sz) {
+		closed = sizeBefore
+	}
+	if weAsk {
+		return px.Sub(entryPx).Mul(closed), true
+	}
+	return entryPx.Sub(px).Mul(closed), true
 }

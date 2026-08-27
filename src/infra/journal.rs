@@ -20,7 +20,9 @@ pub struct ExecRecord {
     pub grid_from: Option<u32>,
     /// 成交后格子。
     pub grid_to: Option<u32>,
-    /// 仅关仓/减格：往返净利 %。开仓为空。
+    /// 仅关仓/减格：双边已实现盈亏（报价货币金额）。开仓为空。
+    pub pnl_usdc: Option<Decimal>,
+    /// 仅关仓/减格：往返净利 %（记录用）。开仓为空。
     pub pnl_pct: Option<Decimal>,
 }
 
@@ -90,6 +92,7 @@ impl ExecJournal {
                 detail: row.get(8)?,
                 grid_from: None,
                 grid_to: None,
+                pnl_usdc: None,
                 pnl_pct: None,
             })
         })?;

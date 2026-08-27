@@ -32,6 +32,7 @@ match venue.id.as_str() {
 | `order_status()` | `OrderAck` | 不确认就不下结论 |
 | `account()` | `AccountSnapshot` | 余额 + 持仓一并返回 |
 | `funding()` | `Vec<FundingRate>` | **缺失返回空表**，不是 0 费率 |
+| `fill_realized_pnl(symbol, order_id)` | `FillPnl` | 该所这一笔（或累计）已实现盈亏。盘口订阅没有这个字段 |
 
 `positions()` / `balances()` 可由 `account()` 派生。`order_status()` / `funding()` 在 trait 上有默认实现（分别返回 `Err` / 空表），但新所两个都要真实现——前者是成交确认的基础，后者关系到费率门。
 
@@ -71,16 +72,17 @@ match venue.id.as_str() {
 
 会话必须**长存**（连接、认证、市场精度只建一次）。每条请求独立 goroutine，会话内部自行加锁。
 
-### 2.1 六条 cmd
+### 2.1 七条 cmd
 
 | cmd | params | data |
 |---|---|---|
-| `account` | — | `{balances:[{asset,available,total}], positions:[{symbol,qty,entry_price}]}` |
+| `account` | — | `{balances:[{asset,available,total}], positions:[{symbol,qty,entry_price,realized_pnl?}]}` |
 | `place` | 见 §2.2 | `{order_id, client_order_id, filled_qty, status, avg_price}` |
 | `cancel` | `order_id, symbol, market_index` | `{order_id, status}` |
 | `order_status` | `order_id, symbol, market_index, qty` | 同 `place` |
 | `funding` | — | `{rates:[{symbol, rate, interval_secs}]}` |
 | `watch` | — | `{status:"watching"}`，启私有订单流，**幂等** |
+| `fill_pnl` | `symbol, order_id` | `{realized_pnl, per_fill, found}`。盘口没有盈亏。Entropy 用成交 `closedPnl`（`per_fill=true`）；Lighter 用成交 `ask_account_pnl`/`bid_account_pnl`（`per_fill=true`）；SoDEX 用持仓累计 `realizedPnL`（`per_fill=false`，本笔=平后−平前）。`found=false` 时上层显示 `—`，不要当成 0 |
 
 `positions[].symbol` 用**交易所原始符号**，不是 `pair_id`——对账靠它匹配。`qty` 带符号（正多负空）。
 
@@ -209,6 +211,7 @@ Lighter 需要：「取 nonce → 签名 → sendTx」整段原子化（`lighter
 | 市价平仓 | `live-test market {venue} {BASE} sell {qty} --reduce-only` | 成交后 `positions` 清空或绝对值下降 |
 | taker 限价 | `live-test aggressive {venue} {BASE} buy {qty} {穿越盘口的限价}` | IOC：成交或整单撤销，**不得**报 `accepted` 后空等 |
 | 挂单 + 撤单 | `live-test limit {venue} {BASE} buy {qty} {远离盘口的价}` → `cancel {venue} {BASE} {order_id}` | 限价单驻留拿到 `order_id`，撤单成功、盘口上消失 |
+| 平仓盈亏 | `live-test fill-pnl {venue} {BASE} {order_id}` | `found=true`，`realized_pnl` 为所方字段（不要用开平仓价本地算） |
 
 注意：
 
@@ -216,6 +219,7 @@ Lighter 需要：「取 nonce → 签名 → sendTx」整段原子化（`lighter
 - 两地址所（SoDEX、Entropy）：`account_address` 必须是**持仓主账户**，`private_key` 是签名/API 钱包。查余额用错地址会看到 0 却不报错。
 - 统一账户（Hyperliquid / Entropy 推荐项）：可用保证金在 API 的 `spotClearinghouseState`，不要只读 perp `withdrawable`。
 - 测完确认无残留仓位、无驻留挂单。记录 `order_id` / `filled_qty` / 持仓变化。
+- 平仓后用 `live-test fill-pnl {venue} {BASE} {order_id}` 核对所方已实现盈亏。Entropy 看 `closedPnl`；Lighter 看成交 `ask_account_pnl` / `bid_account_pnl`（持仓 `realized_pnl` 全平后是 0，不要用）。
 
 ```bash
 # Entropy 示例（SNDK，名义约 10 USDC；数量按当时价格改）
@@ -224,6 +228,7 @@ cargo run --bin live-test -- account entropy
 cargo run --bin live-test -- market entropy SNDK buy 0.007
 cargo run --bin live-test -- positions entropy
 cargo run --bin live-test -- market entropy SNDK sell 0.007 --reduce-only
+cargo run --bin live-test -- fill-pnl entropy SNDK <close_order_id>
 cargo run --bin live-test -- aggressive entropy SNDK buy 0.007 1480
 cargo run --bin live-test -- limit entropy SNDK buy 0.007 1000
 cargo run --bin live-test -- cancel entropy SNDK <order_id>
@@ -233,10 +238,10 @@ cargo run --bin live-test -- cancel entropy SNDK <order_id>
 
 ## 6. 落地清单
 
-- [ ] `src/exchange/{新所}.rs` 实现 `ExchangePort` 八个方法
+- [ ] `src/exchange/{新所}.rs` 实现 `ExchangePort`（含 `fill_realized_pnl`）
 - [ ] `src/exchange/mod.rs:19` 加 `make_adapter` 分支
 - [ ] `src/domain/symbol.rs` 补符号归一（若计价符号是新形态）
-- [ ] `scripts/exchange_sidecar/{新所}.go` 实现六条 cmd
+- [ ] `scripts/exchange_sidecar/{新所}.go` 实现七条 cmd（含 `fill_pnl`）
 - [ ] `main.go` `dispatch()` 加 venue 分支，确定该所的 fill wait 档位
 - [ ] `config/venues/{新所}.example.yaml` 字段占位；真配置不提交
 - [ ] `config/default.yaml` 的 `venues` 与 `leverage_by_venue`

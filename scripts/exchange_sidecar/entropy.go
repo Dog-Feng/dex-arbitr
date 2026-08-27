@@ -69,6 +69,9 @@ type entropyFillNote struct {
 	fromOrder decimal.Decimal
 	fromFills decimal.Decimal
 	px        string
+	closedPnl decimal.Decimal
+	// userFills 见过这条单。closedPnl 可以是 0（打平），不能用「非零」当有没有。
+	sawFill bool
 }
 
 func (n entropyFillNote) qty() decimal.Decimal {
@@ -128,6 +131,8 @@ func dispatchEntropy(ctx context.Context, reg *registry, req request) (any, erro
 	case "watch":
 		s.startOrderStream()
 		return map[string]string{"status": "watching"}, nil
+	case "fill_pnl":
+		return s.fillPnl(ctx, params)
 	default:
 		return nil, fmt.Errorf("unknown cmd %q", req.Cmd)
 	}
@@ -1049,17 +1054,18 @@ func (s *entropySession) noteWsMsg(msg []byte) {
 		var inner struct {
 			IsSnapshot bool `json:"isSnapshot"`
 			Fills      []struct {
-				Oid   int64  `json:"oid"`
-				Sz    string `json:"sz"`
-				Px    string `json:"px"`
-				Cloid string `json:"cloid"`
+				Oid       int64  `json:"oid"`
+				Sz        string `json:"sz"`
+				Px        string `json:"px"`
+				Cloid     string `json:"cloid"`
+				ClosedPnl string `json:"closedPnl"`
 			} `json:"fills"`
 		}
 		if json.Unmarshal(env.Data, &inner) != nil || inner.IsSnapshot {
 			return
 		}
 		for _, f := range inner.Fills {
-			s.addFill(strconv.FormatInt(f.Oid, 10), f.Cloid, decimalFromString(f.Sz), f.Px)
+			s.addFill(strconv.FormatInt(f.Oid, 10), f.Cloid, decimalFromString(f.Sz), f.Px, decimalFromString(f.ClosedPnl))
 		}
 	}
 }
@@ -1088,8 +1094,8 @@ func (s *entropySession) setFill(oid, cloid string, qty decimal.Decimal, px stri
 	}
 }
 
-func (s *entropySession) addFill(oid, cloid string, qty decimal.Decimal, px string) {
-	if !qty.GreaterThan(decimal.Zero) {
+func (s *entropySession) addFill(oid, cloid string, qty decimal.Decimal, px string, closedPnl decimal.Decimal) {
+	if !qty.GreaterThan(decimal.Zero) && closedPnl.IsZero() {
 		return
 	}
 	s.fillMu.Lock()
@@ -1102,12 +1108,30 @@ func (s *entropySession) addFill(oid, cloid string, qty decimal.Decimal, px stri
 			continue
 		}
 		n := s.fills[k]
-		n.fromFills = n.fromFills.Add(qty)
+		n.sawFill = true
+		if qty.GreaterThan(decimal.Zero) {
+			n.fromFills = n.fromFills.Add(qty)
+		}
 		if px != "" {
 			n.px = px
 		}
+		n.closedPnl = n.closedPnl.Add(closedPnl)
 		s.fills[k] = n
 	}
+}
+
+func (s *entropySession) wsClosedPnl(oid, cloid string) (decimal.Decimal, bool) {
+	s.fillMu.Lock()
+	defer s.fillMu.Unlock()
+	for _, k := range []string{oid, cloid} {
+		if k == "" || k == "0" {
+			continue
+		}
+		if n, ok := s.fills[k]; ok && n.sawFill {
+			return n.closedPnl, true
+		}
+	}
+	return decimal.Zero, false
 }
 
 func (s *entropySession) wsFill(oid int64, cloid string) (decimal.Decimal, string, bool) {
@@ -1267,4 +1291,71 @@ func isAlpha(s string) bool {
 		}
 	}
 	return true
+}
+
+func (s *entropySession) fillPnl(ctx context.Context, params map[string]any) (map[string]any, error) {
+	oid := paramString(params, "order_id", "")
+	want := paramString(params, "symbol", "")
+	if oid != "" {
+		if pnl, ok := s.wsClosedPnl(oid, oid); ok {
+			return fillPnlResult(pnl, true, true), nil
+		}
+	}
+	var raw json.RawMessage
+	if err := s.infoJSON(ctx, map[string]any{"type": "userFills", "user": s.addr}, &raw); err != nil {
+		return nil, err
+	}
+	type fillRow struct {
+		Coin      string `json:"coin"`
+		Oid       int64  `json:"oid"`
+		Cloid     string `json:"cloid"`
+		ClosedPnl string `json:"closedPnl"`
+		Time      int64  `json:"time"`
+	}
+	var fills []fillRow
+	if json.Unmarshal(raw, &fills) != nil {
+		var wrap struct {
+			Fills []fillRow `json:"fills"`
+		}
+		if err := json.Unmarshal(raw, &wrap); err != nil {
+			return nil, fmt.Errorf("userFills decode: %w", err)
+		}
+		fills = wrap.Fills
+	}
+	sum := decimal.Zero
+	found := false
+	fillCount := 0
+	nonzero := 0
+	since := time.Now().Add(-30 * time.Second).UnixMilli()
+	if secs := paramString(params, "lookback_secs", ""); secs != "" {
+		if n, err := strconv.ParseInt(secs, 10, 64); err == nil && n > 0 {
+			since = time.Now().Add(-time.Duration(n) * time.Second).UnixMilli()
+		}
+	}
+	for _, f := range fills {
+		match := false
+		if oid != "" {
+			match = strconv.FormatInt(f.Oid, 10) == oid || strings.EqualFold(f.Cloid, oid)
+		} else if want == "*" {
+			match = f.Time >= since
+		} else {
+			match = want != "" && symbolMatch(f.Coin, want) && f.Time >= since
+		}
+		if !match {
+			continue
+		}
+		found = true
+		fillCount++
+		pnl := decimalFromString(f.ClosedPnl)
+		sum = sum.Add(pnl)
+		if !pnl.IsZero() {
+			nonzero++
+		}
+	}
+	out := fillPnlResult(sum, true, found)
+	if want == "*" {
+		out["fill_count"] = fillCount
+		out["nonzero_closed_pnl"] = nonzero
+	}
+	return out, nil
 }

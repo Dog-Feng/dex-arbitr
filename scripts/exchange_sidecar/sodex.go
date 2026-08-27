@@ -103,6 +103,8 @@ func dispatchSodex(ctx context.Context, reg *registry, req request) (any, error)
 	case "watch":
 		s.startOrderStream()
 		return map[string]string{"status": "watching"}, nil
+	case "fill_pnl":
+		return s.fillPnl(ctx, params)
 	default:
 		return nil, fmt.Errorf("unknown cmd %q", req.Cmd)
 	}
@@ -341,6 +343,9 @@ func accountSnapshot(ctx context.Context, baseURL, addr string, accountID uint64
 		}
 		if p.AvgEntryPrice != "" {
 			entry["entry_price"] = p.AvgEntryPrice
+		}
+		if p.RealizedPnL != "" {
+			entry["realized_pnl"] = p.RealizedPnL
 		}
 		outPos = append(outPos, entry)
 	}
@@ -1052,4 +1057,26 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func (s *sodexSession) fillPnl(ctx context.Context, params map[string]any) (map[string]any, error) {
+	want := paramString(params, "symbol", "")
+	base := gatewayBase(s.venue.Rest)
+	query := accountQuery(s.accountID)
+	positions, err := fetchPerpsPositions(ctx, base, s.addr, query)
+	if err != nil {
+		return nil, err
+	}
+	if len(positions) == 0 {
+		if _, statePos, err := fetchPerpsState(ctx, base, s.addr, query); err == nil {
+			positions = statePos
+		}
+	}
+	for _, p := range positions {
+		if !symbolMatch(p.Symbol, want) {
+			continue
+		}
+		return fillPnlResult(decimalFromString(p.RealizedPnL), false, true), nil
+	}
+	return fillPnlResult(decimal.Zero, false, false), nil
 }

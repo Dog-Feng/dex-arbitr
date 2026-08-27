@@ -206,6 +206,7 @@ mod tests {
                         symbol: "MON".into(),
                         qty: q,
                         entry_price: None,
+                        realized_pnl: None,
                     }]
                 })
                 .unwrap_or_default(),

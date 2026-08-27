@@ -61,6 +61,38 @@ pub struct VenuePosition {
     pub symbol: String,
     pub qty: Decimal,
     pub entry_price: Option<Decimal>,
+    /// 该市场累计已实现盈亏（交易所字段）。Entropy 成交用 closedPnl，不走这里。
+    pub realized_pnl: Option<Decimal>,
+}
+
+/// 平仓后从 DEX 取回的已实现盈亏。`per_fill` 为真时是这一笔成交的 pnl，
+/// 为假时是该市场仓位上的累计 realized，要用「平仓后 − 平仓前」才是本笔。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FillPnl {
+    pub realized_pnl: Decimal,
+    pub per_fill: bool,
+    pub found: bool,
+}
+
+impl FillPnl {
+    pub fn missing() -> Self {
+        Self {
+            realized_pnl: Decimal::ZERO,
+            per_fill: false,
+            found: false,
+        }
+    }
+
+    /// 本笔平仓在该所的已实现盈亏。缺数据则 None，不要当成 0。
+    pub fn this_close_pnl(&self, cumulative_before: Option<Decimal>) -> Option<Decimal> {
+        if !self.found {
+            return None;
+        }
+        if self.per_fill {
+            return Some(self.realized_pnl);
+        }
+        Some(self.realized_pnl - cumulative_before?)
+    }
 }
 
 /// 单市场的当期资金费率。`symbol` 是**该所的原始符号**，跨所匹配靠
@@ -112,5 +144,43 @@ pub trait ExchangePort: Send + Sync {
     /// 资金费率门，而不是把缺数据当成 0 费率放行。
     async fn funding(&self) -> Result<Vec<FundingRate>> {
         Ok(Vec::new())
+    }
+    /// 交易所回报的已实现盈亏。盘口订阅没有这个字段。
+    async fn fill_realized_pnl(&self, symbol: &str, order_id: Option<&str>) -> Result<FillPnl> {
+        let _ = (symbol, order_id);
+        Ok(FillPnl::missing())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rust_decimal_macros::dec;
+
+    #[test]
+    fn entropy_style_uses_fill_directly() {
+        let p = FillPnl {
+            realized_pnl: dec!(1.25),
+            per_fill: true,
+            found: true,
+        };
+        assert_eq!(p.this_close_pnl(None), Some(dec!(1.25)));
+        assert_eq!(p.this_close_pnl(Some(dec!(9))), Some(dec!(1.25)));
+    }
+
+    #[test]
+    fn lighter_style_subtracts_cached_cumulative() {
+        let p = FillPnl {
+            realized_pnl: dec!(10.5),
+            per_fill: false,
+            found: true,
+        };
+        assert_eq!(p.this_close_pnl(Some(dec!(10))), Some(dec!(0.5)));
+        assert!(p.this_close_pnl(None).is_none());
+    }
+
+    #[test]
+    fn missing_fill_is_none_not_zero() {
+        assert!(FillPnl::missing().this_close_pnl(Some(dec!(1))).is_none());
     }
 }

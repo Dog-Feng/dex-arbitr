@@ -192,6 +192,8 @@ mod tests {
             entry_notional_usdc: dec!(100),
             entry_net_pct: dec!(0.05),
             entry_raw_pct: dec!(0.05),
+            entry_buy_px: Decimal::ZERO,
+            entry_sell_px: Decimal::ZERO,
             base_qty: dec!(0.001),
             opened_at: std::time::Instant::now(),
         };

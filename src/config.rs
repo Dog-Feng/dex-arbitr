@@ -156,7 +156,7 @@ fn default_depth_pct() -> Decimal {
 }
 
 fn default_refresh_balance_secs() -> u64 {
-    60
+    1
 }
 
 fn default_sizing() -> SizingConfig {
@@ -164,7 +164,7 @@ fn default_sizing() -> SizingConfig {
         max_concurrent_pairs: 5,
         leverage_multiplier: Decimal::from(2),
         depth_pct: Decimal::from(50),
-        refresh_balance_secs: 60,
+        refresh_balance_secs: 1,
         fallback_available_usdc: None,
         margin_utilization_pct: Decimal::from(90),
         leverage_by_venue: HashMap::new(),

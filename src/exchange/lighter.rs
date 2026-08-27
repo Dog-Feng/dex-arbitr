@@ -17,8 +17,8 @@ use crate::domain::{
 };
 
 use super::port::{
-    AccountSnapshot, Balance, BboTx, CancelReq, ExchangePort, FundingRate, OrderAck, OrderReq,
-    VenuePosition,
+    AccountSnapshot, Balance, BboTx, CancelReq, ExchangePort, FillPnl, FundingRate, OrderAck,
+    OrderReq, VenuePosition,
 };
 use super::{bridge, venue_yaml_path};
 
@@ -273,6 +273,13 @@ impl ExchangePort for LighterAdapter {
             return Ok(Vec::new());
         }
         bridge::bridge_funding(&self.venue_path).await
+    }
+
+    async fn fill_realized_pnl(&self, symbol: &str, order_id: Option<&str>) -> Result<FillPnl> {
+        if !self.venue.keys_ready() || !bridge::bridge_available().await {
+            return Ok(FillPnl::missing());
+        }
+        bridge::bridge_fill_pnl(&self.venue_path, symbol, order_id).await
     }
 }
 

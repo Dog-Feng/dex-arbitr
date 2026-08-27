@@ -17,8 +17,9 @@ use crate::domain::{
 };
 use crate::exchange::{make_adapter, ExchangePort};
 use crate::exec::{
-    best_sequenced_spread, closing_sequenced_spread, plan_hedge, resting_open_spread_ok,
-    sequenced_fee, sequenced_spread, Adapters, ExecResult, HedgeExecutor, HedgePlan, LimitMarketRun,
+    best_sequenced_spread, closing_sequenced_spread, dex_close_pnl_usdc, plan_hedge,
+    resting_open_spread_ok, sequenced_fee, sequenced_spread, Adapters, ExecResult, HedgeExecutor,
+    HedgePlan, LimitMarketRun,
 };
 use crate::infra::api::{
     self, ApiHub, AvailableSymbol, AvailableVenuePair, ExchangePositionRow, LiveSnapshot,
@@ -1068,6 +1069,7 @@ impl Controller {
             tokio::select! {
                 Some(ev) = exec_rx.recv() => {
                     self.handle_exec_event(ev).await;
+                    self.publish_api_snapshot();
                 }
                 msg = rx.recv() => {
                     let Some((venue, pair_id, bbo)) = msg else {
@@ -1143,6 +1145,7 @@ impl Controller {
             tokio::select! {
                 Some(ev) = exec_rx.recv() => {
                     self.handle_exec_event(ev).await;
+                    self.publish_api_snapshot();
                 }
                 msg = rx.recv() => {
                     let Some((venue, pair_id, bbo)) = msg else {
@@ -2208,7 +2211,7 @@ impl Controller {
             self.positions.release_pending(slot);
             // 与普通 exec_fail 一样重新攒持续性，避免看门狗刚清完立刻再开。
             self.grid.forget(slot);
-            self.log_plan_record(&pending.plan, "exec_fail", "watchdog_timeout", "");
+            self.log_plan_record(&pending.plan, "exec_fail", "watchdog_timeout", "", None);
             return;
         }
         let already = pending.cancel.load(Ordering::Relaxed);
@@ -2479,6 +2482,7 @@ impl Controller {
                         "orphan_order",
                         "cancel_failed",
                         &format!("order_id={orphan}"),
+                        None,
                     );
                 }
                 if hedged <= Decimal::ZERO {
@@ -2495,6 +2499,11 @@ impl Controller {
                     if msg.plan.is_open { "open" } else { "close" },
                     "both_filled",
                     &format!("hedged={hedged} planned={}", msg.plan.qty),
+                    if msg.plan.is_open || self.cfg.execution.paper_trading {
+                        None
+                    } else {
+                        dex_close_pnl_usdc(&self.adapters_by_id, &msg.plan, &result).await
+                    },
                 );
                 self.naked_exposures
                     .retain(|n| n.pair_id != msg.plan.pair_id);
@@ -2542,7 +2551,7 @@ impl Controller {
                             error = %err,
                             "venue reports reduce-only; blocking opens for this pair until hourly probe clears it"
                         );
-                        self.log_plan_record(&msg.plan, "reduce_only", "blocked", &err);
+                        self.log_plan_record(&msg.plan, "reduce_only", "blocked", &err, None);
                     }
                 }
                 // nonce 冲突 / 限流：登记指数退避，让这个所歇一会儿。
@@ -2562,11 +2571,11 @@ impl Controller {
                             "venue error; backing off"
                         );
                     }
-                    self.log_plan_record(&msg.plan, "backoff", kind.code(), &err);
+                    self.log_plan_record(&msg.plan, "backoff", kind.code(), &err, None);
                 }
                 if err.contains("EMERGENCY_CLOSED") {
                     warn!(pair = %msg.plan.pair_id, error = %err, "second leg failed; first emergency closed");
-                    self.log_plan_record(&msg.plan, "exec_fail", "emergency_closed", &err);
+                    self.log_plan_record(&msg.plan, "exec_fail", "emergency_closed", &err, None);
                     // 紧急平仓**成功**，敞口已经收掉，仓位状态是干净的，
                     // 所以不挂起。但这算一次单腿成交：参考的规则是连续 3 次
                     // 即使每次都补上也要挂起，因为那说明链路有系统性问题。
@@ -2588,7 +2597,7 @@ impl Controller {
                     }
                 } else if err.contains("NAKED_FIRST_LEG") {
                     warn!(pair = %msg.plan.pair_id, error = %err, "naked first leg");
-                    self.log_plan_record(&msg.plan, "exec_fail", "naked", &err);
+                    self.log_plan_record(&msg.plan, "exec_fail", "naked", &err, None);
                     self.record_naked_from_failed_hedge(&msg.plan, msg.plan.qty);
                     // 裸腿且紧急平仓也失败：真实仓位不明，必须停手。
                     self.mark_intervention(
@@ -2603,7 +2612,7 @@ impl Controller {
                         error = %err,
                         "second leg outcome unknown; first leg left in place on purpose"
                     );
-                    self.log_plan_record(&msg.plan, "exec_fail", "second_leg_unknown", &err);
+                    self.log_plan_record(&msg.plan, "exec_fail", "second_leg_unknown", &err, None);
                     // 第一腿确实成交了，第二腿成没成不知道。按裸腿登记以便对账
                     // 能看见它，但绝不自动补——补错方向会变成双倍敞口。
                     // 用 SecondLegUnknown source 与 BotFailure 区分，
@@ -2642,10 +2651,10 @@ impl Controller {
                     );
                 } else if err.contains("limit_zero_fill") {
                     info!(pair = %msg.plan.pair_id, "limit-then-market: zero fill after wait/cancel");
-                    self.log_plan_record(&msg.plan, "cancel", "zero_fill", &err);
+                    self.log_plan_record(&msg.plan, "cancel", "zero_fill", &err, None);
                 } else {
                     warn!(pair = %msg.plan.pair_id, error = %err, "limit-then-market failed");
-                    self.log_plan_record(&msg.plan, "exec_fail", "error", &err);
+                    self.log_plan_record(&msg.plan, "exec_fail", "error", &err, None);
                 }
                 if err.contains("ORPHAN_ORDER") {
                     warn!(
@@ -2669,7 +2678,14 @@ impl Controller {
         }
     }
 
-    fn log_plan_record(&self, plan: &HedgePlan, action: &str, result: &str, detail: &str) {
+    fn log_plan_record(
+        &self,
+        plan: &HedgePlan,
+        action: &str,
+        result: &str,
+        detail: &str,
+        pnl_usdc: Option<Decimal>,
+    ) {
         let Some(hub) = &self.api else {
             return;
         };
@@ -2689,6 +2705,11 @@ impl Controller {
             detail: detail.to_string(),
             grid_from: Some(plan.grid_from),
             grid_to: Some(plan.grid_to),
+            pnl_usdc: if !plan.is_open && action == "close" {
+                pnl_usdc
+            } else {
+                None
+            },
             pnl_pct: if !plan.is_open && action == "close" {
                 plan.pnl_pct
             } else {
@@ -2810,6 +2831,7 @@ impl Controller {
             detail: detail.to_string(),
             grid_from: None,
             grid_to: None,
+            pnl_usdc: None,
             pnl_pct: None,
         });
     }
@@ -2849,6 +2871,8 @@ impl Controller {
                 entry_net,
                 entry_raw,
                 plan.base_qty,
+                result.price_on(&plan.buy_venue).unwrap_or(Decimal::ZERO),
+                result.price_on(&plan.sell_venue).unwrap_or(Decimal::ZERO),
             );
             // 计入当日配额。记在**成交**而不是下单，配额才对应真实开仓次数：
             // 下单被拒/撤单不该吃额度。平仓永远不计——配额是节流开仓的，

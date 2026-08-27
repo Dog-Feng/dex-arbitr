@@ -176,6 +176,21 @@ func TestSignL1RecoversSigner(t *testing.T) {
 	}
 }
 
+func TestSymbolMatch(t *testing.T) {
+	if !symbolMatch("io:SNDK", "SNDK") {
+		t.Fatal("hip3 coin vs bare")
+	}
+	if !symbolMatch("SNDK-USD", "SNDK") {
+		t.Fatal("usd suffix")
+	}
+	if !symbolMatch("CRV", "crv") {
+		t.Fatal("case")
+	}
+	if symbolMatch("BTC", "ETH") {
+		t.Fatal("mismatch")
+	}
+}
+
 func pad32(b []byte) []byte {
 	if len(b) >= 32 {
 		return b[len(b)-32:]

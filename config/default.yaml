@@ -47,7 +47,8 @@ sizing:
   max_concurrent_pairs: 1
   leverage_multiplier: "5"
   depth_pct: "50"
-  refresh_balance_secs: 60
+  # 余额和交易所持仓一起拉。1 = 页面「交易所持仓」每秒更新。
+  refresh_balance_secs: 1
   margin_utilization_pct: "90"
   # SoDEX 公开余额接口可能为空；有真实余额时以 bridge 为准
   fallback_available_usdc: "500"

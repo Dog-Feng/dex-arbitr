@@ -28,7 +28,7 @@ export function emptyParams(): ArbitrageParams {
     max_concurrent_pairs: 1,
     leverage_multiplier: "2",
     depth_pct: "50",
-    refresh_balance_secs: 60,
+    refresh_balance_secs: 1,
     margin_utilization_pct: "90",
     fallback_available_usdc: "500",
     scan_enabled: false,

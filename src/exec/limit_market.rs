@@ -290,6 +290,7 @@ struct AttemptOutcome {
     price: Option<Decimal>,
     /// 撤单失败、状态不明的挂单 id。出现后停止重试并上报。
     orphan: Option<String>,
+    order_id: Option<String>,
 }
 
 impl HedgeExecutor {
@@ -300,11 +301,13 @@ impl HedgeExecutor {
         books: &Books,
         ctx: &LimitMarketRun,
     ) -> Result<crate::exec::ExecResult> {
+        let before = crate::exec::snapshot_realized_before(adapters, plan, false).await;
         let attempts = cfg.order.limit_retry_count.max(1);
         let hedge_floor = plan.hedgeable_min_qty();
         let mut accumulated = Decimal::ZERO;
         let mut baseline = ctx.baseline;
         let mut orphan: Option<String> = None;
+        let mut last_first_oid: Option<String> = None;
         // 第一腿各轮成交按量加权，得到真实均价。
         let mut first_notional = Decimal::ZERO;
         let mut first_priced = Decimal::ZERO;
@@ -325,6 +328,9 @@ impl HedgeExecutor {
                 Self::run_limit_attempt(cfg, adapters, &attempt_plan, books, ctx, baseline, attempt)
                     .await?;
             accumulated += out.filled;
+            if out.filled > Decimal::ZERO {
+                last_first_oid = out.order_id.or(last_first_oid);
+            }
             if let (Some(px), true) = (out.price, out.filled > Decimal::ZERO) {
                 first_notional += px * out.filled;
                 first_priced += out.filled;
@@ -415,6 +421,10 @@ impl HedgeExecutor {
             Self::hedge_second_leg(cfg, adapters, plan, books, false, accumulated, first_price)
                 .await?;
         result.orphan_order = orphan;
+        if result.first.order_id.is_none() {
+            result.first.order_id = last_first_oid;
+        }
+        result.realized_before = before;
         Ok(result)
     }
 
@@ -454,6 +464,7 @@ impl HedgeExecutor {
                 filled,
                 price: Some(post.first.price),
                 orphan,
+                order_id: order_id.clone(),
             });
         }
 
@@ -555,6 +566,7 @@ impl HedgeExecutor {
                 filled: plan.qty,
                 price: fill_price,
                 orphan: None,
+                order_id: order_id.clone(),
             });
         }
 
@@ -565,6 +577,7 @@ impl HedgeExecutor {
                 filled,
                 price: fill_price,
                 orphan: None,
+                order_id: None,
             });
         };
         if let Some((qty, px)) = Self::detect_first_fill(
@@ -586,6 +599,7 @@ impl HedgeExecutor {
                     filled: plan.qty,
                     price: fill_price,
                     orphan: None,
+                    order_id: Some(oid.clone()),
                 });
             }
         }
@@ -628,6 +642,7 @@ impl HedgeExecutor {
             filled,
             price: fill_price,
             orphan,
+            order_id: Some(oid),
         })
     }
 

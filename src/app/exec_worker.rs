@@ -97,12 +97,14 @@ pub fn spawn_account_refresher(
     tokio::spawn(async move {
         loop {
             overlay_page(&mut cfg, &control);
+            let period = Duration::from_secs(cfg.sizing.refresh_balance_secs.max(1));
+            let started = tokio::time::Instant::now();
             let (balance, accounts) = refresh_accounts(&adapters, &cfg.sizing).await;
             let msg = Box::new(AccountsMsg { balance, accounts });
             if tx.send(ExecEvent::Accounts(msg)).is_err() {
                 break;
             }
-            tokio::time::sleep(Duration::from_secs(cfg.sizing.refresh_balance_secs.max(5))).await;
+            tokio::time::sleep_until(started + period).await;
         }
     });
 }

@@ -2,12 +2,14 @@ use anyhow::{bail, Result};
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::time::sleep;
 use tracing::{info, warn};
 
 use crate::config::{AppConfig, OrderStyle};
 use crate::domain::{read_book, Bbo, Books};
 use crate::exec::{fill_slip_overrun, HedgeLeg, HedgePlan};
-use crate::exchange::{CancelReq, ExchangePort, OrderAck, OrderReq, OrderStatus};
+use crate::exchange::{CancelReq, ExchangePort, FillPnl, OrderAck, OrderReq, OrderStatus};
 
 pub type Adapters = HashMap<String, Arc<dyn ExchangePort>>;
 
@@ -21,6 +23,7 @@ pub struct ExecFill {
     pub qty: Decimal,
     pub price: Decimal,
     pub is_buy: bool,
+    pub order_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -31,6 +34,9 @@ pub struct ExecResult {
     pub orphan_order: Option<String>,
     /// 第一腿比第二腿多成交的量（> 0 表示存在未对冲的单边敞口）。
     pub unhedged_qty: Decimal,
+    /// 平仓前各所仓位上的累计 realized（仅 Lighter/SoDEX 这种 per_fill=false 的所）。
+    /// 平仓后用 after − before 得到本笔。Entropy 用成交 closedPnl，不进这张表。
+    pub realized_before: HashMap<String, Decimal>,
 }
 
 impl ExecResult {
@@ -54,7 +60,20 @@ impl ExecResult {
             second,
             orphan_order,
             unhedged_qty,
+            realized_before: HashMap::new(),
         }
+    }
+
+    /// 该所这一腿的成交均价。对不上所或价为 0 则 None。
+    pub fn price_on(&self, venue: &str) -> Option<Decimal> {
+        let px = if self.first.venue == venue {
+            self.first.price
+        } else if self.second.venue == venue {
+            self.second.price
+        } else {
+            return None;
+        };
+        (px > Decimal::ZERO).then_some(px)
     }
 }
 
@@ -75,13 +94,14 @@ impl HedgeExecutor {
         books: &Books,
         paper: bool,
     ) -> Result<ExecResult> {
-        match cfg.order.style {
+        let before = snapshot_realized_before(adapters, plan, paper).await;
+        let mut result = match cfg.order.style {
             OrderStyle::LimitThenMarket => {
                 let post = Self::post_first_leg(cfg, adapters, plan, books, paper).await?;
                 if post.resting && !paper {
                     bail!("first leg resting (limit not filled yet)");
                 }
-                Self::hedge_second_leg(
+                let mut result = Self::hedge_second_leg(
                     cfg,
                     adapters,
                     plan,
@@ -90,16 +110,22 @@ impl HedgeExecutor {
                     post.first.qty,
                     Some(post.first.price),
                 )
-                .await
+                .await?;
+                if result.first.order_id.is_none() {
+                    result.first.order_id = post.order_id;
+                }
+                result
             }
             // AggressiveLimit 只由 `hedge_second_leg` 内部构造，不会出现在
             // 配置里；真配上了就按双吃处理。
             OrderStyle::LimitMaker
             | OrderStyle::MarketTaker
             | OrderStyle::AggressiveLimit => {
-                Self::dual_taker(cfg, adapters, plan, books, paper).await
+                Self::dual_taker(cfg, adapters, plan, books, paper).await?
             }
-        }
+        };
+        result.realized_before = before;
+        Ok(result)
     }
 
     pub async fn post_first_leg(
@@ -118,6 +144,7 @@ impl HedgeExecutor {
                     qty: Decimal::ZERO,
                     price: first_price,
                     is_buy: plan.first.is_buy,
+                    order_id: None,
                 },
                 order_id: None,
                 resting: true,
@@ -147,6 +174,7 @@ impl HedgeExecutor {
             qty: filled_qty,
             price: ack.avg_price.unwrap_or(first_price),
             is_buy: plan.first.is_buy,
+            order_id: ack_order_id(&ack),
         };
         // sidecar 对限价单一律回 accepted，所以「未成交」不等于「还挂着」；
         // 只有明确处于 Accepted/Partial 才当作活跃挂单。
@@ -261,6 +289,7 @@ impl HedgeExecutor {
                 qty,
                 price: market_price(&plan.first, &first_bbo),
                 is_buy: plan.first.is_buy,
+                order_id: None,
             }
         } else {
             ExecFill {
@@ -270,6 +299,7 @@ impl HedgeExecutor {
                 // 第一腿可能是几轮前、在别的价位成交的，用它算建仓净边会偏。
                 price: first_fill_price.unwrap_or(first_price),
                 is_buy: plan.first.is_buy,
+                order_id: None,
             }
         };
         let second_bbo = book_for(books, &plan.second.venue, &plan.pair_id)?;
@@ -547,6 +577,7 @@ impl HedgeExecutor {
                 qty,
                 price: market_price(leg, bbo),
                 is_buy: leg.is_buy,
+                order_id: None,
             });
         }
         let adapter = adapters
@@ -591,6 +622,7 @@ impl HedgeExecutor {
                 qty: Decimal::ZERO,
                 price: ack.avg_price.unwrap_or(price),
                 is_buy: leg.is_buy,
+                order_id: ack_order_id(&ack),
             });
         }
         // 只认 sidecar 回查到的真实成交量。
@@ -628,6 +660,7 @@ impl HedgeExecutor {
             qty: filled.min(qty),
             price: ack.avg_price.unwrap_or(price),
             is_buy: leg.is_buy,
+            order_id: ack_order_id(&ack),
         })
     }
 
@@ -663,6 +696,103 @@ impl HedgeExecutor {
                 slip_pct = %slip,
                 "fill slip overrun"
             );
+        }
+    }
+}
+
+fn ack_order_id(ack: &OrderAck) -> Option<String> {
+    if ack.order_id.is_empty() {
+        None
+    } else {
+        Some(ack.order_id.clone())
+    }
+}
+
+/// 平仓下单前记下各所累计 realized。Entropy 是逐笔 closedPnl，不必记。
+pub async fn snapshot_realized_before(
+    adapters: &Adapters,
+    plan: &HedgePlan,
+    paper: bool,
+) -> HashMap<String, Decimal> {
+    let mut out = HashMap::new();
+    if paper || plan.is_open {
+        return out;
+    }
+    for leg in [&plan.first, &plan.second] {
+        let Some(adapter) = adapters.get(&leg.venue) else {
+            continue;
+        };
+        match adapter.fill_realized_pnl(&leg.symbol, None).await {
+            Ok(p) if p.found && !p.per_fill => {
+                out.insert(leg.venue.clone(), p.realized_pnl);
+            }
+            Ok(_) => {}
+            Err(err) => {
+                warn!(venue = %leg.venue, error = %err, "realized_pnl snapshot failed");
+            }
+        }
+    }
+    out
+}
+
+async fn query_leg_close_pnl(
+    adapters: &Adapters,
+    leg: &HedgeLeg,
+    order_id: Option<&str>,
+    before: Option<Decimal>,
+) -> Option<Decimal> {
+    let adapter = adapters.get(&leg.venue)?;
+    for attempt in 0..4u32 {
+        let after = match adapter.fill_realized_pnl(&leg.symbol, order_id).await {
+            Ok(v) => v,
+            Err(err) => {
+                warn!(venue = %leg.venue, error = %err, "fill_pnl query failed");
+                FillPnl::missing()
+            }
+        };
+        if let Some(pnl) = after.this_close_pnl(before) {
+            return Some(pnl);
+        }
+        if after.found {
+            return None;
+        }
+        if attempt + 1 < 4 {
+            sleep(Duration::from_millis(250)).await;
+        }
+    }
+    None
+}
+
+/// 平仓后向两所取已实现盈亏再相加。缺任一腿则整笔 None（执行带显示 —）。
+pub async fn dex_close_pnl_usdc(
+    adapters: &Adapters,
+    plan: &HedgePlan,
+    result: &ExecResult,
+) -> Option<Decimal> {
+    let (a, b) = tokio::join!(
+        query_leg_close_pnl(
+            adapters,
+            &plan.first,
+            result.first.order_id.as_deref(),
+            result.realized_before.get(&plan.first.venue).copied(),
+        ),
+        query_leg_close_pnl(
+            adapters,
+            &plan.second,
+            result.second.order_id.as_deref(),
+            result.realized_before.get(&plan.second.venue).copied(),
+        ),
+    );
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x + y),
+        _ => {
+            warn!(
+                pair = %plan.pair_id,
+                first_ok = a.is_some(),
+                second_ok = b.is_some(),
+                "venue realized pnl missing on at least one leg; tape shows —"
+            );
+            None
         }
     }
 }
@@ -890,12 +1020,14 @@ mod tests {
                 qty: dec!(1.0),
                 price: dec!(1),
                 is_buy: true,
+                order_id: None,
             },
             ExecFill {
                 venue: "b".into(),
                 qty: dec!(0.6),
                 price: dec!(1),
                 is_buy: false,
+                order_id: None,
             },
             None,
         );

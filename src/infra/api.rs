@@ -309,6 +309,7 @@ struct ExecRow {
     detail: String,
     grid_from: Option<u32>,
     grid_to: Option<u32>,
+    pnl_usdc: Option<String>,
     pnl_pct: Option<String>,
 }
 
@@ -326,6 +327,7 @@ impl From<ExecRecord> for ExecRow {
             detail: r.detail,
             grid_from: r.grid_from,
             grid_to: r.grid_to,
+            pnl_usdc: r.pnl_usdc.map(|v| format!("{:.4}", v.round_dp(4))),
             pnl_pct: r.pnl_pct.map(|v| format!("{:.6}", v.round_dp(6))),
         }
     }

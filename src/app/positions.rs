@@ -94,6 +94,8 @@ impl PositionStore {
         entry_net_pct: Decimal,
         entry_raw_pct: Decimal,
         base_qty: Decimal,
+        entry_buy_px: Decimal,
+        entry_sell_px: Decimal,
     ) {
         self.pending_opens.remove(slot);
         if qty <= Decimal::ZERO {
@@ -118,6 +120,16 @@ impl PositionStore {
                 } else {
                     entry_raw_pct
                 };
+                let weighted_buy = if total_qty > Decimal::ZERO {
+                    (prev.entry_buy_px * prev.qty + entry_buy_px * qty) / total_qty
+                } else {
+                    entry_buy_px
+                };
+                let weighted_sell = if total_qty > Decimal::ZERO {
+                    (prev.entry_sell_px * prev.qty + entry_sell_px * qty) / total_qty
+                } else {
+                    entry_sell_px
+                };
                 self.positions.insert(
                     slot.to_string(),
                     Position {
@@ -129,6 +141,8 @@ impl PositionStore {
                         entry_notional_usdc: total_notional,
                         entry_net_pct: weighted_net,
                         entry_raw_pct: weighted_raw,
+                        entry_buy_px: weighted_buy,
+                        entry_sell_px: weighted_sell,
                         // 保留首次开仓的 base_qty，补仓不覆盖——
                         // GridEngine::segments_held 整个持仓周期用同一把尺。
                         base_qty: prev.base_qty,
@@ -150,6 +164,8 @@ impl PositionStore {
                 entry_notional_usdc,
                 entry_net_pct,
                 entry_raw_pct,
+                entry_buy_px,
+                entry_sell_px,
                 base_qty,
                 opened_at: Instant::now(),
             },
@@ -252,6 +268,8 @@ mod tests {
             net,
             net,
             qty, // base_qty = qty（测试里单格即全量）
+            Decimal::ZERO,
+            Decimal::ZERO,
         );
     }
 
@@ -294,6 +312,8 @@ mod tests {
             dec!(0.05),
             dec!(0.05),
             dec!(0.001),
+            Decimal::ZERO,
+            Decimal::ZERO,
         );
         let pos = store.get(BTC_LS).unwrap();
         assert_eq!(pos.qty, dec!(0.002));
@@ -356,11 +376,49 @@ mod tests {
             dec!(0.05),
             dec!(0.05),
             dec!(0.001),
+            Decimal::ZERO,
+            Decimal::ZERO,
         );
         store.record_close(BTC_LS, dec!(0.001));
         let pos = store.get(BTC_LS).unwrap();
         assert_eq!(pos.qty, dec!(0.002));
         assert_eq!(pos.grid, 2);
+    }
+
+    #[test]
+    fn add_on_averages_entry_prices() {
+        let mut store = PositionStore::default();
+        store.record_open(
+            BTC_LS,
+            "BTC-USD-PERP",
+            VenueId::from("lighter"),
+            VenueId::from("sodex"),
+            dec!(1),
+            1,
+            dec!(100),
+            dec!(0.05),
+            dec!(0.05),
+            dec!(1),
+            dec!(100),
+            dec!(101),
+        );
+        store.record_open(
+            BTC_LS,
+            "BTC-USD-PERP",
+            VenueId::from("lighter"),
+            VenueId::from("sodex"),
+            dec!(1),
+            2,
+            dec!(100),
+            dec!(0.05),
+            dec!(0.05),
+            dec!(1),
+            dec!(110),
+            dec!(111),
+        );
+        let pos = store.get(BTC_LS).unwrap();
+        assert_eq!(pos.entry_buy_px, dec!(105));
+        assert_eq!(pos.entry_sell_px, dec!(106));
     }
 
     #[test]

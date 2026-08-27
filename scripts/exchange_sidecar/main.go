@@ -34,6 +34,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/shopspring/decimal"
 	"gopkg.in/yaml.v3"
 )
 
@@ -256,4 +257,24 @@ func peekVenueID(path string) (string, error) {
 		return "", fmt.Errorf("venue id missing in %s", path)
 	}
 	return id, nil
+}
+
+func fillPnlResult(pnl decimal.Decimal, perFill, found bool) map[string]any {
+	return map[string]any{
+		"realized_pnl": pnl.String(),
+		"per_fill":     perFill,
+		"found":        found,
+	}
+}
+
+func symbolMatch(have, want string) bool {
+	h := strings.ToUpper(strings.TrimSpace(have))
+	w := strings.ToUpper(strings.TrimSpace(want))
+	if h == "" || w == "" {
+		return false
+	}
+	if h == w {
+		return true
+	}
+	return strings.HasSuffix(h, ":"+w) || strings.HasSuffix(h, "-"+w) || strings.HasPrefix(h, w+"-")
 }

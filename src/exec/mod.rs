@@ -4,7 +4,8 @@ pub mod planner;
 pub mod sequence;
 
 pub use executor::{
-    book_for, maker_limit_price, Adapters, ExecFill, ExecResult, HedgeExecutor, PostFirstResult,
+    book_for, dex_close_pnl_usdc, maker_limit_price, snapshot_realized_before, Adapters, ExecFill,
+    ExecResult, HedgeExecutor, PostFirstResult,
 };
 pub use limit_market::LimitMarketRun;
 pub use planner::{plan_hedge, HedgeLeg, HedgePlan};

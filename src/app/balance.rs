@@ -15,6 +15,7 @@ pub struct VenueExchangePosition {
     pub symbol: String,
     pub qty: Decimal,
     pub entry_price: Option<Decimal>,
+    pub realized_pnl: Option<Decimal>,
 }
 
 #[derive(Debug, Clone)]
@@ -133,6 +134,7 @@ pub async fn refresh_accounts(
                     symbol: p.symbol,
                     qty: p.qty,
                     entry_price: p.entry_price,
+                    realized_pnl: p.realized_pnl,
                 })
                 .collect(),
             fresh,

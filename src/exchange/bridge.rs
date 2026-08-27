@@ -15,7 +15,7 @@ use tokio::sync::{broadcast, oneshot};
 use tracing::{debug, warn};
 
 use super::port::{
-    AccountSnapshot, Balance, CancelReq, FundingRate, OrderAck, OrderReq, OrderStatus,
+    AccountSnapshot, Balance, CancelReq, FillPnl, FundingRate, OrderAck, OrderReq, OrderStatus,
     VenuePosition,
 };
 
@@ -364,6 +364,23 @@ pub async fn bridge_positions(venue_yaml: &Path) -> Result<Vec<VenuePosition>> {
     Ok(bridge_account(venue_yaml).await?.positions)
 }
 
+pub async fn bridge_fill_pnl(
+    venue_yaml: &Path,
+    symbol: &str,
+    order_id: Option<&str>,
+) -> Result<FillPnl> {
+    let params = json!({
+        "symbol": symbol,
+        "order_id": order_id.unwrap_or(""),
+    });
+    let data = bridge_call(venue_yaml, "fill_pnl", params).await?;
+    Ok(FillPnl {
+        realized_pnl: data.get("realized_pnl").and_then(dec).unwrap_or(Decimal::ZERO),
+        per_fill: data.get("per_fill").and_then(|v| v.as_bool()).unwrap_or(false),
+        found: data.get("found").and_then(|v| v.as_bool()).unwrap_or(false),
+    })
+}
+
 pub async fn bridge_place(venue_yaml: &Path, req: &OrderReq) -> Result<OrderAck> {
     let style = match req.style {
         crate::config::OrderStyle::LimitMaker | crate::config::OrderStyle::LimitThenMarket => {
@@ -443,6 +460,7 @@ fn parse_account(data: &Value) -> AccountSnapshot {
                         symbol: p.get("symbol")?.as_str()?.to_string(),
                         qty: dec(p.get("qty")?)?,
                         entry_price: p.get("entry_price").and_then(dec),
+                        realized_pnl: p.get("realized_pnl").and_then(dec),
                     })
                 })
                 .collect()
