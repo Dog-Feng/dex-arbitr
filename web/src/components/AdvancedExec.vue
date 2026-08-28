@@ -15,21 +15,17 @@
     <Field label="margin_utilization_pct" hint="可用余额最多用到多少">
       <n-input :value="String(p.margin_utilization_pct)" @update:value="p.margin_utilization_pct = $event" />
     </Field>
-    <Field label="refresh_balance_secs" hint="余额和交易所持仓刷新间隔（秒）">
+    <Field label="refresh_balance_secs" hint="余额和交易所持仓刷新间隔（秒）。保存后立即按新间隔拉各所账户">
       <n-input-number v-model:value="p.refresh_balance_secs" :min="1" :step="1" />
     </Field>
     <Field label="fallback_available_usdc" hint="余额接口为空时的回退值">
       <n-input :value="String(p.fallback_available_usdc)" @update:value="p.fallback_available_usdc = $event" />
     </Field>
-    <Field label="order_style" hint="limit_then_market 综合手续费最低">
-      <n-select v-model:value="p.order_style" :options="[
-        { label: 'limit_then_market — 先挂后吃', value: 'limit_then_market' },
-        { label: 'market_taker — 双腿市价', value: 'market_taker' },
-        { label: 'limit_maker — 双腿限价', value: 'limit_maker' },
-      ]" />
-    </Field>
-    <Field label="limit_timeout_ms" hint="限价单等待时间">
+    <Field label="limit_timeout_ms" hint="第一腿限价最多挂多久（阶段 2）">
       <n-input-number v-model:value="p.limit_timeout_ms" :min="100" :step="100" />
+    </Field>
+    <Field label="second_leg_verify_ms" hint="第二腿激进限价失败后，等这么久再查实仓；没有仓则市价平第一腿">
+      <n-input-number v-model:value="p.second_leg_verify_ms" :min="0" :step="100" />
     </Field>
     <Field label="maker_inside_ticks" hint="maker 腿往点差内侧挪几个 tick">
       <n-input-number v-model:value="p.maker_inside_ticks" :min="0" />

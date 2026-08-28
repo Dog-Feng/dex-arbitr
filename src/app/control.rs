@@ -7,21 +7,25 @@
 //!
 //! 状态纯内存，重启后回到 yaml 的初始值。
 
-use std::collections::HashMap;
-
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
-use crate::config::{AppConfig, OrderStyle, PairDefaults, PairSetting};
+use crate::config::{AppConfig, PairDefaults, PairSetting};
 
-fn default_page_persist_mode() -> String {
-    "bucket".into()
+fn default_window_samples() -> usize {
+    10_000
 }
-fn default_page_persist_secs() -> u32 {
-    1
+
+fn default_sample_interval_ms() -> u64 {
+    1000
 }
-fn default_page_persist_strict() -> bool {
-    true
+
+fn default_step_hysteresis() -> Decimal {
+    Decimal::new(25, 2)
+}
+
+fn default_second_leg_verify_ms() -> u64 {
+    2000
 }
 
 /// default.yaml 里**全部**可在 UI 热改的参数。
@@ -66,16 +70,20 @@ pub struct ArbitrageParams {
 
     // ═══ grid persistence（阈值在 pair_defaults / pairs）═══
     pub persistence_ms: u64,
-    #[serde(default = "default_page_persist_mode")]
-    pub persistence_mode: String,
-    #[serde(default = "default_page_persist_secs")]
-    pub spread_persistence_seconds: u32,
-    #[serde(default = "default_page_persist_strict")]
-    pub strict_persistence_check: bool,
+    /// 1 秒内至少几次达标。0 = 连续不掉线。
+    #[serde(default)]
+    pub persistence_min_hits: u32,
+    #[serde(default = "default_window_samples")]
+    pub window_samples: usize,
+    #[serde(default = "default_sample_interval_ms")]
+    pub sample_interval_ms: u64,
+    #[serde(default = "default_step_hysteresis")]
+    pub step_hysteresis: Decimal,
 
     // ═══ order ═══
-    pub order_style: String,            // "limit_then_market" | "market_taker" | "limit_maker"
     pub limit_timeout_ms: u64,
+    #[serde(default = "default_second_leg_verify_ms")]
+    pub second_leg_verify_ms: u64,
     pub maker_inside_ticks: u32,
     pub limit_retry_count: u32,
 
@@ -90,41 +98,6 @@ pub struct ArbitrageParams {
     pub history_min_points: u32,
     pub history_sample_interval_secs: u64,
     pub history_refresh_interval_secs: u64,
-
-    // ═══ risk — 盘口质量 ═══
-    /// 逐币最小一档深度，如 {"BTC":"0.001"}
-    #[serde(default)]
-    pub min_book_qty: HashMap<String, Decimal>,
-    pub max_venue_spread_pct: Decimal,
-    pub price_stability_window_secs: Decimal,
-    pub price_stability_threshold_pct: Decimal,
-
-    // ═══ risk — reduce-only 探针 ═══
-    pub reduce_only_probe_enabled: bool,
-    pub reduce_only_probe_second: u32,
-
-    // ═══ risk — 资金费率 ═══
-    pub funding_annual_threshold_pct: Decimal,
-    pub funding_unfavorable_duration_minutes: u64,
-    pub funding_refresh_secs: u64,
-
-    // ═══ risk — 全局限额 ═══
-    pub max_daily_opens: u32,
-    pub max_position_hours: u64,
-
-    // ═══ risk — 余额下限 ═══
-    pub min_balance_warn_usdc: Decimal,
-    pub min_balance_close_usdc: Decimal,
-
-    // ═══ risk — 名义敞口 ═══
-    pub max_single_token_notional_usdc: Decimal,
-    pub max_total_notional_usdc: Decimal,
-
-    // ═══ risk — 错误退避 ═══
-    pub backoff_min_secs: u64,
-    pub backoff_max_secs: u64,
-    pub backoff_multiplier: u32,
-    pub backoff_reset_secs: u64,
 }
 
 impl ArbitrageParams {
@@ -158,12 +131,13 @@ impl ArbitrageParams {
             scan_log_interval_secs: cfg.scan.log_interval_secs,
 
             persistence_ms: cfg.grid.persistence_ms,
-            persistence_mode: cfg.grid.persistence_mode.clone(),
-            spread_persistence_seconds: cfg.grid.spread_persistence_seconds,
-            strict_persistence_check: cfg.grid.strict_persistence_check,
+            persistence_min_hits: cfg.grid.persistence_min_hits,
+            window_samples: cfg.grid.window_samples,
+            sample_interval_ms: cfg.grid.sample_interval_ms,
+            step_hysteresis: cfg.grid.step_hysteresis,
 
-            order_style: cfg.order.style.as_str().into(),
             limit_timeout_ms: cfg.order.limit_timeout_ms,
+            second_leg_verify_ms: cfg.order.second_leg_verify_ms,
             maker_inside_ticks: cfg.order.maker_inside_ticks,
             limit_retry_count: cfg.order.limit_retry_count,
 
@@ -176,32 +150,6 @@ impl ArbitrageParams {
             history_min_points: cfg.history.min_points as u32,
             history_sample_interval_secs: cfg.history.sample_interval_secs,
             history_refresh_interval_secs: cfg.history.refresh_interval_secs,
-
-            min_book_qty: cfg.risk.min_book_qty.clone(),
-            max_venue_spread_pct: cfg.risk.max_venue_spread_pct,
-            price_stability_window_secs: cfg.risk.price_stability_window_secs,
-            price_stability_threshold_pct: cfg.risk.price_stability_threshold_pct,
-
-            reduce_only_probe_enabled: cfg.risk.reduce_only_probe_enabled,
-            reduce_only_probe_second: cfg.risk.reduce_only_probe_second,
-
-            funding_annual_threshold_pct: cfg.risk.funding_annual_threshold_pct,
-            funding_unfavorable_duration_minutes: cfg.risk.funding_unfavorable_duration_minutes,
-            funding_refresh_secs: cfg.risk.funding_refresh_secs,
-
-            max_daily_opens: cfg.risk.max_daily_opens,
-            max_position_hours: cfg.risk.max_position_hours,
-
-            min_balance_warn_usdc: cfg.risk.min_balance_warn_usdc,
-            min_balance_close_usdc: cfg.risk.min_balance_close_usdc,
-
-            max_single_token_notional_usdc: cfg.risk.max_single_token_notional_usdc,
-            max_total_notional_usdc: cfg.risk.max_total_notional_usdc,
-
-            backoff_min_secs: cfg.risk.backoff_min_secs,
-            backoff_max_secs: cfg.risk.backoff_max_secs,
-            backoff_multiplier: cfg.risk.backoff_multiplier,
-            backoff_reset_secs: cfg.risk.backoff_reset_secs,
         }
     }
 
@@ -237,17 +185,14 @@ impl ArbitrageParams {
         cfg.scan.log_interval_secs = self.scan_log_interval_secs;
 
         cfg.grid.persistence_ms = self.persistence_ms;
-        cfg.grid.persistence_mode = if self.persistence_mode.eq_ignore_ascii_case("window") {
-            "window".into()
-        } else {
-            "bucket".into()
-        };
-        cfg.grid.spread_persistence_seconds = self.spread_persistence_seconds;
-        cfg.grid.strict_persistence_check = self.strict_persistence_check;
+        cfg.grid.persistence_min_hits = self.persistence_min_hits;
+        cfg.grid.window_samples = self.window_samples.max(1);
+        cfg.grid.sample_interval_ms = self.sample_interval_ms.max(1);
+        cfg.grid.step_hysteresis = self.step_hysteresis.max(Decimal::ZERO);
 
-        cfg.order.style = OrderStyle::from_page(&self.order_style);
         cfg.order.limit_timeout_ms = self.limit_timeout_ms;
-        cfg.order.maker_inside_ticks = self.maker_inside_ticks.max(1);
+        cfg.order.second_leg_verify_ms = self.second_leg_verify_ms;
+        cfg.order.maker_inside_ticks = self.maker_inside_ticks;
         cfg.order.limit_retry_count = self.limit_retry_count.max(1);
 
         cfg.cost.default_slip_pct = self.default_slip_pct;
@@ -259,26 +204,6 @@ impl ArbitrageParams {
         cfg.history.min_points = self.history_min_points as usize;
         cfg.history.sample_interval_secs = self.history_sample_interval_secs;
         cfg.history.refresh_interval_secs = self.history_refresh_interval_secs;
-
-        cfg.risk.min_book_qty = self.min_book_qty.clone();
-        cfg.risk.max_venue_spread_pct = self.max_venue_spread_pct;
-        cfg.risk.price_stability_window_secs = self.price_stability_window_secs;
-        cfg.risk.price_stability_threshold_pct = self.price_stability_threshold_pct;
-        cfg.risk.reduce_only_probe_enabled = self.reduce_only_probe_enabled;
-        cfg.risk.reduce_only_probe_second = self.reduce_only_probe_second;
-        cfg.risk.funding_annual_threshold_pct = self.funding_annual_threshold_pct;
-        cfg.risk.funding_unfavorable_duration_minutes = self.funding_unfavorable_duration_minutes;
-        cfg.risk.funding_refresh_secs = self.funding_refresh_secs;
-        cfg.risk.max_daily_opens = self.max_daily_opens;
-        cfg.risk.max_position_hours = self.max_position_hours;
-        cfg.risk.min_balance_warn_usdc = self.min_balance_warn_usdc;
-        cfg.risk.min_balance_close_usdc = self.min_balance_close_usdc;
-        cfg.risk.max_single_token_notional_usdc = self.max_single_token_notional_usdc;
-        cfg.risk.max_total_notional_usdc = self.max_total_notional_usdc;
-        cfg.risk.backoff_min_secs = self.backoff_min_secs;
-        cfg.risk.backoff_max_secs = self.backoff_max_secs;
-        cfg.risk.backoff_multiplier = self.backoff_multiplier.max(1);
-        cfg.risk.backoff_reset_secs = self.backoff_reset_secs;
     }
 }
 
@@ -291,23 +216,26 @@ pub struct ValidationResult {
 pub fn validate(p: &ArbitrageParams) -> ValidationResult {
     let mut errors = Vec::new();
 
-    if p.pair_defaults.initial_spread_threshold <= Decimal::ZERO {
-        errors.push("pair_defaults.initial_spread_threshold 必须 > 0".into());
-    }
-    if p.pair_defaults.grid_step < Decimal::ZERO {
-        errors.push("pair_defaults.grid_step 不能为负".into());
+    if p.pair_defaults.target_bp <= Decimal::ZERO {
+        errors.push("pair_defaults.target_bp 必须 > 0".into());
     }
     if p.pair_defaults.max_segments == 0 {
         errors.push("pair_defaults.max_segments 必须 >= 1".into());
     }
+    if p.window_samples == 0 {
+        errors.push("window_samples 必须 >= 1".into());
+    }
+    if p.sample_interval_ms == 0 {
+        errors.push("sample_interval_ms 必须 >= 1".into());
+    }
+    if p.step_hysteresis < Decimal::ZERO {
+        errors.push("step_hysteresis 不能为负".into());
+    }
+    if p.step_hysteresis >= Decimal::new(5, 1) {
+        errors.push("step_hysteresis 必须 < 0.5，否则一格锁不住价差".into());
+    }
     if p.max_concurrent_pairs == 0 {
         errors.push("max_concurrent_pairs 必须 >= 1".into());
-    }
-    if p.pair_defaults.scalping_enabled && p.pair_defaults.scalping_trigger_segment == 0 {
-        errors.push("scalping_trigger_segment 必须 >= 1".into());
-    }
-    if p.pair_defaults.scalping_profit_threshold_pct < Decimal::ZERO {
-        errors.push("scalping_profit_threshold_pct 不能为负".into());
     }
     for s in &p.pairs {
         if s.symbol.trim().is_empty() {
@@ -319,25 +247,9 @@ pub fn validate(p: &ArbitrageParams) -> ValidationResult {
         if s.max_segments == Some(0) {
             errors.push(format!("{} max_segments 必须 >= 1", s.symbol));
         }
-        if s.initial_spread_threshold.is_some_and(|v| v <= Decimal::ZERO) {
-            errors.push(format!("{} initial_spread_threshold 必须 > 0", s.symbol));
+        if s.target_bp.is_some_and(|v| v <= Decimal::ZERO) {
+            errors.push(format!("{} target_bp 必须 > 0", s.symbol));
         }
-        if s.grid_step.is_some_and(|v| v < Decimal::ZERO) {
-            errors.push(format!("{} grid_step 不能为负", s.symbol));
-        }
-    }
-    let persist_mode = p.persistence_mode.to_ascii_lowercase();
-    if persist_mode != "bucket" && persist_mode != "window" {
-        errors.push("persistence_mode 必须是 bucket 或 window".into());
-    }
-    if p.funding_annual_threshold_pct < Decimal::ZERO {
-        errors.push("funding_annual_threshold_pct 不能为负".into());
-    }
-    if p.min_balance_close_usdc > Decimal::ZERO
-        && p.min_balance_warn_usdc > Decimal::ZERO
-        && p.min_balance_close_usdc >= p.min_balance_warn_usdc
-    {
-        errors.push("min_balance_close_usdc 必须小于 min_balance_warn_usdc".into());
     }
 
     ValidationResult { ok: errors.is_empty(), errors }
@@ -371,31 +283,20 @@ mod tests {
     fn apply_to_overrides_yaml_grid_and_sizing() {
         let mut cfg = AppConfig::load_from(Path::new("config/default.yaml")).unwrap();
         let mut p = ArbitrageParams::from_config(&cfg);
-        p.pair_defaults.initial_spread_threshold = dec!(0.08);
+        p.pair_defaults.target_bp = dec!(1);
         p.pair_defaults.max_segments = 5;
         p.paper_trading = true;
         p.pairs = vec![crate::config::PairSetting {
             symbol: "SNDK".into(),
             base_qty: dec!(0.01),
             max_segments: None,
-            initial_spread_threshold: None,
-            grid_step: None,
-            t0_ratio: None,
+            target_bp: None,
             split_order_size: None,
-            scalping_enabled: None,
-            scalping_trigger_segment: None,
-            scalping_profit_threshold_pct: None,
             overrides: vec![],
         }];
         p.apply_to(&mut cfg);
-        assert_eq!(cfg.pairs.defaults.initial_spread_threshold, dec!(0.08));
+        assert_eq!(cfg.pairs.defaults.target_bp, dec!(1));
         assert_eq!(cfg.pairs.defaults.max_segments, 5);
-        p.pair_defaults.scalping_enabled = true;
-        p.pair_defaults.scalping_trigger_segment = 2;
-        p.pair_defaults.scalping_profit_threshold_pct = dec!(0.02);
-        p.apply_to(&mut cfg);
-        assert!(cfg.pairs.defaults.scalping_enabled);
-        assert_eq!(cfg.pairs.defaults.scalping_trigger_segment, 2);
         assert!(cfg.execution.paper_trading);
         assert_eq!(cfg.pairs.enabled[0].symbol, "SNDK");
     }

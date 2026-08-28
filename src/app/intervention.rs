@@ -71,7 +71,7 @@ pub struct Waiting {
     pub since: Instant,
     /// 挂起时的格数。参考 `should_block`：格数变了就自动恢复，
     /// 因为那说明行情已经走到另一个区间，旧的判断不再适用。
-    pub grid_level: Option<u32>,
+    pub grid_level: Option<i32>,
 }
 
 /// 一次门禁查询的结果。`should_block` 需要 `&mut self`（可能触发自动解除），
@@ -110,7 +110,7 @@ impl InterventionGuard {
         pair_id: &str,
         cause: Cause,
         detail: impl Into<String>,
-        grid_level: Option<u32>,
+        grid_level: Option<i32>,
         now: Instant,
     ) -> bool {
         let detail = detail.into();
@@ -142,7 +142,7 @@ impl InterventionGuard {
     pub fn should_block(
         &mut self,
         pair_id: &str,
-        current_grid: Option<u32>,
+        current_grid: Option<i32>,
         now: Instant,
     ) -> Gate {
         let Some(st) = self.pairs.get(pair_id) else {

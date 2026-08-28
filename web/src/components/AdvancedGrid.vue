@@ -1,61 +1,52 @@
 <template>
   <div class="g">
-    <Field label="initial_spread_threshold（%）" hint="T1：毛价差 ≥ T1 并过持续性才开。可被单个交易对或所对覆盖">
-      <n-input :value="str('initial_spread_threshold')" @update:value="set('initial_spread_threshold', $event)" />
+    <Field label="target_bp（目标净利）" hint="一格开平扣完四腿市价费和两所点差中枢平均后的目标（bp）。1 bp = 0.01%。运行时反推 Δ">
+      <n-input :value="str('target_bp')" @update:value="set('target_bp', $event)" />
     </Field>
-    <Field label="grid_step（%）" hint="相邻格间距。应大于该所对往返手续费">
-      <n-input :value="str('grid_step')" @update:value="set('grid_step', $event)" />
-    </Field>
-    <Field label="max_segments" hint="默认最多同时持几格">
+    <Field label="max_segments（max_step）" hint="|STEP| 上限。到 ±N 停加不停减。过零必须先回 0">
       <n-input-number v-model:value="store.params.pair_defaults.max_segments" :min="1" :max="20" />
     </Field>
-    <Field label="t0_ratio" hint="T0 = T1 × 该系数。跌破 T0 全平">
-      <n-input :value="str('t0_ratio')" @update:value="set('t0_ratio', $event)" />
+    <Field label="window_samples" hint="满这么多个秒级点才有 μ 和各所点差中枢；点差中枢折进 Δ。代码默认 10000 ≈ 2h47m；yaml 现为 1000 ≈ 17 分钟">
+      <n-input-number v-model:value="store.params.window_samples" :min="1" :step="100" />
+    </Field>
+    <Field label="sample_interval_ms" hint="入窗间隔。1000 = 1Hz；同一间隔内多次盘口覆盖为最后一次">
+      <n-input-number v-model:value="store.params.sample_interval_ms" :min="1" :step="100" />
+    </Field>
+    <Field label="step_hysteresis（格）" hint="加仓 raw ≥ k+1−h，减仓 raw ≤ k−1+h。0.25 时一格只锁 0.5Δ；0 = 满格才开、回到 μ 才平。必须 &lt; 0.5">
+      <n-input :value="hystStr" @update:value="setHyst($event)" />
+    </Field>
+    <Field label="persistence_ms" hint="检查时间窗（毫秒）。1000 + 决策环 100ms ≈ 1 秒查 10 次">
+      <n-input-number v-model:value="store.params.persistence_ms" :min="0" :step="100" />
+    </Field>
+    <Field label="persistence_min_hits" hint="这 1 秒里至少几次达标即通过（5 或 7）。0 = 连续不掉线">
+      <n-input-number v-model:value="store.params.persistence_min_hits" :min="0" />
     </Field>
     <Field label="split_order_size（0=不拆）" hint="单笔最大开/平仓量，0 = 一次下完">
       <n-input :value="str('split_order_size')" @update:value="set('split_order_size', $event)" />
-    </Field>
-    <Field label="persistence_mode" hint="默认秒桶。window 是连续毫秒窗口">
-      <n-select v-model:value="store.params.persistence_mode" :options="[
-        { label: 'bucket（参考秒桶）', value: 'bucket' },
-        { label: 'window（persistence_ms）', value: 'window' },
-      ]" />
-    </Field>
-    <Field label="spread_persistence_seconds" hint="秒桶要连续满足的秒数。≤1 不累计">
-      <n-input-number v-model:value="store.params.spread_persistence_seconds" :min="0" />
-    </Field>
-    <Field label="strict_persistence_check" hint="严格秒桶。关掉则每秒至少一次达标即可">
-      <n-switch v-model:value="store.params.strict_persistence_check" />
-    </Field>
-    <Field label="persistence_ms" hint="仅 window 模式">
-      <n-input-number v-model:value="store.params.persistence_ms" :min="0" :step="100" />
-    </Field>
-    <Field label="scalping_enabled" hint="分段网格剥头皮。默认关">
-      <n-switch v-model:value="store.params.pair_defaults.scalping_enabled" />
-    </Field>
-    <Field label="scalping_trigger_segment" hint="进入剥头皮的开仓视角格子">
-      <n-input-number v-model:value="store.params.pair_defaults.scalping_trigger_segment" :min="1" />
-    </Field>
-    <Field label="scalping_profit_threshold_pct（%）" hint="建仓均毛价差 − 当前剩余毛价差 ≥ 该值才减">
-      <n-input :value="str('scalping_profit_threshold_pct')" @update:value="set('scalping_profit_threshold_pct', $event)" />
     </Field>
   </div>
 </template>
 
 <script setup lang="ts">
+import { computed } from "vue";
 import { store } from "../store";
 import Field from "./Field.vue";
 import type { PairDefaults } from "../types";
 
 function str(k: keyof PairDefaults) {
-  return String(store.params.pair_defaults[k] ?? "");
+  const v = store.params.pair_defaults[k];
+  return v == null ? "" : String(v);
 }
-function set(k: keyof PairDefaults, v: string) {
-  (store.params.pair_defaults as Record<string, unknown>)[k] = v;
+function set(k: keyof PairDefaults, v: string | null) {
+  (store.params.pair_defaults as Record<string, unknown>)[k] = v ?? "";
+}
+
+const hystStr = computed(() => String(store.params.step_hysteresis ?? "0.25"));
+function setHyst(v: string | null) {
+  store.params.step_hysteresis = v ?? "0.25";
 }
 </script>
 
 <style scoped>
-.g { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 10px 16px; padding: 8px 4px 12px; min-width: 0; }
-@media (max-width: 900px) { .g { grid-template-columns: 1fr; } }
+.g { display: grid; gap: 10px; }
 </style>

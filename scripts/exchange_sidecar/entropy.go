@@ -554,16 +554,15 @@ func (s *entropySession) place(ctx context.Context, params map[string]any) (map[
 		if f.GreaterThan(filled) {
 			filled = f
 		}
-		if ap != "" {
+		// waitOrderFill 从订单视图拿到的是 limitPx（滑点保护限价），不是成交均价。
+		// 已有 Filled.AvgPx 或 userFills 的 px 时不要覆盖。
+		if avg == "" && ap != "" {
 			avg = ap
 		}
 	} else if oid != 0 || cloid != "" {
 		if view, ok := s.lookupOrder(ctx, oid, cloid); ok {
 			if f := view.filledQty(); f.GreaterThan(filled) {
 				filled = f
-			}
-			if ap := view.avgPx(); ap != "" {
-				avg = ap
 			}
 			if oid == 0 {
 				oid = view.oid
@@ -581,9 +580,8 @@ func (s *entropySession) place(ctx context.Context, params map[string]any) (map[
 	case ioc:
 		outStatus = "unknown"
 	}
-	if avg == "" {
-		avg = hlPxWire(px)
-	}
+	// 缺成交均价就留空：上层用决策 BBO。绝不能回填保护限价，否则执行带
+	// 会把每腿 ~max_slippage 记成真实滑点（开+平约 20 bp 假亏）。
 	return map[string]string{
 		"order_id":        strconv.FormatInt(oid, 10),
 		"client_order_id": rawCloid,
@@ -790,7 +788,7 @@ func (v hlOrderView) filledAndStatus(reqQty decimal.Decimal, ioc bool) (decimal.
 			}
 		}
 	}
-	return filled, v.px, out
+	return filled, "", out
 }
 
 func (s *entropySession) lookupByCloid(ctx context.Context, cloid string) (hlOrderView, bool) {
@@ -1048,7 +1046,7 @@ func (s *entropySession) noteWsMsg(msg []byte) {
 			if st == "filled" && orig.GreaterThan(decimal.Zero) {
 				filled = orig
 			}
-			s.setFill(strconv.FormatInt(it.Order.Oid, 10), it.Order.Cloid, filled, it.Order.LimitPx)
+			s.setFill(strconv.FormatInt(it.Order.Oid, 10), it.Order.Cloid, filled, "")
 		}
 	case "userFills":
 		var inner struct {

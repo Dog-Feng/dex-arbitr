@@ -15,7 +15,6 @@ async fn main() -> Result<()> {
     let _log_guard = infra::init_log(&cfg.system.log_dir);
     tracing::info!(
         monitor_only = cfg.system.monitor_only,
-        order_style = cfg.order.style.as_str(),
         venues = ?cfg.venues,
         scan = cfg.scan.enabled,
         min_raw = %cfg.scan.min_spread_pct,

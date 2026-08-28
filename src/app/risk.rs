@@ -14,30 +14,12 @@ pub fn books_fresh_ok(cfg: &AppConfig, buy: &Bbo, sell: &Bbo) -> Result<(), &'st
     Ok(())
 }
 
-/// 单所自身买卖点差门槛（对齐参考 `_passes_local_orderbook_spread`）。
-/// 加格、减格入口都走：点差过宽时两边都不下。
-pub fn books_own_spread_ok(cfg: &AppConfig, buy: &Bbo, sell: &Bbo) -> Result<(), &'static str> {
-    let max_own = cfg.risk.max_venue_spread_pct;
-    if max_own > Decimal::ZERO {
-        for book in [buy, sell] {
-            match book.own_spread_pct() {
-                Some(s) if s > max_own => return Err("wide_book"),
-                None => return Err("invalid_bbo"),
-                _ => {}
-            }
-        }
-    }
-    Ok(())
-}
-
-/// 数据质量门槛：新鲜度、合法 BBO、单所自身点差。**不含深度**。
-/// 空仓开仓、有仓加/减格入口都走这一层。
+/// 数据质量门槛：新鲜度、合法 BBO。
 pub fn books_quality_ok(cfg: &AppConfig, buy: &Bbo, sell: &Bbo) -> Result<(), &'static str> {
-    books_fresh_ok(cfg, buy, sell)?;
-    books_own_spread_ok(cfg, buy, sell)
+    books_fresh_ok(cfg, buy, sell)
 }
 
-/// 开仓门槛：数据质量 + 一档深度。
+/// 开仓门槛：数据质量 + 一档深度（按每格数量 / 两腿 min_qty）。
 pub fn books_tradable(
     cfg: &AppConfig,
     pair: &Pair,
@@ -47,21 +29,16 @@ pub fn books_tradable(
 ) -> Result<(), &'static str> {
     books_quality_ok(cfg, buy, sell)?;
 
-    // 厚度下限：配置里没写这个币时退到两腿 min_qty 的较大者，
-    // 而不是退成 0（那等于关掉厚度校验）。
     let base = &pair.legs[0].base;
     let min_qty = cfg
-        .min_book_qty(base)
-        .max(
-            cfg.grid_for(
-                base,
-                pair.legs[0].venue.as_str(),
-                pair.legs[1].venue.as_str(),
-                pair.min_qty(),
-            )
-            .map(|p| p.base_qty)
-            .unwrap_or(Decimal::ZERO),
+        .grid_for(
+            base,
+            pair.legs[0].venue.as_str(),
+            pair.legs[1].venue.as_str(),
+            pair.min_qty(),
         )
+        .map(|p| p.base_qty)
+        .unwrap_or(Decimal::ZERO)
         .max(probe_qty)
         .max(pair.min_qty());
     if min_qty <= Decimal::ZERO {
@@ -116,20 +93,7 @@ mod tests {
         AppConfig::load_from(std::path::Path::new("config/default.yaml")).unwrap()
     }
 
-    #[test]
-    fn rejects_wide_single_venue_spread() {
-        let good = book(dec!(100.00), dec!(100.02), dec!(1));
-        let wide = book(dec!(100.00), dec!(101.00), dec!(1));
-        assert_eq!(
-            books_tradable(&cfg(), &pair(), &good, &wide, dec!(0.001)),
-            Err("wide_book")
-        );
-        assert!(books_tradable(&cfg(), &pair(), &good, &good, dec!(0.001)).is_ok());
-        assert_eq!(books_quality_ok(&cfg(), &good, &wide), Err("wide_book"));
-        assert_eq!(books_own_spread_ok(&cfg(), &good, &wide), Err("wide_book"));
-    }
-
-    /// probe_qty 为 0（配置里没写这个币）时仍要按两腿 min_qty 校验厚度。
+    /// probe_qty 为 0 时仍要按两腿 min_qty 校验厚度。
     #[test]
     fn thin_check_falls_back_to_leg_min_qty() {
         let thin = book(dec!(100.00), dec!(100.02), dec!(0.0001));

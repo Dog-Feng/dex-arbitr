@@ -3,26 +3,33 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 
-use crate::app::balance::{refresh_accounts, BalanceCache, VenueAccountCache};
+use crate::app::balance::{fetch_pair_equity, refresh_accounts, BalanceCache, VenueAccountCache};
 use crate::app::control::ArbitrageControl;
-use crate::app::funding::{refresh_funding, FundingCache};
 use crate::config::AppConfig;
 use crate::domain::Books;
 use crate::exchange::ExchangePort;
-use crate::exec::{Adapters, ExecResult, HedgeExecutor, HedgePlan, LimitMarketRun};
+use crate::exec::{Adapters, ExecFill, ExecResult, HedgeExecutor, HedgePlan, LimitMarketRun};
 
 pub enum ExecEvent {
     RunPlan(RunPlanMsg),
     /// 账户快照。余额/持仓刷新走后台 task，不能在 100ms 决策环里 await——
     /// 单次 sidecar 调用最长十几秒，会把整个决策环拖停。
     Accounts(Box<AccountsMsg>),
-    /// 资金费率快照。同样走后台：两个所各一次 REST，不能挡决策环。
-    Funding(Box<FundingCache>),
+    /// 裸仓补对冲结果。下单走后台，避免卡死决策环。
+    NakedHedge(NakedHedgeMsg),
 }
 
 pub struct AccountsMsg {
     pub balance: BalanceCache,
     pub accounts: VenueAccountCache,
+}
+
+pub struct NakedHedgeMsg {
+    pub key: String,
+    pub pair_id: String,
+    pub venue: String,
+    pub counterparty: String,
+    pub result: Result<ExecFill, String>,
 }
 
 pub struct RunPlanMsg {
@@ -66,13 +73,64 @@ pub fn spawn_run_plan(
     paper: bool,
 ) {
     tokio::spawn(async move {
-        let result = HedgeExecutor::run_plan(&cfg, &adapters, &plan, &books, paper)
+        let equity_before = if plan.is_open && !paper {
+            fetch_pair_equity(&adapters, &plan.first.venue, &plan.second.venue).await
+        } else {
+            None
+        };
+        let mut result = HedgeExecutor::run_plan(&cfg, &adapters, &plan, &books, paper)
             .await
             .map_err(|e| e.to_string());
+        if let Ok(r) = &mut result {
+            r.equity_before = equity_before;
+            if !plan.is_open && !paper {
+                // 成交后权益入账有延迟；等一小会再拉，比立刻读更接近实际。
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                r.equity_after =
+                    fetch_pair_equity(&adapters, &plan.first.venue, &plan.second.venue).await;
+            }
+        }
         let _ = tx.send(ExecEvent::RunPlan(RunPlanMsg {
             slot: plan.slot.clone(),
             pair_i,
             plan,
+            result,
+        }));
+    });
+}
+
+pub fn spawn_naked_hedge(
+    tx: mpsc::UnboundedSender<ExecEvent>,
+    cfg: AppConfig,
+    adapters: Adapters,
+    books: Books,
+    key: String,
+    pair_id: String,
+    venue: String,
+    counterparty: String,
+    leg: crate::exec::HedgeLeg,
+    qty: rust_decimal::Decimal,
+    is_buy: bool,
+) {
+    tokio::spawn(async move {
+        let result = HedgeExecutor::market_leg(
+            &cfg,
+            &adapters,
+            &pair_id,
+            &leg,
+            qty,
+            is_buy,
+            false,
+            &books,
+            false,
+        )
+        .await
+        .map_err(|e| e.to_string());
+        let _ = tx.send(ExecEvent::NakedHedge(NakedHedgeMsg {
+            key,
+            pair_id,
+            venue,
+            counterparty,
             result,
         }));
     });
@@ -104,29 +162,19 @@ pub fn spawn_account_refresher(
             if tx.send(ExecEvent::Accounts(msg)).is_err() {
                 break;
             }
-            tokio::time::sleep_until(started + period).await;
-        }
-    });
-}
-
-/// 后台周期性拉资金费率。
-///
-/// 首轮立即拉：进入循环先 refresh 再 sleep，启动后就有数据，
-/// 不必等一个完整周期——否则启动初期所有 pair 都因缺费率被开仓门拦住。
-pub fn spawn_funding_refresher(
-    tx: mpsc::UnboundedSender<ExecEvent>,
-    adapters: Vec<Arc<dyn ExchangePort>>,
-    mut cfg: AppConfig,
-    control: Option<Arc<Mutex<ArbitrageControl>>>,
-) {
-    tokio::spawn(async move {
-        loop {
-            overlay_page(&mut cfg, &control);
-            let cache = refresh_funding(&adapters).await;
-            if tx.send(ExecEvent::Funding(Box::new(cache))).is_err() {
-                break;
+            // 以 refresh_balance_secs 为周期。睡眠拆成短片，页面改间隔后最多 ~200ms 生效。
+            loop {
+                overlay_page(&mut cfg, &control);
+                let want = Duration::from_secs(cfg.sizing.refresh_balance_secs.max(1));
+                if want != period {
+                    break;
+                }
+                let elapsed = started.elapsed();
+                if elapsed >= period {
+                    break;
+                }
+                tokio::time::sleep((period - elapsed).min(Duration::from_millis(200))).await;
             }
-            tokio::time::sleep(Duration::from_secs(cfg.risk.funding_refresh_secs.max(5))).await;
         }
     });
 }

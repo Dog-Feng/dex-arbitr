@@ -7,16 +7,24 @@ export function qtyFitsPrecision(qty: number, prec: number): boolean {
   return Math.abs(scaled - Math.round(scaled)) < 1e-6;
 }
 
-export function feeWarns(t1: number, step: number, t0ratio: number, fee: number): string[] {
+/** 与后端 `grid_step_from_target_bp` 同一式：Δ = (目标% + F + C) / (1−2h)，C 为两所中枢平均 */
+export function deltaFromTargetBp(
+  targetBp: number,
+  roundTripFeePct: number,
+  h: number,
+  spreadPct = 0
+): number {
+  const cost = Math.max(roundTripFeePct, 0) + Math.max(spreadPct, 0);
+  const need = Math.max(targetBp, 0) / 100 + cost;
+  const span = 1 - 2 * Math.max(h, 0);
+  const step = span > 0 ? need / span : need;
+  return Math.max(step, cost);
+}
+
+export function feeWarns(step: number, fee: number): string[] {
   const msgs: string[] = [];
   if (!(fee > 0)) return msgs;
-  const feeS = fmtPctNum(fee);
-  if (t1 > 0 && t1 < fee) msgs.push(`T1 ${fmtPctNum(t1)}% < 往返费 ${feeS}%`);
-  if (step > 0 && step < fee) msgs.push(`step ${fmtPctNum(step)}% < 往返费 ${feeS}%`);
-  if (t1 > 0) {
-    const conv = t1 * (1 - (Number.isFinite(t0ratio) ? t0ratio : 0.4));
-    if (conv < fee) msgs.push(`T1→T0 收敛 ${fmtPctNum(conv)}% < 往返费 ${feeS}%`);
-  }
+  if (step > 0 && step < fee) msgs.push(`Δ ${fmtPctNum(step)}% < 往返费 ${fmtPctNum(fee)}%`);
   return msgs;
 }
 
@@ -34,12 +42,13 @@ export interface PairIssues {
 export function collectPairIssues(
   drafts: PairDraft[],
   activeVenues: string[],
-  defT1: number,
-  defStep: number,
-  t0ratio: number
+  defTargetBp: number,
+  hysteresis: number
 ): PairIssues {
   const errors: string[] = [];
   const warnings: string[] = [];
+  if (!(defTargetBp > 0)) errors.push("target_bp 必须 > 0");
+  if (hysteresis >= 0.5) errors.push("step_hysteresis 必须 < 0.5");
   for (const d of drafts) {
     const symbol = normalizeSymbol(d.symbol);
     if (!symbol) continue;
@@ -49,17 +58,16 @@ export function collectPairIssues(
       if (d.minQty > 0 && qty < d.minQty) errors.push(`${symbol} 每格数量 ${qty} 低于最小量 ${d.minQty}`);
       if (d.minQty > 0 && !qtyFitsPrecision(qty, d.prec)) errors.push(`${symbol} 每格数量精度须 ≤ ${d.prec} 位小数`);
     }
-    const pairT1 = parseNum(d.t1);
-    const pairStep = parseNum(d.step);
+    const pairTarget = parseNum(d.step);
     for (const vp of d.venuePairs) {
       if (activeVenues.length && !vp.venues.every((v) => activeVenues.includes(v))) continue;
       const fee = parseFloat(vp.round_trip_fee_pct);
       if (Number.isNaN(fee)) continue;
       const key = pairVenueKey(vp.venues);
       const ov = d.overrides[key];
-      const t1 = pick(parseNum(ov?.t1), pairT1, defT1);
-      const step = pick(parseNum(ov?.step), pairStep, defStep);
-      for (const w of feeWarns(t1, step, t0ratio, fee)) {
+      const target = pick(parseNum(ov?.step), pairTarget, defTargetBp);
+      const step = deltaFromTargetBp(target, fee, hysteresis);
+      for (const w of feeWarns(step, fee)) {
         warnings.push(`${d.symbol} ${vp.venues.join("↔")}：${w}`);
       }
     }
@@ -84,16 +92,14 @@ export function venuePairWarns(
   d: PairDraft,
   vp: AvailableVenuePair,
   activeVenues: string[],
-  defT1: number,
-  defStep: number,
-  t0ratio: number
+  defTargetBp: number,
+  hysteresis: number
 ): string[] {
   if (activeVenues.length && !vp.venues.every((v) => activeVenues.includes(v))) return [];
   const fee = parseFloat(vp.round_trip_fee_pct);
   if (!(fee > 0)) return [];
   const key = pairVenueKey(vp.venues);
   const ov = d.overrides[key];
-  const t1 = pick(parseNum(ov?.t1), parseNum(d.t1), defT1);
-  const step = pick(parseNum(ov?.step), parseNum(d.step), defStep);
-  return feeWarns(t1, step, t0ratio, fee);
+  const target = pick(parseNum(ov?.step), parseNum(d.step), defTargetBp);
+  return feeWarns(deltaFromTargetBp(target, fee, hysteresis), fee);
 }

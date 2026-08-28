@@ -6,7 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::domain::{GridParams, PersistenceMode, VenueId};
+use crate::domain::{GridParams, VenueId};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
@@ -17,7 +17,6 @@ pub struct AppConfig {
     pub order: OrderConfig,
     pub cost: CostConfig,
     pub history: HistoryConfig,
-    pub risk: RiskConfig,
     #[serde(default = "default_scan")]
     pub scan: ScanConfig,
     #[serde(default = "default_execution")]
@@ -225,33 +224,26 @@ pub struct PairsConfig {
     pub enabled: Vec<PairSetting>,
 }
 
+fn default_target_bp() -> Decimal {
+    Decimal::ONE
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PairDefaults {
     pub max_segments: u32,
-    pub initial_spread_threshold: Decimal,
-    pub grid_step: Decimal,
-    pub t0_ratio: Decimal,
+    /// 一格开平目标净利（bp）。1 bp = 0.01%。运行时反推 Δ。
+    #[serde(default = "default_target_bp")]
+    pub target_bp: Decimal,
     #[serde(default)]
     pub split_order_size: Decimal,
-    #[serde(default)]
-    pub scalping_enabled: bool,
-    #[serde(default = "default_scalping_trigger_segment")]
-    pub scalping_trigger_segment: u32,
-    #[serde(default = "default_scalping_profit_threshold")]
-    pub scalping_profit_threshold_pct: Decimal,
 }
 
 impl Default for PairDefaults {
     fn default() -> Self {
         Self {
             max_segments: 3,
-            initial_spread_threshold: Decimal::new(5, 2),
-            grid_step: Decimal::new(5, 2),
-            t0_ratio: Decimal::new(4, 1),
+            target_bp: default_target_bp(),
             split_order_size: Decimal::ZERO,
-            scalping_enabled: false,
-            scalping_trigger_segment: default_scalping_trigger_segment(),
-            scalping_profit_threshold_pct: default_scalping_profit_threshold(),
         }
     }
 }
@@ -263,19 +255,9 @@ pub struct PairOverride {
     #[serde(default)]
     pub max_segments: Option<u32>,
     #[serde(default)]
-    pub initial_spread_threshold: Option<Decimal>,
-    #[serde(default)]
-    pub grid_step: Option<Decimal>,
-    #[serde(default)]
-    pub t0_ratio: Option<Decimal>,
+    pub target_bp: Option<Decimal>,
     #[serde(default)]
     pub split_order_size: Option<Decimal>,
-    #[serde(default)]
-    pub scalping_enabled: Option<bool>,
-    #[serde(default)]
-    pub scalping_trigger_segment: Option<u32>,
-    #[serde(default)]
-    pub scalping_profit_threshold_pct: Option<Decimal>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -286,19 +268,9 @@ pub struct PairSetting {
     #[serde(default)]
     pub max_segments: Option<u32>,
     #[serde(default)]
-    pub initial_spread_threshold: Option<Decimal>,
-    #[serde(default)]
-    pub grid_step: Option<Decimal>,
-    #[serde(default)]
-    pub t0_ratio: Option<Decimal>,
+    pub target_bp: Option<Decimal>,
     #[serde(default)]
     pub split_order_size: Option<Decimal>,
-    #[serde(default)]
-    pub scalping_enabled: Option<bool>,
-    #[serde(default)]
-    pub scalping_trigger_segment: Option<u32>,
-    #[serde(default)]
-    pub scalping_profit_threshold_pct: Option<Decimal>,
     #[serde(default)]
     pub overrides: Vec<PairOverride>,
 }
@@ -315,44 +287,42 @@ impl PairSetting {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct GridConfig {
-    /// `window` = 原连续毫秒窗口；`bucket` = 参考宽松/严格秒桶。缺省 bucket。
-    #[serde(default = "default_persistence_mode")]
-    pub persistence_mode: String,
     pub persistence_ms: u64,
-    /// 秒桶连续满足秒数。对齐参考：`<= 1` 时达标即放行。
-    #[serde(default = "default_spread_persistence_seconds")]
-    pub spread_persistence_seconds: u32,
-    /// `true` = 严格（窗口内每笔达标）；`false` = 宽松（每秒至少一次）。
-    #[serde(default = "default_strict_persistence_check")]
-    pub strict_persistence_check: bool,
+    /// 时间窗内累计达标次数。0 = 连续不掉线。
+    #[serde(default)]
+    pub persistence_min_hits: u32,
+    /// 滑动窗口点数。满窗后才有 μ，才允许开仓。
+    #[serde(default = "default_window_samples")]
+    pub window_samples: usize,
+    /// 入窗间隔。1000 = 1Hz，同一间隔内多次盘口覆盖为最后一次。
+    #[serde(default = "default_sample_interval_ms")]
+    pub sample_interval_ms: u64,
+    /// STEP 滞后（格）。加仓 raw ≥ k+1−h，减仓 raw ≤ k−1+h。
+    #[serde(default = "default_step_hysteresis")]
+    pub step_hysteresis: Decimal,
 }
 
-fn default_scalping_trigger_segment() -> u32 {
-    2
+fn default_window_samples() -> usize {
+    10_000
 }
 
-fn default_scalping_profit_threshold() -> Decimal {
-    Decimal::new(2, 2) // 0.02%
+fn default_sample_interval_ms() -> u64 {
+    1000
 }
 
-fn default_persistence_mode() -> String {
-    "bucket".into()
-}
-
-fn default_spread_persistence_seconds() -> u32 {
-    1
-}
-
-fn default_strict_persistence_check() -> bool {
-    true
+fn default_step_hysteresis() -> Decimal {
+    Decimal::new(25, 2)
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct OrderConfig {
-    pub style: OrderStyle,
-    /// 第一腿限价最长等待。超时未成交则撤。
+    /// 第一腿限价最长等待。超时未成交则撤。阶段 2 用。
     #[serde(default = "default_limit_timeout_ms")]
     pub limit_timeout_ms: u64,
+    /// 第二腿激进限价（或市价结果不明）之后，等这么久再查该所实仓。
+    /// 没有对应仓位则市价平掉第一腿。0 = 不等，立刻查。
+    #[serde(default = "default_second_leg_verify_ms")]
+    pub second_leg_verify_ms: u64,
     /// maker 腿往点差内侧挪几个 tick。0 = 贴自家盘口（队尾，几乎不成交）。
     #[serde(default = "default_maker_inside_ticks")]
     pub maker_inside_ticks: u32,
@@ -362,6 +332,10 @@ pub struct OrderConfig {
 }
 
 fn default_limit_timeout_ms() -> u64 {
+    2000
+}
+
+fn default_second_leg_verify_ms() -> u64 {
     2000
 }
 
@@ -395,15 +369,6 @@ impl OrderStyle {
             Self::MarketTaker => "market_taker",
             Self::LimitThenMarket => "limit_then_market",
             Self::AggressiveLimit => "aggressive_limit",
-        }
-    }
-
-    /// 页面下拉的三种挂单风格。无法识别时回落到先挂后吃。
-    pub fn from_page(s: &str) -> Self {
-        match s {
-            "limit_maker" => Self::LimitMaker,
-            "market_taker" => Self::MarketTaker,
-            _ => Self::LimitThenMarket,
         }
     }
 
@@ -460,147 +425,6 @@ fn default_refresh_interval_secs() -> u64 {
 pub struct VenueFees {
     pub maker: Decimal,
     pub taker: Decimal,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct RiskConfig {
-    pub min_book_qty: HashMap<String, Decimal>,
-    /// 单所自身买卖点差上限（%）。超过说明该所报价不可信 / 流动性极差。
-    /// 对齐参考 `max_local_orderbook_spread_pct`。0 = 不检查。
-    #[serde(default = "default_max_venue_spread_pct")]
-    pub max_venue_spread_pct: Decimal,
-    /// 价格稳定性观察窗口（秒）。0 = 关闭检查。
-    /// 对齐参考 `price_stability_window_seconds`。
-    #[serde(default = "default_price_stability_window_secs")]
-    pub price_stability_window_secs: Decimal,
-    /// 窗口内允许的最大波动（%）：`(max−min)/min×100`。0 = 关闭检查。
-    /// 对齐参考 `price_stability_threshold_pct`。
-    #[serde(default = "default_price_stability_threshold_pct")]
-    pub price_stability_threshold_pct: Decimal,
-    /// reduce-only 拉闸后，是否每小时发最小量探针验证开仓能力。
-    /// 关掉则拉闸只能靠重启清除（状态纯内存）。
-    #[serde(default = "default_true")]
-    pub reduce_only_probe_enabled: bool,
-    /// 探针在每小时的第几秒触发。对齐参考的 `HH:00:05`。
-    #[serde(default = "default_reduce_only_probe_second")]
-    pub reduce_only_probe_second: u32,
-    /// 资金费率年化阈值（%/年）。对齐参考 `funding_rate_annual_threshold`。
-    /// 开仓侧：净支付且年化超此值则不开。持仓侧：净支付超此值触发退出。
-    /// 0 = 不检查。
-    #[serde(default = "default_funding_annual_threshold_pct")]
-    pub funding_annual_threshold_pct: Decimal,
-    /// 费率不利需持续多久才平仓（分钟）。对齐参考
-    /// `unfavorable_funding_rate_duration_minutes`。
-    ///
-    /// 这个门是必要的：费率是逐周期结算的，瞬时读数不利不等于要付钱。
-    /// 没有持续性要求，费率在阈值边缘抖动就会反复开平，磨掉的手续费
-    /// 远超省下的费率。
-    #[serde(default = "default_funding_unfavorable_duration_minutes")]
-    pub funding_unfavorable_duration_minutes: u64,
-    /// 资金费率刷新间隔（秒）。两个所都是小时结算，不需要高频拉。
-    #[serde(default = "default_funding_refresh_secs")]
-    pub funding_refresh_secs: u64,
-    /// 每日最大**开仓**次数。对齐参考 `max_daily_trades`。0 = 不限。
-    ///
-    /// 只算开仓：平仓占配额会让「开了一半就没配额平」，把仓位锁死。
-    #[serde(default = "default_max_daily_opens")]
-    pub max_daily_opens: u32,
-    /// 单笔持仓最长持有时间（小时），超时自动平仓。
-    /// 对齐参考 `max_position_duration` + `auto_close_on_timeout`。0 = 不限。
-    #[serde(default = "default_max_position_hours")]
-    pub max_position_hours: u64,
-    /// 余额告警线（USDC）：低于此值停止该所开仓。0 = 关闭。
-    /// 对齐参考 `min_balance_warning`。
-    #[serde(default)]
-    pub min_balance_warn_usdc: Decimal,
-    /// 余额清仓线（USDC）：低于此值主动平掉该所全部仓位。0 = 关闭。
-    /// 对齐参考 `min_balance_close_position`。
-    ///
-    /// 默认 0（关闭）而不是参考的 500：参考假定的是大账户，把这个默认值
-    /// 带过来会让小额实盘账户一启动就被全量清仓。要用必须显式配。
-    #[serde(default)]
-    pub min_balance_close_usdc: Decimal,
-    /// 单币最大名义敞口（USDC，建仓名义）。0 = 不限。
-    ///
-    /// 与参考项目的刻意分歧：参考用币本位（`max_single_token_position`），
-    /// 本项目改成名义口径。原因：BTC/ETH/DOGE 的「10 个币」量纲完全不同，
-    /// 一个全局默认值不可能同时对大币和小币有意义；名义口径跨币种可比，
-    /// 且 `Position.entry_notional_usdc` 本来就有，不需要新数据。
-    ///
-    /// 用**建仓名义**而非实时市值：盘口拿不到时限额判定仍然有效。
-    #[serde(default)]
-    pub max_single_token_notional_usdc: Decimal,
-    /// 全部持仓名义之和上限（USDC，建仓名义）。0 = 不限。
-    ///
-    /// 与参考的币本位 `max_total_position` 对应，但口径不同：
-    /// 币本位下「所有币数量之和」把不同量纲直接相加（0.05 BTC + 1 ETH = 1.05），
-    /// 这个数没有物理意义，名义 USDC 加总才是真实的总风险敞口。
-    #[serde(default)]
-    pub max_total_notional_usdc: Decimal,
-    /// nonce / 限流错误的退避下限（秒）。对齐参考 `min_backoff_seconds`。
-    #[serde(default = "default_backoff_min_secs")]
-    pub backoff_min_secs: u64,
-    /// 退避上限（秒）。对齐参考 `max_backoff_seconds`。
-    #[serde(default = "default_backoff_max_secs")]
-    pub backoff_max_secs: u64,
-    /// 每次连续错误的退避倍数。对齐参考 `backoff_multiplier`。
-    #[serde(default = "default_backoff_multiplier")]
-    pub backoff_multiplier: u32,
-    /// 多久没再出错就把连续计数清零（秒）。
-    #[serde(default = "default_backoff_reset_secs")]
-    pub backoff_reset_secs: u64,
-}
-
-fn default_backoff_min_secs() -> u64 {
-    120 // 同参考
-}
-
-fn default_backoff_max_secs() -> u64 {
-    3600 // 同参考
-}
-
-fn default_backoff_multiplier() -> u32 {
-    2
-}
-
-fn default_backoff_reset_secs() -> u64 {
-    600
-}
-
-fn default_max_daily_opens() -> u32 {
-    100 // 同参考
-}
-
-fn default_max_position_hours() -> u64 {
-    168 // 7 天，同参考
-}
-
-fn default_funding_annual_threshold_pct() -> Decimal {
-    Decimal::new(10, 0) // 10%/年，同参考
-}
-
-fn default_funding_unfavorable_duration_minutes() -> u64 {
-    60 // 同参考
-}
-
-fn default_funding_refresh_secs() -> u64 {
-    60
-}
-
-fn default_reduce_only_probe_second() -> u32 {
-    5
-}
-
-fn default_max_venue_spread_pct() -> Decimal {
-    Decimal::new(5, 2) // 0.05%，对齐参考 max_local_orderbook_spread_pct
-}
-
-fn default_price_stability_window_secs() -> Decimal {
-    Decimal::new(1, 0) // 1s，对齐参考 price_stability_window_seconds
-}
-
-fn default_price_stability_threshold_pct() -> Decimal {
-    Decimal::new(1, 2) // 0.01%，对齐参考 price_stability_threshold_pct
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -721,30 +545,43 @@ impl AppConfig {
 
         Some(GridParams {
             base_qty: s.base_qty,
-            initial: pick!(initial_spread_threshold, d.initial_spread_threshold),
-            step: pick!(grid_step, d.grid_step),
+            step: self.delta_from_target(symbol, venue_a, venue_b),
             max_segments: pick!(max_segments, d.max_segments),
-            t0_ratio: pick!(t0_ratio, d.t0_ratio),
             split_order_size: pick!(split_order_size, d.split_order_size),
-            scalping_enabled: pick!(scalping_enabled, d.scalping_enabled),
-            scalping_trigger_segment: pick!(
-                scalping_trigger_segment,
-                d.scalping_trigger_segment
-            ),
-            scalping_profit_threshold: pick!(
-                scalping_profit_threshold_pct,
-                d.scalping_profit_threshold_pct
-            ),
             min_qty,
             persistence: Duration::from_millis(self.grid.persistence_ms),
-            persistence_mode: if self.grid.persistence_mode.eq_ignore_ascii_case("window") {
-                PersistenceMode::Window
-            } else {
-                PersistenceMode::Bucket
-            },
-            spread_persistence_seconds: self.grid.spread_persistence_seconds,
-            strict_persistence_check: self.grid.strict_persistence_check,
+            persistence_min_hits: self.grid.persistence_min_hits,
         })
+    }
+
+    /// 阶段 1 双腿市价：开+平四腿 taker。
+    pub fn market_round_trip_taker(&self, a: &VenueId, b: &VenueId) -> Decimal {
+        (self.taker_fee(a) + self.taker_fee(b)) * Decimal::from(2)
+    }
+
+    pub fn target_bp_for(&self, symbol: &str, venue_a: &str, venue_b: &str) -> Decimal {
+        let d = &self.pairs.defaults;
+        let Some(s) = self.pair_setting(symbol) else {
+            return d.target_bp;
+        };
+        let ov = s.override_for(venue_a, venue_b);
+        ov.and_then(|o| o.target_bp)
+            .or(s.target_bp)
+            .unwrap_or(d.target_bp)
+    }
+
+    /// 静态格距（C=0）。运行时 `process_pair` 用两所 live 点差中枢的平均覆盖。
+    fn delta_from_target(&self, symbol: &str, venue_a: &str, venue_b: &str) -> Decimal {
+        let target = self.target_bp_for(symbol, venue_a, venue_b);
+        let a = VenueId::from(venue_a);
+        let b = VenueId::from(venue_b);
+        let rt = self.market_round_trip_taker(&a, &b);
+        crate::domain::grid_step_from_target_bp(
+            target,
+            rt,
+            Decimal::ZERO,
+            self.grid.step_hysteresis,
+        )
     }
 
     pub fn pair_setting(&self, symbol: &str) -> Option<&PairSetting> {
@@ -754,12 +591,9 @@ impl AppConfig {
             .find(|p| p.symbol.eq_ignore_ascii_case(symbol))
     }
 
-    /// 某个所对上「先挂后吃」一次的手续费。
+    /// 开/平一腿各一次的手续费。策略固定双腿市价，两所都按 taker。
     pub fn round_leg_fee(&self, a: &VenueId, b: &VenueId) -> Decimal {
-        match self.order.style {
-            OrderStyle::LimitThenMarket => crate::exec::sequenced_fee(self, a, b),
-            _ => self.exec_fee(a) + self.exec_fee(b),
-        }
+        self.taker_fee(a) + self.taker_fee(b)
     }
 
     fn hydrate_fees(&mut self) -> Result<()> {
@@ -785,24 +619,9 @@ impl AppConfig {
             .unwrap_or(Decimal::ZERO)
     }
 
-    /// Fee used on the hot path: taker when eating, maker when posting.
+    /// 热路径手续费。策略固定双腿市价（含激进限价兜底），一律按 taker。
     pub fn exec_fee(&self, venue: &VenueId) -> Decimal {
-        match self.order.style {
-            OrderStyle::LimitMaker => self.maker_fee(venue),
-            // 激进限价越过盘口吃单，收的是 taker 费率。
-            OrderStyle::MarketTaker
-            | OrderStyle::LimitThenMarket
-            | OrderStyle::AggressiveLimit => self.taker_fee(venue),
-        }
-    }
-
-    pub fn min_book_qty(&self, base: &str) -> Decimal {
-        self.risk
-            .min_book_qty
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(base))
-            .map(|(_, v)| *v)
-            .unwrap_or(Decimal::ZERO)
+        self.taker_fee(venue)
     }
 
     pub fn leverage_for(&self, venue: &str) -> Decimal {
@@ -896,11 +715,34 @@ mod tests {
         let btc = cfg.grid_for("BTC", "lighter", "sodex", Decimal::ZERO).unwrap();
         assert_eq!(btc.base_qty, dec!(0.001));
         let cheap = cfg.grid_for("BTC", "lighter", "entropy", Decimal::ZERO).unwrap();
-        assert_eq!(cheap.step, dec!(0.02));
+        let cheap_rt = cfg.market_round_trip_taker(
+            &VenueId::from("lighter"),
+            &VenueId::from("entropy"),
+        );
+        assert_eq!(
+            cheap.step,
+            crate::domain::grid_step_from_target_bp(
+                cfg.target_bp_for("BTC", "lighter", "entropy"),
+                cheap_rt,
+                Decimal::ZERO,
+                cfg.grid.step_hysteresis
+            )
+        );
         assert_eq!(cheap.max_segments, 6);
-        assert!(cheap.scalping_enabled);
         let expensive = cfg.grid_for("BTC", "sodex", "lighter_rh", Decimal::ZERO).unwrap();
-        assert_eq!(expensive.step, dec!(0.05));
+        let exp_rt = cfg.market_round_trip_taker(
+            &VenueId::from("sodex"),
+            &VenueId::from("lighter_rh"),
+        );
+        assert_eq!(
+            expensive.step,
+            crate::domain::grid_step_from_target_bp(
+                cfg.pairs.defaults.target_bp,
+                exp_rt,
+                Decimal::ZERO,
+                cfg.grid.step_hysteresis
+            )
+        );
         assert_eq!(
             cfg.grid_for("BTC", "entropy", "lighter", Decimal::ZERO)
                 .unwrap()
@@ -911,15 +753,15 @@ mod tests {
         let venue = cfg.load_venue("lighter_rh").unwrap();
         assert_eq!(venue.chain_id, 466324);
         assert_eq!(venue.quote, "USDG");
-        assert_eq!(cfg.order.style, OrderStyle::LimitThenMarket);
-        assert_eq!(cfg.maker_fee(&VenueId::from("lighter")), dec!(0.005));
+        let lighter = cfg.load_venue("lighter").unwrap();
+        assert_eq!(cfg.maker_fee(&VenueId::from("lighter")), lighter.fees.maker);
+        assert_eq!(cfg.taker_fee(&VenueId::from("lighter")), lighter.fees.taker);
         assert_eq!(cfg.maker_fee(&VenueId::from("lighter_rh")), dec!(0.012));
-        assert_eq!(cfg.taker_fee(&VenueId::from("lighter")), dec!(0.005));
         assert_eq!(cfg.taker_fee(&VenueId::from("lighter_rh")), dec!(0.035));
         assert!(cfg.maker_fee(&VenueId::from("sodex")) > dec!(0));
         assert_eq!(
             cfg.exec_fee(&VenueId::from("lighter")) + cfg.exec_fee(&VenueId::from("lighter_rh")),
-            dec!(0.040)
+            cfg.taker_fee(&VenueId::from("lighter")) + cfg.taker_fee(&VenueId::from("lighter_rh"))
         );
         assert!(cfg.history.enabled);
         assert_eq!(cfg.history.min_points, 10);
@@ -927,22 +769,18 @@ mod tests {
         assert_eq!(cfg.scan.min_spread_pct, dec!(0.1));
         assert!(cfg.scan.cross_use_natural);
         assert_eq!(cfg.grid.persistence_ms, 1000);
-        assert_eq!(cfg.grid.persistence_mode, "bucket");
-        assert_eq!(cfg.grid.spread_persistence_seconds, 1);
-        assert!(cfg.grid.strict_persistence_check);
-        assert_eq!(cfg.pairs.defaults.scalping_trigger_segment, 2);
-        assert_eq!(cfg.pairs.defaults.scalping_profit_threshold_pct, dec!(0.02));
-        assert_eq!(cfg.sizing.leverage_multiplier, dec!(2));
-        assert_eq!(cfg.risk.max_venue_spread_pct, dec!(0.05));
-        assert_eq!(cfg.risk.price_stability_window_secs, dec!(1));
-        assert_eq!(cfg.risk.price_stability_threshold_pct, dec!(0.01));
+        assert_eq!(cfg.grid.persistence_min_hits, 7);
+        assert_eq!(cfg.grid.window_samples, 1000);
+        assert_eq!(cfg.grid.sample_interval_ms, 1000);
+        assert_eq!(cfg.grid.step_hysteresis, Decimal::ZERO);
+        assert_eq!(cfg.pairs.defaults.target_bp, dec!(1));
+        assert_eq!(cfg.sizing.leverage_multiplier, dec!(5));
         let sodex = cfg.load_venue("sodex").unwrap();
         assert_eq!(sodex.chain_id, 623);
         assert_eq!(sodex.id, "sodex");
         // 新增的成本一致性字段
         assert!(cfg.order.maker_inside_ticks >= 1);
         assert!(cfg.order.limit_retry_count >= 1);
-        assert!(cfg.risk.max_venue_spread_pct > dec!(0));
     }
 
     /// 滑点保护必须配上，且紧急倍数 ≥ 1——否则平仓时保护反而更严，平不掉。

@@ -26,9 +26,8 @@ function issues() {
   return collectPairIssues(
     store.drafts,
     store.params.active_venues,
-    parseNum(d.initial_spread_threshold) ?? 0.05,
-    parseNum(d.grid_step) ?? 0.05,
-    parseNum(d.t0_ratio) ?? 0.4
+    parseNum(d.target_bp) ?? 1,
+    parseNum(store.params.step_hysteresis) ?? 0.25
   );
 }
 
@@ -104,7 +103,7 @@ async function stop() {
   busy.value = true;
   try {
     await apiFetch("/api/arbitrage/stop", { method: "POST" });
-    show("套利已停止（持有仓位继续平仓）", "success");
+    show("套利已停止（列表已清空；持有仓位继续平仓）", "success");
     emit("stopped");
   } catch (e) {
     show("停止失败: " + (e as Error).message, "error");

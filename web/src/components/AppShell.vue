@@ -20,7 +20,7 @@
       <div class="stat" v-for="id in venueIds" :key="'b'+id">
         <div class="lbl">{{ venueLabel(id, venues) }}</div>
         <div class="val tabular">{{ bal(id) }}</div>
-        <div class="sub">可用 · {{ venueQuote(id, venues) }}</div>
+        <div class="sub">总额 · {{ venueQuote(id, venues) }}</div>
       </div>
       <div class="stat">
         <div class="lbl">匹配对</div>
@@ -31,6 +31,11 @@
         <div class="lbl">交易所持仓</div>
         <div class="val tabular">{{ (snap?.exchange_positions || []).length }}</div>
         <div class="sub">{{ exDetail }}</div>
+      </div>
+      <div class="stat">
+        <div class="lbl">本次套利收益</div>
+        <div class="val tabular" :class="sessionPnlCls">{{ sessionPnlText }}</div>
+        <div class="sub">执行带合计 · USDC</div>
       </div>
       <div class="stat">
         <div class="lbl">今日成交</div>
@@ -70,6 +75,29 @@ const enabled = ref(false);
 const snap = ref<LiveSnapshot | null>(null);
 const execs = ref<ExecRow[]>([]);
 const execCount = computed(() => execs.value.length);
+const sessionPnl = computed(() => {
+  const raw = snap.value?.session_pnl_usdc;
+  if (raw != null && raw !== "") {
+    const n = parseFloat(raw);
+    if (!Number.isNaN(n)) return n;
+  }
+  return execs.value
+    .filter((r) => r.action === "close" && r.pnl_usdc != null && r.pnl_usdc !== "")
+    .reduce((s, r) => s + (parseFloat(r.pnl_usdc as string) || 0), 0);
+});
+const sessionPnlText = computed(() => {
+  const n = sessionPnl.value;
+  const body = Math.abs(n).toFixed(2);
+  if (n > 0) return `+${body}`;
+  if (n < 0) return `-${body}`;
+  return "0.00";
+});
+const sessionPnlCls = computed(() => {
+  const n = sessionPnl.value;
+  if (n > 0) return "up";
+  if (n < 0) return "dn";
+  return "mu";
+});
 const venues = computed(() => store.venues);
 const venueIds = computed(() => {
   const ids = store.venues.map((v) => v.id);
@@ -100,7 +128,9 @@ function connected(id: string) {
 function bal(id: string) {
   const b = (snap.value?.balances || []).find((x) => x.venue === id);
   if (!b) return "—";
-  const n = parseFloat(b.available);
+  const total = parseFloat(b.total);
+  const avail = parseFloat(b.available);
+  const n = !Number.isNaN(total) && total > 0 ? total : avail;
   return Number.isNaN(n) ? "—" : n.toFixed(2);
 }
 

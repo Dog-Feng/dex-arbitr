@@ -89,7 +89,7 @@ impl PositionStore {
         buy: VenueId,
         sell: VenueId,
         qty: Decimal,
-        grid: u32,
+        grid: i32,
         entry_notional_usdc: Decimal,
         entry_net_pct: Decimal,
         entry_raw_pct: Decimal,
@@ -137,14 +137,13 @@ impl PositionStore {
                         buy,
                         sell,
                         qty: total_qty,
-                        grid: grid.max(prev.grid),
+                        grid,
                         entry_notional_usdc: total_notional,
                         entry_net_pct: weighted_net,
                         entry_raw_pct: weighted_raw,
                         entry_buy_px: weighted_buy,
                         entry_sell_px: weighted_sell,
-                        // 保留首次开仓的 base_qty，补仓不覆盖——
-                        // GridEngine::segments_held 整个持仓周期用同一把尺。
+                        // 保留首次开仓的 base_qty，补仓不覆盖。
                         base_qty: prev.base_qty,
                         // 保留最早的建仓时刻，补仓不给仓位「续命」。
                         opened_at: prev.opened_at,
@@ -188,9 +187,9 @@ impl PositionStore {
         } else if pos.base_qty > Decimal::ZERO {
             let ratio = pos.qty / pos.base_qty;
             let ceil = ratio.ceil();
-            pos.grid = u32::try_from(ceil.trunc().mantissa().max(0))
-                .unwrap_or(u32::MAX)
-                .max(1);
+            let abs = i32::try_from(ceil.trunc().mantissa().max(0)).unwrap_or(i32::MAX);
+            let sign = if pos.grid < 0 { -1 } else { 1 };
+            pos.grid = sign * abs.max(1);
         }
     }
 

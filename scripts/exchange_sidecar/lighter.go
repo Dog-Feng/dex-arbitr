@@ -690,7 +690,7 @@ func (s *lighterSession) place(ctx context.Context, params map[string]any) (map[
 					"client_order_id": coidStr,
 					"filled_qty":      filled.String(),
 					"status":          status,
-					"avg_price":       limitPriceStr,
+					"avg_price":       "",
 				}, nil
 			}
 		}
@@ -728,7 +728,7 @@ func (s *lighterSession) place(ctx context.Context, params map[string]any) (map[
 		"client_order_id": coidStr,
 		"filled_qty":      filled.String(),
 		"status":          status,
-		"avg_price":       limitPriceStr,
+		"avg_price":       "",
 	}, nil
 }
 

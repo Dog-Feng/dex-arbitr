@@ -8,38 +8,23 @@ export interface VenueMeta {
 
 export interface PairDefaults {
   max_segments: number;
-  initial_spread_threshold: string | number;
-  grid_step: string | number;
-  t0_ratio: string | number;
+  target_bp: string | number;
   split_order_size: string | number;
-  scalping_enabled: boolean;
-  scalping_trigger_segment: number;
-  scalping_profit_threshold_pct: string | number;
 }
 
 export interface PairOverride {
   venues: string[];
   max_segments?: number | null;
-  initial_spread_threshold?: string | number | null;
-  grid_step?: string | number | null;
-  t0_ratio?: string | number | null;
+  target_bp?: string | number | null;
   split_order_size?: string | number | null;
-  scalping_enabled?: boolean | null;
-  scalping_trigger_segment?: number | null;
-  scalping_profit_threshold_pct?: string | number | null;
 }
 
 export interface PairSetting {
   symbol: string;
   base_qty: string | number;
   max_segments?: number | null;
-  initial_spread_threshold?: string | number | null;
-  grid_step?: string | number | null;
-  t0_ratio?: string | number | null;
+  target_bp?: string | number | null;
   split_order_size?: string | number | null;
-  scalping_enabled?: boolean | null;
-  scalping_trigger_segment?: number | null;
-  scalping_profit_threshold_pct?: string | number | null;
   overrides?: PairOverride[];
 }
 
@@ -65,11 +50,12 @@ export interface ArbitrageParams {
   cross_use_natural: boolean;
   scan_log_interval_secs: number;
   persistence_ms: number;
-  persistence_mode: string;
-  spread_persistence_seconds: number;
-  strict_persistence_check: boolean;
-  order_style: string;
+  persistence_min_hits: number;
+  window_samples: number;
+  sample_interval_ms: number;
+  step_hysteresis: string | number;
   limit_timeout_ms: number;
+  second_leg_verify_ms: number;
   maker_inside_ticks: number;
   limit_retry_count: number;
   default_slip_pct: string | number;
@@ -80,25 +66,6 @@ export interface ArbitrageParams {
   history_min_points: number;
   history_sample_interval_secs: number;
   history_refresh_interval_secs: number;
-  min_book_qty: Record<string, string>;
-  max_venue_spread_pct: string | number;
-  price_stability_window_secs: string | number;
-  price_stability_threshold_pct: string | number;
-  reduce_only_probe_enabled: boolean;
-  reduce_only_probe_second: number;
-  funding_annual_threshold_pct: string | number;
-  funding_unfavorable_duration_minutes: number;
-  funding_refresh_secs: number;
-  max_daily_opens: number;
-  max_position_hours: number;
-  min_balance_warn_usdc: string | number;
-  min_balance_close_usdc: string | number;
-  max_single_token_notional_usdc: string | number;
-  max_total_notional_usdc: string | number;
-  backoff_min_secs: number;
-  backoff_max_secs: number;
-  backoff_multiplier: number;
-  backoff_reset_secs: number;
 }
 
 export interface AvailableVenuePair {
@@ -125,6 +92,8 @@ export interface PairRow {
   nat_pct: string;
   res_pct: string;
   entry_pct: string;
+  dev_pct?: string;
+  delta_pct?: string;
   grid: string;
   target_qty: string;
   actual_qty: string;
@@ -153,6 +122,12 @@ export interface ExchangePositionRow {
   entry_price?: string | null;
 }
 
+export interface VenueLiveRow {
+  venue: string;
+  spread_mu: string;
+  volume: string;
+}
+
 export interface NakedExposureRow {
   pair_id: string;
   venue: string;
@@ -172,6 +147,7 @@ export interface LiveSnapshot {
   positions: PositionRow[];
   balances: VenueBalanceRow[];
   exchange_positions: ExchangePositionRow[];
+  venue_stats?: VenueLiveRow[];
   naked_exposures: NakedExposureRow[];
   venue_matches: VenueMatchRow[];
   stats: { matched_pairs: number; open_positions: number; best_net_pct?: string | null };
@@ -180,6 +156,7 @@ export interface LiveSnapshot {
   arbitrage_enabled: boolean;
   matching: boolean;
   available: AvailableSymbol[];
+  session_pnl_usdc?: string;
   updated_at: number;
 }
 
@@ -205,7 +182,6 @@ export interface PairDraft {
   enabled: boolean;
   qty: string;
   segs: string;
-  t1: string;
   step: string;
   minQty: number;
   prec: number;
@@ -213,6 +189,6 @@ export interface PairDraft {
   expanded: boolean;
   overrides: Record<
     string,
-    { t1: string; step: string; segs: string; scalp: boolean; scalpTrig: string }
+    { step: string; segs: string }
   >;
 }

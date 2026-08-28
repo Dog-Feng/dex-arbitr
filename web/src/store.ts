@@ -5,13 +5,8 @@ import { pairVenueKey, parseNum, normalizeSymbol } from "./format";
 export function emptyDefaults() {
   return {
     max_segments: 3,
-    initial_spread_threshold: "0.05",
-    grid_step: "0.05",
-    t0_ratio: "0.4",
+    target_bp: "1",
     split_order_size: "0",
-    scalping_enabled: false,
-    scalping_trigger_segment: 2,
-    scalping_profit_threshold_pct: "0.02",
   };
 }
 
@@ -38,11 +33,12 @@ export function emptyParams(): ArbitrageParams {
     cross_use_natural: true,
     scan_log_interval_secs: 30,
     persistence_ms: 1000,
-    persistence_mode: "bucket",
-    spread_persistence_seconds: 1,
-    strict_persistence_check: true,
-    order_style: "limit_then_market",
+    persistence_min_hits: 5,
+    window_samples: 10000,
+    sample_interval_ms: 1000,
+    step_hysteresis: "0.25",
     limit_timeout_ms: 2000,
+    second_leg_verify_ms: 2000,
     maker_inside_ticks: 1,
     limit_retry_count: 3,
     default_slip_pct: "0.01",
@@ -53,25 +49,6 @@ export function emptyParams(): ArbitrageParams {
     history_min_points: 10,
     history_sample_interval_secs: 5,
     history_refresh_interval_secs: 1800,
-    min_book_qty: { BTC: "0.001", ETH: "0.01" },
-    max_venue_spread_pct: "0.05",
-    price_stability_window_secs: "1",
-    price_stability_threshold_pct: "0.01",
-    reduce_only_probe_enabled: true,
-    reduce_only_probe_second: 5,
-    funding_annual_threshold_pct: "10",
-    funding_unfavorable_duration_minutes: 60,
-    funding_refresh_secs: 60,
-    max_daily_opens: 100,
-    max_position_hours: 168,
-    min_balance_warn_usdc: "40",
-    min_balance_close_usdc: "20",
-    max_single_token_notional_usdc: "0",
-    max_total_notional_usdc: "0",
-    backoff_min_secs: 120,
-    backoff_max_secs: 3600,
-    backoff_multiplier: 2,
-    backoff_reset_secs: 600,
   };
 }
 
@@ -82,7 +59,6 @@ function blankDraft(symbol = "", qty = ""): PairDraft {
     enabled: true,
     qty,
     segs: "",
-    t1: "",
     step: "",
     minQty: 0,
     prec: 8,
@@ -97,11 +73,8 @@ function draftFromSetting(s: PairSetting): PairDraft {
   for (const ov of s.overrides || []) {
     const key = pairVenueKey(ov.venues);
     overrides[key] = {
-      t1: ov.initial_spread_threshold != null ? String(ov.initial_spread_threshold) : "",
-      step: ov.grid_step != null ? String(ov.grid_step) : "",
+      step: ov.target_bp != null ? String(ov.target_bp) : "",
       segs: ov.max_segments != null ? String(ov.max_segments) : "",
-      scalp: !!ov.scalping_enabled,
-      scalpTrig: ov.scalping_trigger_segment != null ? String(ov.scalping_trigger_segment) : "",
     };
   }
   return {
@@ -110,8 +83,7 @@ function draftFromSetting(s: PairSetting): PairDraft {
     enabled: true,
     qty: s.base_qty != null ? String(s.base_qty) : "",
     segs: s.max_segments != null ? String(s.max_segments) : "",
-    t1: s.initial_spread_threshold != null ? String(s.initial_spread_threshold) : "",
-    step: s.grid_step != null ? String(s.grid_step) : "",
+    step: s.target_bp != null ? String(s.target_bp) : "",
     minQty: 0,
     prec: 8,
     venuePairs: [],
@@ -133,7 +105,6 @@ export function applyParams(p: ArbitrageParams) {
     ...emptyParams(),
     ...p,
     pair_defaults: { ...emptyDefaults(), ...(p.pair_defaults || {}) },
-    min_book_qty: { ...(p.min_book_qty || {}) },
     pairs: p.pairs || [],
     active_venues: p.active_venues || [],
   };
@@ -172,38 +143,22 @@ export function collectEnabledPairs(): PairSetting[] {
     const row: PairSetting = { symbol, base_qty: String(qty) };
     const segs = parseNum(d.segs);
     if (segs != null) row.max_segments = segs;
-    const t1 = parseNum(d.t1);
-    if (t1 != null) row.initial_spread_threshold = t1;
     const step = parseNum(d.step);
-    if (step != null) row.grid_step = step;
+    if (step != null) row.target_bp = step;
     const overrides: PairOverride[] = [];
     for (const [key, ov] of Object.entries(d.overrides || {})) {
       const venues = key.split("|").filter(Boolean);
       if (venues.length < 2) continue;
       const item: PairOverride = { venues };
       let has = false;
-      const ot1 = parseNum(ov.t1);
-      if (ot1 != null) {
-        item.initial_spread_threshold = ot1;
-        has = true;
-      }
       const ostep = parseNum(ov.step);
       if (ostep != null) {
-        item.grid_step = ostep;
+        item.target_bp = ostep;
         has = true;
       }
       const osegs = parseNum(ov.segs);
       if (osegs != null) {
         item.max_segments = osegs;
-        has = true;
-      }
-      if (ov.scalp) {
-        item.scalping_enabled = true;
-        has = true;
-      }
-      const trig = parseNum(ov.scalpTrig);
-      if (trig != null) {
-        item.scalping_trigger_segment = trig;
         has = true;
       }
       if (has) overrides.push(item);
@@ -218,6 +173,5 @@ export function payload(): ArbitrageParams {
   return {
     ...store.params,
     pairs: collectEnabledPairs(),
-    min_book_qty: { ...store.params.min_book_qty },
   };
 }

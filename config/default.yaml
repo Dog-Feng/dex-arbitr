@@ -16,28 +16,18 @@ venues:
 pairs:
   defaults:
     max_segments: 3
-    initial_spread_threshold: "0.05"
-    grid_step: "0.05"
-    t0_ratio: "0.4"
+    # 一格开平目标净利（bp）。1 bp = 0.01%。运行时 Δ = (目标% + 四腿市价费 + 两所点差中枢平均) / (1−2h)
+    target_bp: "1"
     split_order_size: "0"
-    scalping_enabled: false
-    scalping_trigger_segment: 2
-    scalping_profit_threshold_pct: "0.02"
   # HTTP 开着时这里只是页面初始行，启动进程不会去各所拉市场。
   # 点「启动套利」后按用户填写的 symbol + 所选所再匹配。空列表 = 只监控不交易。
   enabled:
     - symbol: BTC
       base_qty: "0.001"
       max_segments: 3
-      initial_spread_threshold: "0.05"
-      grid_step: "0.05"
       overrides:
         - venues: [lighter, entropy]
-          initial_spread_threshold: "0.02"
-          grid_step: "0.02"
           max_segments: 6
-          scalping_enabled: true
-          scalping_trigger_segment: 2
     - symbol: ETH
       base_qty: "0.02"
 
@@ -47,7 +37,8 @@ sizing:
   max_concurrent_pairs: 1
   leverage_multiplier: "5"
   depth_pct: "50"
-  # 余额和交易所持仓一起拉。1 = 页面「交易所持仓」每秒更新。
+  # 余额和交易所持仓一起拉。1 = 顶栏 DEX 余额与「交易所持仓」每秒更新。
+  # 停止套利后仍继续刷新，不依赖套利开关。
   refresh_balance_secs: 1
   margin_utilization_pct: "90"
   # SoDEX 公开余额接口可能为空；有真实余额时以 bridge 为准
@@ -55,7 +46,8 @@ sizing:
 
 # 对齐参考套利监控 V2：毛价差 ≥ 0.1% 记为机会，分析环扫内存盘口。
 # 不改格子、不下单。scan.enabled: false 则回到旧的单币格子监控。
-# execution.enabled: true → 统一决策环（格子 + 定仓 + 下单），不再走纯 scan 监控。
+# execution.enabled: true → 无 HTTP 时启动即进统一决策环。
+# HTTP 开着时始终走统一决策环，是否交易看页面「启动套利」。
 execution:
   enabled: false
   loop_interval_ms: 100
@@ -88,18 +80,17 @@ scan:
   log_interval_secs: 30
 
 grid:
-  # 阈值已下沉到 pairs.defaults / enabled / overrides。这里只留持续性。
-  # window = persistence_ms 连续窗口；bucket = 参考秒桶（默认）。
+  # 决策环 100ms 一拍则 1 秒大约查 10 次。min_hits = 这 1 秒里至少几次达标即通过（5 或 7）。0 = 连续不掉线。
   persistence_ms: 1000
-  persistence_mode: window
-  spread_persistence_seconds: 1
-  strict_persistence_check: true
+  persistence_min_hits: 7
+  # 满这么多个秒级点才有 μ（跨所 mid 价差）和各所点差中枢。1000 ≈ 17 分钟；代码默认 10000 ≈ 2h47m。两所中枢平均折进 Δ。
+  window_samples: 1000
+  sample_interval_ms: 1000
+  # STEP 滞后（格）。加仓 raw ≥ k+1−h，减仓 raw ≤ k−1+h。
+  step_hysteresis: "0"
 
-# limit_then_market：吃单费率高的一所先挂限价，成交后再对另一所市价。
-# 挂着期间价差不够了就撤；若已经成交，另一边仍市价对冲，避免单边。
-# market_taker：双腿同时市价。limit_maker：双腿限价。
+# 策略固定双腿市价。下面几项只给市价失败后的激进限价兜底 / 看门狗用。
 order:
-  style: limit_then_market
   limit_timeout_ms: 2000
   # maker 腿往点差内侧挪几个 tick。0 = 贴自家 bid/ask（队尾，2 秒超时几乎
   # 不可能成交）。参考项目的 tick 模式就是买 Ask1−1tick、卖 Bid1+1tick。
@@ -107,6 +98,9 @@ order:
   # 第一腿限价最多挂几轮：每轮用最新盘口重算价格，部分成交累积，
   # 每轮结束一定撤掉余量。撤不掉会上报 orphan 并停止重试。
   limit_retry_count: 3
+  # 第二腿激进限价失败（或市价结果不明）后等这么久，再查该所实仓。
+  # 没有对应仓位则市价平掉第一腿。0 = 不等立刻查。
+  second_leg_verify_ms: 2000
 
 cost:
   # 决策不预扣滑点（小额只看卖一/买一）。成交后按实际成交价扣；超过本值记 overrun。
@@ -115,13 +109,13 @@ cost:
   # 以**决策信号价**为基准，超出这个幅度交易所直接拒单。
   # 这是唯一的穿档保护：不在本地遍历订单簿估 VWAP，而是把限价交给交易所
   # 强制执行——参考项目同样不做走档计算。
-  max_slippage_pct: "0.1"
+  max_slippage_pct: "1"
   # 平仓 / 紧急平仓 / 补对冲时把上面的上限放大这么多倍。
   # 对齐参考的「紧急平仓 50 倍滑点」：平不掉的风险远大于穿档成本。
   emergency_slippage_multiplier: "50"
 
 # 对齐参考项目：SQLite 记毛价差，中位数当天然价差。
-# 开仓看 净边 − max(天然, 0) ≥ T1。无 nat 快照时只记录、不开仓。
+# nat 只给监控/扫描上榜；开仓看窗口 μ 与 STEP，不要求 raw ≥ 绝对门槛。
 history:
   enabled: true
   db_path: data/spreads.sqlite
@@ -131,68 +125,3 @@ history:
   # 有 natural_spreads 快照则启动直接用；之后隔这么久重算 24h 中位数（1800 = 30 分钟）。
   refresh_interval_secs: 1800
   max_age_secs: 200
-
-risk:
-  # 没列出的币退到两腿 min_qty 的较大者，不再退成 0（那等于关掉厚度校验）
-  min_book_qty:
-    BTC: "0.001"
-    ETH: "0.01"
-  # 单所自身买卖点差上限（%）。超过说明该所报价不可信 / 流动性极差，
-  # 而 maker 腿正要挂在它盘口上。对齐参考 max_local_orderbook_spread_pct。
-  max_venue_spread_pct: "0.05"
-  # 价格稳定性：窗口内 (max−min)/min×100 超阈值就不开不平。
-  # 判据是极值而非标准差——极值对单次插针敏感，而插针正是先挂后吃最怕的：
-  # 挂单在插针价上成交，对冲腿却回不来。对齐参考 passes_price_stability。
-  # 超阈值会清空历史重新计时，避免价格刚稳就放行、而窗口里还留着插针尾巴。
-  # 两项任一为 0 = 关闭检查。
-  price_stability_window_secs: "1"
-  price_stability_threshold_pct: "0.01"
-  # reduce-only 拉闸后每小时发一次最小量探针，能开就解闸。
-  # 关掉则拉闸只能靠重启清除（状态纯内存）——交易所早已恢复，机器人还在自我禁言。
-  reduce_only_probe_enabled: true
-  # 探针在每小时的第几秒触发，对齐参考的 HH:00:05。窗口是该秒起 60 秒。
-  reduce_only_probe_second: 5
-  # ── 资金费率维度（对齐参考 funding_rate_annual_threshold 等）──
-  # 净支付且年化超此值：开仓侧直接否决，持仓侧计时。0 = 关闭该维度。
-  # 判定用**带符号**净年化，正数是我方净收，只有负到 -threshold 才算不利。
-  funding_annual_threshold_pct: "10"
-  # 费率不利需持续多久才平仓（分钟）。开仓侧不看这个门——现在就知道要
-  # 净付钱，没理由先开进来再等。持仓侧必须有：费率逐周期结算，瞬时读数
-  # 不利不等于真要付钱，阈值边缘抖动会把仓位反复开平。
-  funding_unfavorable_duration_minutes: 60
-  # 刷新间隔（秒）。两个所都是小时结算，不需要高频拉。
-  funding_refresh_secs: 60
-  # ── 全局限额（对齐参考 GlobalRiskController）──
-  # 每日最大开仓次数。只算开仓：平仓占配额会出现「开了却没配额平」，
-  # 把仓位锁死在交易所。0 = 不限。
-  max_daily_opens: 100
-  # 持仓超过此小时数自动平仓（对齐参考 max_position_duration=168 + 超时平仓）。
-  # 双边对冲仓不会因价差扩大而爆，但资金费率和手续费在持续流血，
-  # 而且长期占着槽位和保证金。0 = 不限。
-  max_position_hours: 168
-  # ── 余额下限（默认关闭，必须按账户规模显式配）──
-  # 参考的默认是 warn=1000 / close=500，那是大账户的量级。直接照搬会让
-  # 小额实盘账户一启动就被判「余额严重不足」并全量清仓，所以这里默认 0。
-  # warn：低于此值停止该所开仓（仓位不动）。
-  # close：低于此值主动平掉该所全部仓位。close 必须小于 warn。
-  min_balance_warn_usdc: "25"
-  min_balance_close_usdc: "20"
-  # ── 持仓名义敞口上限（USDC，建仓名义）──
-  # 口径说明：参考项目用币本位（max_single_token_position），但币本位跨币种
-  # 不可比（10 BTC 是天量，10 DOGE 是零头），且「所有币数量之和」没有物理
-  # 意义（BTC + ETH + DOGE 的数量直接相加）。改成名义 USDC 之后一个数管所有
-  # 币，BTC/ETH/小币全部可比。
-  # 用建仓名义而非实时市值：盘口拿不到时限额判定仍然有效。
-  # 0 = 不限（默认关闭，按账户规模显式配）。
-  max_single_token_notional_usdc: "0"
-  max_total_notional_usdc: "0"
-  # ── 错误退避（对齐参考 min/max_backoff_seconds + backoff_multiplier）──
-  # nonce 冲突和限流是**按所**的：一条腿退避不该停掉另一个所。但对冲仓要两腿
-  # 同时可用，所以任一腿在退避期整条 pair 停开。
-  # 退避只拦开仓，不拦平仓——退避期还堵着平仓，仓位就锁死在交易所了。
-  backoff_min_secs: 120
-  backoff_max_secs: 3600
-  backoff_multiplier: 2
-  # 连续多久没再出错就把退避阶梯清零，避免一次偶发错误把该所压到上限后
-  # 再也回不来。
-  backoff_reset_secs: 600

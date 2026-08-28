@@ -1,7 +1,7 @@
 use rust_decimal::Decimal;
 use std::time::Duration;
 
-use crate::config::{AppConfig, OrderStyle};
+use crate::config::AppConfig;
 use crate::domain::{
     spread::{decide_spread, realized_slip_pct},
     Bbo, NetSpread, VenueId,
@@ -20,12 +20,9 @@ pub enum LimitWatch {
     FilledHedgeNow,
 }
 
-/// 开仓挂单还够不够：方向没反，且毛价差仍在格子持有区（≥ T0）。
-///
-/// 开仓门槛是 T1 + 持续性；挂上之后不能再用 T1 一 tick 就撤——价差在 T1
-/// 附近抖动时会刚挂就被撕掉，页面上看不见 resting 单。
-pub fn resting_open_spread_ok(raw_pct: Decimal, same_dir: bool, t0: Decimal) -> bool {
-    same_dir && raw_pct >= t0
+/// 开仓挂单还够不够：方向没反，且毛价差仍不低于给定下限（阶段 1 用 Δ×滞后）。
+pub fn resting_open_spread_ok(raw_pct: Decimal, same_dir: bool, min_raw: Decimal) -> bool {
+    same_dir && raw_pct >= min_raw
 }
 
 pub fn watch_resting_limit(
@@ -103,16 +100,12 @@ pub fn sequenced_spread(
     sell_book: &Bbo,
     qty: Decimal,
 ) -> Option<NetSpread> {
-    let fee = if matches!(cfg.order.style, OrderStyle::LimitThenMarket) {
-        sequenced_fee(cfg, buy, sell)
-    } else {
-        cfg.exec_fee(buy) + cfg.exec_fee(sell)
-    };
+    let fee = cfg.exec_fee(buy) + cfg.exec_fee(sell);
     decide_spread(buy.clone(), sell.clone(), buy_book, sell_book, fee, qty)
 }
 
 /// 平仓视角净边：买回原 sell 所（吃它 Ask1）、卖回原 buy 所（吃它 Bid1），
-/// 用**当前**盘口重算，手续费按平仓那一次的先挂后吃计。
+/// 用**当前**盘口重算，手续费按双腿 taker。
 ///
 /// 对齐参考 `build_closing_spread_from_orderbooks`：不能把开仓价差取负，也不能
 /// 只调换 price_buy / price_sell 字段。正常返回负数——现在平仓要吐回一部分价差。
@@ -181,14 +174,12 @@ mod tests {
     }
 
     #[test]
-    fn resting_open_uses_t0_hysteresis_not_t1() {
-        let t1 = dec!(0.015);
-        let t0 = t1 * dec!(0.4);
-        assert!(resting_open_spread_ok(dec!(0.016), true, t0));
-        // 刚开仓后 raw 掉到 T1 以下、T0 以上：单子继续挂。
-        assert!(resting_open_spread_ok(dec!(0.010), true, t0));
-        assert!(!resting_open_spread_ok(dec!(0.005), true, t0));
-        assert!(!resting_open_spread_ok(dec!(0.020), false, t0));
+    fn resting_open_keeps_order_above_floor() {
+        let floor = dec!(0.05) * dec!(0.25);
+        assert!(resting_open_spread_ok(dec!(0.040), true, floor));
+        assert!(resting_open_spread_ok(dec!(0.013), true, floor));
+        assert!(!resting_open_spread_ok(dec!(0.005), true, floor));
+        assert!(!resting_open_spread_ok(dec!(0.040), false, floor));
     }
 
     fn book(bid: Decimal, ask: Decimal) -> Bbo {
@@ -252,7 +243,7 @@ mod tests {
     }
 
     /// 盘口薄到撑不住本笔平仓量时，带 qty 的平仓视角返回 None。
-    /// 上层据此丢掉格子/剥头皮平仓意图（对齐参考）。价差本身仍用 qty=0 算。
+    /// 上层据此丢掉格子平仓意图。价差本身仍用 qty=0 算。
     #[test]
     fn closing_view_with_qty_is_blocked_by_thin_book() {
         let cfg = AppConfig::load_from(std::path::Path::new("config/default.yaml")).unwrap();

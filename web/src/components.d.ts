@@ -10,7 +10,6 @@ declare module 'vue' {
   export interface GlobalComponents {
     AdvancedExec: typeof import('./components/AdvancedExec.vue')['default']
     AdvancedGrid: typeof import('./components/AdvancedGrid.vue')['default']
-    AdvancedRisk: typeof import('./components/AdvancedRisk.vue')['default']
     AdvancedScan: typeof import('./components/AdvancedScan.vue')['default']
     AppShell: typeof import('./components/AppShell.vue')['default']
     ConfigPage: typeof import('./components/ConfigPage.vue')['default']
@@ -30,7 +29,6 @@ declare module 'vue' {
     NInput: typeof import('naive-ui')['NInput']
     NInputNumber: typeof import('naive-ui')['NInputNumber']
     NMessageProvider: typeof import('naive-ui')['NMessageProvider']
-    NSelect: typeof import('naive-ui')['NSelect']
     NSwitch: typeof import('naive-ui')['NSwitch']
     NTabPane: typeof import('naive-ui')['NTabPane']
     NTabs: typeof import('naive-ui')['NTabs']

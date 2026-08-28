@@ -11,7 +11,7 @@ import { h } from "vue";
 import { NTag } from "naive-ui";
 import type { DataTableColumns } from "naive-ui";
 import type { ExecRow } from "../types";
-import { statusKind } from "../format";
+import { statusKind, tapeResultLabel } from "../format";
 
 defineProps<{ rows: ExecRow[] }>();
 
@@ -79,7 +79,7 @@ const cols: DataTableColumns<ExecRow> = [
     render: (r) => h("span", { class: "tabular mu" }, gridStep(r)),
   },
   {
-    title: "盈亏 USDC",
+    title: "本次收益",
     key: "pnl",
     width: 110,
     render: (r) => h("span", { class: `tabular ${pnlCls(r)}` }, pnlText(r)),
@@ -89,7 +89,12 @@ const cols: DataTableColumns<ExecRow> = [
     key: "result",
     minWidth: 120,
     ellipsis: { tooltip: true },
-    render: (r) => h(NTag, { size: "small", type: statusKind(r.result) }, { default: () => r.result || "—" }),
+    render: (r) =>
+      h(
+        NTag,
+        { size: "small", type: statusKind(tapeResultLabel(r)), title: r.detail || undefined },
+        { default: () => tapeResultLabel(r) }
+      ),
   },
 ];
 </script>

@@ -40,6 +40,10 @@ pub struct PairRow {
     pub nat_pct: String,
     pub res_pct: String,
     pub entry_pct: String,
+    pub dev_pct: String,
+    /// 当前格宽 Δ（%）。未满点差窗时 C=0，只含费。
+    #[serde(default)]
+    pub delta_pct: String,
     pub grid: String,
     pub target_qty: String,
     pub actual_qty: String,
@@ -52,7 +56,7 @@ pub struct PositionRow {
     pub buy: String,
     pub sell: String,
     pub qty: String,
-    pub grid: u32,
+    pub grid: i32,
     pub entry_notional: String,
 }
 
@@ -69,6 +73,15 @@ pub struct ExchangePositionRow {
     pub symbol: String,
     pub qty: String,
     pub entry_price: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct VenueLiveRow {
+    pub venue: String,
+    /// 满窗为点差中枢（%）；未满为 `n/cap`；还没采样为 `—`。
+    pub spread_mu: String,
+    /// 本次进程该所成交名义（USDC）。
+    pub volume: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -93,6 +106,9 @@ pub struct LiveSnapshot {
     pub positions: Vec<PositionRow>,
     pub balances: Vec<VenueBalanceRow>,
     pub exchange_positions: Vec<ExchangePositionRow>,
+    /// 已加载所各一行：点差中枢 + 本次交易量。两所中枢的平均折进 Δ。
+    #[serde(default)]
+    pub venue_stats: Vec<VenueLiveRow>,
     pub naked_exposures: Vec<NakedExposureRow>,
     #[serde(default)]
     pub venue_matches: Vec<VenueMatchRow>,
@@ -107,6 +123,9 @@ pub struct LiveSnapshot {
     /// 启动时加载的交集全集（不订阅、不进决策）。
     #[serde(default)]
     pub available: Vec<AvailableSymbol>,
+    /// 本次进程执行带上各笔平仓实际盈亏之和（两所账户权益差）。
+    #[serde(default)]
+    pub session_pnl_usdc: String,
     pub updated_at: i64,
 }
 
@@ -188,6 +207,19 @@ impl ApiHub {
             .lock()
             .map(|v| v.iter().take(limit).cloned().collect())
             .unwrap_or_default()
+    }
+
+    /// 本次运行已记账的平仓实际盈亏之和（执行带 close 记录的 pnl_usdc）。
+    pub fn session_pnl_usdc(&self) -> Decimal {
+        self.session_execs
+            .lock()
+            .map(|v| {
+                v.iter()
+                    .filter(|r| r.action == "close")
+                    .filter_map(|r| r.pnl_usdc)
+                    .sum()
+            })
+            .unwrap_or(Decimal::ZERO)
     }
 
     pub fn spawn(self: Arc<Self>, bind: &str) -> tokio::task::JoinHandle<()> {
@@ -289,6 +321,7 @@ async fn positions(State(hub): State<Arc<ApiHub>>) -> impl IntoResponse {
             "positions": s.positions,
             "balances": s.balances,
             "exchange_positions": s.exchange_positions,
+            "venue_stats": s.venue_stats,
             "naked_exposures": s.naked_exposures,
         }))
             .into_response(),
@@ -307,8 +340,8 @@ struct ExecRow {
     net_pct: Option<String>,
     result: String,
     detail: String,
-    grid_from: Option<u32>,
-    grid_to: Option<u32>,
+    grid_from: Option<i32>,
+    grid_to: Option<i32>,
     pnl_usdc: Option<String>,
     pnl_pct: Option<String>,
 }

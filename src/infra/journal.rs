@@ -17,12 +17,12 @@ pub struct ExecRecord {
     pub result: String,
     pub detail: String,
     /// 成交前格子。开仓从 0，减仓从当前格。
-    pub grid_from: Option<u32>,
-    /// 成交后格子。
-    pub grid_to: Option<u32>,
-    /// 仅关仓/减格：双边已实现盈亏（报价货币金额）。开仓为空。
+    pub grid_from: Option<i32>,
+    /// 成交后格子（有符号 STEP）。
+    pub grid_to: Option<i32>,
+    /// 仅关仓/减格：两所账户权益差之和（开仓前快照 vs 平仓后）。开仓为空。
     pub pnl_usdc: Option<Decimal>,
-    /// 仅关仓/减格：往返净利 %（记录用）。开仓为空。
+    /// 已不再用于执行带展示；保留字段以免旧客户端崩。
     pub pnl_pct: Option<Decimal>,
 }
 

@@ -60,7 +60,7 @@
 
       <n-card size="small" title="高级" :bordered="true">
         <n-collapse class="adv" display-directive="show">
-          <n-collapse-item title="格子默认值" name="grid">
+          <n-collapse-item title="滑动窗口 / STEP" name="grid">
             <AdvancedGrid />
           </n-collapse-item>
           <n-collapse-item title="容量 / 下单 / 成本" name="exec">
@@ -68,9 +68,6 @@
           </n-collapse-item>
           <n-collapse-item title="扫描 / 历史" name="scan">
             <AdvancedScan />
-          </n-collapse-item>
-          <n-collapse-item title="风控" name="risk">
-            <AdvancedRisk />
           </n-collapse-item>
         </n-collapse>
       </n-card>
@@ -90,7 +87,6 @@ import LiveLists from "./LiveLists.vue";
 import AdvancedGrid from "./AdvancedGrid.vue";
 import AdvancedExec from "./AdvancedExec.vue";
 import AdvancedScan from "./AdvancedScan.vue";
-import AdvancedRisk from "./AdvancedRisk.vue";
 
 defineProps<{ enabled: boolean; snap: LiveSnapshot | null }>();
 const emit = defineEmits<{ saved: []; started: []; stopped: [] }>();

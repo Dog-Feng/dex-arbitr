@@ -70,9 +70,9 @@ export function fmtPctNum(n: number): string {
 
 export function statusKind(s: string): "success" | "default" | "error" | "warning" {
   const t = String(s || "");
-  if (/开仓|平仓|open|filled|挂单/i.test(t)) return "success";
+  if (/开仓|平仓|成交|open|filled|挂单/i.test(t)) return "success";
   if (/持有|hold|已匹配|监控/i.test(t)) return "default";
-  if (/error|fail|不足|过期|过宽|非法|波动/i.test(t)) return "error";
+  if (/error|fail|失败|不足|过期|过宽|非法|波动|未知|敞口|超时/i.test(t)) return "error";
   return "warning";
 }
 
@@ -89,6 +89,37 @@ export function statusLabel(s: string): string {
     canceling: "撤单中",
     filled_open: "已开仓",
     filled_close: "已平仓",
+    both_filled: "双腿成交",
+    cancel_failed: "撤单失败",
+    emergency_closed: "第二腿失败，已紧急平第一腿",
+    naked: "单边敞口",
+    second_leg_unknown: "第二腿结果未知",
+    zero_fill: "未成交已撤",
+    error: "下单失败",
+    watchdog_timeout: "执行超时",
   };
   return map[t] || t || "—";
+}
+
+/** 执行带「结果」列：英文码换成中文；失败时带上 detail 摘要。 */
+export function tapeResultLabel(r: {
+  action?: string;
+  result?: string;
+  detail?: string;
+}): string {
+  const code = String(r.result || "").trim();
+  const action = String(r.action || "").trim();
+  if (code === "both_filled") {
+    if (action === "open") return "市价开仓成交";
+    if (action === "close") return "市价平仓成交";
+    return "双腿成交";
+  }
+  const label = statusLabel(code);
+  const detail = String(r.detail || "").trim();
+  if (!detail) return label;
+  if (code === "error" || code === "naked" || code === "emergency_closed" || code === "zero_fill") {
+    const short = detail.length > 80 ? detail.slice(0, 80) + "…" : detail;
+    return `${label}：${short}`;
+  }
+  return label;
 }

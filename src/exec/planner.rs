@@ -3,8 +3,6 @@ use rust_decimal::Decimal;
 use crate::config::{AppConfig, OrderStyle};
 use crate::domain::{slot_key, Intent, Pair, Position, VenueId};
 
-use super::sequence::first_limit_venue;
-
 #[derive(Debug, Clone)]
 pub struct HedgeLeg {
     pub venue: String,
@@ -33,14 +31,14 @@ pub struct HedgePlan {
     /// 决策那一刻的净边（raw − 开仓手续费，**未扣 nat**）。
     /// 成交价拿不到时用它当建仓净边，平仓算往返净利要用。
     pub decision_net_pct: Decimal,
-    /// 决策那一刻的毛价差。成交价拿不到时当建仓 raw，剥头皮止盈用。
+    /// 决策那一刻的毛价差。成交价拿不到时当建仓 raw。
     pub decision_raw_pct: Decimal,
     /// 开仓时定仓所得单格数量，固化到 Position.base_qty。
     /// 平仓计划此字段为 ZERO（平仓不需要重新定仓）。
     pub base_qty: Decimal,
-    /// 成交前 / 后格子，执行带「格子步」用。
-    pub grid_from: u32,
-    pub grid_to: u32,
+    /// 成交前 / 后有符号 STEP。
+    pub grid_from: i32,
+    pub grid_to: i32,
     /// 仅平仓：决策时的往返净利 %。
     pub pnl_pct: Option<Decimal>,
     pub first: HedgeLeg,
@@ -75,7 +73,7 @@ pub fn plan_hedge(
 
 fn build(
     pair: &Pair,
-    cfg: &AppConfig,
+    _cfg: &AppConfig,
     qty: Decimal,
     is_open: bool,
     buy: &VenueId,
@@ -83,13 +81,13 @@ fn build(
 ) -> Option<HedgePlan> {
     let buy_leg = pair.leg(buy.as_str())?;
     let sell_leg = pair.leg(sell.as_str())?;
-    let (first, second) = sequenced_legs(cfg, buy, sell, buy_leg, sell_leg);
+    let (first, second) = sequenced_legs(buy, sell, buy_leg, sell_leg);
     Some(HedgePlan {
         pair_id: pair.pair_id.clone(),
         slot: slot_key(&pair.pair_id, buy.as_str(), sell.as_str()),
         qty,
         is_open,
-        style: cfg.order.style,
+        style: OrderStyle::MarketTaker,
         buy_market_index: buy_leg.market_index,
         sell_market_index: sell_leg.market_index,
         buy_symbol: buy_leg.raw_symbol.clone(),
@@ -108,7 +106,6 @@ fn build(
 }
 
 fn sequenced_legs(
-    cfg: &AppConfig,
     buy: &VenueId,
     sell: &VenueId,
     buy_leg: &crate::domain::VenueMarket,
@@ -130,22 +127,7 @@ fn sequenced_legs(
         style: OrderStyle::MarketTaker,
         min_qty: sell_leg.min_qty,
     };
-    if !matches!(cfg.order.style, OrderStyle::LimitThenMarket) {
-        return (buy_h, sell_h);
-    }
-    match first_limit_venue(cfg, buy, sell) {
-        Some((first_v, _)) if first_v == buy => {
-            let mut first = buy_h;
-            first.style = OrderStyle::LimitMaker;
-            (first, sell_h)
-        }
-        Some(_) => {
-            let mut first = sell_h;
-            first.style = OrderStyle::LimitMaker;
-            (first, buy_h)
-        }
-        None => (buy_h, sell_h),
-    }
+    (buy_h, sell_h)
 }
 
 #[cfg(test)]
@@ -213,15 +195,17 @@ mod tests {
         assert_eq!(plan.buy_venue, "lighter_rh");
         assert_eq!(plan.sell_venue, "lighter");
         assert_eq!(plan.first.venue, "lighter_rh");
-        assert_eq!(plan.first.style, OrderStyle::LimitMaker);
+        assert!(plan.first.is_buy);
+        assert_eq!(plan.first.style, OrderStyle::MarketTaker);
         assert_eq!(plan.second.venue, "lighter");
+        assert!(!plan.second.is_buy);
         assert_eq!(plan.second.style, OrderStyle::MarketTaker);
         // 开仓和平仓落在同一个槽位
         assert_eq!(plan.slot, pos.slot_key());
     }
 
     #[test]
-    fn open_posts_higher_taker_first() {
+    fn open_both_legs_market_taker() {
         let cfg = AppConfig::load_from(std::path::Path::new("config/default.yaml")).unwrap();
         let plan = plan_hedge(
             &pair(),
@@ -235,13 +219,13 @@ mod tests {
             &cfg,
         )
         .unwrap();
-        assert_eq!(plan.first.venue, "lighter_rh");
-        assert!(!plan.first.is_buy);
-        assert_eq!(plan.first.style, OrderStyle::LimitMaker);
-        assert_eq!(plan.second.venue, "lighter");
-        assert!(plan.second.is_buy);
+        assert_eq!(plan.style, OrderStyle::MarketTaker);
+        assert_eq!(plan.first.venue, "lighter");
+        assert!(plan.first.is_buy);
+        assert_eq!(plan.first.style, OrderStyle::MarketTaker);
+        assert_eq!(plan.second.venue, "lighter_rh");
+        assert!(!plan.second.is_buy);
         assert_eq!(plan.second.style, OrderStyle::MarketTaker);
-        // 第二腿是 lighter，最小量取 lighter 的
-        assert_eq!(plan.hedgeable_min_qty(), dec!(0.0002));
+        assert_eq!(plan.hedgeable_min_qty(), dec!(0.0003));
     }
 }

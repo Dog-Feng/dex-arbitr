@@ -24,7 +24,7 @@
         :bordered="false"
         :single-line="false"
         size="small"
-        :scroll-x="1100"
+        :scroll-x="1000"
         :max-height="420"
       />
     </n-card>
@@ -32,7 +32,8 @@
     <n-card size="small" title="交易所持仓">
       <n-data-table
         :columns="exCols"
-        :data="snap?.exchange_positions || []"
+        :data="venueRows"
+        :row-key="venueRowKey"
         size="small"
         :bordered="false"
         :max-height="240"
@@ -45,8 +46,8 @@
 import { computed, h, ref } from "vue";
 import { NTag } from "naive-ui";
 import type { DataTableColumns } from "naive-ui";
-import type { ExchangePositionRow, LiveSnapshot, PairRow } from "../types";
-import { netCls, numFmt, parsePct, qtyFmt, statusKind, statusLabel, venueLabel } from "../format";
+import type { LiveSnapshot, PairRow, VenueLiveRow } from "../types";
+import { moneyFmt, netCls, qtyFmt, statusKind, statusLabel, venueLabel } from "../format";
 import { store } from "../store";
 
 const props = defineProps<{ snap: LiveSnapshot | null }>();
@@ -58,6 +59,10 @@ function pairKey(a: string, b: string) {
 
 function pairRowKey(r: PairRow) {
   return `${r.pair_id}|${r.buy}|${r.sell}`;
+}
+
+function venueRowKey(r: VenueLiveRow) {
+  return r.venue;
 }
 
 const pairTitle = computed(() => {
@@ -75,6 +80,18 @@ const pairRows = computed(() => {
   return list.filter((p) => pairKey(p.buy, p.sell) === filter.value);
 });
 
+const venueRows = computed((): VenueLiveRow[] => {
+  const stats = props.snap?.venue_stats;
+  if (stats && stats.length) return stats;
+  return store.venues.map((v) => ({ venue: v.id, spread_mu: "—", volume: "0.00" }));
+});
+
+function holdingsOf(venue: string) {
+  const rows = (props.snap?.exchange_positions || []).filter((p) => p.venue === venue);
+  if (!rows.length) return "—";
+  return rows.map((p) => `${p.symbol} ${qtyFmt(p.qty)}`).join(" · ");
+}
+
 function pctCell(v: unknown) {
   return h("span", { class: netCls(v) }, String(v || "—"));
 }
@@ -84,23 +101,10 @@ const pairCols: DataTableColumns<PairRow> = [
   { title: "买", key: "buy", width: 90, render: (r) => venueLabel(r.buy, store.venues) },
   { title: "卖", key: "sell", width: 90, render: (r) => venueLabel(r.sell, store.venues) },
   { title: "毛价差", key: "raw_pct", width: 78, render: (r) => pctCell(r.raw_pct) },
-  { title: "净边", key: "net_pct", width: 78, render: (r) => pctCell(r.net_pct) },
-  {
-    title: "费率",
-    key: "fee_pct",
-    width: 78,
-    render: (r) => {
-      const fee = parsePct(r.fee_pct);
-      const raw = parsePct(r.raw_pct);
-      const net = parsePct(r.net_pct);
-      const v = fee == null && raw != null && net != null ? raw - net : fee;
-      return h("span", { class: "mu" }, v == null ? "—" : numFmt(v));
-    },
-  },
-  { title: "天然", key: "nat_pct", width: 78, render: (r) => h("span", { class: "mu" }, r.nat_pct || "—") },
-  { title: "残差", key: "res_pct", width: 78, render: (r) => pctCell(r.res_pct) },
-  { title: "门槛", key: "entry_pct", width: 78, render: (r) => h("span", { class: "mu" }, r.entry_pct || "—") },
-  { title: "格子", key: "grid", width: 56, render: (r) => h("span", { class: "mu" }, r.grid || "—") },
+  { title: "中枢", key: "entry_pct", width: 90, render: (r) => h("span", { class: "mu" }, r.entry_pct || "—") },
+  { title: "偏离", key: "dev_pct", width: 78, render: (r) => pctCell(r.dev_pct || "—") },
+  { title: "当前格宽", key: "delta_pct", width: 88, render: (r) => h("span", { class: "mu" }, r.delta_pct || "—") },
+  { title: "STEP", key: "grid", width: 56, render: (r) => h("span", { class: "mu" }, r.grid || "—") },
   { title: "目标量", key: "target_qty", width: 80, render: (r) => qtyFmt(r.target_qty) },
   { title: "持仓", key: "actual_qty", width: 80, render: (r) => qtyFmt(r.actual_qty || "0") },
   {
@@ -112,11 +116,21 @@ const pairCols: DataTableColumns<PairRow> = [
   },
 ];
 
-const exCols: DataTableColumns<ExchangePositionRow> = [
-  { title: "交易所", key: "venue", render: (r) => venueLabel(r.venue, store.venues) },
-  { title: "合约", key: "symbol" },
-  { title: "数量", key: "qty", render: (r) => qtyFmt(r.qty) },
-  { title: "开仓价", key: "entry_price", render: (r) => r.entry_price || "—" },
+const exCols: DataTableColumns<VenueLiveRow> = [
+  { title: "交易所", key: "venue", width: 110, render: (r) => venueLabel(r.venue, store.venues) },
+  {
+    title: "点差中枢",
+    key: "spread_mu",
+    width: 100,
+    render: (r) => h("span", { class: "mu" }, r.spread_mu || "—"),
+  },
+  {
+    title: "交易量",
+    key: "volume",
+    width: 100,
+    render: (r) => moneyFmt(r.volume),
+  },
+  { title: "持仓", key: "holdings", ellipsis: { tooltip: true }, render: (r) => holdingsOf(r.venue) },
 ];
 </script>
 
