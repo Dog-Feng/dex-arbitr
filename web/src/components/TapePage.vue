@@ -79,9 +79,9 @@ const cols: DataTableColumns<ExecRow> = [
     render: (r) => h("span", { class: "tabular mu" }, gridStep(r)),
   },
   {
-    title: "盈亏",
+    title: "盈亏 USDC",
     key: "pnl",
-    width: 100,
+    width: 110,
     render: (r) => h("span", { class: `tabular ${pnlCls(r)}` }, pnlText(r)),
   },
   {
