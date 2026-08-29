@@ -44,10 +44,9 @@ sizing:
   # SoDEX 公开余额接口可能为空；有真实余额时以 bridge 为准
   fallback_available_usdc: "500"
 
-# 对齐参考套利监控 V2：毛价差 ≥ 0.1% 记为机会，分析环扫内存盘口。
-# 不改格子、不下单。scan.enabled: false 则回到旧的单币格子监控。
-# execution.enabled: true → 无 HTTP 时启动即进统一决策环。
-# HTTP 开着时始终走统一决策环，是否交易看页面「启动套利」。
+# 扫描环：analysis_interval_ms / watch_top。旧毛价差门槛与天然基差已拆。
+# scan.enabled: false 且 execution.enabled: false 时走事件格子环。
+# HTTP 开着时是否交易看页面「启动套利」；扫描看「启动扫描」。
 execution:
   enabled: false
   loop_interval_ms: 100
@@ -71,13 +70,13 @@ http:
 
 scan:
   enabled: false
-  min_spread_pct: "0.1"
   analysis_interval_ms: 50
   watch_top: 20
-  # SoDEX 与 Lighter 不同链，raw 里常有天然基差。true = 跨 DEX 上榜看 residual = raw − max(nat,0)
-  cross_use_natural: true
-  # 控制台和文件同一套：只打每个币的关键行。上榜/下榜立刻记，仍在榜上至少隔这么多秒。
-  log_interval_secs: 30
+  window_samples: 120
+  max_own_spread_pct: "0.15"
+  min_level_notional_usdc: "200"
+  min_volume_24h_usdc: "3000000"
+  coarse_refresh_secs: 60
 
 grid:
   # 决策环 100ms 一拍则 1 秒大约查 10 次。min_hits = 这 1 秒里至少几次达标即通过（5 或 7）。0 = 连续不掉线。
@@ -114,14 +113,8 @@ cost:
   # 对齐参考的「紧急平仓 50 倍滑点」：平不掉的风险远大于穿档成本。
   emergency_slippage_multiplier: "50"
 
-# 对齐参考项目：SQLite 记毛价差，中位数当天然价差。
-# nat 只给监控/扫描上榜；开仓看窗口 μ 与 STEP，不要求 raw ≥ 绝对门槛。
+# SQLite 天然价差。开关/窗长/采样间隔用代码默认；页面只热改 min_points（样本数）。
 history:
-  enabled: true
   db_path: data/spreads.sqlite
-  sample_interval_secs: 5
-  window_hours: 24
   min_points: 10
-  # 有 natural_spreads 快照则启动直接用；之后隔这么久重算 24h 中位数（1800 = 30 分钟）。
-  refresh_interval_secs: 1800
   max_age_secs: 200

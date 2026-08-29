@@ -70,6 +70,7 @@ mod tests {
             market_index: 1,
             qty_precision: 5,
             min_qty: dec!(0.0002),
+            volume_24h_usdc: None,
         };
         Pair {
             pair_id: "BTC-USD-PERP".into(),

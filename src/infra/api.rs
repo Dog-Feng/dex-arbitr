@@ -12,7 +12,8 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder;
 use hyper_util::service::TowerToHyperService;
 use rust_decimal::Decimal;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
@@ -89,7 +90,7 @@ pub struct VenueLiveRow {
     pub spread_mu: String,
     /// 本次进程该所成交名义（USDC）。
     pub volume: String,
-    /// Lighter：最近一次 Go 签名到 sendTx 确认回包。其它所为 `—`。
+    /// Lighter：签名+确认；其它所：发单到 DEX 回包的墙钟。
     #[serde(default)]
     pub place_rtt: String,
 }
@@ -136,7 +137,62 @@ pub struct LiveSnapshot {
     /// 本次进程执行带上各笔平仓实际盈亏之和（两所账户权益差）。
     #[serde(default)]
     pub session_pnl_usdc: String,
+    /// 扫描表。执行带的 `pairs` 不要复用。
+    #[serde(default)]
+    pub scan: ScanSnapshot,
+    /// 扫描模式是否在跑（与 `arbitrage_enabled` 互斥）。
+    #[serde(default)]
+    pub scan_running: bool,
     pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ScanSnapshot {
+    pub updated_at: i64,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub universe: usize,
+    pub candidates: usize,
+    pub sampling_n: usize,
+    pub filled_n: usize,
+    /// 候选里当前最多已采点数，满窗倒数用 `window_samples - window_n`。
+    #[serde(default)]
+    pub window_n: usize,
+    pub watch_top: usize,
+    pub window_samples: usize,
+    pub sample_interval_ms: u64,
+    #[serde(default)]
+    pub venues: Vec<String>,
+    #[serde(default)]
+    pub rows: Vec<ScanRow>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ScanRow {
+    pub rank: usize,
+    pub base: String,
+    pub pair_id: String,
+    pub left: String,
+    pub right: String,
+    pub same_family: bool,
+    pub eligible: bool,
+    pub edge: String,
+    pub sigma: String,
+    pub delta: String,
+    pub mu: String,
+    pub hub_c: String,
+    pub crosses: u32,
+    pub n: usize,
+    pub cap: usize,
+    #[serde(default)]
+    pub venues: HashMap<String, ScanVenueCell>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ScanVenueCell {
+    pub mid_mean: String,
+    pub own_spread_mean: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -268,6 +324,8 @@ impl ApiHub {
                 .route("/api/config/defaults", get(get_config_defaults))
                 .route("/api/arbitrage/start", post(arbitrage_start))
                 .route("/api/arbitrage/stop", post(arbitrage_stop))
+                .route("/api/scan/start", post(scan_start))
+                .route("/api/scan/stop", post(scan_stop))
                 .route("/api/venues", get(get_venues))
                 .route("/api/pairs/available", get(available_pairs))
                 .route_layer(middleware::from_fn_with_state(
@@ -522,6 +580,11 @@ async fn arbitrage_start(State(hub): State<Arc<ApiHub>>) -> impl IntoResponse {
             )
                 .into_response();
         }
+        if ctrl.scan_running {
+            ctrl.scan_running = false;
+            ctrl.rematch_scan = false;
+            ctrl.params.scan_enabled = false;
+        }
         ctrl.enabled = true;
         ctrl.rematch = true;
     }
@@ -536,4 +599,63 @@ async fn arbitrage_stop(State(hub): State<Arc<ApiHub>>) -> impl IntoResponse {
     }
     tracing::info!("arbitrage disabled via API");
     Json(serde_json::json!({ "ok": true, "enabled": false }))
+}
+
+#[derive(Debug, Deserialize)]
+struct ScanStartReq {
+    #[serde(default)]
+    venues: Vec<String>,
+}
+
+async fn scan_start(
+    State(hub): State<Arc<ApiHub>>,
+    body: Option<Json<ScanStartReq>>,
+) -> impl IntoResponse {
+    let venues = body.map(|j| j.0.venues).unwrap_or_default();
+    {
+        let mut ctrl = hub.control.lock().unwrap_or_else(|e| e.into_inner());
+        if ctrl.enabled {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "errors": ["请先停止套利再启动扫描"]
+                })),
+            )
+                .into_response();
+        }
+        let scan_venues = if venues.len() >= 2 {
+            venues
+        } else {
+            ctrl.params.scan_venues.clone()
+        };
+        if scan_venues.len() < 2 {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "errors": ["请至少勾选两个交易所再启动扫描"]
+                })),
+            )
+                .into_response();
+        }
+        ctrl.params.scan_venues = scan_venues;
+        ctrl.params.scan_enabled = true;
+        ctrl.scan_running = true;
+        ctrl.rematch_scan = true;
+        ctrl.enabled = false;
+    }
+    tracing::info!("scan enabled via API");
+    Json(serde_json::json!({ "ok": true, "scan_running": true })).into_response()
+}
+
+async fn scan_stop(State(hub): State<Arc<ApiHub>>) -> impl IntoResponse {
+    {
+        let mut ctrl = hub.control.lock().unwrap_or_else(|e| e.into_inner());
+        ctrl.scan_running = false;
+        ctrl.rematch_scan = false;
+        ctrl.params.scan_enabled = false;
+    }
+    tracing::info!("scan disabled via API");
+    Json(serde_json::json!({ "ok": true, "scan_running": false }))
 }

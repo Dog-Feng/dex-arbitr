@@ -81,9 +81,12 @@ const pairRows = computed(() => {
 });
 
 const venueRows = computed((): VenueLiveRow[] => {
-  const stats = props.snap?.venue_stats;
-  if (stats && stats.length) return stats;
-  return store.venues.map((v) => ({ venue: v.id, spread_mu: "—", volume: "0.00", place_rtt: "—" }));
+  const selected = store.params.active_venues || [];
+  if (!selected.length) return [];
+  const stats = props.snap?.venue_stats || [];
+  const fromSnap = stats.filter((r) => selected.includes(r.venue));
+  if (fromSnap.length) return fromSnap;
+  return selected.map((id) => ({ venue: id, spread_mu: "—", volume: "0.00", place_rtt: "—" }));
 });
 
 function holdingsOf(venue: string) {
@@ -131,10 +134,18 @@ const exCols: DataTableColumns<VenueLiveRow> = [
     render: (r) => moneyFmt(r.volume),
   },
   {
-    title: "签名→确认",
+    title: "操作→确认",
     key: "place_rtt",
-    width: 140,
-    render: (r) => h("span", { class: "tabular mu", title: "Lighter：Go 签名开始到 sendTx 回包。sign+http=合计" }, r.place_rtt || "—"),
+    width: 180,
+    render: (r) =>
+      h(
+        "span",
+        {
+          class: "tabular mu",
+          title: "从本地下单到交易所回包的链路耗时。Lighter 另给签名+HTTP 分解。",
+        },
+        r.place_rtt || "—"
+      ),
   },
   { title: "持仓", key: "holdings", ellipsis: { tooltip: true }, render: (r) => holdingsOf(r.venue) },
 ];

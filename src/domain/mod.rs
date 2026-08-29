@@ -16,6 +16,7 @@ pub use window_grid::{WindowGridEngine, WindowGridParams};
 pub use position::{Position, ThisClosePnl};
 pub use spread::NetSpread;
 pub use symbol::{
-    is_cross_dex, match_all_pairs, match_pairs, slot_key, whitelist_allows, MarketKind, Pair,
+    is_cross_dex, match_all_pairs, match_pairs, order_pairs_legs, slot_key, whitelist_allows,
+    MarketKind, Pair,
     VenueId, VenueMarket,
 };

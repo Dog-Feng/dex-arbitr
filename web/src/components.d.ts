@@ -33,7 +33,10 @@ declare module 'vue' {
     NTabPane: typeof import('naive-ui')['NTabPane']
     NTabs: typeof import('naive-ui')['NTabs']
     NTag: typeof import('naive-ui')['NTag']
+    NTooltip: typeof import('naive-ui')['NTooltip']
     PairList: typeof import('./components/PairList.vue')['default']
+    ScanHeadHint: typeof import('./components/ScanHeadHint.vue')['default']
+    ScanPage: typeof import('./components/ScanPage.vue')['default']
     TapePage: typeof import('./components/TapePage.vue')['default']
   }
 }

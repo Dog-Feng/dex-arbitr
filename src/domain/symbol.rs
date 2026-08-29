@@ -38,6 +38,8 @@ pub struct VenueMarket {
     pub market_index: i32,
     pub qty_precision: u32,
     pub min_qty: Decimal,
+    /// 该所该永续最近 24h 合约报价名义（USDC，稳定币 1:1）。缺字段 = 扫描不合格。
+    pub volume_24h_usdc: Option<Decimal>,
 }
 
 #[derive(Debug, Clone)]
@@ -207,6 +209,29 @@ pub fn match_all_pairs(venues: &[Vec<VenueMarket>]) -> Vec<Pair> {
     pairs
 }
 
+/// `legs[0]` = `config/venues` 列表里更靠前的所。
+pub fn order_pair_legs(mut pair: Pair, venue_order: &[String]) -> Pair {
+    let i0 = venue_order
+        .iter()
+        .position(|v| v == pair.legs[0].venue.as_str());
+    let i1 = venue_order
+        .iter()
+        .position(|v| v == pair.legs[1].venue.as_str());
+    if let (Some(a), Some(b)) = (i0, i1) {
+        if a > b {
+            pair.legs.swap(0, 1);
+        }
+    }
+    pair
+}
+
+pub fn order_pairs_legs(pairs: Vec<Pair>, venue_order: &[String]) -> Vec<Pair> {
+    pairs
+        .into_iter()
+        .map(|p| order_pair_legs(p, venue_order))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,6 +247,7 @@ mod tests {
             market_index: id,
             qty_precision: 4,
             min_qty: dec!(0.001),
+            volume_24h_usdc: None,
         })
     }
 
@@ -293,5 +319,17 @@ mod tests {
         let pairs = match_all_pairs(&[lighter, rh, sodex]);
         assert_eq!(pairs.len(), 3);
         assert!(pairs.iter().all(|p| p.pair_id == "BTC-USD-PERP"));
+    }
+
+    #[test]
+    fn legs_follow_config_venue_order() {
+        let sodex = vec![mkt("sodex", "BTC-USD", "perp", 24).unwrap()];
+        let lighter = vec![mkt("lighter", "BTC-USDC", "perp", 1).unwrap()];
+        let pairs = order_pairs_legs(
+            match_all_pairs(&[sodex, lighter]),
+            &["lighter".into(), "sodex".into()],
+        );
+        assert_eq!(pairs[0].legs[0].venue.as_str(), "lighter");
+        assert_eq!(pairs[0].legs[1].venue.as_str(), "sodex");
     }
 }

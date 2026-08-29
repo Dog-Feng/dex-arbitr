@@ -7,9 +7,27 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use rust_decimal::Decimal;
+use serde_json::Value;
+use std::str::FromStr;
 use tokio::sync::watch;
 use tokio_tungstenite::{connect_async_tls_with_config, Connector, MaybeTlsStream, WebSocketStream};
 use tracing::warn;
+
+/// JSON 字符串或 number → Decimal。缺字段 / 非法 → None。
+pub fn json_decimal(v: &Value) -> Option<Decimal> {
+    if let Some(s) = v.as_str() {
+        let s = s.trim();
+        if s.is_empty() {
+            return None;
+        }
+        return Decimal::from_str(s).ok();
+    }
+    if let Some(n) = v.as_number() {
+        return Decimal::from_str(&n.to_string()).ok();
+    }
+    None
+}
 
 pub fn http_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
@@ -97,6 +115,14 @@ impl FeedGuard {
         self.tx.send_replace(gen);
         Some((gen, self.tx.subscribe()))
     }
+
+    /// 空订必须 bump。第二次 `begin("off")` 指纹相同不会杀掉旧循环。
+    pub fn interrupt(&self) {
+        let mut prev = self.fingerprint.lock().unwrap_or_else(|e| e.into_inner());
+        *prev = String::new();
+        let gen = *self.tx.borrow() + 1;
+        self.tx.send_replace(gen);
+    }
 }
 
 pub fn spawn_feed_loop<F, Fut>(mut rx: watch::Receiver<u64>, gen: u64, task: &'static str, run: F)
@@ -152,6 +178,17 @@ mod tests {
         assert!(g.begin("a,b").is_none());
         assert!(g.begin("a,b,c").is_some());
         assert!(g.begin("a,b,c").is_none());
+    }
+
+    #[test]
+    fn interrupt_kills_even_when_already_off() {
+        let g = FeedGuard::new();
+        let (gen, rx) = g.begin("off").expect("first off");
+        g.interrupt();
+        assert_ne!(*rx.borrow(), gen);
+        let gen2 = *rx.borrow();
+        g.interrupt();
+        assert_ne!(*rx.borrow(), gen2);
     }
 
     #[test]

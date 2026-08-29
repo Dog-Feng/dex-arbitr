@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use rust_decimal::Decimal;
 use serde::Deserialize;
+use serde_json::Value;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
@@ -16,7 +17,7 @@ use crate::domain::{
     Bbo, VenueId, VenueMarket,
 };
 
-use super::net::{connect_ws, http_client, spawn_feed_loop, FeedGuard};
+use super::net::{connect_ws, http_client, json_decimal, spawn_feed_loop, FeedGuard};
 
 use super::port::{
     AccountSnapshot, Balance, BboTx, CancelReq, ExchangePort, FillPnl, FundingRate, OrderAck,
@@ -71,6 +72,30 @@ struct RawSymbol {
     min_quantity: String,
     #[serde(default)]
     quantity_precision: i32,
+}
+
+#[derive(Debug, Deserialize)]
+struct TickersResp {
+    #[serde(default)]
+    code: i64,
+    #[serde(default)]
+    data: Vec<RawTicker>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawTicker {
+    symbol: String,
+    #[serde(default)]
+    quote_volume: Option<Value>,
+    #[serde(default, rename = "bidPx")]
+    bid_px: Option<String>,
+    #[serde(default, rename = "askPx")]
+    ask_px: Option<String>,
+    #[serde(default, rename = "bidSz")]
+    bid_sz: Option<String>,
+    #[serde(default, rename = "askSz")]
+    ask_sz: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -158,13 +183,22 @@ impl ExchangePort for SodexAdapter {
                 market_index,
                 qty_precision: raw.quantity_precision.max(0) as u32,
                 min_qty,
+                volume_24h_usdc: None,
             });
+        }
+        match fetch_sodex_tickers(&self.venue.rest).await {
+            Ok(tickers) => apply_sodex_volumes(&mut out, &tickers),
+            Err(err) => warn!(venue = self.venue.id, error = %err, "sodex tickers failed; 24h volume missing"),
         }
         info!(venue = self.venue.id, n = out.len(), "loaded perp markets");
         Ok(out)
     }
 
     async fn subscribe_bbo(&self, markets: &[VenueMarket], tx: BboTx) -> Result<()> {
+        if markets.is_empty() {
+            self.feeds.interrupt();
+            return Ok(());
+        }
         let aliases = symbol_alias_map(markets, &self.venue.quote);
         let fp: String = {
             let mut keys: Vec<_> = aliases.keys().cloned().collect();
@@ -258,6 +292,84 @@ impl ExchangePort for SodexAdapter {
         }
         bridge::bridge_fill_pnl(&self.venue_path, symbol, order_id).await
     }
+
+    async fn snapshot_bbos(&self, markets: &[VenueMarket]) -> HashMap<String, Bbo> {
+        let Ok(tickers) = fetch_sodex_tickers(&self.venue.rest).await else {
+            return HashMap::new();
+        };
+        let by_raw: HashMap<String, &RawTicker> = tickers
+            .iter()
+            .map(|t| (t.symbol.to_ascii_uppercase(), t))
+            .collect();
+        let mut out = HashMap::new();
+        for m in markets {
+            let Some(t) = by_raw.get(&m.raw_symbol.to_ascii_uppercase()) else {
+                continue;
+            };
+            let Some(bbo) = rest_ticker_bbo(t) else {
+                continue;
+            };
+            out.insert(m.pair_id.clone(), bbo);
+        }
+        out
+    }
+}
+
+async fn fetch_sodex_tickers(rest: &str) -> Result<Vec<RawTicker>> {
+    let url = format!("{}/markets/tickers", rest.trim_end_matches('/'));
+    let resp: TickersResp = http_client()
+        .get(&url)
+        .timeout(Duration::from_secs(15))
+        .send()
+        .await
+        .with_context(|| format!("GET {url}"))?
+        .error_for_status()?
+        .json()
+        .await
+        .context("decode sodex tickers")?;
+    if resp.code != 0 {
+        bail!("sodex tickers code={}", resp.code);
+    }
+    Ok(resp.data)
+}
+
+fn apply_sodex_volumes(markets: &mut [VenueMarket], tickers: &[RawTicker]) {
+    let mut by_name: HashMap<String, Decimal> = HashMap::new();
+    for t in tickers {
+        if let Some(v) = t.quote_volume.as_ref().and_then(json_decimal) {
+            by_name.insert(t.symbol.to_ascii_uppercase(), v);
+        }
+    }
+    for m in markets {
+        m.volume_24h_usdc = by_name.get(&m.raw_symbol.to_ascii_uppercase()).copied();
+    }
+}
+
+fn rest_ticker_bbo(t: &RawTicker) -> Option<Bbo> {
+    let bid = Decimal::from_str(t.bid_px.as_deref()?.trim()).ok()?;
+    let ask = Decimal::from_str(t.ask_px.as_deref()?.trim()).ok()?;
+    let bid_qty = t
+        .bid_sz
+        .as_deref()
+        .and_then(|s| Decimal::from_str(s.trim()).ok())
+        .unwrap_or(Decimal::ZERO);
+    let ask_qty = t
+        .ask_sz
+        .as_deref()
+        .and_then(|s| Decimal::from_str(s.trim()).ok())
+        .unwrap_or(Decimal::ZERO);
+    if bid <= Decimal::ZERO || ask <= Decimal::ZERO || ask <= bid {
+        return None;
+    }
+    Some(Bbo {
+        bid,
+        ask,
+        bid_qty,
+        ask_qty,
+        bids: vec![(bid, bid_qty)],
+        asks: vec![(ask, ask_qty)],
+        ts: Instant::now(),
+    })
 }
 
 fn sodex_pair(raw: &RawSymbol) -> Option<(String, String)> {

@@ -81,10 +81,10 @@ pub fn detect_naked_exposures(pairs: &[Pair], accounts: &VenueAccountCache) -> V
     out
 }
 
-/// 内存持仓 vs 交易所实盘的数量偏差。返回 `(slot, pair_id, 内存量, 实盘量)`。
+/// 内存持仓 vs 交易所实盘的数量偏差。返回 `(内存量, 实盘重叠对冲量)`。
 ///
-/// 对齐参考 `_audit_position_alignment`：只报不自动改方向，数量偏差交给
-/// `PositionStore::reconcile_qty` 单向收缩。
+/// 两腿同号且都非零时对冲量视为 0。数量偏差交给 `PositionStore::reconcile_qty`
+/// 按实盘校正（少则缩、多则在上限内抬）。
 pub fn audit_position_qty(
     pair: &Pair,
     accounts: &VenueAccountCache,
@@ -187,6 +187,7 @@ mod tests {
             market_index: 1,
             qty_precision: 0,
             min_qty: dec!(1),
+            volume_24h_usdc: None,
         }
     }
 
@@ -284,6 +285,19 @@ mod tests {
         let p = pair("sodex", "lighter");
         assert_eq!(audit_position_qty(&p, &accounts, dec!(676)), Some((dec!(676), dec!(600))));
         assert_eq!(audit_position_qty(&p, &accounts, dec!(600)), None);
+    }
+
+    #[test]
+    fn audit_flags_memory_under_exchange() {
+        let accounts = cache(vec![
+            snap("sodex", Some(dec!(45)), true),
+            snap("lighter", Some(dec!(-45)), true),
+        ]);
+        let p = pair("sodex", "lighter");
+        assert_eq!(
+            audit_position_qty(&p, &accounts, dec!(30)),
+            Some((dec!(30), dec!(45)))
+        );
     }
 
     #[test]

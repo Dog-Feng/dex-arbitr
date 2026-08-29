@@ -4,6 +4,7 @@ use futures_util::{SinkExt, StreamExt};
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -16,7 +17,7 @@ use crate::domain::{
     Bbo, VenueId, VenueMarket,
 };
 
-use super::net::{connect_ws, http_client, spawn_feed_loop, FeedGuard};
+use super::net::{connect_ws, http_client, json_decimal, spawn_feed_loop, FeedGuard};
 
 use super::port::{
     AccountSnapshot, Balance, BboTx, CancelReq, ExchangePort, FillPnl, FundingRate, OrderAck,
@@ -141,6 +142,10 @@ impl ExchangePort for EntropyAdapter {
     }
 
     async fn subscribe_bbo(&self, markets: &[VenueMarket], tx: BboTx) -> Result<()> {
+        if markets.is_empty() {
+            self.feeds.interrupt();
+            return Ok(());
+        }
         let coins: Vec<(String, String)> = markets
             .iter()
             .map(|m| (m.raw_symbol.clone(), m.pair_id.clone()))
@@ -243,6 +248,10 @@ impl ExchangePort for EntropyAdapter {
         }
         bridge::bridge_fill_pnl(&self.venue_path, symbol, order_id).await
     }
+
+    async fn snapshot_bbos(&self, markets: &[VenueMarket]) -> HashMap<String, Bbo> {
+        snapshot_entropy_bbos(&self.venue.rest, markets).await
+    }
 }
 
 fn info_url(rest: &str) -> String {
@@ -276,6 +285,11 @@ fn hip3_asset_id(dex_index: i32, index_in_meta: i32) -> i32 {
     100_000 + dex_index * 10_000 + index_in_meta
 }
 
+fn ctx_volume(body: &Value, index: usize) -> Option<Decimal> {
+    let ctx = body.as_array()?.get(1)?.as_array()?.get(index)?;
+    json_decimal(ctx.get("dayNtlVlm")?)
+}
+
 fn parse_io_markets(
     venue: &VenueId,
     dex_index: i32,
@@ -301,6 +315,7 @@ fn parse_io_markets(
         }
         let index_in_meta = i32::try_from(i).unwrap_or(0);
         let min_qty = Decimal::new(1, raw.sz_decimals.min(18));
+        let volume_24h_usdc = ctx_volume(body, i);
         out.push(VenueMarket {
             venue: venue.clone(),
             raw_symbol: raw.name.clone(),
@@ -309,6 +324,7 @@ fn parse_io_markets(
             market_index: hip3_asset_id(dex_index, index_in_meta),
             qty_precision: raw.sz_decimals,
             min_qty,
+            volume_24h_usdc,
         });
     }
     Ok(out)
@@ -453,6 +469,39 @@ async fn poll_l2_books(
     }
 }
 
+async fn snapshot_entropy_bbos(rest: &str, markets: &[VenueMarket]) -> HashMap<String, Bbo> {
+    let client = http_client();
+    let info = info_url(rest);
+    let mut out = HashMap::new();
+    for m in markets {
+        let body = serde_json::json!({"type": "l2Book", "coin": m.raw_symbol});
+        let Ok(resp) = client
+            .post(&info)
+            .timeout(Duration::from_secs(8))
+            .json(&body)
+            .send()
+            .await
+        else {
+            continue;
+        };
+        let Ok(val) = resp.json::<Value>().await else {
+            continue;
+        };
+        let Some(levels) = val.get("levels").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        let parsed: Vec<Vec<WsLevel>> = levels
+            .iter()
+            .filter_map(|side| serde_json::from_value(side.clone()).ok())
+            .collect();
+        let Some(bbo) = bbo_from_l2(&parsed) else {
+            continue;
+        };
+        out.insert(m.pair_id.clone(), bbo);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -488,7 +537,11 @@ mod tests {
                     {"name": "io:SNDK", "szDecimals": 4}
                 ]
             },
-            []
+            [
+                {"dayNtlVlm": "0"},
+                {"dayNtlVlm": "44448746.76"},
+                {"dayNtlVlm": "22249125.73"}
+            ]
         ]);
         let venue = VenueId::from("entropy");
         let markets = parse_io_markets(&venue, 10, &body, &[]).unwrap();
@@ -499,6 +552,9 @@ mod tests {
         assert_eq!(sndk.market_index, 200_002);
         assert_eq!(sndk.qty_precision, 4);
         assert_eq!(sndk.min_qty, dec!(0.0001));
+        assert_eq!(sndk.volume_24h_usdc, Some(dec!(22249125.73)));
+        let anth = markets.iter().find(|m| m.base == "ANTH").unwrap();
+        assert_eq!(anth.volume_24h_usdc, Some(dec!(44448746.76)));
     }
 
     #[test]

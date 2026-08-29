@@ -13,6 +13,7 @@ export function emptyDefaults() {
 export function emptyParams(): ArbitrageParams {
   return {
     active_venues: [],
+    scan_venues: [],
     monitor_only: false,
     data_freshness_ms: 3000,
     pair_defaults: emptyDefaults(),
@@ -27,11 +28,9 @@ export function emptyParams(): ArbitrageParams {
     margin_utilization_pct: "90",
     fallback_available_usdc: "500",
     scan_enabled: false,
-    min_spread_pct: "0.1",
     analysis_interval_ms: 50,
     watch_top: 20,
-    cross_use_natural: true,
-    scan_log_interval_secs: 30,
+    scan_window_samples: 60,
     persistence_ms: 1000,
     persistence_min_hits: 5,
     window_samples: 10000,
@@ -44,11 +43,7 @@ export function emptyParams(): ArbitrageParams {
     default_slip_pct: "0.01",
     max_slippage_pct: "0.1",
     emergency_slippage_multiplier: "50",
-    history_enabled: true,
-    history_window_hours: 24,
     history_min_points: 10,
-    history_sample_interval_secs: 5,
-    history_refresh_interval_secs: 1800,
   };
 }
 
@@ -95,6 +90,8 @@ function draftFromSetting(s: PairSetting): PairDraft {
 export const store = reactive({
   params: emptyParams(),
   venues: [] as VenueMeta[],
+  /** 仅扫描页勾选，不进 /api/config。 */
+  scan_venues: [] as string[],
   drafts: [blankDraft()] as PairDraft[],
   available: [] as AvailableSymbol[],
   filter: "",
@@ -120,6 +117,14 @@ export function applyAvailable(list: AvailableSymbol[]) {
 
 export function applyVenues(list: VenueMeta[]) {
   store.venues = list || [];
+  const ids = store.venues.map((v) => v.id);
+  if (!ids.length) return;
+  if (!store.scan_venues.length) {
+    store.scan_venues = [...ids];
+    return;
+  }
+  const keep = store.scan_venues.filter((id) => ids.includes(id));
+  store.scan_venues = keep.length ? keep : [...ids];
 }
 
 export function addDraft() {

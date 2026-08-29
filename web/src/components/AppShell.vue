@@ -57,6 +57,9 @@
       <n-tab-pane name="tape" tab="执行带">
         <TapePage :rows="execs" />
       </n-tab-pane>
+      <n-tab-pane name="scan" tab="套利扫描">
+        <ScanPage :enabled="scanOn" :snap="snap" @started="onScanStarted" @stopped="onScanStopped" />
+      </n-tab-pane>
     </n-tabs>
   </div>
 </template>
@@ -70,6 +73,7 @@ import { applyParams, applyVenues, store } from "../store";
 import type { ExecRow, LiveSnapshot, VenueMeta } from "../types";
 import ConfigPage from "./ConfigPage.vue";
 import TapePage from "./TapePage.vue";
+import ScanPage from "./ScanPage.vue";
 
 const tab = ref("config");
 const clock = ref("");
@@ -116,6 +120,8 @@ const modeLabel = computed(() => {
   if (snap.value.monitor_only) return "监控";
   return snap.value.paper_trading ? "Paper" : "实盘";
 });
+
+const scanOn = computed(() => !!snap.value?.scan_running);
 
 const exDetail = computed(() => {
   const rows = snap.value?.exchange_positions || [];
@@ -222,6 +228,8 @@ function onStarted() {
 function onStopped() {
   enabled.value = false;
 }
+function onScanStarted() {}
+function onScanStopped() {}
 
 onMounted(() => {
   tickClock();

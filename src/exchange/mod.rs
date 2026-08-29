@@ -11,8 +11,8 @@ use std::sync::Arc;
 use crate::config::VenueFile;
 
 pub use bridge::{
-    bridge_available, bridge_call, bridge_watch, last_lighter_place_rtt, subscribe_order_pushes,
-    LighterPlaceRtt, OrderPush,
+    bridge_available, bridge_call, bridge_watch, last_lighter_place_rtt, last_place_rtt,
+    subscribe_order_pushes, LighterPlaceRtt, OrderPush, PlaceChainRtt,
 };
 pub use entropy::EntropyAdapter;
 pub use lighter::LighterAdapter;

@@ -8,7 +8,7 @@ use std::process::Stdio;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{broadcast, oneshot};
@@ -98,8 +98,17 @@ impl Sidecar {
 static SIDECAR: Mutex<Option<Arc<Sidecar>>> = Mutex::new(None);
 /// 已启动过 WS 订单流的 venue。重启后要重新订阅，否则成交检测退化成纯轮询。
 static WATCHED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
-/// Lighter 最近一次「签名 → sendTx 回包」耗时（主网 / RH 共用这段 Go 路径）。
-static LAST_LIGHTER_PLACE_RTT: Mutex<Option<HashMap<String, LighterPlaceRtt>>> = Mutex::new(None);
+/// 各所最近一次下单：Rust 发起到 sidecar 拿到 DEX 回包的墙钟。
+static LAST_PLACE_RTT: Mutex<Option<HashMap<String, PlaceChainRtt>>> = Mutex::new(None);
+
+/// 下单链路耗时。Lighter 另有 Go 侧签名→sendTx 分解。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlaceChainRtt {
+    pub wall_ms: u64,
+    pub sign_ms: Option<u64>,
+    pub send_ms: Option<u64>,
+    pub sign_to_ack_ms: Option<u64>,
+}
 
 /// Lighter 下单：Go 签名开始到 `/api/v1/sendTx` 确认回包。不含等锁、拉 nonce、成交回查。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,8 +118,8 @@ pub struct LighterPlaceRtt {
     pub sign_to_ack_ms: u64,
 }
 
-pub fn last_lighter_place_rtt(venue_id: &str) -> Option<LighterPlaceRtt> {
-    LAST_LIGHTER_PLACE_RTT
+pub fn last_place_rtt(venue_id: &str) -> Option<PlaceChainRtt> {
+    LAST_PLACE_RTT
         .lock()
         .ok()?
         .as_ref()?
@@ -118,11 +127,33 @@ pub fn last_lighter_place_rtt(venue_id: &str) -> Option<LighterPlaceRtt> {
         .copied()
 }
 
-pub fn note_lighter_place_rtt(venue_id: &str, rtt: LighterPlaceRtt) {
-    if let Ok(mut g) = LAST_LIGHTER_PLACE_RTT.lock() {
+pub fn last_lighter_place_rtt(venue_id: &str) -> Option<LighterPlaceRtt> {
+    let r = last_place_rtt(venue_id)?;
+    Some(LighterPlaceRtt {
+        sign_ms: r.sign_ms?,
+        send_ms: r.send_ms?,
+        sign_to_ack_ms: r.sign_to_ack_ms?,
+    })
+}
+
+pub fn note_place_rtt(venue_id: &str, rtt: PlaceChainRtt) {
+    if let Ok(mut g) = LAST_PLACE_RTT.lock() {
         g.get_or_insert_with(HashMap::new)
             .insert(venue_id.to_string(), rtt);
     }
+}
+
+pub fn note_lighter_place_rtt(venue_id: &str, rtt: LighterPlaceRtt) {
+    let mut row = last_place_rtt(venue_id).unwrap_or(PlaceChainRtt {
+        wall_ms: rtt.sign_to_ack_ms,
+        sign_ms: None,
+        send_ms: None,
+        sign_to_ack_ms: None,
+    });
+    row.sign_ms = Some(rtt.sign_ms);
+    row.send_ms = Some(rtt.send_ms);
+    row.sign_to_ack_ms = Some(rtt.sign_to_ack_ms);
+    note_place_rtt(venue_id, row);
 }
 
 pub fn parse_lighter_place_rtt_line(line: &str) -> Option<(String, LighterPlaceRtt)> {
@@ -170,22 +201,15 @@ fn venue_id_from_yaml(path: &Path) -> String {
     }
 }
 
-fn note_rtt_from_place_json(venue_yaml: &Path, data: &Value) {
-    let (Some(sign_ms), Some(send_ms), Some(sign_to_ack_ms)) = (
-        json_ms(data, "sign_ms"),
-        json_ms(data, "send_ms"),
-        json_ms(data, "sign_to_ack_ms"),
-    ) else {
-        return;
+fn note_rtt_from_place_json(venue_yaml: &Path, data: &Value, wall_ms: u64) {
+    let venue = venue_id_from_yaml(venue_yaml);
+    let rtt = PlaceChainRtt {
+        wall_ms,
+        sign_ms: json_ms(data, "sign_ms"),
+        send_ms: json_ms(data, "send_ms"),
+        sign_to_ack_ms: json_ms(data, "sign_to_ack_ms"),
     };
-    note_lighter_place_rtt(
-        &venue_id_from_yaml(venue_yaml),
-        LighterPlaceRtt {
-            sign_ms,
-            send_ms,
-            sign_to_ack_ms,
-        },
-    );
+    note_place_rtt(&venue, rtt);
 }
 
 fn sidecar_binary() -> PathBuf {
@@ -518,8 +542,10 @@ pub async fn bridge_place(venue_yaml: &Path, req: &OrderReq) -> Result<OrderAck>
         "target_price": req.target_price.map(|p| p.to_string()),
         "slippage_pct": req.slippage_pct.map(|p| p.to_string()),
     });
+    let t0 = Instant::now();
     let data = bridge_call(venue_yaml, "place", params).await?;
-    note_rtt_from_place_json(venue_yaml, &data);
+    let wall_ms = t0.elapsed().as_millis() as u64;
+    note_rtt_from_place_json(venue_yaml, &data, wall_ms);
     parse_order_ack(&data)
 }
 

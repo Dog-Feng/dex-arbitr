@@ -30,6 +30,7 @@ export interface PairSetting {
 
 export interface ArbitrageParams {
   active_venues: string[];
+  scan_venues: string[];
   monitor_only: boolean;
   data_freshness_ms: number;
   pair_defaults: PairDefaults;
@@ -44,11 +45,9 @@ export interface ArbitrageParams {
   margin_utilization_pct: string | number;
   fallback_available_usdc: string | number;
   scan_enabled: boolean;
-  min_spread_pct: string | number;
   analysis_interval_ms: number;
   watch_top: number;
-  cross_use_natural: boolean;
-  scan_log_interval_secs: number;
+  scan_window_samples: number;
   persistence_ms: number;
   persistence_min_hits: number;
   window_samples: number;
@@ -61,11 +60,7 @@ export interface ArbitrageParams {
   default_slip_pct: string | number;
   max_slippage_pct: string | number;
   emergency_slippage_multiplier: string | number;
-  history_enabled: boolean;
-  history_window_hours: number;
   history_min_points: number;
-  history_sample_interval_secs: number;
-  history_refresh_interval_secs: number;
 }
 
 export interface AvailableVenuePair {
@@ -158,7 +153,49 @@ export interface LiveSnapshot {
   matching: boolean;
   available: AvailableSymbol[];
   session_pnl_usdc?: string;
+  scan?: ScanSnapshot;
+  scan_running?: boolean;
   updated_at: number;
+}
+
+export interface ScanVenueCell {
+  mid_mean: string;
+  own_spread_mean: string;
+}
+
+export interface ScanRow {
+  rank: number;
+  base: string;
+  pair_id: string;
+  left: string;
+  right: string;
+  same_family: boolean;
+  eligible: boolean;
+  edge: string;
+  sigma: string;
+  delta: string;
+  mu: string;
+  hub_c: string;
+  crosses: number;
+  n: number;
+  cap: number;
+  venues: Record<string, ScanVenueCell>;
+}
+
+export interface ScanSnapshot {
+  updated_at: number;
+  status: string;
+  error?: string | null;
+  universe: number;
+  candidates: number;
+  sampling_n: number;
+  filled_n: number;
+  window_n?: number;
+  watch_top: number;
+  window_samples: number;
+  sample_interval_ms: number;
+  venues?: string[];
+  rows: ScanRow[];
 }
 
 export interface ExecRow {

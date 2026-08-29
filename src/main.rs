@@ -17,7 +17,7 @@ async fn main() -> Result<()> {
         monitor_only = cfg.system.monitor_only,
         venues = ?cfg.venues,
         scan = cfg.scan.enabled,
-        min_raw = %cfg.scan.min_spread_pct,
+        watch_top = cfg.scan.watch_top,
         enabled = ?cfg.pairs.enabled.iter().map(|p| p.symbol.as_str()).collect::<Vec<_>>(),
         log_dir = %cfg.system.log_dir,
         "dex-arbitr P1 start"

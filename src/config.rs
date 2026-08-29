@@ -170,38 +170,60 @@ fn default_sizing() -> SizingConfig {
     }
 }
 
-/// 对齐参考监控 V2：毛价差门槛 + 定时分析环。不改格子、不下单。
+/// 扫描环：间隔 + Top N + 样本窗。粗筛门槛仅 yaml，页面第一期不暴露。
 #[derive(Debug, Clone, Deserialize)]
 pub struct ScanConfig {
     pub enabled: bool,
-    pub min_spread_pct: Decimal,
     pub analysis_interval_ms: u64,
     pub watch_top: usize,
-    /// 跨 DEX（如 SoDEX ↔ Lighter）用 24h raw 中位数当天然价差，上榜看 residual。
-    #[serde(default = "default_true")]
-    pub cross_use_natural: bool,
-    /// 仍在榜上的币至少隔这么多秒再打一行。上榜/下榜立刻记。
-    #[serde(default = "default_log_interval_secs")]
-    pub log_interval_secs: u64,
-}
-
-fn default_log_interval_secs() -> u64 {
-    30
-}
-
-fn default_true() -> bool {
-    true
+    /// 满这么多个秒级点才打分。与格子 `grid.window_samples` 分开。
+    #[serde(default = "default_scan_window_samples")]
+    pub window_samples: usize,
+    /// 0 = `max(watch_top×4, 40)`。
+    #[serde(default)]
+    pub candidate_cap: usize,
+    #[serde(default = "default_max_own_spread_pct")]
+    pub max_own_spread_pct: Decimal,
+    #[serde(default = "default_min_level_notional")]
+    pub min_level_notional_usdc: Decimal,
+    #[serde(default = "default_min_volume_24h")]
+    pub min_volume_24h_usdc: Decimal,
+    #[serde(default = "default_coarse_refresh_secs")]
+    pub coarse_refresh_secs: u64,
 }
 
 fn default_scan() -> ScanConfig {
     ScanConfig {
-        enabled: true,
-        min_spread_pct: Decimal::new(1, 1),
+        enabled: false,
         analysis_interval_ms: 50,
-        watch_top: 10,
-        cross_use_natural: true,
-        log_interval_secs: 30,
+        watch_top: 20,
+        window_samples: default_scan_window_samples(),
+        candidate_cap: 0,
+        max_own_spread_pct: default_max_own_spread_pct(),
+        min_level_notional_usdc: default_min_level_notional(),
+        min_volume_24h_usdc: default_min_volume_24h(),
+        coarse_refresh_secs: default_coarse_refresh_secs(),
     }
+}
+
+fn default_scan_window_samples() -> usize {
+    60
+}
+
+fn default_max_own_spread_pct() -> Decimal {
+    Decimal::new(15, 2)
+}
+
+fn default_min_level_notional() -> Decimal {
+    Decimal::from(200)
+}
+
+fn default_min_volume_24h() -> Decimal {
+    Decimal::from(10_000_000)
+}
+
+fn default_coarse_refresh_secs() -> u64 {
+    60
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -404,21 +426,36 @@ fn default_emergency_slip_mult() -> Decimal {
     Decimal::from(50)
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct HistoryConfig {
-    pub enabled: bool,
-    pub db_path: String,
-    pub sample_interval_secs: u64,
-    pub window_hours: u64,
-    pub min_points: usize,
-    pub max_age_secs: u64,
-    /// 库里已有 `natural_spreads` 则启动直接用；之后隔这么久用窗口样本重算一次。
-    #[serde(default = "default_refresh_interval_secs")]
-    pub refresh_interval_secs: u64,
+fn default_true() -> bool {
+    true
+}
+
+fn default_history_sample_interval_secs() -> u64 {
+    5
+}
+
+fn default_history_window_hours() -> u64 {
+    24
 }
 
 fn default_refresh_interval_secs() -> u64 {
     1800
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct HistoryConfig {
+    /// 不再热改。缺省开库；扫描页只留 min_points（样本数）。
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    pub db_path: String,
+    #[serde(default = "default_history_sample_interval_secs")]
+    pub sample_interval_secs: u64,
+    #[serde(default = "default_history_window_hours")]
+    pub window_hours: u64,
+    pub min_points: usize,
+    pub max_age_secs: u64,
+    #[serde(default = "default_refresh_interval_secs")]
+    pub refresh_interval_secs: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -756,8 +793,8 @@ mod tests {
         let lighter = cfg.load_venue("lighter").unwrap();
         assert_eq!(cfg.maker_fee(&VenueId::from("lighter")), lighter.fees.maker);
         assert_eq!(cfg.taker_fee(&VenueId::from("lighter")), lighter.fees.taker);
-        assert_eq!(cfg.maker_fee(&VenueId::from("lighter_rh")), dec!(0.012));
-        assert_eq!(cfg.taker_fee(&VenueId::from("lighter_rh")), dec!(0.035));
+        assert_eq!(cfg.maker_fee(&VenueId::from("lighter_rh")), venue.fees.maker);
+        assert_eq!(cfg.taker_fee(&VenueId::from("lighter_rh")), venue.fees.taker);
         assert!(cfg.maker_fee(&VenueId::from("sodex")) > dec!(0));
         assert_eq!(
             cfg.exec_fee(&VenueId::from("lighter")) + cfg.exec_fee(&VenueId::from("lighter_rh")),
@@ -766,8 +803,9 @@ mod tests {
         assert!(cfg.history.enabled);
         assert_eq!(cfg.history.min_points, 10);
         assert_eq!(cfg.history.refresh_interval_secs, 1800);
-        assert_eq!(cfg.scan.min_spread_pct, dec!(0.1));
-        assert!(cfg.scan.cross_use_natural);
+        assert_eq!(cfg.scan.watch_top, 20);
+        assert_eq!(cfg.scan.analysis_interval_ms, 50);
+        assert_eq!(cfg.scan.window_samples, 60);
         assert_eq!(cfg.grid.persistence_ms, 1000);
         assert_eq!(cfg.grid.persistence_min_hits, 7);
         assert_eq!(cfg.grid.window_samples, 1000);

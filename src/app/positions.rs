@@ -176,38 +176,35 @@ impl PositionStore {
         let Some(pos) = self.positions.get_mut(slot) else {
             return;
         };
-        let before = pos.qty;
-        pos.qty = (before - qty).max(Decimal::ZERO);
-        if before > Decimal::ZERO {
-            // 名义按比例缩减，剩余仓位的保证金占用才不会一直按开仓全量算。
-            pos.entry_notional_usdc = pos.entry_notional_usdc * pos.qty / before;
-        }
+        apply_qty_scale(pos, pos.qty - qty);
         if pos.qty.is_zero() {
             self.positions.remove(slot);
-        } else if pos.base_qty > Decimal::ZERO {
-            let ratio = pos.qty / pos.base_qty;
-            let ceil = ratio.ceil();
-            let abs = i32::try_from(ceil.trunc().mantissa().max(0)).unwrap_or(i32::MAX);
-            let sign = if pos.grid < 0 { -1 } else { 1 };
-            pos.grid = sign * abs.max(1);
         }
     }
 
-    /// 交易所实盘持仓与内存不一致时按实盘校正（只缩不放，避免放大敞口）。
+    /// 交易所实盘重叠对冲量与内存不一致时，按实盘校正数量。
+    ///
+    /// 实盘少：收缩内存（漏平、部分成交）。实盘多：在安全上限内抬到实盘
+    /// （漏记成交）；超过上限不抬，避免账户快照异常把策略仓一次性放大。
+    /// 名义按比例缩放，格子按 `base_qty` 重算，后续平仓才平得干净。
     pub fn reconcile_qty(&mut self, slot: &str, exchange_qty: Decimal) -> Option<(Decimal, Decimal)> {
         let pos = self.positions.get_mut(slot)?;
         let before = pos.qty;
-        if before <= Decimal::ZERO || exchange_qty >= before {
+        if before <= Decimal::ZERO {
             return None;
         }
-        pos.qty = exchange_qty.max(Decimal::ZERO);
-        if before > Decimal::ZERO {
-            pos.entry_notional_usdc = pos.entry_notional_usdc * pos.qty / before;
+        let target = exchange_qty.max(Decimal::ZERO);
+        if target == before {
+            return None;
         }
+        if target > before && target > reconcile_grow_cap(before, pos.base_qty) {
+            return None;
+        }
+        apply_qty_scale(pos, target);
         if pos.qty.is_zero() {
             self.positions.remove(slot);
         }
-        Some((before, exchange_qty))
+        Some((before, target))
     }
 
     pub fn is_pending(&self, slot: &str) -> bool {
@@ -240,6 +237,34 @@ impl PositionStore {
             .values()
             .filter(|p| p.qty > Decimal::ZERO)
             .collect()
+    }
+}
+
+/// 单次对账最多把内存抬到 `max(4×当前量, 当前量 + 8×base_qty)`。
+/// 漏记一两笔分段成交能跟上；账户快照把仓位报成百倍时不跟。
+fn reconcile_grow_cap(before: Decimal, base_qty: Decimal) -> Decimal {
+    let by_ratio = before * Decimal::from(4);
+    if base_qty > Decimal::ZERO {
+        by_ratio.max(before + base_qty * Decimal::from(8))
+    } else {
+        by_ratio
+    }
+}
+
+fn apply_qty_scale(pos: &mut Position, new_qty: Decimal) {
+    let before = pos.qty;
+    let new_qty = new_qty.max(Decimal::ZERO);
+    if before > Decimal::ZERO {
+        // 名义按比例缩放，剩余仓位的保证金占用才不会一直按开仓全量算。
+        pos.entry_notional_usdc = pos.entry_notional_usdc * new_qty / before;
+    }
+    pos.qty = new_qty;
+    if pos.qty > Decimal::ZERO && pos.base_qty > Decimal::ZERO {
+        let ratio = pos.qty / pos.base_qty;
+        let ceil = ratio.ceil();
+        let abs = i32::try_from(ceil.trunc().mantissa().max(0)).unwrap_or(i32::MAX);
+        let sign = if pos.grid < 0 { -1 } else { 1 };
+        pos.grid = sign * abs.max(1);
     }
 }
 
@@ -439,8 +464,30 @@ mod tests {
             store.reconcile_qty(BTC_LS, dec!(0.004)),
             Some((dec!(0.01), dec!(0.004)))
         );
-        assert_eq!(store.get(BTC_LS).unwrap().qty, dec!(0.004));
-        // 实盘比内存多时不动（宁可少记，避免放大敞口）
-        assert_eq!(store.reconcile_qty(BTC_LS, dec!(0.02)), None);
+        let pos = store.get(BTC_LS).unwrap();
+        assert_eq!(pos.qty, dec!(0.004));
+        assert_eq!(pos.entry_notional_usdc, dec!(160));
+    }
+
+    #[test]
+    fn reconcile_raises_to_exchange_qty() {
+        let mut store = PositionStore::default();
+        open(&mut store, BTC_LS, dec!(0.030), dec!(300), dec!(0.05));
+        assert_eq!(
+            store.reconcile_qty(BTC_LS, dec!(0.045)),
+            Some((dec!(0.030), dec!(0.045)))
+        );
+        let pos = store.get(BTC_LS).unwrap();
+        assert_eq!(pos.qty, dec!(0.045));
+        assert_eq!(pos.entry_notional_usdc, dec!(450));
+        assert_eq!(pos.grid, 2);
+    }
+
+    #[test]
+    fn reconcile_refuses_huge_exchange_jump() {
+        let mut store = PositionStore::default();
+        open(&mut store, BTC_LS, dec!(0.01), dec!(400), dec!(0.05));
+        assert_eq!(store.reconcile_qty(BTC_LS, dec!(100)), None);
+        assert_eq!(store.get(BTC_LS).unwrap().qty, dec!(0.01));
     }
 }

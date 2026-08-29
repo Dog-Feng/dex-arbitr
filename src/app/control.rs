@@ -16,6 +16,10 @@ fn default_window_samples() -> usize {
     10_000
 }
 
+fn default_scan_window_samples() -> usize {
+    60
+}
+
 fn default_sample_interval_ms() -> u64 {
     1000
 }
@@ -36,6 +40,9 @@ pub struct ArbitrageParams {
     /// 参与套利的所（cfg.venues 的子集）。空 = 全部已加载所。
     #[serde(default)]
     pub active_venues: Vec<String>,
+    /// 扫描页勾选。与 `active_venues` 分开，避免扫的所污染执行名单。
+    #[serde(default)]
+    pub scan_venues: Vec<String>,
 
     // ═══ system ═══
     pub monitor_only: bool,
@@ -62,11 +69,10 @@ pub struct ArbitrageParams {
 
     // ═══ scan ═══
     pub scan_enabled: bool,
-    pub min_spread_pct: Decimal,
     pub analysis_interval_ms: u64,
     pub watch_top: u32,
-    pub cross_use_natural: bool,
-    pub scan_log_interval_secs: u64,
+    #[serde(default = "default_scan_window_samples")]
+    pub scan_window_samples: usize,
 
     // ═══ grid persistence（阈值在 pair_defaults / pairs）═══
     pub persistence_ms: u64,
@@ -93,11 +99,7 @@ pub struct ArbitrageParams {
     pub emergency_slippage_multiplier: Decimal,
 
     // ═══ history ═══
-    pub history_enabled: bool,
-    pub history_window_hours: u64,
     pub history_min_points: u32,
-    pub history_sample_interval_secs: u64,
-    pub history_refresh_interval_secs: u64,
 }
 
 impl ArbitrageParams {
@@ -105,6 +107,7 @@ impl ArbitrageParams {
         Self {
             // 页面默认不勾 DEX；yaml `venues` 只决定连哪些适配器。
             active_venues: Vec::new(),
+            scan_venues: Vec::new(),
 
             monitor_only: cfg.system.monitor_only,
             data_freshness_ms: cfg.system.data_freshness_ms,
@@ -124,11 +127,9 @@ impl ArbitrageParams {
             fallback_available_usdc: cfg.sizing.fallback_available_usdc.unwrap_or_default(),
 
             scan_enabled: cfg.scan.enabled,
-            min_spread_pct: cfg.scan.min_spread_pct,
             analysis_interval_ms: cfg.scan.analysis_interval_ms,
             watch_top: cfg.scan.watch_top as u32,
-            cross_use_natural: cfg.scan.cross_use_natural,
-            scan_log_interval_secs: cfg.scan.log_interval_secs,
+            scan_window_samples: cfg.scan.window_samples.max(10),
 
             persistence_ms: cfg.grid.persistence_ms,
             persistence_min_hits: cfg.grid.persistence_min_hits,
@@ -145,11 +146,7 @@ impl ArbitrageParams {
             max_slippage_pct: cfg.cost.max_slippage_pct,
             emergency_slippage_multiplier: cfg.cost.emergency_slippage_multiplier,
 
-            history_enabled: cfg.history.enabled,
-            history_window_hours: cfg.history.window_hours,
             history_min_points: cfg.history.min_points as u32,
-            history_sample_interval_secs: cfg.history.sample_interval_secs,
-            history_refresh_interval_secs: cfg.history.refresh_interval_secs,
         }
     }
 
@@ -178,11 +175,12 @@ impl ArbitrageParams {
         };
 
         cfg.scan.enabled = self.scan_enabled;
-        cfg.scan.min_spread_pct = self.min_spread_pct;
         cfg.scan.analysis_interval_ms = self.analysis_interval_ms;
         cfg.scan.watch_top = self.watch_top as usize;
-        cfg.scan.cross_use_natural = self.cross_use_natural;
-        cfg.scan.log_interval_secs = self.scan_log_interval_secs;
+        cfg.scan.window_samples = self.scan_window_samples.max(10);
+        if cfg.scan.min_volume_24h_usdc <= Decimal::ZERO {
+            cfg.scan.min_volume_24h_usdc = Decimal::from(10_000_000);
+        }
 
         cfg.grid.persistence_ms = self.persistence_ms;
         cfg.grid.persistence_min_hits = self.persistence_min_hits;
@@ -199,11 +197,7 @@ impl ArbitrageParams {
         cfg.cost.max_slippage_pct = self.max_slippage_pct;
         cfg.cost.emergency_slippage_multiplier = self.emergency_slippage_multiplier;
 
-        cfg.history.enabled = self.history_enabled;
-        cfg.history.window_hours = self.history_window_hours;
-        cfg.history.min_points = self.history_min_points as usize;
-        cfg.history.sample_interval_secs = self.history_sample_interval_secs;
-        cfg.history.refresh_interval_secs = self.history_refresh_interval_secs;
+        cfg.history.min_points = self.history_min_points.max(1) as usize;
     }
 }
 
@@ -224,6 +218,9 @@ pub fn validate(p: &ArbitrageParams) -> ValidationResult {
     }
     if p.window_samples == 0 {
         errors.push("window_samples 必须 >= 1".into());
+    }
+    if p.scan_window_samples < 10 {
+        errors.push("scan_window_samples 必须 >= 10".into());
     }
     if p.sample_interval_ms == 0 {
         errors.push("sample_interval_ms 必须 >= 1".into());
@@ -260,6 +257,9 @@ pub struct ArbitrageControl {
     pub enabled: bool,
     /// 点「启动套利」后置位；决策环按当前 `active_venues` 拉市场并匹配后清掉。
     pub rematch: bool,
+    /// 点「启动扫描」后置位；走扫描宇宙，不校验交易对数量。
+    pub rematch_scan: bool,
+    pub scan_running: bool,
     pub params: ArbitrageParams,
 }
 
@@ -268,6 +268,8 @@ impl ArbitrageControl {
         Self {
             enabled: false,
             rematch: false,
+            rematch_scan: false,
+            scan_running: false,
             params: ArbitrageParams::from_config(cfg),
         }
     }

@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use rust_decimal::Decimal;
 use serde::Deserialize;
+use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
 use std::time::{Duration, Instant};
@@ -16,7 +17,7 @@ use crate::domain::{
     Bbo, VenueId, VenueMarket,
 };
 
-use super::net::{connect_ws, http_client, spawn_feed_loop, FeedGuard};
+use super::net::{connect_ws, http_client, json_decimal, spawn_feed_loop, FeedGuard};
 
 use super::port::{
     AccountSnapshot, Balance, BboTx, CancelReq, ExchangePort, FillPnl, FundingRate, OrderAck,
@@ -49,6 +50,7 @@ impl LighterAdapter {
 
 #[derive(Debug, Deserialize)]
 struct OrderBooksResp {
+    #[serde(default, alias = "order_book_details")]
     order_books: Vec<RawBook>,
 }
 
@@ -64,6 +66,8 @@ struct RawBook {
     min_base_amount: String,
     #[serde(default)]
     supported_size_decimals: u32,
+    #[serde(default)]
+    daily_quote_token_volume: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -148,7 +152,7 @@ impl ExchangePort for LighterAdapter {
 
     async fn list_perps(&self) -> Result<Vec<VenueMarket>> {
         let url = format!(
-            "{}/api/v1/orderBooks?filter=perp",
+            "{}/api/v1/orderBookDetails?filter=perp",
             self.venue.rest.trim_end_matches('/')
         );
         let resp: OrderBooksResp = http_client()
@@ -160,7 +164,7 @@ impl ExchangePort for LighterAdapter {
             .error_for_status()?
             .json()
             .await
-            .context("decode orderBooks")?;
+            .context("decode orderBookDetails")?;
 
         let mut out = Vec::new();
         for raw in resp.order_books {
@@ -194,6 +198,7 @@ impl ExchangePort for LighterAdapter {
                 market_index: raw.market_id,
                 qty_precision: raw.supported_size_decimals,
                 min_qty,
+                volume_24h_usdc: raw.daily_quote_token_volume.as_ref().and_then(json_decimal),
             });
         }
         info!(venue = self.venue.id, n = out.len(), "loaded perp markets");
@@ -201,6 +206,10 @@ impl ExchangePort for LighterAdapter {
     }
 
     async fn subscribe_bbo(&self, markets: &[VenueMarket], tx: BboTx) -> Result<()> {
+        if markets.is_empty() {
+            self.feeds.interrupt();
+            return Ok(());
+        }
         let id_to_pair: Vec<(i32, String)> = markets
             .iter()
             .map(|m| (m.market_index, m.pair_id.clone()))
@@ -296,6 +305,10 @@ impl ExchangePort for LighterAdapter {
             return Ok(FillPnl::missing());
         }
         bridge::bridge_fill_pnl(&self.venue_path, symbol, order_id).await
+    }
+
+    async fn snapshot_bbos(&self, markets: &[VenueMarket]) -> HashMap<String, Bbo> {
+        snapshot_lighter_bbos(&self.venue.rest, markets).await
     }
 }
 
@@ -405,6 +418,55 @@ fn parse_market_id(channel: &str) -> Option<i32> {
         .rsplit(['/', ':'])
         .next()
         .and_then(|s| s.parse().ok())
+}
+
+async fn snapshot_lighter_bbos(rest: &str, markets: &[VenueMarket]) -> HashMap<String, Bbo> {
+    let client = http_client();
+    let base = rest.trim_end_matches('/');
+    let mut out = HashMap::new();
+    for chunk in markets.chunks(8) {
+        let futs = chunk.iter().map(|m| {
+            let url = format!("{base}/api/v1/orderBookOrders?market_id={}&limit=1", m.market_index);
+            let pair_id = m.pair_id.clone();
+            let client = client.clone();
+            async move {
+                let resp = client
+                    .get(&url)
+                    .timeout(Duration::from_secs(8))
+                    .send()
+                    .await
+                    .ok()?;
+                let data: Value = resp.json().await.ok()?;
+                let bbo = bbo_from_lighter_orders(&data)?;
+                Some((pair_id, bbo))
+            }
+        });
+        for (pair_id, bbo) in futures_util::future::join_all(futs).await.into_iter().flatten() {
+            out.insert(pair_id, bbo);
+        }
+    }
+    out
+}
+
+fn bbo_from_lighter_orders(data: &Value) -> Option<Bbo> {
+    let bid_lv = data.get("bids")?.as_array()?.first()?;
+    let ask_lv = data.get("asks")?.as_array()?.first()?;
+    let bid = json_decimal(bid_lv.get("price")?)?;
+    let ask = json_decimal(ask_lv.get("price")?)?;
+    let bid_qty = json_decimal(bid_lv.get("remaining_base_amount")?).unwrap_or(Decimal::ZERO);
+    let ask_qty = json_decimal(ask_lv.get("remaining_base_amount")?).unwrap_or(Decimal::ZERO);
+    if bid <= Decimal::ZERO || ask <= Decimal::ZERO || ask <= bid {
+        return None;
+    }
+    Some(Bbo {
+        bid,
+        ask,
+        bid_qty,
+        ask_qty,
+        bids: vec![(bid, bid_qty)],
+        asks: vec![(ask, ask_qty)],
+        ts: Instant::now(),
+    })
 }
 
 #[cfg(test)]

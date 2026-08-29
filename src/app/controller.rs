@@ -12,8 +12,9 @@ use tracing::{info, warn};
 use crate::config::{AppConfig, OrderStyle};
 use crate::domain::spread::raw_spread_pct;
 use crate::domain::{
-    grid_step_from_target_bp, is_cross_dex, match_all_pairs, new_books, read_book, Bbo, Books,
-    CloseReason, CloseView, Intent, Pair, VenueId, VenueMarket, WindowGridEngine, WindowGridParams,
+    grid_step_from_target_bp, is_cross_dex, match_all_pairs, new_books, order_pairs_legs, read_book,
+    Bbo, Books, CloseReason, CloseView, Intent, Pair, VenueId, VenueMarket, WindowGridEngine,
+    WindowGridParams,
 };
 use crate::exchange::{make_adapter, ExchangePort};
 use crate::exec::{
@@ -22,7 +23,8 @@ use crate::exec::{
 };
 use crate::infra::api::{
     self, ApiHub, AvailableSymbol, AvailableVenuePair, ExchangePositionRow, LiveSnapshot,
-    NakedExposureRow, PairRow, PositionRow, VenueBalanceRow, VenueLiveRow, VenueMatchRow,
+    NakedExposureRow, PairRow, PositionRow, ScanSnapshot, ScanVenueCell, VenueBalanceRow,
+    VenueLiveRow, VenueMatchRow,
 };
 use crate::infra::dashboard::{self, LivePanel};
 use crate::infra::history::{residual_net, HistoryStore, NaturalSpread};
@@ -41,7 +43,11 @@ use super::reconcile::{
 };
 use super::intervention::{Cause, Gate, InterventionGuard, SINGLE_LEG_STREAK_LIMIT};
 use super::risk::{books_quality_ok, books_tradable};
-use super::scan::OpportunityTracker;
+use super::scan::{
+    candidate_cap, coarse_spread_sum, expand_scan_subscribe, filter_scan_markets,
+    merge_coarse_refresh, pair_has_books, pair_volume_ok, rank_bases, select_candidates, CoarseCfg,
+    ScanEngine, ScanPhase, COARSE_PROBE_BATCH, COARSE_PROBE_WAIT_SECS,
+};
 use super::sizing::{check_capacity, mid_from_bbo, LegMargin};
 use super::window_spread::{
     exec_spread_pct, mid_spread_pct, own_spread_mid_pct, pair_spread_hub_avg, VenueSpreadBook,
@@ -78,8 +84,17 @@ pub struct Controller {
     hedging: HashSet<String>,
     exec_tx: mpsc::UnboundedSender<ExecEvent>,
     exec_rx: Option<mpsc::UnboundedReceiver<ExecEvent>>,
-    scanner: OpportunityTracker,
-    last_token_log: HashMap<String, LoggedToken>,
+    scan_engine: ScanEngine,
+    scan_universe: Vec<Pair>,
+    scan_candidates: Vec<Pair>,
+    scan_phase: ScanPhase,
+    scan_error: Option<String>,
+    scan_venues: Vec<String>,
+    scan_was_running: bool,
+    last_coarse_at: Instant,
+    scan_probe_books: HashMap<(String, String), Bbo>,
+    scan_probe_queue: Vec<Pair>,
+    scan_probe_until: Option<Instant>,
     balance: BalanceCache,
     venue_accounts: VenueAccountCache,
     api: Option<Arc<ApiHub>>,
@@ -95,21 +110,14 @@ pub struct Controller {
     last_snap_at: Instant,
     /// 残仓低于 min_qty 的起始时刻。连续 5 分钟才报灰尘仓介入。
     dust_since: HashMap<String, Instant>,
+    /// 对账无法校正时的告警节流（同一槽位不要每秒刷 WARN）。
+    mismatch_log_at: HashMap<String, Instant>,
     /// 上一拍套利开关，用来检测「停止」边沿并清空所对列表。
     was_enabled: bool,
     /// 每个槽位开仓前两所账户权益。平仓后用最新权益相减得到实际盈亏。
     open_equity: HashMap<String, HashMap<String, Decimal>>,
     /// 本次进程各所成交名义（qty × 成交价），开平都累计。
     session_volume: HashMap<String, Decimal>,
-}
-
-struct LoggedToken {
-    pair_id: String,
-    buy: String,
-    sell: String,
-    raw: Decimal,
-    residual: Decimal,
-    at: Instant,
 }
 
 #[derive(Clone)]
@@ -217,8 +225,17 @@ impl Controller {
             hedging: HashSet::new(),
             exec_tx,
             exec_rx: Some(exec_rx),
-            scanner: OpportunityTracker::default(),
-            last_token_log: HashMap::new(),
+            scan_engine: ScanEngine::default(),
+            scan_universe: Vec::new(),
+            scan_candidates: Vec::new(),
+            scan_phase: ScanPhase::Idle,
+            scan_error: None,
+            scan_venues: Vec::new(),
+            scan_was_running: false,
+            last_coarse_at: Instant::now(),
+            scan_probe_books: HashMap::new(),
+            scan_probe_queue: Vec::new(),
+            scan_probe_until: None,
             balance: BalanceCache::default(),
             venue_accounts: VenueAccountCache::default(),
             api: api_hub,
@@ -229,6 +246,7 @@ impl Controller {
             intervention: InterventionGuard::default(),
             last_snap_at: Instant::now(),
             dust_since: HashMap::new(),
+            mismatch_log_at: HashMap::new(),
             was_enabled: false,
             open_equity: HashMap::new(),
             session_volume: HashMap::new(),
@@ -252,8 +270,19 @@ impl Controller {
         this.publish_api_snapshot();
         // 无 HTTP 面板时没有「启动套利」按钮，立刻按 yaml 启用的交易对激活。
         if this.control.is_none() {
-            if let Err(err) = this.activate_pairs().await {
+            let scan_only = this.cfg.scan.enabled && !this.cfg.execution.enabled;
+            let result = if scan_only {
+                this.scan_venues = this.cfg.venues.clone();
+                this.activate_scan().await
+            } else {
+                this.activate_pairs().await
+            };
+            if let Err(err) = result {
                 warn!(error = %err, "startup pair activate failed");
+                if scan_only {
+                    this.fail_scan(err.to_string());
+                    let _ = this.subscribe_pairs(&[]).await;
+                }
             }
             this.publish_api_snapshot();
         }
@@ -360,6 +389,61 @@ impl Controller {
         out
     }
 
+    fn take_scan_rematch(&self) -> Option<bool> {
+        let Some(ctrl) = self.control.as_ref() else {
+            return None;
+        };
+        let Ok(mut ctrl) = ctrl.lock() else {
+            return None;
+        };
+        if !ctrl.rematch_scan {
+            return None;
+        }
+        ctrl.rematch_scan = false;
+        Some(ctrl.scan_running && ctrl.params.scan_venues.len() >= 2)
+    }
+
+    fn scan_is_running(&self) -> bool {
+        self.control
+            .as_ref()
+            .and_then(|c| c.lock().ok())
+            .map(|c| c.scan_running)
+            .unwrap_or(self.cfg.scan.enabled && !self.cfg.execution.enabled)
+    }
+
+    fn live_scan_venues(&self) -> Vec<String> {
+        self.control
+            .as_ref()
+            .and_then(|c| c.lock().ok())
+            .map(|c| c.params.scan_venues.clone())
+            .filter(|v| v.len() >= 2)
+            .unwrap_or_else(|| self.scan_venues.clone())
+    }
+
+    async fn sync_scan_edge(&mut self) {
+        let on = self.scan_is_running();
+        if self.scan_was_running && !on {
+            self.stop_scan_runtime().await;
+        }
+        self.scan_was_running = on;
+    }
+
+    async fn stop_scan_runtime(&mut self) {
+        self.scan_universe.clear();
+        self.scan_candidates.clear();
+        self.scan_engine.clear();
+        self.clear_scan_probe();
+        self.scan_phase = ScanPhase::Idle;
+        self.scan_error = None;
+        self.scan_venues.clear();
+        if self.pairs.is_empty() {
+            let _ = self.subscribe_pairs(&[]).await;
+        } else {
+            let _ = self.subscribe_for_active().await;
+        }
+        info!("scan stopped; scan books unsubscribed");
+    }
+
     fn take_rematch(&self) -> Option<Vec<String>> {
         let mut ctrl = self.control.as_ref()?.lock().ok()?;
         if !ctrl.rematch {
@@ -374,8 +458,32 @@ impl Controller {
 
     async fn rematch_if_requested(&mut self) {
         self.sync_enabled_edge();
+        self.sync_scan_edge().await;
         self.sync_page_config();
-        // 在飞订单按 spawn 时的 pair_i 回写。换所对会重排 `pairs`，等回写完再匹配。
+        match self.take_scan_rematch() {
+            Some(true) => {
+                self.scan_phase = ScanPhase::Starting;
+                self.matching = true;
+                self.publish_api_snapshot();
+                let result = self.activate_scan().await;
+                self.matching = false;
+                if let Err(err) = result {
+                    warn!(error = %err, "scan match failed");
+                    self.fail_scan(err.to_string());
+                    let _ = self.subscribe_pairs(&[]).await;
+                }
+                self.publish_api_snapshot();
+                return;
+            }
+            Some(false) => {
+                self.fail_scan("请至少勾选两个交易所再启动扫描".into());
+                let _ = self.subscribe_pairs(&[]).await;
+                self.publish_api_snapshot();
+                return;
+            }
+            None => {}
+        }
+        // 扫描不改执行 `pairs` 下标，飞单不必挡住扫描启动。
         if self.execution_in_flight() {
             return;
         }
@@ -403,6 +511,10 @@ impl Controller {
             .configure(self.cfg.grid.window_samples, self.cfg.grid.sample_interval_ms);
         self.venue_spreads
             .configure(self.cfg.grid.window_samples, self.cfg.grid.sample_interval_ms);
+        self.scan_engine.configure(
+            self.cfg.scan.window_samples.max(10),
+            self.cfg.grid.sample_interval_ms.max(1),
+        );
     }
 
     fn forget_persist(&mut self, slot: &str) {
@@ -628,24 +740,36 @@ impl Controller {
     }
 
     async fn subscribe_for_active(&mut self) -> Result<()> {
+        let pairs = self.pairs.clone();
+        self.subscribe_pairs_inner(&pairs, true).await
+    }
+
+    /// 扫描订阅：只订传入的 Pair 腿，不动 `self.pairs`，SoDEX 也不拿未过滤全集。
+    async fn subscribe_pairs(&mut self, pairs: &[Pair]) -> Result<()> {
+        self.subscribe_pairs_inner(pairs, false).await
+    }
+
+    async fn subscribe_pairs_inner(&mut self, pairs: &[Pair], sodex_use_listed: bool) -> Result<()> {
         let tx = self
             .bbo_tx
             .clone()
             .ok_or_else(|| anyhow::anyhow!("bbo channel missing"))?;
         let mut by_venue: HashMap<String, Vec<VenueMarket>> = HashMap::new();
-        for pair in &self.pairs {
+        for pair in pairs {
             for leg in &pair.legs {
-                by_venue
+                let entry = by_venue
                     .entry(leg.venue.as_str().to_string())
-                    .or_default()
-                    .push(leg.clone());
+                    .or_default();
+                if !entry.iter().any(|m| m.pair_id == leg.pair_id) {
+                    entry.push(leg.clone());
+                }
             }
         }
         for (id, mkts) in &by_venue {
             let Some(adapter) = self.adapters_by_id.get(id).cloned() else {
                 continue;
             };
-            let to_sub: &[VenueMarket] = if id == "sodex" {
+            let to_sub: &[VenueMarket] = if sodex_use_listed && id == "sodex" {
                 self.listed_markets
                     .get(id)
                     .map(|m| m.as_slice())
@@ -660,7 +784,290 @@ impl Controller {
                     .insert((id.clone(), m.pair_id.clone()));
             }
         }
+        let active: HashSet<String> = by_venue.keys().cloned().collect();
+        let stale: Vec<String> = self
+            .subscribed
+            .iter()
+            .filter(|id| !active.contains(*id))
+            .cloned()
+            .collect();
+        for id in stale {
+            if let Some(adapter) = self.adapters_by_id.get(&id).cloned() {
+                let _ = adapter.subscribe_bbo(&[], tx.clone()).await;
+            }
+            self.subscribed.remove(&id);
+            self.subscribed_markets.retain(|(v, _)| v != &id);
+        }
         Ok(())
+    }
+
+    async fn activate_scan(&mut self) -> Result<()> {
+        self.sync_page_config();
+        self.scan_phase = ScanPhase::Starting;
+        self.scan_error = None;
+        self.scan_engine.clear();
+        self.clear_scan_probe();
+        let venues = self.live_scan_venues();
+        if venues.len() < 2 {
+            anyhow::bail!("请至少勾选两个交易所再启动扫描");
+        }
+        self.scan_venues = venues.clone();
+        let mut listed: Vec<(String, Vec<VenueMarket>)> = Vec::new();
+        for id in &venues {
+            let Some(adapter) = self.adapters_by_id.get(id).cloned() else {
+                continue;
+            };
+            match adapter.list_perps().await {
+                Ok(m) => listed.push((id.clone(), m)),
+                Err(e) => warn!(venue = %id, error = %e, "list_perps failed; venue excluded"),
+            }
+        }
+        let min_vol = self.scan_min_volume();
+        let (kept, dropped) = filter_scan_markets(listed, min_vol);
+        if !dropped.is_empty() {
+            warn!(?dropped, "venues excluded from scan match");
+        }
+        if kept.len() < 2 {
+            self.scan_universe.clear();
+            self.scan_candidates.clear();
+            anyhow::bail!("至少两个所有 24h 成交量数据才能扫描（缺字段的所已剔除）");
+        }
+        self.scan_universe = order_pairs_legs(match_all_pairs(&kept), &self.cfg.venues);
+        info!(
+            universe = self.scan_universe.len(),
+            venues = ?venues,
+            "scan universe matched after volume gate"
+        );
+        self.scan_phase = ScanPhase::Coarse;
+        self.publish_api_snapshot();
+        let books = self.collect_rest_bbos(&self.scan_universe).await;
+        let missing: Vec<Pair> = self
+            .scan_universe
+            .iter()
+            .filter(|p| !pair_has_books(p, &books))
+            .cloned()
+            .collect();
+        if missing.is_empty() {
+            self.finish_scan_coarse(books).await?;
+            return Ok(());
+        }
+        info!(
+            missing = missing.len(),
+            rest = books.len(),
+            "scan coarse REST incomplete; short-subscribe remaining pairs"
+        );
+        self.scan_probe_books = books;
+        self.scan_probe_queue = missing;
+        self.start_next_scan_probe_batch().await?;
+        Ok(())
+    }
+
+    fn scan_min_volume(&self) -> Decimal {
+        if self.cfg.scan.min_volume_24h_usdc <= Decimal::ZERO {
+            Decimal::from(10_000_000)
+        } else {
+            self.cfg.scan.min_volume_24h_usdc
+        }
+    }
+
+    fn coarse_cfg(&self, require_fresh: bool) -> CoarseCfg {
+        CoarseCfg {
+            min_volume: self.scan_min_volume(),
+            max_own_spread_pct: self.cfg.scan.max_own_spread_pct,
+            min_level_notional_usdc: self.cfg.scan.min_level_notional_usdc,
+            freshness_ms: self.cfg.system.data_freshness_ms,
+            require_fresh,
+        }
+    }
+
+    fn clear_scan_probe(&mut self) {
+        self.scan_probe_books.clear();
+        self.scan_probe_queue.clear();
+        self.scan_probe_until = None;
+    }
+
+    fn fail_scan(&mut self, err: String) {
+        self.scan_universe.clear();
+        self.scan_candidates.clear();
+        self.scan_engine.clear();
+        self.clear_scan_probe();
+        self.scan_phase = ScanPhase::Error;
+        self.scan_error = Some(err);
+        self.scan_was_running = false;
+        if let Some(ctrl) = self.control.as_ref() {
+            if let Ok(mut g) = ctrl.lock() {
+                g.scan_running = false;
+                g.rematch_scan = false;
+                g.params.scan_enabled = false;
+            }
+        }
+    }
+
+    async fn start_next_scan_probe_batch(&mut self) -> Result<()> {
+        if self.scan_probe_queue.is_empty() {
+            let books = std::mem::take(&mut self.scan_probe_books);
+            return self.finish_scan_coarse(books).await;
+        }
+        let n = COARSE_PROBE_BATCH.min(self.scan_probe_queue.len());
+        let batch: Vec<Pair> = self.scan_probe_queue.drain(..n).collect();
+        info!(
+            n = batch.len(),
+            left = self.scan_probe_queue.len(),
+            "scan coarse WS probe batch"
+        );
+        self.subscribe_pairs(&batch).await?;
+        self.scan_probe_until =
+            Some(Instant::now() + Duration::from_secs(COARSE_PROBE_WAIT_SECS));
+        Ok(())
+    }
+
+    async fn finish_scan_coarse(&mut self, books: HashMap<(String, String), Bbo>) -> Result<()> {
+        self.clear_scan_probe();
+        let cap = candidate_cap(self.cfg.scan.watch_top, self.cfg.scan.candidate_cap);
+        let cfg = self.coarse_cfg(false);
+        self.scan_candidates = select_candidates(&self.scan_universe, &books, &cfg, cap);
+        info!(
+            candidates = self.scan_candidates.len(),
+            cap,
+            "scan coarse filter done"
+        );
+        let to_sub = expand_scan_subscribe(&self.scan_candidates, &self.scan_universe);
+        self.subscribe_pairs(&to_sub).await?;
+        self.last_coarse_at = Instant::now();
+        self.scan_phase = if self.scan_candidates.is_empty() {
+            ScanPhase::Live
+        } else {
+            ScanPhase::Sampling
+        };
+        Ok(())
+    }
+
+    async fn tick_scan_probe(&mut self) -> bool {
+        let Some(until) = self.scan_probe_until else {
+            return false;
+        };
+        if Instant::now() < until {
+            return true;
+        }
+        if let Ok(live) = self.books.read() {
+            for (k, v) in live.iter() {
+                self.scan_probe_books.insert(k.clone(), v.clone());
+            }
+        }
+        self.scan_probe_until = None;
+        if let Err(err) = self.start_next_scan_probe_batch().await {
+            warn!(error = %err, "scan WS probe batch failed");
+            self.fail_scan(err.to_string());
+            let _ = self.subscribe_pairs(&[]).await;
+        }
+        true
+    }
+
+    async fn refresh_scan_volumes(&mut self) {
+        let min = self.scan_min_volume();
+        let venues = self.scan_venues.clone();
+        for id in venues {
+            let Some(adapter) = self.adapters_by_id.get(&id).cloned() else {
+                continue;
+            };
+            match adapter.list_perps().await {
+                Ok(markets) => {
+                    let vol: HashMap<String, Option<Decimal>> = markets
+                        .into_iter()
+                        .map(|m| (m.pair_id, m.volume_24h_usdc))
+                        .collect();
+                    for p in &mut self.scan_universe {
+                        for leg in &mut p.legs {
+                            if leg.venue.as_str() == id {
+                                if let Some(v) = vol.get(&leg.pair_id) {
+                                    leg.volume_24h_usdc = *v;
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => warn!(venue = %id, error = %e, "scan volume refresh list_perps failed"),
+            }
+        }
+        let before = self.scan_universe.len();
+        self.scan_universe.retain(|p| pair_volume_ok(p, min));
+        let dropped = before.saturating_sub(self.scan_universe.len());
+        if dropped > 0 {
+            info!(dropped, "scan universe pairs dropped after 24h volume refresh");
+        }
+    }
+
+    fn scan_keep_venue_coins(&self) -> HashSet<String> {
+        let mut out = HashSet::new();
+        for p in &self.scan_candidates {
+            for v in &self.scan_venues {
+                out.insert(format!("{v}|{}", p.pair_id));
+            }
+        }
+        out
+    }
+
+    fn retain_topn_keys(&self, books: &HashMap<(String, String), Bbo>, cfg: &CoarseCfg) -> HashSet<String> {
+        let target_bp = self.cfg.pairs.defaults.target_bp;
+        let h = self.cfg.grid.step_hysteresis;
+        let mut scored = Vec::new();
+        for p in &self.scan_candidates {
+            let fee = self
+                .cfg
+                .market_round_trip_taker(&p.legs[0].venue, &p.legs[1].venue);
+            if let Some(s) = self.scan_engine.score(p, target_bp, fee, h) {
+                scored.push(s);
+            }
+        }
+        let rows = rank_bases(
+            scored,
+            &self.scan_engine,
+            &self.scan_venues,
+            self.cfg.scan.watch_top,
+        );
+        let mut keys = HashSet::new();
+        for r in rows {
+            let Some(pair) = self.scan_candidates.iter().find(|p| {
+                p.pair_id == r.pair_id
+                    && p.legs[0].venue.as_str() == r.left
+                    && p.legs[1].venue.as_str() == r.right
+            }) else {
+                continue;
+            };
+            if !self.scan_engine.is_filled(pair) {
+                continue;
+            }
+            if coarse_spread_sum(pair, books, cfg).is_none() {
+                continue;
+            }
+            keys.insert(pair.slot_key());
+        }
+        keys
+    }
+
+    async fn collect_rest_bbos(&self, pairs: &[Pair]) -> HashMap<(String, String), Bbo> {
+        let mut by_venue: HashMap<String, Vec<VenueMarket>> = HashMap::new();
+        for pair in pairs {
+            for leg in &pair.legs {
+                let entry = by_venue
+                    .entry(leg.venue.as_str().to_string())
+                    .or_default();
+                if !entry.iter().any(|m| m.pair_id == leg.pair_id) {
+                    entry.push(leg.clone());
+                }
+            }
+        }
+        let mut out = HashMap::new();
+        for (id, mkts) in by_venue {
+            let Some(adapter) = self.adapters_by_id.get(&id).cloned() else {
+                continue;
+            };
+            let snap = adapter.snapshot_bbos(&mkts).await;
+            for (pair_id, bbo) in snap {
+                out.insert((id.clone(), pair_id), bbo);
+            }
+        }
+        out
     }
 
     async fn start_private_streams(&self, venues: &[String]) {
@@ -828,8 +1235,9 @@ impl Controller {
         self.audit_memory_positions();
     }
 
-    /// 内存持仓 vs 交易所实盘的数量对账。对齐参考 `_audit_position_alignment`：
-    /// 报警 + 单向收缩到实盘量，绝不放大。
+    /// 内存持仓 vs 交易所实盘的数量对账。
+    /// 两腿反向时按重叠对冲量校正：实盘少则缩内存，实盘多则在上限内抬内存，
+    /// 后续平仓才按真实对冲量走。跳变过大不抬仓，节流告警。
     fn audit_memory_positions(&mut self) {
         let mut fixes = Vec::new();
         for pair in &self.pairs {
@@ -842,16 +1250,61 @@ impl Controller {
             }
         }
         for (slot, pair_id, mem, exch) in fixes {
-            warn!(
-                pair = %pair_id,
-                memory_qty = %mem,
-                exchange_qty = %exch,
-                "position mismatch between memory and exchange"
-            );
-            if self.positions.reconcile_qty(&slot, exch).is_some() {
-                warn!(pair = %pair_id, qty = %exch, "shrunk memory position to exchange qty");
+            match self.positions.reconcile_qty(&slot, exch) {
+                Some((before, after)) if after > before => {
+                    self.mismatch_log_at.remove(&slot);
+                    warn!(
+                        pair = %pair_id,
+                        memory_qty = %before,
+                        exchange_qty = %after,
+                        "raised memory position to exchange qty"
+                    );
+                }
+                Some((before, after)) => {
+                    self.mismatch_log_at.remove(&slot);
+                    warn!(
+                        pair = %pair_id,
+                        memory_qty = %before,
+                        exchange_qty = %after,
+                        "shrunk memory position to exchange qty"
+                    );
+                }
+                None => {
+                    if !self.should_log_mismatch(&slot) {
+                        continue;
+                    }
+                    if exch > mem {
+                        warn!(
+                            pair = %pair_id,
+                            memory_qty = %mem,
+                            exchange_qty = %exch,
+                            "position mismatch; memory not raised (exchange jump exceeds cap)"
+                        );
+                    } else {
+                        warn!(
+                            pair = %pair_id,
+                            memory_qty = %mem,
+                            exchange_qty = %exch,
+                            "position mismatch between memory and exchange"
+                        );
+                    }
+                }
             }
         }
+    }
+
+    fn should_log_mismatch(&mut self, slot: &str) -> bool {
+        const INTERVAL: Duration = Duration::from_secs(30);
+        let now = Instant::now();
+        if self
+            .mismatch_log_at
+            .get(slot)
+            .is_some_and(|t| now.duration_since(*t) < INTERVAL)
+        {
+            return false;
+        }
+        self.mismatch_log_at.insert(slot.to_string(), now);
+        true
     }
 
     fn log_naked_journal(&self, n: &NakedExposure, reason: &str) {
@@ -998,7 +1451,11 @@ impl Controller {
     async fn loop_unified(&mut self) -> Result<()> {
         let mut rx = self.event_rx.take().expect("bootstrap must run first");
         let mut exec_rx = self.exec_rx.take().expect("exec channel");
-        let mut interval_ms = self.cfg.execution.loop_interval_ms.max(10);
+        let mut interval_ms = if self.scan_is_running() {
+            self.cfg.scan.analysis_interval_ms.max(10)
+        } else {
+            self.cfg.execution.loop_interval_ms.max(10)
+        };
         let mut tick = tokio::time::interval(Duration::from_millis(interval_ms));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
@@ -1018,14 +1475,22 @@ impl Controller {
                         self.put_book(venue.as_str(), pair_id, bbo);
                     }
                     self.sync_page_config();
-                    let want = self.cfg.execution.loop_interval_ms.max(10);
+                    self.rematch_if_requested().await;
+                    let want = if self.scan_is_running() {
+                        self.cfg.scan.analysis_interval_ms.max(10)
+                    } else {
+                        self.cfg.execution.loop_interval_ms.max(10)
+                    };
                     if want != interval_ms {
                         interval_ms = want;
                         tick = tokio::time::interval(Duration::from_millis(interval_ms));
                         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                     }
-                    self.rematch_if_requested().await;
-                    self.tick_execution().await;
+                    if self.scan_is_running() {
+                        self.tick_scan().await;
+                    } else {
+                        self.tick_execution().await;
+                    }
                     self.panel.flush();
                 }
             }
@@ -1100,7 +1565,7 @@ impl Controller {
                         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                     }
                     self.rematch_if_requested().await;
-                    self.paint_scan();
+                    self.tick_scan().await;
                     self.publish_api_snapshot();
                 }
             }
@@ -1108,120 +1573,99 @@ impl Controller {
         Ok(())
     }
 
-    fn paint_scan(&mut self) {
-        if !self.arbitrage_enabled() {
+    async fn tick_scan(&mut self) {
+        if !self.scan_is_running() {
             return;
         }
-        let snapshot = self.books.read().map(|b| b.clone()).unwrap_or_default();
-        self.sample_scan_history(&snapshot);
-        let mut round = self.scanner.evaluate(
-            &self.pairs,
-            &snapshot,
-            self.cfg.system.data_freshness_ms,
-            self.cfg.scan.min_spread_pct,
-            Instant::now(),
-        );
-        OpportunityTracker::apply_cross_natural(
-            &mut round,
-            self.history.as_ref(),
-            self.cfg.scan.min_spread_pct,
-            self.cfg.scan.cross_use_natural,
-        );
-        self.emit_token_lines(&round);
-    }
-
-    fn sample_scan_history(&self, snapshot: &crate::domain::BookMap) {
-        let Some(store) = &self.history else {
+        if self.scan_phase == ScanPhase::Idle || self.scan_phase == ScanPhase::Error {
             return;
-        };
-        for pair in &self.pairs {
+        }
+        if self.tick_scan_probe().await {
+            self.publish_api_snapshot();
+            return;
+        }
+        let sampling = self.scan_phase == ScanPhase::Sampling || self.scan_phase == ScanPhase::Live;
+        if sampling
+            && self.last_coarse_at.elapsed()
+                >= Duration::from_secs(self.cfg.scan.coarse_refresh_secs.max(30))
+            && !self.scan_universe.is_empty()
+        {
+            // 先拍内存盘口，再 list_perps。刷新量会卡住几秒，若先拉市场再读盘口，
+            // 全会超过 data_freshness_ms，粗筛把未满窗的候选全部踢掉并退订。
+            let snapshot = self.books.read().map(|b| b.clone()).unwrap_or_default();
+            self.refresh_scan_volumes().await;
+            let cap = candidate_cap(self.cfg.scan.watch_top, self.cfg.scan.candidate_cap);
+            let cfg = self.coarse_cfg(true);
+            let next = select_candidates(&self.scan_universe, &snapshot, &cfg, cap);
+            let retain = self.retain_topn_keys(&snapshot, &cfg);
+            let merged = merge_coarse_refresh(&self.scan_candidates, next, &retain, cap);
+            if merged.is_empty() && !self.scan_candidates.is_empty() {
+                warn!(
+                    had = self.scan_candidates.len(),
+                    "scan coarse refresh produced empty set; keep current candidates"
+                );
+            } else if merged.iter().map(|p| p.slot_key()).collect::<HashSet<_>>()
+                != self
+                    .scan_candidates
+                    .iter()
+                    .map(|p| p.slot_key())
+                    .collect::<HashSet<_>>()
+            {
+                self.scan_candidates = merged;
+                let to_sub = expand_scan_subscribe(&self.scan_candidates, &self.scan_universe);
+                let _ = self.subscribe_pairs(&to_sub).await;
+                let keep_slots: HashSet<String> =
+                    self.scan_candidates.iter().map(|p| p.slot_key()).collect();
+                let keep_vc = self.scan_keep_venue_coins();
+                self.scan_engine.drop_except(&keep_slots, &keep_vc);
+            }
+            self.last_coarse_at = Instant::now();
+        }
+        let snapshot = self.books.read().map(|b| b.clone()).unwrap_or_default();
+        let now_ms = unix_now_ms();
+        let freshness = self.cfg.system.data_freshness_ms;
+        for pair in &self.scan_candidates {
             let v0 = pair.legs[0].venue.as_str();
             let v1 = pair.legs[1].venue.as_str();
-            if !is_cross_dex(v0, v1) {
-                continue;
-            }
             let Some(b0) = snapshot.get(&(v0.to_string(), pair.pair_id.clone())) else {
                 continue;
             };
             let Some(b1) = snapshot.get(&(v1.to_string(), pair.pair_id.clone())) else {
                 continue;
             };
-            if !b0.is_fresh(self.cfg.system.data_freshness_ms)
-                || !b1.is_fresh(self.cfg.system.data_freshness_ms)
-                || !b0.valid()
-                || !b1.valid()
-            {
+            if !b0.is_fresh(freshness) || !b1.is_fresh(freshness) || !b0.valid() || !b1.valid() {
                 continue;
             }
-            for (buy, sell, bb, sb) in [(v0, v1, b0, b1), (v1, v0, b1, b0)] {
-                let Some(raw) = raw_spread_pct(bb.ask, sb.bid) else {
+            self.scan_engine.observe(pair, b0, b1, now_ms);
+        }
+        // 候选所对之外的 DEX 列：只要同币有盘口就单独入窗，避免 Lighter×RH 占满候选后
+        // SoDEX / Entropy 整列都是 —。
+        let pair_ids: Vec<String> = self
+            .scan_candidates
+            .iter()
+            .map(|p| p.pair_id.clone())
+            .collect();
+        let venues = self.scan_venues.clone();
+        for pid in &pair_ids {
+            for v in &venues {
+                let Some(b) = snapshot.get(&(v.clone(), pid.clone())) else {
                     continue;
                 };
-                if let Err(err) = store.maybe_sample(&pair.pair_id, buy, sell, raw, raw) {
-                    warn!(error = %err, pair = %pair.pair_id, "scan history sample failed");
+                if !b.is_fresh(freshness) || !b.valid() {
+                    continue;
                 }
+                self.scan_engine.observe_venue(v, pid, b, now_ms);
             }
         }
-    }
-
-    fn emit_token_lines(&mut self, round: &super::scan::ScanRound) {
-        let interval = Duration::from_secs(self.cfg.scan.log_interval_secs.max(5));
-        let min_change = Decimal::new(5, 2);
-        let mut live = HashSet::new();
-        let now = Instant::now();
-        for o in &round.opportunities {
-            let key = o.key();
-            live.insert(key.clone());
-            let due = match self.last_token_log.get(&key) {
-                None => true,
-                Some(prev) => {
-                    prev.at.elapsed() >= interval
-                        || (prev.raw - o.raw_pct).abs() >= min_change
-                        || (prev.residual - o.residual_pct).abs() >= min_change
-                }
-            };
-            if !due {
-                continue;
-            }
-            info!(
-                "{}",
-                dashboard::token_key_line(
-                    &o.pair_id,
-                    &o.buy,
-                    &o.sell,
-                    o.raw_pct,
-                    o.nat_pct,
-                    o.residual_pct,
-                    o.cross_dex,
-                    o.age_secs(),
-                )
-            );
-            self.last_token_log.insert(
-                key,
-                LoggedToken {
-                    pair_id: o.pair_id.clone(),
-                    buy: o.buy.clone(),
-                    sell: o.sell.clone(),
-                    raw: o.raw_pct,
-                    residual: o.residual_pct,
-                    at: now,
-                },
-            );
-        }
-        let gone: Vec<String> = self
-            .last_token_log
-            .keys()
-            .filter(|k| !live.contains(*k))
-            .cloned()
-            .collect();
-        for key in gone {
-            if let Some(prev) = self.last_token_log.remove(&key) {
-                info!(
-                    "{}",
-                    dashboard::token_gone_line(&prev.pair_id, &prev.buy, &prev.sell)
-                );
-            }
-        }
+        let filled = self.scan_engine.filled_n(&self.scan_candidates);
+        self.scan_phase = if filled > 0 {
+            ScanPhase::Live
+        } else if self.scan_candidates.is_empty() {
+            ScanPhase::Live
+        } else {
+            ScanPhase::Sampling
+        };
+        self.publish_api_snapshot();
     }
 
     async fn loop_events(&mut self) -> Result<()> {
@@ -2901,9 +3345,11 @@ impl Controller {
                 })
             })
             .collect();
-        let venue_stats: Vec<VenueLiveRow> = self
-            .cfg
-            .venues
+        let selected: Vec<String> = self
+            .live_params()
+            .map(|p| p.active_venues)
+            .unwrap_or_default();
+        let venue_stats: Vec<VenueLiveRow> = selected
             .iter()
             .map(|v| {
                 let cap = self.venue_spreads.cap();
@@ -2928,7 +3374,7 @@ impl Controller {
                     venue: v.clone(),
                     spread_mu,
                     volume: format!("{:.2}", volume.round_dp(2)),
-                    place_rtt: lighter_place_rtt_text(v),
+                    place_rtt: place_rtt_text(v),
                 }
             })
             .collect();
@@ -2985,8 +3431,90 @@ impl Controller {
             matching: self.matching,
             available: self.available_pairs_payload(),
             session_pnl_usdc: format!("{:.4}", hub.session_pnl_usdc().round_dp(4)),
+            scan: self.build_scan_snapshot(),
+            scan_running: self.scan_is_running(),
             updated_at: now_ts(),
         });
+    }
+
+    fn build_scan_snapshot(&self) -> ScanSnapshot {
+        if !self.scan_is_running() && self.scan_phase == ScanPhase::Idle {
+            return ScanSnapshot {
+                status: ScanPhase::Idle.as_str().into(),
+                ..ScanSnapshot::default()
+            };
+        }
+        let target_bp = self.cfg.pairs.defaults.target_bp;
+        let h = self.cfg.grid.step_hysteresis;
+        let mut scored = Vec::new();
+        for p in &self.scan_candidates {
+            let fee = self
+                .cfg
+                .market_round_trip_taker(&p.legs[0].venue, &p.legs[1].venue);
+            if let Some(s) = self.scan_engine.score(p, target_bp, fee, h) {
+                scored.push(s);
+            }
+        }
+        let domain_rows = rank_bases(
+            scored,
+            &self.scan_engine,
+            &self.scan_venues,
+            self.cfg.scan.watch_top,
+        );
+        let rows = domain_rows
+            .into_iter()
+            .map(|r| api::ScanRow {
+                rank: r.rank,
+                base: r.base,
+                pair_id: r.pair_id,
+                left: r.left,
+                right: r.right,
+                same_family: r.same_family,
+                eligible: r.eligible,
+                edge: api::fmt_pct(r.edge),
+                sigma: api::fmt_pct(r.sigma),
+                delta: api::fmt_pct(r.delta),
+                mu: api::fmt_pct(r.mu),
+                hub_c: api::fmt_pct(r.hub_c),
+                crosses: r.crosses,
+                n: r.n,
+                cap: r.cap,
+                venues: r
+                    .venues
+                    .into_iter()
+                    .map(|(k, c)| {
+                        (
+                            k,
+                            ScanVenueCell {
+                                mid_mean: c
+                                    .mid_mean
+                                    .map(|m| format!("{m}"))
+                                    .unwrap_or_else(|| "—".into()),
+                                own_spread_mean: c
+                                    .own_spread_mean
+                                    .map(api::fmt_pct)
+                                    .unwrap_or_else(|| "—".into()),
+                            },
+                        )
+                    })
+                    .collect(),
+            })
+            .collect();
+        ScanSnapshot {
+            updated_at: now_ts(),
+            status: self.scan_phase.as_str().into(),
+            error: self.scan_error.clone(),
+            universe: self.scan_universe.len(),
+            candidates: self.scan_candidates.len(),
+            sampling_n: self.scan_engine.sampling_n(&self.scan_candidates),
+            filled_n: self.scan_engine.filled_n(&self.scan_candidates),
+            window_n: self.scan_engine.max_n(&self.scan_candidates),
+            watch_top: self.cfg.scan.watch_top,
+            window_samples: self.scan_engine.cap(),
+            sample_interval_ms: self.cfg.grid.sample_interval_ms,
+            venues: self.scan_venues.clone(),
+            rows,
+        }
     }
 }
 
@@ -3011,9 +3539,15 @@ fn force_market_taker(plan: &mut HedgePlan) {
     plan.second.style = OrderStyle::MarketTaker;
 }
 
-fn lighter_place_rtt_text(venue: &str) -> String {
-    match crate::exchange::last_lighter_place_rtt(venue) {
-        Some(r) => format!("{}+{}={}ms", r.sign_ms, r.send_ms, r.sign_to_ack_ms),
+fn place_rtt_text(venue: &str) -> String {
+    match crate::exchange::last_place_rtt(venue) {
+        Some(r) => {
+            if let (Some(sign), Some(send), Some(ack)) = (r.sign_ms, r.send_ms, r.sign_to_ack_ms) {
+                format!("{}+{}={}ms · 全链路{}ms", sign, send, ack, r.wall_ms)
+            } else {
+                format!("{}ms", r.wall_ms)
+            }
+        }
         None => "—".into(),
     }
 }

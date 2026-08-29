@@ -6,6 +6,14 @@ function headers(): HeadersInit {
 }
 
 function briefHttpError(status: number, body: string): string {
+  try {
+    const j = JSON.parse(body);
+    if (Array.isArray(j.errors) && j.errors.length) {
+      return j.errors.join("；");
+    }
+  } catch {
+    /* not JSON */
+  }
   let text = String(body || "")
     .replace(/<[^>]+>/g, " ")
     .replace(/\s+/g, " ")

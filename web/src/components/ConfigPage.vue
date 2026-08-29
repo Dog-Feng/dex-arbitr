@@ -66,9 +66,6 @@
           <n-collapse-item title="容量 / 下单 / 成本" name="exec">
             <AdvancedExec />
           </n-collapse-item>
-          <n-collapse-item title="扫描 / 历史" name="scan">
-            <AdvancedScan />
-          </n-collapse-item>
         </n-collapse>
       </n-card>
     </div>
@@ -86,7 +83,6 @@ import CtrlAside from "./CtrlAside.vue";
 import LiveLists from "./LiveLists.vue";
 import AdvancedGrid from "./AdvancedGrid.vue";
 import AdvancedExec from "./AdvancedExec.vue";
-import AdvancedScan from "./AdvancedScan.vue";
 
 defineProps<{ enabled: boolean; snap: LiveSnapshot | null }>();
 const emit = defineEmits<{ saved: []; started: []; stopped: [] }>();

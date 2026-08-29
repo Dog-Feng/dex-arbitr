@@ -1,6 +1,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use rust_decimal::Decimal;
+use std::collections::HashMap;
 use tokio::sync::mpsc;
 
 use crate::config::OrderStyle;
@@ -125,6 +126,11 @@ pub trait ExchangePort: Send + Sync {
     fn id(&self) -> VenueId;
     async fn list_perps(&self) -> Result<Vec<VenueMarket>>;
     async fn subscribe_bbo(&self, markets: &[VenueMarket], tx: BboTx) -> Result<()>;
+    /// 粗筛用的廉价盘口快照。`pair_id → Bbo`。默认空：该所粗筛缺盘口即失败。
+    async fn snapshot_bbos(&self, markets: &[VenueMarket]) -> HashMap<String, Bbo> {
+        let _ = markets;
+        HashMap::new()
+    }
     async fn place(&self, req: OrderReq) -> Result<OrderAck>;
     async fn cancel(&self, req: &CancelReq) -> Result<()>;
     /// 查询挂单/最近成交；未接线的 venue 返回 Err。

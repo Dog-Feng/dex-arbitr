@@ -148,6 +148,7 @@ mod tests {
                     market_index: 1,
                     qty_precision: 5,
                     min_qty: dec!(0.0002),
+                    volume_24h_usdc: None,
                 },
                 VenueMarket {
                     venue: VenueId::from("lighter_rh"),
@@ -157,6 +158,7 @@ mod tests {
                     market_index: 1,
                     qty_precision: 5,
                     min_qty: dec!(0.0003),
+                    volume_24h_usdc: None,
                 },
             ],
         }
