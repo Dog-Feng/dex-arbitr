@@ -1,4 +1,5 @@
 use axum::{
+    body::Body,
     extract::{Request, State},
     http::{header, StatusCode},
     middleware::{self, Next},
@@ -6,11 +7,17 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use hyper::body::Incoming;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto::Builder;
+use hyper_util::service::TowerToHyperService;
 use rust_decimal::Decimal;
 use serde::Serialize;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
+use tower::ServiceExt;
 use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
 
@@ -278,10 +285,36 @@ impl ApiHub {
                 .layer(CorsLayer::permissive());
             tracing::info!(%addr, "http api listening");
             let listener = tokio::net::TcpListener::bind(addr).await.expect("bind http");
-            if axum::serve(listener, app).await.is_err() {
-                tracing::warn!("http server stopped");
-            }
+            serve_http1_close(listener, app).await;
+            tracing::warn!("http server stopped");
         })
+    }
+}
+
+/// HTTP/1 应答后立刻拆连接。axum 默认 keep-alive，页面 250ms 轮询会把空闲
+/// socket 堆到 `ulimit -n`（常见 1024）然后 accept EMFILE。
+async fn serve_http1_close(listener: tokio::net::TcpListener, app: Router) {
+    loop {
+        let (tcp, _) = match listener.accept().await {
+            Ok(conn) => conn,
+            Err(err) => {
+                tracing::error!(error = %err, "accept error");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+        };
+        let _ = tcp.set_nodelay(true);
+        let app = app.clone();
+        tokio::spawn(async move {
+            let mut builder = Builder::new(TokioExecutor::new());
+            builder.http1().keep_alive(false);
+            let svc = TowerToHyperService::new(
+                app.map_request(|req: hyper::Request<Incoming>| req.map(Body::new)),
+            );
+            let _ = builder
+                .serve_connection_with_upgrades(TokioIo::new(tcp), svc)
+                .await;
+        });
     }
 }
 
