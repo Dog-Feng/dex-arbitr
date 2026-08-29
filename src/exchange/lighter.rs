@@ -218,7 +218,6 @@ impl ExchangePort for LighterAdapter {
         spawn_feed_loop(rx, gen, "lighter ws", move || {
             run_ws(ws_url.clone(), venue.clone(), id_to_pair.clone(), tx.clone())
         });
-        info!(venue = self.venue.id, n = markets.len(), "subscribed order_book");
         Ok(())
     }
 
@@ -310,73 +309,92 @@ async fn run_ws(
     let (mut write, mut read) = ws.split();
     let mut books: HashMap<i32, LocalBook> = HashMap::new();
     let mut subscribed = false;
+    // Lighter 公共流约 120s 无 client ping 就踢连接。日志里是稳定的 124s
+    // 一轮（120s 超时 + 3s 重连）。主动 ping，不要靠空闲超时去拆。
+    let mut ping = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(30),
+        Duration::from_secs(30),
+    );
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    while let Some(frame) = read.next().await {
-        let frame = frame?;
-        let text = match frame {
-            Message::Text(t) => t.to_string(),
-            Message::Binary(b) => String::from_utf8_lossy(&b).into_owned(),
-            Message::Ping(_) | Message::Pong(_) => continue,
-            Message::Close(_) => break,
-            _ => continue,
-        };
-        let Ok(msg) = serde_json::from_str::<WsMsg>(&text) else {
-            continue;
-        };
+    loop {
+        tokio::select! {
+            _ = ping.tick() => {
+                write
+                    .send(Message::Text(r#"{"type":"ping"}"#.to_string().into()))
+                    .await?;
+            }
+            frame = read.next() => {
+                let Some(frame) = frame else {
+                    break;
+                };
+                let frame = frame?;
+                let text = match frame {
+                    Message::Text(t) => t.to_string(),
+                    Message::Binary(b) => String::from_utf8_lossy(&b).into_owned(),
+                    Message::Ping(_) | Message::Pong(_) => continue,
+                    Message::Close(_) => break,
+                    _ => continue,
+                };
+                let Ok(msg) = serde_json::from_str::<WsMsg>(&text) else {
+                    continue;
+                };
 
-        if msg.kind == "ping" {
-            write
-                .send(Message::Text(r#"{"type":"pong"}"#.to_string().into()))
-                .await?;
-            continue;
-        }
+                if msg.kind == "ping" {
+                    write
+                        .send(Message::Text(r#"{"type":"pong"}"#.to_string().into()))
+                        .await?;
+                    continue;
+                }
 
-        if msg.kind == "connected" && !subscribed {
-            for (i, (market_id, _)) in markets.iter().enumerate() {
-                let sub = serde_json::json!({
-                    "type": "subscribe",
-                    "channel": format!("order_book/{market_id}")
-                });
-                write.send(Message::Text(sub.to_string().into())).await?;
-                if i + 1 < markets.len() && (i + 1) % 10 == 0 {
-                    tokio::time::sleep(Duration::from_millis(200)).await;
+                if msg.kind == "connected" && !subscribed {
+                    for (i, (market_id, _)) in markets.iter().enumerate() {
+                        let sub = serde_json::json!({
+                            "type": "subscribe",
+                            "channel": format!("order_book/{market_id}")
+                        });
+                        write.send(Message::Text(sub.to_string().into())).await?;
+                        if i + 1 < markets.len() && (i + 1) % 10 == 0 {
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                        }
+                    }
+                    subscribed = true;
+                    info!(
+                        venue = venue.as_str(),
+                        n = markets.len(),
+                        "subscribed order_book"
+                    );
+                    continue;
+                }
+
+                let is_snapshot = msg.kind == "subscribed/order_book";
+                let is_delta = msg.kind == "update/order_book";
+                if !is_snapshot && !is_delta {
+                    continue;
+                }
+                let Some(raw) = msg.order_book else {
+                    continue;
+                };
+                let Some(market_id) = parse_market_id(&msg.channel) else {
+                    continue;
+                };
+                let Some((_, pair_id)) = markets.iter().find(|(id, _)| *id == market_id) else {
+                    continue;
+                };
+
+                let book = books.entry(market_id).or_default();
+                if is_snapshot {
+                    book.replace(&raw);
+                } else {
+                    book.apply(&raw);
+                }
+                let Some(bbo) = book.bbo() else {
+                    continue;
+                };
+                if tx.send((venue.clone(), pair_id.clone(), bbo)).is_err() {
+                    break;
                 }
             }
-            subscribed = true;
-            info!(
-                venue = venue.as_str(),
-                n = markets.len(),
-                "subscribed order_book"
-            );
-            continue;
-        }
-
-        let is_snapshot = msg.kind == "subscribed/order_book";
-        let is_delta = msg.kind == "update/order_book";
-        if !is_snapshot && !is_delta {
-            continue;
-        }
-        let Some(raw) = msg.order_book else {
-            continue;
-        };
-        let Some(market_id) = parse_market_id(&msg.channel) else {
-            continue;
-        };
-        let Some((_, pair_id)) = markets.iter().find(|(id, _)| *id == market_id) else {
-            continue;
-        };
-
-        let book = books.entry(market_id).or_default();
-        if is_snapshot {
-            book.replace(&raw);
-        } else {
-            book.apply(&raw);
-        }
-        let Some(bbo) = book.bbo() else {
-            continue;
-        };
-        if tx.send((venue.clone(), pair_id.clone(), bbo)).is_err() {
-            break;
         }
     }
     Ok(())

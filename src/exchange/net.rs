@@ -1,9 +1,7 @@
-//! 行情 HTTP / WSS 共用一套 TLS 根证书和连接池。
+//! 行情 HTTP / WSS 共用一套内存根证书和连接池。
 //!
-//! `rustls-native-certs` 在 Linux 上会打开 `/etc/ssl/certs` 里每一份 PEM。
-//! 每次 `reqwest::Client::builder()` 或 `connect_async` 都扫一遍的话，
-//! 行情重连一密，文件描述符会先被证书读光，再报
-//! `failed to read PEM from file ... Too many open files`。
+//! Linux 上 `rustls-native-certs` 会打开 `/etc/ssl/certs` 里每一份 PEM。
+//! 每次建连都扫一遍的话，Lighter 约 2 分钟重连一次就能把默认 1024 FD 打满。
 use std::future::Future;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -32,16 +30,7 @@ fn rustls_config() -> Arc<rustls::ClientConfig> {
     CFG.get_or_init(|| {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let mut roots = rustls::RootCertStore::empty();
-        let native = rustls_native_certs::load_native_certs();
-        for err in &native.errors {
-            warn!(error = %err, "native TLS cert skipped");
-        }
-        for cert in native.certs {
-            let _ = roots.add(cert);
-        }
-        if roots.is_empty() {
-            warn!("native TLS root store is empty; HTTPS/WSS will fail");
-        }
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         Arc::new(
             rustls::ClientConfig::builder()
                 .with_root_certificates(roots)
@@ -54,15 +43,29 @@ fn rustls_config() -> Arc<rustls::ClientConfig> {
 pub type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
 pub async fn connect_ws(url: &str) -> Result<WsStream> {
-    let (ws, _) = connect_async_tls_with_config(
-        url,
-        None,
-        true,
-        Some(Connector::Rustls(rustls_config())),
+    let (ws, _) = tokio::time::timeout(
+        Duration::from_secs(10),
+        connect_async_tls_with_config(
+            url,
+            None,
+            true,
+            Some(Connector::Rustls(rustls_config())),
+        ),
     )
     .await
+    .with_context(|| format!("ws connect timeout {url}"))?
     .with_context(|| format!("ws connect {url}"))?;
     Ok(ws)
+}
+
+fn is_emfile(err: &anyhow::Error) -> bool {
+    err.chain().any(|e| {
+        if let Some(io) = e.downcast_ref::<std::io::Error>() {
+            return io.raw_os_error() == Some(24);
+        }
+        let s = e.to_string();
+        s.contains("Too many open files") || s.contains("os error 24")
+    })
 }
 
 /// 同一适配器上新的订阅会 bump，旧循环在下一次 select 退出并丢掉旧连接。
@@ -106,15 +109,20 @@ where
             if *rx.borrow() != gen {
                 return;
             }
+            let mut retry = Duration::from_secs(3);
             tokio::select! {
                 _ = rx.changed() => {
                     if *rx.borrow() != gen {
                         return;
                     }
+                    continue;
                 }
                 result = run() => {
                     if let Err(err) = result {
-                        warn!(task, error = %err, "feed stopped");
+                        if is_emfile(&err) {
+                            retry = Duration::from_secs(30);
+                        }
+                        warn!(task, error = %format!("{err:#}"), retry_secs = retry.as_secs(), "feed stopped");
                     }
                 }
             }
@@ -127,7 +135,7 @@ where
                         return;
                     }
                 }
-                _ = tokio::time::sleep(Duration::from_secs(3)) => {}
+                _ = tokio::time::sleep(retry) => {}
             }
         }
     });
@@ -155,5 +163,13 @@ mod tests {
         let (gen2, rx2) = g.begin("m2").expect("second subscribe");
         assert_eq!(*rx2.borrow(), gen2);
         assert_ne!(*rx.borrow(), gen);
+    }
+
+    #[test]
+    fn emfile_detected_through_anyhow_context() {
+        let err = anyhow::Error::from(std::io::Error::from_raw_os_error(24))
+            .context("ws connect wss://example");
+        assert!(is_emfile(&err));
+        assert!(!is_emfile(&anyhow::anyhow!("connection reset")));
     }
 }
