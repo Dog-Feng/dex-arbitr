@@ -93,10 +93,12 @@ pub fn audit_position_qty(
     if !accounts.all_fresh() || memory_qty <= Decimal::ZERO {
         return None;
     }
-    let a = venue_position_qty(accounts, &pair.legs[0]).abs();
-    let b = venue_position_qty(accounts, &pair.legs[1]).abs();
-    // 对冲仓两腿数量应当一致；取较小者作为「真正对冲上的量」。
-    let hedged = a.min(b);
+    let a = venue_position_qty(accounts, &pair.legs[0]);
+    let b = venue_position_qty(accounts, &pair.legs[1]);
+    if !a.is_zero() && !b.is_zero() && a.is_sign_positive() == b.is_sign_positive() {
+        return Some((memory_qty, Decimal::ZERO));
+    }
+    let hedged = a.abs().min(b.abs());
     let tol = pair.min_qty();
     if (memory_qty - hedged).abs() <= tol {
         return None;
@@ -282,6 +284,19 @@ mod tests {
         let p = pair("sodex", "lighter");
         assert_eq!(audit_position_qty(&p, &accounts, dec!(676)), Some((dec!(676), dec!(600))));
         assert_eq!(audit_position_qty(&p, &accounts, dec!(600)), None);
+    }
+
+    #[test]
+    fn audit_same_direction_is_zero_hedge() {
+        let accounts = cache(vec![
+            snap("sodex", Some(dec!(10)), true),
+            snap("lighter", Some(dec!(5)), true),
+        ]);
+        let p = pair("sodex", "lighter");
+        assert_eq!(
+            audit_position_qty(&p, &accounts, dec!(5)),
+            Some((dec!(5), Decimal::ZERO))
+        );
     }
 
     #[test]

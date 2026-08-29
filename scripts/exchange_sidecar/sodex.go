@@ -53,6 +53,7 @@ type sodexSession struct {
 type sodexFillNote struct {
 	qty decimal.Decimal
 	px  string
+	at  time.Time
 }
 
 func (s *sodexSession) close() {
@@ -63,10 +64,13 @@ func (s *sodexSession) close() {
 
 func (r *registry) sodexSession(ctx context.Context, path string) (*sodexSession, error) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if r.sodex != nil {
-		return r.sodex, nil
+		s := r.sodex
+		r.mu.Unlock()
+		return s, nil
 	}
+	r.mu.Unlock()
+
 	venue, err := loadSodexVenue(path)
 	if err != nil {
 		return nil, err
@@ -76,6 +80,13 @@ func (r *registry) sodexSession(ctx context.Context, path string) (*sodexSession
 		return nil, err
 	}
 	s := &sodexSession{venue: venue, client: client, accountID: accountID, addr: addr}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.sodex != nil {
+		s.close()
+		return r.sodex, nil
+	}
 	r.sodex = s
 	return s, nil
 }
@@ -908,7 +919,7 @@ func (s *sodexSession) noteOrderUpdate(upd sodexws.AccountOrderUpdate) {
 	if s.fills == nil {
 		s.fills = make(map[string]sodexFillNote)
 	}
-	note := sodexFillNote{qty: qty, px: px}
+	note := sodexFillNote{qty: qty, px: px, at: time.Now()}
 	for _, k := range []string{upd.ClOrdID, strconv.FormatInt(upd.OrderID, 10)} {
 		if k == "" || k == "0" {
 			continue
@@ -918,6 +929,7 @@ func (s *sodexSession) noteOrderUpdate(upd sodexws.AccountOrderUpdate) {
 		}
 		s.fills[k] = note
 	}
+	pruneFillCache(s.fills, func(v sodexFillNote) time.Time { return v.at })
 }
 
 func (s *sodexSession) wsFill(orderID uint64, clOrdID string) (decimal.Decimal, string, bool) {

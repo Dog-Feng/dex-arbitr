@@ -96,6 +96,8 @@ impl Position {
         if qty <= Decimal::ZERO
             || self.entry_buy_px <= Decimal::ZERO
             || self.entry_sell_px <= Decimal::ZERO
+            || exit_px_buy_venue <= Decimal::ZERO
+            || exit_px_sell_venue <= Decimal::ZERO
         {
             return None;
         }
@@ -162,5 +164,13 @@ mod tests {
         assert!((got.pct - dec!(0.7197002997)).abs() < dec!(0.0001));
         let notional = (dec!(100) + dec!(100.5)) / dec!(2);
         assert!((got.usdc - got.pct / dec!(100) * notional).abs() < dec!(0.0000001));
+    }
+
+    #[test]
+    fn this_close_pnl_none_without_exit_prices() {
+        let mut p = pos(dec!(100), dec!(100.5));
+        p.entry_net_pct = dec!(0.46);
+        assert!(p.this_close_pnl(dec!(1), Decimal::ZERO, dec!(100.1), dec!(0.04)).is_none());
+        assert!(p.this_close_pnl(dec!(1), dec!(100.4), Decimal::ZERO, dec!(0.04)).is_none());
     }
 }

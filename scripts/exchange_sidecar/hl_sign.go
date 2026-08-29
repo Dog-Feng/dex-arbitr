@@ -71,23 +71,27 @@ type hlCancelByCloidAction struct {
 	Cancels []hlCancelCloidItem `msgpack:"cancels" json:"cancels"`
 }
 
-func hlActionHash(action any, nonce int64) []byte {
+func hlActionHash(action any, nonce int64) ([]byte, error) {
 	var buf bytes.Buffer
 	enc := msgpack.NewEncoder(&buf)
 	enc.UseCompactInts(true)
 	if err := enc.Encode(action); err != nil {
-		panic(fmt.Sprintf("msgpack action: %v", err))
+		return nil, fmt.Errorf("msgpack action: %w", err)
 	}
 	data := compactMsgpackStr16(buf.Bytes())
 	nonceBytes := make([]byte, 8)
 	binary.BigEndian.PutUint64(nonceBytes, uint64(nonce))
 	data = append(data, nonceBytes...)
 	data = append(data, 0x00) // 无 vault
-	return crypto.Keccak256(data)
+	return crypto.Keccak256(data), nil
 }
 
 func hlSignL1(pk *ecdsa.PrivateKey, action any, nonce int64, mainnet bool) (hlSig, error) {
-	digest, err := hlTypedDigest(hlActionHash(action, nonce), mainnet)
+	actionHash, err := hlActionHash(action, nonce)
+	if err != nil {
+		return hlSig{}, err
+	}
+	digest, err := hlTypedDigest(actionHash, mainnet)
 	if err != nil {
 		return hlSig{}, fmt.Errorf("eip712 hash: %w", err)
 	}

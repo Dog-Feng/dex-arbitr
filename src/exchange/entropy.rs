@@ -7,7 +7,7 @@ use serde_json::Value;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::tungstenite::Message;
 use tracing::{info, warn};
 
 use crate::config::VenueFile;
@@ -15,6 +15,8 @@ use crate::domain::{
     symbol::{normalize_perp, whitelist_allows},
     Bbo, VenueId, VenueMarket,
 };
+
+use super::net::{connect_ws, http_client, spawn_feed_loop, FeedGuard};
 
 use super::port::{
     AccountSnapshot, Balance, BboTx, CancelReq, ExchangePort, FillPnl, FundingRate, OrderAck,
@@ -29,6 +31,7 @@ pub struct EntropyAdapter {
     venue: VenueFile,
     whitelist: Vec<String>,
     venue_path: std::path::PathBuf,
+    feeds: FeedGuard,
 }
 
 impl EntropyAdapter {
@@ -38,6 +41,7 @@ impl EntropyAdapter {
             venue,
             whitelist,
             venue_path,
+            feeds: FeedGuard::new(),
         }
     }
 
@@ -93,10 +97,7 @@ impl ExchangePort for EntropyAdapter {
 
     async fn list_perps(&self) -> Result<Vec<VenueMarket>> {
         let info = info_url(&self.venue.rest);
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(15))
-            .user_agent("dex-arbitr/0.1")
-            .build()?;
+        let client = http_client();
 
         let dexes: Value = client
             .post(&info)
@@ -144,28 +145,27 @@ impl ExchangePort for EntropyAdapter {
             .iter()
             .map(|m| (m.raw_symbol.clone(), m.pair_id.clone()))
             .collect();
+        let fp: String = {
+            let mut ids: Vec<_> = coins.iter().map(|(_, p)| p.clone()).collect();
+            ids.sort();
+            ids.join(",")
+        };
+        let Some((gen, rx)) = self.feeds.begin(&fp) else {
+            return Ok(());
+        };
         let ws_url = self.venue.ws.clone();
         let rest = self.venue.rest.clone();
         let venue = self.venue_id();
-        let n = markets.len();
-        tokio::spawn({
+        spawn_feed_loop(rx.clone(), gen, "entropy ws", {
             let coins = coins.clone();
             let venue = venue.clone();
             let tx = tx.clone();
-            async move {
-                loop {
-                    if let Err(err) =
-                        run_ws(ws_url.clone(), venue.clone(), coins.clone(), tx.clone()).await
-                    {
-                        warn!(venue = venue.as_str(), error = %err, "entropy ws stopped");
-                    }
-                    tokio::time::sleep(Duration::from_secs(3)).await;
-                }
-            }
+            move || run_ws(ws_url.clone(), venue.clone(), coins.clone(), tx.clone())
         });
-        // HIP-3 的 bbo 频道有时很久才推；REST l2Book 兜底，监控页不会一直空着。
-        tokio::spawn(poll_l2_books(rest, venue, coins, tx));
-        info!(venue = self.venue.id, n, "subscribed bbo");
+        spawn_feed_loop(rx, gen, "entropy l2", move || {
+            poll_l2_books(rest.clone(), venue.clone(), coins.clone(), tx.clone())
+        });
+        info!(venue = self.venue.id, n = markets.len(), "subscribed bbo");
         Ok(())
     }
 
@@ -320,9 +320,7 @@ async fn run_ws(
     coins: Vec<(String, String)>,
     tx: mpsc::UnboundedSender<(VenueId, String, Bbo)>,
 ) -> Result<()> {
-    let (ws, _) = connect_async(&url)
-        .await
-        .with_context(|| format!("ws connect {url}"))?;
+    let ws = connect_ws(&url).await?;
     info!(venue = venue.as_str(), n = coins.len(), "entropy ws connected");
     let (mut write, mut read) = ws.split();
     for (i, (coin, _)) in coins.iter().enumerate() {
@@ -417,14 +415,8 @@ async fn poll_l2_books(
     venue: VenueId,
     coins: Vec<(String, String)>,
     tx: BboTx,
-) {
-    let Ok(client) = reqwest::Client::builder()
-        .timeout(Duration::from_secs(8))
-        .user_agent("dex-arbitr/0.1")
-        .build()
-    else {
-        return;
-    };
+) -> Result<()> {
+    let client = http_client();
     let info = info_url(&rest);
     let mut tick = tokio::time::interval(Duration::from_millis(800));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -432,7 +424,13 @@ async fn poll_l2_books(
         tick.tick().await;
         for (coin, pair_id) in &coins {
             let body = serde_json::json!({"type": "l2Book", "coin": coin});
-            let Ok(resp) = client.post(&info).json(&body).send().await else {
+            let Ok(resp) = client
+                .post(&info)
+                .timeout(Duration::from_secs(8))
+                .json(&body)
+                .send()
+                .await
+            else {
                 continue;
             };
             let Ok(val) = resp.json::<Value>().await else {
@@ -449,7 +447,7 @@ async fn poll_l2_books(
                 continue;
             };
             if tx.send((venue.clone(), pair_id.clone(), bbo)).is_err() {
-                return;
+                return Ok(());
             }
         }
     }

@@ -55,8 +55,10 @@ pub fn decide_spread(
 }
 
 /// 小额只看一档：买腿 Ask1、卖腿 Bid1 数量都够。
+/// `qty == 0` 表示只算价差、不查厚度（平仓格子判断会这么用）。
 pub fn l1_covers(buy_book: &Bbo, sell_book: &Bbo, qty: Decimal) -> bool {
-    qty <= Decimal::ZERO || (buy_book.ask_qty >= qty && sell_book.bid_qty >= qty)
+    qty >= Decimal::ZERO
+        && (qty.is_zero() || (buy_book.ask_qty >= qty && sell_book.bid_qty >= qty))
 }
 
 /// 成交后相对决策价的实际滑点（%）。买相对 Ask1，卖相对 Bid1。
@@ -117,6 +119,15 @@ mod tests {
             asks: vec![(ask, dec!(1))],
             ts: Instant::now(),
         }
+    }
+
+    #[test]
+    fn l1_covers_rejects_negative_qty() {
+        let a = book(dec!(100), dec!(100.01));
+        let b = book(dec!(100.08), dec!(100.09));
+        assert!(l1_covers(&a, &b, Decimal::ZERO));
+        assert!(!l1_covers(&a, &b, dec!(-1)));
+        assert!(l1_covers(&a, &b, dec!(0.001)));
     }
 
     #[test]

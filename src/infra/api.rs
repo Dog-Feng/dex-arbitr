@@ -82,6 +82,9 @@ pub struct VenueLiveRow {
     pub spread_mu: String,
     /// 本次进程该所成交名义（USDC）。
     pub volume: String,
+    /// Lighter：最近一次 Go 签名到 sendTx 确认回包。其它所为 `—`。
+    #[serde(default)]
+    pub place_rtt: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -187,18 +190,22 @@ impl ApiHub {
     }
 
     pub fn publish(&self, snap: LiveSnapshot) {
-        if let Ok(mut w) = self.state.write() {
-            *w = snap;
-        }
+        let mut w = self.state.write().unwrap_or_else(|e| {
+            tracing::warn!("snapshot lock poisoned; recovering");
+            e.into_inner()
+        });
+        *w = snap;
     }
 
     pub fn push_execution(&self, rec: ExecRecord) {
-        if let Ok(mut v) = self.session_execs.lock() {
-            v.insert(0, rec);
-            const MAX: usize = 200;
-            if v.len() > MAX {
-                v.truncate(MAX);
-            }
+        let mut v = self.session_execs.lock().unwrap_or_else(|e| {
+            tracing::warn!("executions lock poisoned; recovering");
+            e.into_inner()
+        });
+        v.insert(0, rec);
+        const MAX: usize = 200;
+        if v.len() > MAX {
+            v.truncate(MAX);
         }
     }
 
@@ -206,7 +213,7 @@ impl ApiHub {
         self.session_execs
             .lock()
             .map(|v| v.iter().take(limit).cloned().collect())
-            .unwrap_or_default()
+            .unwrap_or_else(|e| e.into_inner().iter().take(limit).cloned().collect())
     }
 
     /// 本次运行已记账的平仓实际盈亏之和（执行带 close 记录的 pnl_usdc）。
@@ -219,7 +226,13 @@ impl ApiHub {
                     .filter_map(|r| r.pnl_usdc)
                     .sum()
             })
-            .unwrap_or(Decimal::ZERO)
+            .unwrap_or_else(|e| {
+                e.into_inner()
+                    .iter()
+                    .filter(|r| r.action == "close")
+                    .filter_map(|r| r.pnl_usdc)
+                    .sum()
+            })
     }
 
     pub fn spawn(self: Arc<Self>, bind: &str) -> tokio::task::JoinHandle<()> {

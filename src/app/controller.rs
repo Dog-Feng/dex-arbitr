@@ -645,29 +645,20 @@ impl Controller {
             let Some(adapter) = self.adapters_by_id.get(id).cloned() else {
                 continue;
             };
-            if id == "sodex" {
-                if self.subscribed.contains(id) {
-                    continue;
-                }
-                let all = self
-                    .listed_markets
+            let to_sub: &[VenueMarket] = if id == "sodex" {
+                self.listed_markets
                     .get(id)
                     .map(|m| m.as_slice())
-                    .unwrap_or(mkts);
-                adapter.subscribe_bbo(all, tx.clone()).await?;
-                self.subscribed.insert(id.clone());
-                continue;
-            }
-            let fresh: Vec<VenueMarket> = mkts
-                .iter()
-                .filter(|m| self.subscribed_markets.insert((id.clone(), m.pair_id.clone())))
-                .cloned()
-                .collect();
-            if fresh.is_empty() {
-                continue;
-            }
-            adapter.subscribe_bbo(&fresh, tx.clone()).await?;
+                    .unwrap_or(mkts)
+            } else {
+                mkts
+            };
+            adapter.subscribe_bbo(to_sub, tx.clone()).await?;
             self.subscribed.insert(id.clone());
+            for m in mkts {
+                self.subscribed_markets
+                    .insert((id.clone(), m.pair_id.clone()));
+            }
         }
         Ok(())
     }
@@ -2937,6 +2928,7 @@ impl Controller {
                     venue: v.clone(),
                     spread_mu,
                     volume: format!("{:.2}", volume.round_dp(2)),
+                    place_rtt: lighter_place_rtt_text(v),
                 }
             })
             .collect();
@@ -3017,6 +3009,13 @@ fn force_market_taker(plan: &mut HedgePlan) {
     plan.style = OrderStyle::MarketTaker;
     plan.first.style = OrderStyle::MarketTaker;
     plan.second.style = OrderStyle::MarketTaker;
+}
+
+fn lighter_place_rtt_text(venue: &str) -> String {
+    match crate::exchange::last_lighter_place_rtt(venue) {
+        Some(r) => format!("{}+{}={}ms", r.sign_ms, r.send_ms, r.sign_to_ack_ms),
+        None => "—".into(),
+    }
 }
 
 fn skip_reason_label(reason: &str) -> String {

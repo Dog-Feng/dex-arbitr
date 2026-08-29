@@ -12,7 +12,7 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{broadcast, oneshot};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use super::port::{
     AccountSnapshot, Balance, CancelReq, FillPnl, FundingRate, OrderAck, OrderReq, OrderStatus,
@@ -98,6 +98,95 @@ impl Sidecar {
 static SIDECAR: Mutex<Option<Arc<Sidecar>>> = Mutex::new(None);
 /// 已启动过 WS 订单流的 venue。重启后要重新订阅，否则成交检测退化成纯轮询。
 static WATCHED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+/// Lighter 最近一次「签名 → sendTx 回包」耗时（主网 / RH 共用这段 Go 路径）。
+static LAST_LIGHTER_PLACE_RTT: Mutex<Option<HashMap<String, LighterPlaceRtt>>> = Mutex::new(None);
+
+/// Lighter 下单：Go 签名开始到 `/api/v1/sendTx` 确认回包。不含等锁、拉 nonce、成交回查。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LighterPlaceRtt {
+    pub sign_ms: u64,
+    pub send_ms: u64,
+    pub sign_to_ack_ms: u64,
+}
+
+pub fn last_lighter_place_rtt(venue_id: &str) -> Option<LighterPlaceRtt> {
+    LAST_LIGHTER_PLACE_RTT
+        .lock()
+        .ok()?
+        .as_ref()?
+        .get(venue_id)
+        .copied()
+}
+
+pub fn note_lighter_place_rtt(venue_id: &str, rtt: LighterPlaceRtt) {
+    if let Ok(mut g) = LAST_LIGHTER_PLACE_RTT.lock() {
+        g.get_or_insert_with(HashMap::new)
+            .insert(venue_id.to_string(), rtt);
+    }
+}
+
+pub fn parse_lighter_place_rtt_line(line: &str) -> Option<(String, LighterPlaceRtt)> {
+    let line = line.trim();
+    if !line.starts_with("lighter place rtt ") {
+        return None;
+    }
+    let mut venue = None;
+    let mut sign_ms = None;
+    let mut send_ms = None;
+    let mut total_ms = None;
+    for part in line.split_whitespace() {
+        if let Some(v) = part.strip_prefix("venue=") {
+            venue = Some(v.to_string());
+        } else if let Some(v) = part.strip_prefix("sign_ms=") {
+            sign_ms = v.parse().ok();
+        } else if let Some(v) = part.strip_prefix("send_ms=") {
+            send_ms = v.parse().ok();
+        } else if let Some(v) = part.strip_prefix("sign_to_ack_ms=") {
+            total_ms = v.parse().ok();
+        }
+    }
+    Some((
+        venue?,
+        LighterPlaceRtt {
+            sign_ms: sign_ms?,
+            send_ms: send_ms?,
+            sign_to_ack_ms: total_ms?,
+        },
+    ))
+}
+
+fn json_ms(data: &Value, key: &str) -> Option<u64> {
+    let v = data.get(key)?;
+    if let Some(s) = v.as_str() {
+        return s.parse().ok();
+    }
+    v.as_u64()
+}
+
+fn venue_id_from_yaml(path: &Path) -> String {
+    match path.file_stem().and_then(|s| s.to_str()).unwrap_or("") {
+        "lighter_robinhood" => "lighter_rh".into(),
+        other => other.into(),
+    }
+}
+
+fn note_rtt_from_place_json(venue_yaml: &Path, data: &Value) {
+    let (Some(sign_ms), Some(send_ms), Some(sign_to_ack_ms)) = (
+        json_ms(data, "sign_ms"),
+        json_ms(data, "send_ms"),
+        json_ms(data, "sign_to_ack_ms"),
+    ) else {
+        return;
+    };
+    note_lighter_place_rtt(
+        &venue_id_from_yaml(venue_yaml),
+        LighterPlaceRtt {
+            sign_ms,
+            send_ms,
+            sign_to_ack_ms,
+        },
+    );
+}
 
 fn sidecar_binary() -> PathBuf {
     if let Ok(p) = std::env::var("DEX_EXCHANGE_SIDECAR") {
@@ -144,7 +233,13 @@ fn sidecar() -> Result<Arc<Sidecar>, String> {
     drop(guard);
 
     // 重启后补订阅：WS 流在新进程里是空的。
-    let watched: Vec<PathBuf> = WATCHED.lock().map(|w| w.clone()).unwrap_or_default();
+    let watched: Vec<PathBuf> = match WATCHED.lock() {
+        Ok(w) => w.clone(),
+        Err(e) => {
+            warn!("WATCHED lock poisoned; recovering");
+            e.into_inner().clone()
+        }
+    };
     if !watched.is_empty() {
         let sc2 = sc.clone();
         tokio::spawn(async move {
@@ -243,7 +338,20 @@ fn spawn_sidecar() -> Result<Arc<Sidecar>, String> {
         tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                if !line.trim().is_empty() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                if let Some((venue, rtt)) = parse_lighter_place_rtt_line(&line) {
+                    note_lighter_place_rtt(&venue, rtt);
+                    info!(
+                        target: "sidecar",
+                        venue = %venue,
+                        sign_ms = rtt.sign_ms,
+                        send_ms = rtt.send_ms,
+                        sign_to_ack_ms = rtt.sign_to_ack_ms,
+                        "{line}"
+                    );
+                } else {
                     warn!(target: "sidecar", "{line}");
                 }
             }
@@ -314,12 +422,17 @@ async fn call_on(sc: &Arc<Sidecar>, venue_yaml: &Path, cmd: &str, params: Value)
 
 /// 启动该 venue 的私有 WS 订单流。幂等，并登记以便 sidecar 重启后自动补订阅。
 pub async fn bridge_watch(venue_yaml: &Path) -> Result<()> {
-    if let Ok(mut w) = WATCHED.lock() {
-        if !w.iter().any(|p| p == venue_yaml) {
-            w.push(venue_yaml.to_path_buf());
-        }
-    }
     bridge_call(venue_yaml, "watch", json!({})).await?;
+    let mut w = match WATCHED.lock() {
+        Ok(g) => g,
+        Err(e) => {
+            warn!("WATCHED lock poisoned; recovering");
+            e.into_inner()
+        }
+    };
+    if !w.iter().any(|p| p == venue_yaml) {
+        w.push(venue_yaml.to_path_buf());
+    }
     Ok(())
 }
 
@@ -406,6 +519,7 @@ pub async fn bridge_place(venue_yaml: &Path, req: &OrderReq) -> Result<OrderAck>
         "slippage_pct": req.slippage_pct.map(|p| p.to_string()),
     });
     let data = bridge_call(venue_yaml, "place", params).await?;
+    note_rtt_from_place_json(venue_yaml, &data);
     parse_order_ack(&data)
 }
 
@@ -482,12 +596,21 @@ fn parse_order_ack(data: &Value) -> Result<OrderAck> {
         "unknown" | "not_found" => OrderStatus::Unknown,
         _ => OrderStatus::Unknown,
     };
+    let order_id = data
+        .get("order_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if order_id.is_empty()
+        && matches!(
+            status,
+            OrderStatus::Accepted | OrderStatus::Partial | OrderStatus::Filled
+        )
+    {
+        anyhow::bail!("sidecar place returned empty order_id");
+    }
     Ok(OrderAck {
-        order_id: data
-            .get("order_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
+        order_id,
         client_order_id: data
             .get("client_order_id")
             .and_then(|v| v.as_str())
@@ -517,4 +640,37 @@ fn dec(v: &Value) -> Option<Decimal> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_lighter_place_rtt_line() {
+        let line = "lighter place rtt venue=lighter order=42 sign_ms=3 send_ms=41 sign_to_ack_ms=44 result=ok";
+        let (venue, rtt) = parse_lighter_place_rtt_line(line).expect("parse");
+        assert_eq!(venue, "lighter");
+        assert_eq!(
+            rtt,
+            LighterPlaceRtt {
+                sign_ms: 3,
+                send_ms: 41,
+                sign_to_ack_ms: 44,
+            }
+        );
+        assert!(parse_lighter_place_rtt_line("sidecar panic").is_none());
+    }
+
+    #[test]
+    fn venue_id_from_lighter_yaml_names() {
+        assert_eq!(
+            venue_id_from_yaml(Path::new("config/venues/lighter.yaml")),
+            "lighter"
+        );
+        assert_eq!(
+            venue_id_from_yaml(Path::new("config/venues/lighter_robinhood.yaml")),
+            "lighter_rh"
+        );
+    }
 }

@@ -30,6 +30,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -62,6 +63,11 @@ const (
 	// 参考在最后一轮把休眠夹到 deadline：`min(safe_interval,
 	// max(0.5, deadline - now))`。0.5s 是它的下限。
 	minFillPoll = 500 * time.Millisecond
+	// 成交缓存超过这么久就丢掉，避免长驻进程无限涨。
+	fillCacheTTL = time.Hour
+	// stdin 请求并发上限。满了直接报 busy，不堵 scanner（撤单还要读进来）。
+	maxInflightRequests = 32
+	nonceFetchTimeout   = 5 * time.Second
 )
 
 // fillPollSleep 复刻参考的 `await asyncio.sleep(min(safe_interval,
@@ -168,6 +174,7 @@ func main() {
 	// stdin 关闭时（父进程退出或管道用完）必须等 in-flight 请求写完响应，
 	// 否则最后几条请求会静默丢失——尤其是管道式调用，EOF 来得比处理快。
 	var inflight sync.WaitGroup
+	slots := make(chan struct{}, maxInflightRequests)
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -179,11 +186,24 @@ func main() {
 			respond(0, false, nil, "invalid json: "+err.Error())
 			continue
 		}
+		select {
+		case slots <- struct{}{}:
+		default:
+			respond(req.ID, false, nil, "sidecar busy: too many in-flight requests")
+			continue
+		}
 		// 每条请求独立 goroutine：一次慢的 place 不能挡住后续的 order_status。
 		// 会话内部各自加锁（nonce、WS 写）保证并发安全。
 		inflight.Add(1)
 		go func(req request) {
 			defer inflight.Done()
+			defer func() { <-slots }()
+			defer func() {
+				if rec := recover(); rec != nil {
+					fmt.Fprintf(os.Stderr, "sidecar panic id=%d cmd=%s: %v\n%s\n", req.ID, req.Cmd, rec, debug.Stack())
+					respond(req.ID, false, nil, fmt.Sprintf("internal panic: %v", rec))
+				}
+			}()
 			ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
 			defer cancel()
 			data, err := dispatch(ctx, reg, req)
@@ -194,7 +214,24 @@ func main() {
 			respond(req.ID, true, data, "")
 		}(req)
 	}
+	if err := scanner.Err(); err != nil {
+		fmt.Fprintf(os.Stderr, "stdin scanner: %v\n", err)
+		inflight.Wait()
+		os.Exit(1)
+	}
 	inflight.Wait()
+}
+
+func pruneFillCache[K comparable, V any](m map[K]V, at func(V) time.Time) {
+	if len(m) == 0 {
+		return
+	}
+	cutoff := time.Now().Add(-fillCacheTTL)
+	for k, v := range m {
+		if at(v).Before(cutoff) {
+			delete(m, k)
+		}
+	}
 }
 
 func dispatch(ctx context.Context, reg *registry, req request) (any, error) {

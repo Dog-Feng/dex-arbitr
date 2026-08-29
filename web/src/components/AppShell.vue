@@ -12,6 +12,7 @@
         <n-tag :type="enabled ? 'success' : 'default'" round size="small">
           {{ enabled ? "套利运行中" : "未启动" }}
         </n-tag>
+        <n-tag v-if="offline" type="error" round size="small">与后端断开</n-tag>
         <span class="clock">{{ clock }}</span>
       </div>
     </header>
@@ -62,6 +63,7 @@
 
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from "vue";
+import { useMessage } from "naive-ui";
 import { venueLabel, venueQuote } from "../format";
 import { apiFetch } from "../api";
 import { applyParams, applyVenues, store } from "../store";
@@ -74,6 +76,10 @@ const clock = ref("");
 const enabled = ref(false);
 const snap = ref<LiveSnapshot | null>(null);
 const execs = ref<ExecRow[]>([]);
+const offline = ref(false);
+const msg = useMessage();
+let pollFail = 0;
+let toldOffline = false;
 const execCount = computed(() => execs.value.length);
 const sessionPnl = computed(() => {
   const raw = snap.value?.session_pnl_usdc;
@@ -138,9 +144,30 @@ let clockT: number;
 let snapT: number;
 let tapeT: number;
 let snapBusy = false;
+let tapeBusy = false;
+const pollAc = new AbortController();
 
 function tickClock() {
   clock.value = new Date().toLocaleString("zh-CN", { hour12: false });
+}
+
+function notePollOk() {
+  pollFail = 0;
+  if (offline.value) {
+    offline.value = false;
+    toldOffline = false;
+  }
+}
+
+function notePollFail() {
+  pollFail += 1;
+  if (pollFail >= 3) {
+    offline.value = true;
+    if (!toldOffline) {
+      toldOffline = true;
+      msg.error("与后端失去连接");
+    }
+  }
 }
 
 async function loadConfig() {
@@ -163,22 +190,28 @@ async function pollSnap() {
   if (snapBusy) return;
   snapBusy = true;
   try {
-    const s = await apiFetch<LiveSnapshot>("/api/snapshot");
+    const s = await apiFetch<LiveSnapshot>("/api/snapshot", { signal: pollAc.signal });
     snap.value = s;
     enabled.value = !!s.arbitrage_enabled;
-  } catch {
-    /* offline */
+    notePollOk();
+  } catch (e) {
+    if ((e as Error).name !== "AbortError") notePollFail();
   } finally {
     snapBusy = false;
   }
 }
 
 async function pollTape() {
+  if (tapeBusy) return;
+  tapeBusy = true;
   try {
-    const r = await apiFetch<{ executions: ExecRow[] }>("/api/executions");
+    const r = await apiFetch<{ executions: ExecRow[] }>("/api/executions", { signal: pollAc.signal });
     execs.value = (r.executions || []).slice(0, 50);
-  } catch {
-    /* ignore */
+    notePollOk();
+  } catch (e) {
+    if ((e as Error).name !== "AbortError") notePollFail();
+  } finally {
+    tapeBusy = false;
   }
 }
 
@@ -203,6 +236,7 @@ onUnmounted(() => {
   clearInterval(clockT);
   clearInterval(snapT);
   clearInterval(tapeT);
+  pollAc.abort();
 });
 </script>
 

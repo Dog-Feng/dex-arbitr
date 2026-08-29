@@ -126,6 +126,7 @@ export interface VenueLiveRow {
   venue: string;
   spread_mu: string;
   volume: string;
+  place_rtt?: string;
 }
 
 export interface NakedExposureRow {

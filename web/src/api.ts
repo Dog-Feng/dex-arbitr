@@ -22,6 +22,7 @@ export async function apiFetch<T = unknown>(path: string, opts: RequestInit = {}
   const r = await fetch(path, {
     ...opts,
     headers: { ...headers(), ...(opts.headers || {}) },
+    signal: opts.signal,
   });
   const ct = (r.headers.get("content-type") || "").toLowerCase();
   if (!r.ok) throw new Error(briefHttpError(r.status, await r.text()));

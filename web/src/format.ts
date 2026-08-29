@@ -22,7 +22,7 @@ export function pairVenueKey(venues: string[]): string {
 export function numFmt(v: unknown): string {
   const n = typeof v === "number" ? v : parseFloat(String(v || "").replace(/[^0-9.+\-]/g, ""));
   if (Number.isNaN(n)) return String(v || "—");
-  return (n >= 0 ? "+" : "") + n.toFixed(3) + "%";
+  return (n > 0 ? "+" : "") + n.toFixed(3) + "%";
 }
 
 export function netCls(v: unknown): "up" | "dn" | "mu" {

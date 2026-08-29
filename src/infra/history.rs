@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use rust_decimal::Decimal;
 use rusqlite::Connection;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Mutex;
@@ -31,6 +31,7 @@ pub struct HistoryStore {
     last_sample: Mutex<HashMap<String, Instant>>,
     cache: Mutex<HashMap<String, NaturalSpread>>,
     last_prune: Mutex<Instant>,
+    refreshing: Mutex<HashSet<String>>,
 }
 
 impl HistoryStore {
@@ -71,6 +72,7 @@ impl HistoryStore {
             last_sample: Mutex::new(HashMap::new()),
             cache: Mutex::new(cache),
             last_prune: Mutex::new(Instant::now()),
+            refreshing: Mutex::new(HashSet::new()),
         };
         store.prune_samples()?;
         if store.snapshot_count() == 0 {
@@ -274,6 +276,30 @@ impl HistoryStore {
     }
 
     fn refresh_natural(
+        &self,
+        pair_id: &str,
+        buy: &str,
+        sell: &str,
+    ) -> Result<Option<NaturalSpread>> {
+        let key = sample_key(pair_id, buy, sell);
+        {
+            let mut g = self
+                .refreshing
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if !g.insert(key.clone()) {
+                return Ok(self.cached(&key));
+            }
+        }
+        let result = self.refresh_natural_inner(pair_id, buy, sell);
+        self.refreshing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&key);
+        result
+    }
+
+    fn refresh_natural_inner(
         &self,
         pair_id: &str,
         buy: &str,

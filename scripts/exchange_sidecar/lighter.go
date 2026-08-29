@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -15,7 +16,6 @@ import (
 	"time"
 
 	lighterclient "github.com/elliottech/lighter-go/client"
-	lighterhttp "github.com/elliottech/lighter-go/client/http"
 	"github.com/elliottech/lighter-go/types"
 	"github.com/elliottech/lighter-go/types/txtypes"
 	"github.com/gorilla/websocket"
@@ -53,6 +53,9 @@ type lighterSession struct {
 	// 刻意只覆盖到 sendTx 返回：之后的成交回查是 REST 轮询，把它圈进来会让
 	// 并发的撤单排在后面等，而撤单在超时路径上是要抢时间的。
 	submitMu sync.Mutex
+	// IOC 确认窗口：baseline → sendTx → waitMarketFill。同市场串行，避免
+	// REST 持仓 delta 把别人的成交算进自己。
+	marketLocks sync.Map // marketIndex -> *sync.Mutex
 
 	// 市场精度缓存。A3：marketDecimals 原来每次下单都打一遍
 	// /api/v1/orderBookDetails，和 lastTradePrice 重复请求同一接口。
@@ -67,7 +70,12 @@ type lighterSession struct {
 	// WS 推送的成交量，按 client_order_index / order_index 索引。
 	// waitMarketFill 命中后立刻返回，不必再等 REST 持仓快照（原先 2s 一轮）。
 	fillMu sync.Mutex
-	fills  map[string]decimal.Decimal
+	fills  map[string]lighterFill
+}
+
+type lighterFill struct {
+	qty decimal.Decimal
+	at  time.Time
 }
 
 func (s *lighterSession) close() {
@@ -109,7 +117,7 @@ func (s *lighterSession) connect(ctx context.Context) error {
 	if s.txClient != nil {
 		return nil
 	}
-	// 传 nil 作为 HTTP 客户端：nonce 由我们自己管理（reserveNonce），
+	// 传 nil 作为 HTTP 客户端：nonce 由我们自己管理（syncNonce），
 	// 绝不让 SDK 在签名路径上偷偷发请求，也不调 Check()。
 	// Check() 内部走 /api/v1/apikeys，在某些网络环境下会阻塞 10+ 秒，
 	// 而且对下单没有任何保护意义——参数错了 sendTx 会直接报错。
@@ -156,10 +164,12 @@ func dispatchLighter(ctx context.Context, reg *registry, venueID string, req req
 
 func (r *registry) lighterSession(ctx context.Context, venueID, path string) (*lighterSession, error) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if s, ok := r.lighter[venueID]; ok {
+		r.mu.Unlock()
 		return s, nil
 	}
+	r.mu.Unlock()
+
 	venue, err := loadLighterVenue(path)
 	if err != nil {
 		return nil, err
@@ -169,9 +179,17 @@ func (r *registry) lighterSession(ctx context.Context, venueID, path string) (*l
 		baseURL:    lighterBaseURL(venue.Rest),
 		httpClient: &http.Client{Timeout: 30 * time.Second},
 		decs:       make(map[int]marketDecimals),
+		fills:      make(map[string]lighterFill),
 	}
 	if err := s.connect(ctx); err != nil {
 		return nil, err
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if existing, ok := r.lighter[venueID]; ok {
+		s.close()
+		return existing, nil
 	}
 	r.lighter[venueID] = s
 	return s, nil
@@ -285,7 +303,7 @@ func (s *lighterSession) waitMarketFill(
 ) decimal.Decimal {
 	deadline := time.Now().Add(lighterFillWait)
 	best := decimal.Zero
-	sizeDec := 4
+	sizeDec := 0
 	if d, err := s.marketDecimals(ctx, marketIndex); err == nil {
 		sizeDec = d.sizeDec
 	}
@@ -338,8 +356,9 @@ func (s *lighterSession) noteWsFills(msg map[string]any) {
 	s.fillMu.Lock()
 	defer s.fillMu.Unlock()
 	if s.fills == nil {
-		s.fills = make(map[string]decimal.Decimal)
+		s.fills = make(map[string]lighterFill)
 	}
+	now := time.Now()
 	for _, raw := range orders {
 		filled := decimalValue(firstValue(raw, "filled_base_amount", "filled_amount"))
 		if !filled.GreaterThan(decimal.Zero) {
@@ -350,22 +369,23 @@ func (s *lighterSession) noteWsFills(msg map[string]any) {
 			stringValue(firstValue(raw, "order_index", "order_id")),
 		} {
 			if key != "" && key != "0" {
-				if prev, ok := s.fills[key]; !ok || filled.GreaterThan(prev) {
-					s.fills[key] = filled
+				if prev, ok := s.fills[key]; !ok || filled.GreaterThan(prev.qty) {
+					s.fills[key] = lighterFill{qty: filled, at: now}
 				}
 			}
 		}
 	}
+	pruneFillCache(s.fills, func(v lighterFill) time.Time { return v.at })
 }
 
 func (s *lighterSession) wsFilled(orderID string, want decimal.Decimal, sizeDec int) (decimal.Decimal, bool) {
 	s.fillMu.Lock()
 	defer s.fillMu.Unlock()
-	raw, ok := s.fills[orderID]
-	if !ok || !raw.GreaterThan(decimal.Zero) {
+	n, ok := s.fills[orderID]
+	if !ok || !n.qty.GreaterThan(decimal.Zero) {
 		return decimal.Zero, false
 	}
-	filled := normalizeWsFilled(raw, want, sizeDec)
+	filled := normalizeWsFilled(n.qty, want, sizeDec)
 	if !filled.GreaterThan(decimal.Zero) {
 		return decimal.Zero, false
 	}
@@ -373,13 +393,19 @@ func (s *lighterSession) wsFilled(orderID string, want decimal.Decimal, sizeDec 
 }
 
 // WS 有的所回报人类可读数量，有的回报 size_decimals 缩放整数。
-// 只在「整数且明显比 want 大一个数量级」时才除回去，避免把 1.5 ETH 误当成整数缩放。
+// 整数时两种解读都算一遍，取更接近请求量的那个——比「>50× 就除」稳。
 func normalizeWsFilled(raw, want decimal.Decimal, sizeDec int) decimal.Decimal {
 	if sizeDec <= 0 || !raw.GreaterThan(decimal.Zero) {
 		return raw
 	}
-	if raw.Equal(raw.Truncate(0)) && want.GreaterThan(decimal.Zero) && raw.GreaterThan(want.Mul(decimal.NewFromInt(50))) {
-		return raw.Div(decimal.New(1, int32(sizeDec)))
+	if !want.GreaterThan(decimal.Zero) {
+		return raw
+	}
+	scaled := raw.Div(decimal.New(1, int32(sizeDec)))
+	lo := want.Div(decimal.NewFromInt(2))
+	hi := want.Mul(decimal.NewFromInt(2))
+	if scaled.GreaterThanOrEqual(lo) && scaled.LessThanOrEqual(hi) && raw.GreaterThan(hi) {
+		return scaled
 	}
 	return raw
 }
@@ -395,7 +421,7 @@ func (s *lighterSession) marketDecimals(ctx context.Context, marketIndex int) (m
 
 	result, err := s.get(ctx, "/api/v1/orderBookDetails", url.Values{"filter": {"perp"}}, nil)
 	if err != nil {
-		return marketDecimals{4, 2}, err
+		return marketDecimals{}, err
 	}
 	// 一次拿到全部市场，顺手全缓存——之后任何币种都不用再请求。
 	s.decMu.Lock()
@@ -414,7 +440,7 @@ func (s *lighterSession) marketDecimals(ctx context.Context, marketIndex int) (m
 	if ok {
 		return d, nil
 	}
-	return marketDecimals{4, 2}, nil
+	return marketDecimals{}, fmt.Errorf("lighter market %d decimals unknown", marketIndex)
 }
 
 // startOrderStream 连接 Lighter 私有 WS，订阅本账户订单推送。
@@ -463,16 +489,40 @@ func (s *lighterSession) orderStreamOnce(ctx context.Context, venueID string) er
 		return fmt.Errorf("subscribe: %w", err)
 	}
 
+	done := make(chan struct{})
+	defer close(done)
 	go func() {
-		<-ctx.Done()
-		_ = conn.Close()
+		t := time.NewTicker(40 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				_ = conn.Close()
+				return
+			case <-done:
+				_ = conn.Close()
+				return
+			case <-t.C:
+				_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+				if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+					_ = conn.Close()
+					return
+				}
+			}
+		}
 	}()
+	conn.SetPongHandler(func(string) error {
+		_ = conn.SetReadDeadline(time.Now().Add(90 * time.Second))
+		return nil
+	})
+	_ = conn.SetReadDeadline(time.Now().Add(90 * time.Second))
 
 	for {
 		var msg map[string]any
 		if err := conn.ReadJSON(&msg); err != nil {
 			return err
 		}
+		_ = conn.SetReadDeadline(time.Now().Add(90 * time.Second))
 		kind := stringValue(msg["type"])
 		if !strings.Contains(kind, "order") {
 			continue
@@ -597,10 +647,27 @@ func (s *lighterSession) place(ctx context.Context, params map[string]any) (map[
 		expiry = txtypes.NilOrderExpiry
 	}
 
+	price, err := uint32PriceUnits(priceUnits, dec.priceDec)
+	if err != nil {
+		return nil, err
+	}
+	mi, err := int16MarketIndex(marketIndex)
+	if err != nil {
+		return nil, err
+	}
+
 	// IOC 腿：下单**前**取持仓基线，成交量只能靠 delta 确认。
-	// 基线查询要一次 REST，可能失败，所以必须排在 reserveNonce **之前**：
+	// 基线查询要一次 REST，可能失败，所以必须排在 nonce **之前**：
 	// 对齐参考 `_place_market_order`「只有在所有前置条件都满足后，才获取nonce，
 	// 这样可以避免nonce被消耗但订单没有发送的情况」。
+	//
+	// per-market 锁罩住 baseline → sendTx → waitMarketFill，避免同市场
+	// 并发 IOC 把对方的仓变算进自己的 REST delta。
+	if ioc {
+		lk := s.marketLock(marketIndex)
+		lk.Lock()
+		defer lk.Unlock()
+	}
 	baseline := decimal.Zero
 	haveBaseline := false
 	if ioc {
@@ -614,21 +681,28 @@ func (s *lighterSession) place(ctx context.Context, params map[string]any) (map[
 		}
 	}
 
+	if err := s.syncNonce(ctx); err != nil {
+		return nil, err
+	}
 	// 取 nonce / 签名 / 发送必须作为一个整体串行，见 submitMu 注释。
-	var reserveErr, signErr, sendErr error
+	// 链上拉 nonce 已在 syncNonce（锁外）完成，这里只做本地自增。
+	var signErr, sendErr error
+	var signMs, sendMs, totalMs int64
 	func() {
 		s.submitMu.Lock()
 		defer s.submitMu.Unlock()
-		nonce, nerr := s.reserveNonce(ctx)
+		nonce, nerr := s.takeNonce()
 		if nerr != nil {
-			reserveErr = nerr
+			signErr = nerr
 			return
 		}
+		// 耗时：Go 签名开始 → sendTx 收到 Lighter 确认回包。不含等锁、拉 nonce、成交回查。
+		tSign := time.Now()
 		tx, terr := s.txClient.GetCreateOrderTransaction(&types.CreateOrderTxReq{
-			MarketIndex:      int16(marketIndex),
+			MarketIndex:      mi,
 			ClientOrderIndex: coid,
 			BaseAmount:       baseAmount,
-			Price:            uint32(priceUnits),
+			Price:            price,
 			IsAsk:            boolByte(!isBuy),
 			Type:             orderType,
 			TimeInForce:      tif,
@@ -638,20 +712,28 @@ func (s *lighterSession) place(ctx context.Context, params map[string]any) (map[
 		if terr != nil {
 			s.invalidateNonce()
 			signErr = terr
+			signMs = time.Since(tSign).Milliseconds()
+			totalMs = signMs
 			return
 		}
+		info := txInfo(tx)
+		signMs = time.Since(tSign).Milliseconds()
+		tSend := time.Now()
 		// nonce 无条件重同步：交易可能已上链也可能没有，本地回退会撞已用号。
-		if sendErr = s.sendTx(ctx, int(tx.GetTxType()), txInfo(tx)); sendErr != nil {
+		sendErr = s.sendTx(ctx, int(tx.GetTxType()), info)
+		sendMs = time.Since(tSend).Milliseconds()
+		totalMs = time.Since(tSign).Milliseconds()
+		if sendErr != nil {
 			s.invalidateNonce()
 		}
 	}()
-	if reserveErr != nil {
-		return nil, reserveErr
+	coidStr = strconv.FormatInt(coid, 10)
+	if signMs > 0 || sendMs > 0 || totalMs > 0 {
+		logLighterPlaceRTT(s.venue.ID, coidStr, signMs, sendMs, totalMs, sendErr == nil && signErr == nil)
 	}
 	if signErr != nil {
 		return nil, fmt.Errorf("sign create order: %w", signErr)
 	}
-	coidStr = strconv.FormatInt(coid, 10)
 	if sendErr != nil {
 		// 对齐参考「不确认就不下结论」：先问交易所这张单在不在。
 		if !ioc {
@@ -665,13 +747,13 @@ func (s *lighterSession) place(ctx context.Context, params map[string]any) (map[
 					}
 				}
 				fmt.Fprintf(os.Stderr, "lighter place: sendTx failed (%v) but order %s is live; reporting %s\n", sendErr, coidStr, status)
-				return map[string]string{
+				return mergePlaceRTT(map[string]string{
 					"order_id":        coidStr,
 					"client_order_id": coidStr,
 					"filled_qty":      found.filled.String(),
 					"status":          status,
 					"avg_price":       found.price,
-				}, nil
+				}, signMs, sendMs, totalMs), nil
 			}
 			return nil, sendErr
 		}
@@ -685,26 +767,26 @@ func (s *lighterSession) place(ctx context.Context, params map[string]any) (map[
 					status = "partial"
 				}
 				fmt.Fprintf(os.Stderr, "lighter place: sendTx failed (%v) but position moved %s; reporting %s\n", sendErr, filled, status)
-				return map[string]string{
+				return mergePlaceRTT(map[string]string{
 					"order_id":        coidStr,
 					"client_order_id": coidStr,
 					"filled_qty":      filled.String(),
 					"status":          status,
 					"avg_price":       "",
-				}, nil
+				}, signMs, sendMs, totalMs), nil
 			}
 		}
 		return nil, sendErr
 	}
 
 	if !ioc {
-		return map[string]string{
+		return mergePlaceRTT(map[string]string{
 			"order_id":        coidStr,
 			"client_order_id": coidStr,
 			"filled_qty":      "0",
 			"status":          "accepted",
 			"avg_price":       limitPriceStr,
-		}, nil
+		}, signMs, sendMs, totalMs), nil
 	}
 	// IOC 腿：用持仓 delta 确认真实成交量。sendTx 成功 ≠ 撮合成交——
 	// IOC 在限价（市价是保护价 ±5%，激进限价是上层算的价）内吃不到量会整单
@@ -723,13 +805,38 @@ func (s *lighterSession) place(ctx context.Context, params map[string]any) (map[
 	case filled.LessThan(qty):
 		status = "partial"
 	}
-	return map[string]string{
+	return mergePlaceRTT(map[string]string{
 		"order_id":        coidStr,
 		"client_order_id": coidStr,
 		"filled_qty":      filled.String(),
 		"status":          status,
 		"avg_price":       "",
-	}, nil
+	}, signMs, sendMs, totalMs), nil
+}
+
+func logLighterPlaceRTT(venue, orderID string, signMs, sendMs, totalMs int64, ok bool) {
+	fmt.Fprintf(os.Stderr, "%s\n", formatLighterPlaceRTT(venue, orderID, signMs, sendMs, totalMs, ok))
+}
+
+func formatLighterPlaceRTT(venue, orderID string, signMs, sendMs, totalMs int64, ok bool) string {
+	result := "ok"
+	if !ok {
+		result = "err"
+	}
+	return fmt.Sprintf(
+		"lighter place rtt venue=%s order=%s sign_ms=%d send_ms=%d sign_to_ack_ms=%d result=%s",
+		venue, orderID, signMs, sendMs, totalMs, result,
+	)
+}
+
+func mergePlaceRTT(out map[string]string, signMs, sendMs, totalMs int64) map[string]string {
+	if out == nil {
+		out = make(map[string]string)
+	}
+	out["sign_ms"] = strconv.FormatInt(signMs, 10)
+	out["send_ms"] = strconv.FormatInt(sendMs, 10)
+	out["sign_to_ack_ms"] = strconv.FormatInt(totalMs, 10)
+	return out
 }
 
 func (s *lighterSession) lastTradePrice(ctx context.Context, marketIndex int) (decimal.Decimal, error) {
@@ -760,15 +867,22 @@ func (s *lighterSession) cancel(ctx context.Context, params map[string]any) (map
 	if err != nil || orderIndex <= 0 {
 		return nil, fmt.Errorf("lighter cancel requires numeric client_order_index, got %q", orderID)
 	}
+	mi, err := int16MarketIndex(marketIndex)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.syncNonce(ctx); err != nil {
+		return nil, err
+	}
 	// 撤单同样要串行：它和下单共用同一条 nonce 序列。
 	s.submitMu.Lock()
 	defer s.submitMu.Unlock()
-	nonce, err := s.reserveNonce(ctx)
+	nonce, err := s.takeNonce()
 	if err != nil {
 		return nil, err
 	}
 	tx, err := s.txClient.GetCancelOrderTransaction(&types.CancelOrderTxReq{
-		MarketIndex: int16(marketIndex),
+		MarketIndex: mi,
 		Index:       orderIndex,
 	}, s.ops(nonce))
 	if err != nil {
@@ -867,23 +981,36 @@ func (s *lighterSession) confirmOrderLanded(ctx context.Context, marketIndex int
 	return matchActiveOrder(result, orderID)
 }
 
-// reserveNonce 取一个 nonce 并本地自增。
+// 任何 sendTx 失败都必须调 invalidateNonce：预留的号没有上链，不清掉的话
+// 本地序号比链上永久高出 1，该 venue 之后每笔下单和撤单都会因 nonce 不匹配被拒。
 //
-// A1 常驻化前每次调用都是新进程，`nextNonce` 必然重新拉取，自带纠偏。
-// 常驻后本地自增会一直跑下去，所以**任何 sendTx 失败都必须调
-// invalidateNonce**：预留的号没有上链，不清掉的话本地序号比链上永久
-// 高出 1，该 venue 之后每笔下单和撤单都会因 nonce 不匹配被拒——
-// 持仓期间撞上就是平仓指令再也发不出去。
-func (s *lighterSession) reserveNonce(ctx context.Context) (int64, error) {
+// syncNonce 保证本地有可自增的序号。网络拉取在 nonceMu / submitMu 之外，
+// 这样 REST 挂起时不会堵住已经有缓存 nonce 的撤单。
+func (s *lighterSession) syncNonce(ctx context.Context) error {
+	s.nonceMu.Lock()
+	if s.nextNonce != nil {
+		s.nonceMu.Unlock()
+		return nil
+	}
+	s.nonceMu.Unlock()
+
+	fetched, err := s.fetchNextNonce(ctx)
+	if err != nil {
+		return err
+	}
 	s.nonceMu.Lock()
 	defer s.nonceMu.Unlock()
 	if s.nextNonce == nil {
-		api := lighterhttp.NewClient(s.baseURL)
-		nonce, err := api.GetNextNonce(s.venue.AccountIndex, s.venue.APIKeyIndex)
-		if err != nil {
-			return 0, err
-		}
-		s.nextNonce = &nonce
+		s.nextNonce = &fetched
+	}
+	return nil
+}
+
+func (s *lighterSession) takeNonce() (int64, error) {
+	s.nonceMu.Lock()
+	defer s.nonceMu.Unlock()
+	if s.nextNonce == nil {
+		return 0, errors.New("nonce not synced")
 	}
 	n := *s.nextNonce
 	next := n + 1
@@ -891,7 +1018,65 @@ func (s *lighterSession) reserveNonce(ctx context.Context) (int64, error) {
 	return n, nil
 }
 
-// invalidateNonce 丢弃本地序号，下次 reserveNonce 重新向链上同步。
+func (s *lighterSession) fetchNextNonce(ctx context.Context) (int64, error) {
+	ctx, cancel := context.WithTimeout(ctx, nonceFetchTimeout)
+	defer cancel()
+	result, err := s.get(ctx, "/api/v1/nextNonce", url.Values{
+		"account_index": {strconv.FormatInt(s.venue.AccountIndex, 10)},
+		"api_key_index": {strconv.Itoa(int(s.venue.APIKeyIndex))},
+	}, nil)
+	if err != nil {
+		return 0, fmt.Errorf("fetch nonce: %w", err)
+	}
+	n, ok := int64Value(result["nonce"])
+	if !ok {
+		return 0, errors.New("fetch nonce: missing nonce in response")
+	}
+	return n, nil
+}
+
+func (s *lighterSession) marketLock(marketIndex int) *sync.Mutex {
+	v, _ := s.marketLocks.LoadOrStore(marketIndex, &sync.Mutex{})
+	return v.(*sync.Mutex)
+}
+
+func uint32PriceUnits(units int64, priceDec int) (uint32, error) {
+	if units <= 0 {
+		return 0, errors.New("non-positive price units")
+	}
+	if units > int64(math.MaxUint32) {
+		return 0, fmt.Errorf("price overflow uint32 after scale 10^%d: %d", priceDec, units)
+	}
+	return uint32(units), nil
+}
+
+func int16MarketIndex(idx int) (int16, error) {
+	if idx < math.MinInt16 || idx > math.MaxInt16 {
+		return 0, fmt.Errorf("market index %d out of int16 range", idx)
+	}
+	return int16(idx), nil
+}
+
+func int64Value(v any) (int64, bool) {
+	switch t := v.(type) {
+	case float64:
+		return int64(t), true
+	case int64:
+		return t, true
+	case int:
+		return int64(t), true
+	case json.Number:
+		n, err := t.Int64()
+		return n, err == nil
+	case string:
+		n, err := strconv.ParseInt(strings.TrimSpace(t), 10, 64)
+		return n, err == nil
+	default:
+		return 0, false
+	}
+}
+
+// invalidateNonce 丢弃本地序号，下次 syncNonce 重新向链上同步。
 //
 // 不做 `nextNonce--`：失败原因可能是超时或网络中断，交易实际已被序列器
 // 收下，此时回退会把下一笔的 nonce 撞到已用号上。重新拉取是唯一安全的选择。

@@ -11,7 +11,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math"
 	"net/http"
 	"os"
 	"strconv"
@@ -72,6 +71,7 @@ type entropyFillNote struct {
 	closedPnl decimal.Decimal
 	// userFills 见过这条单。closedPnl 可以是 0（打平），不能用「非零」当有没有。
 	sawFill bool
+	at      time.Time
 }
 
 func (n entropyFillNote) qty() decimal.Decimal {
@@ -96,13 +96,23 @@ func (s *entropySession) dex() string {
 
 func (r *registry) entropySession(ctx context.Context, path string) (*entropySession, error) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if r.entropy != nil {
-		return r.entropy, nil
+		s := r.entropy
+		r.mu.Unlock()
+		return s, nil
 	}
+	r.mu.Unlock()
+
 	s, err := newEntropySession(ctx, path)
 	if err != nil {
 		return nil, err
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.entropy != nil {
+		s.close()
+		return r.entropy, nil
 	}
 	r.entropy = s
 	return s, nil
@@ -927,8 +937,8 @@ func (s *entropySession) nextNonce() int64 {
 
 func (s *entropySession) postAction(ctx context.Context, action any) (json.RawMessage, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	nonce := s.nextNonce()
+	s.mu.Unlock()
 	sig, err := hlSignL1(s.pk, action, nonce, true)
 	if err != nil {
 		return nil, err
@@ -1088,8 +1098,10 @@ func (s *entropySession) setFill(oid, cloid string, qty decimal.Decimal, px stri
 		if px != "" {
 			n.px = px
 		}
+		n.at = time.Now()
 		s.fills[k] = n
 	}
+	pruneFillCache(s.fills, func(v entropyFillNote) time.Time { return v.at })
 }
 
 func (s *entropySession) addFill(oid, cloid string, qty decimal.Decimal, px string, closedPnl decimal.Decimal) {
@@ -1114,8 +1126,10 @@ func (s *entropySession) addFill(oid, cloid string, qty decimal.Decimal, px stri
 			n.px = px
 		}
 		n.closedPnl = n.closedPnl.Add(closedPnl)
+		n.at = time.Now()
 		s.fills[k] = n
 	}
+	pruneFillCache(s.fills, func(v entropyFillNote) time.Time { return v.at })
 }
 
 func (s *entropySession) wsClosedPnl(oid, cloid string) (decimal.Decimal, bool) {
@@ -1252,12 +1266,28 @@ func roundHlPx(px decimal.Decimal, szDecimals int, roundUp bool) decimal.Decimal
 }
 
 func hlSigFigStep(px decimal.Decimal, figs int) decimal.Decimal {
-	f, _ := px.Float64()
-	if f <= 0 || figs < 1 {
+	if !px.GreaterThan(decimal.Zero) || figs < 1 {
 		return decimal.New(1, -8)
 	}
-	exp := math.Floor(math.Log10(f)) - float64(figs-1)
-	return decimal.New(1, int32(exp))
+	n := px.Abs()
+	exp := int32(0)
+	ten := decimal.NewFromInt(10)
+	one := decimal.NewFromInt(1)
+	for n.GreaterThanOrEqual(ten) {
+		n = n.Div(ten)
+		exp++
+		if exp > 24 {
+			break
+		}
+	}
+	for n.LessThan(one) {
+		n = n.Mul(ten)
+		exp--
+		if exp < -24 {
+			break
+		}
+	}
+	return decimal.New(1, exp-int32(figs-1))
 }
 
 func hlPxWire(d decimal.Decimal) string {

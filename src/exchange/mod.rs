@@ -1,6 +1,7 @@
 pub mod bridge;
 pub mod entropy;
 pub mod lighter;
+pub mod net;
 pub mod port;
 pub mod sodex;
 
@@ -9,7 +10,10 @@ use std::sync::Arc;
 
 use crate::config::VenueFile;
 
-pub use bridge::{bridge_available, bridge_call, bridge_watch, subscribe_order_pushes, OrderPush};
+pub use bridge::{
+    bridge_available, bridge_call, bridge_watch, last_lighter_place_rtt, subscribe_order_pushes,
+    LighterPlaceRtt, OrderPush,
+};
 pub use entropy::EntropyAdapter;
 pub use lighter::LighterAdapter;
 pub use port::{

@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::tungstenite::Message;
 use tracing::{info, warn};
 
 use crate::config::VenueFile;
@@ -15,6 +15,8 @@ use crate::domain::{
     symbol::{normalize_perp, whitelist_allows},
     Bbo, VenueId, VenueMarket,
 };
+
+use super::net::{connect_ws, http_client, spawn_feed_loop, FeedGuard};
 
 use super::port::{
     AccountSnapshot, Balance, BboTx, CancelReq, ExchangePort, FillPnl, FundingRate, OrderAck,
@@ -26,6 +28,7 @@ pub struct SodexAdapter {
     venue: VenueFile,
     whitelist: Vec<String>,
     venue_path: std::path::PathBuf,
+    feeds: FeedGuard,
 }
 
 impl SodexAdapter {
@@ -35,6 +38,7 @@ impl SodexAdapter {
             venue,
             whitelist,
             venue_path,
+            feeds: FeedGuard::new(),
         }
     }
 
@@ -107,11 +111,9 @@ impl ExchangePort for SodexAdapter {
             "{}/markets/symbols",
             self.venue.rest.trim_end_matches('/')
         );
-        let resp: SymbolsResp = reqwest::Client::builder()
-            .timeout(Duration::from_secs(15))
-            .user_agent("dex-arbitr/0.1")
-            .build()?
+        let resp: SymbolsResp = http_client()
             .get(&url)
+            .timeout(Duration::from_secs(15))
             .send()
             .await
             .with_context(|| format!("GET {url}"))?
@@ -134,7 +136,19 @@ impl ExchangePort for SodexAdapter {
             if !whitelist_allows(&base, &self.whitelist) {
                 continue;
             }
-            let min_qty = Decimal::from_str(&raw.min_quantity).unwrap_or(Decimal::ZERO);
+            let min_qty = match Decimal::from_str(&raw.min_quantity) {
+                Ok(q) if q > Decimal::ZERO => q,
+                other => {
+                    warn!(
+                        venue = self.venue.id,
+                        symbol = %raw.name,
+                        raw = %raw.min_quantity,
+                        ok = other.is_ok(),
+                        "skip market: bad min_qty"
+                    );
+                    continue;
+                }
+            };
             let market_index = i32::try_from(raw.id).unwrap_or(0);
             out.push(VenueMarket {
                 venue: self.venue_id(),
@@ -152,19 +166,20 @@ impl ExchangePort for SodexAdapter {
 
     async fn subscribe_bbo(&self, markets: &[VenueMarket], tx: BboTx) -> Result<()> {
         let aliases = symbol_alias_map(markets, &self.venue.quote);
+        let fp: String = {
+            let mut keys: Vec<_> = aliases.keys().cloned().collect();
+            keys.sort();
+            keys.join(",")
+        };
+        let Some((gen, rx)) = self.feeds.begin(&fp) else {
+            return Ok(());
+        };
         let ws_url = self.venue.ws.clone();
         let venue = self.venue_id();
-        let n = markets.len();
-        tokio::spawn(async move {
-            loop {
-                if let Err(err) = run_ws(ws_url.clone(), venue.clone(), aliases.clone(), tx.clone()).await
-                {
-                    warn!(venue = venue.as_str(), error = %err, "sodex ws stopped");
-                }
-                tokio::time::sleep(Duration::from_secs(3)).await;
-            }
+        spawn_feed_loop(rx, gen, "sodex ws", move || {
+            run_ws(ws_url.clone(), venue.clone(), aliases.clone(), tx.clone())
         });
-        info!(venue = self.venue.id, n, "subscribed allBookTicker");
+        info!(venue = self.venue.id, n = markets.len(), "subscribed allBookTicker");
         Ok(())
     }
 
@@ -280,9 +295,7 @@ async fn run_ws(
     aliases: HashMap<String, String>,
     tx: mpsc::UnboundedSender<(VenueId, String, Bbo)>,
 ) -> Result<()> {
-    let (ws, _) = connect_async(&url)
-        .await
-        .with_context(|| format!("ws connect {url}"))?;
+    let ws = connect_ws(&url).await?;
     let (mut write, mut read) = ws.split();
     let sub = serde_json::json!({
         "op": "subscribe",

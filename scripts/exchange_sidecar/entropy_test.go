@@ -149,7 +149,11 @@ func TestSignL1RecoversSigner(t *testing.T) {
 	if sig.V != 27 && sig.V != 28 {
 		t.Fatalf("v=%d", sig.V)
 	}
-	digest, err := hlTypedDigest(hlActionHash(action, nonce), true)
+	actionHash, err := hlActionHash(action, nonce)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest, err := hlTypedDigest(actionHash, true)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::tungstenite::Message;
 use tracing::{info, warn};
 
 use crate::config::VenueFile;
@@ -15,6 +15,8 @@ use crate::domain::{
     symbol::{normalize_perp, whitelist_allows},
     Bbo, VenueId, VenueMarket,
 };
+
+use super::net::{connect_ws, http_client, spawn_feed_loop, FeedGuard};
 
 use super::port::{
     AccountSnapshot, Balance, BboTx, CancelReq, ExchangePort, FillPnl, FundingRate, OrderAck,
@@ -26,6 +28,7 @@ pub struct LighterAdapter {
     venue: VenueFile,
     whitelist: Vec<String>,
     venue_path: std::path::PathBuf,
+    feeds: FeedGuard,
 }
 
 impl LighterAdapter {
@@ -35,6 +38,7 @@ impl LighterAdapter {
             venue,
             whitelist,
             venue_path,
+            feeds: FeedGuard::new(),
         }
     }
 
@@ -147,11 +151,9 @@ impl ExchangePort for LighterAdapter {
             "{}/api/v1/orderBooks?filter=perp",
             self.venue.rest.trim_end_matches('/')
         );
-        let resp: OrderBooksResp = reqwest::Client::builder()
-            .timeout(Duration::from_secs(15))
-            .user_agent("dex-arbitr/0.1")
-            .build()?
+        let resp: OrderBooksResp = http_client()
             .get(&url)
+            .timeout(Duration::from_secs(15))
             .send()
             .await
             .with_context(|| format!("GET {url}"))?
@@ -171,7 +173,19 @@ impl ExchangePort for LighterAdapter {
             if !whitelist_allows(&base, &self.whitelist) {
                 continue;
             }
-            let min_qty = Decimal::from_str(&raw.min_base_amount).unwrap_or(Decimal::ZERO);
+            let min_qty = match Decimal::from_str(&raw.min_base_amount) {
+                Ok(q) if q > Decimal::ZERO => q,
+                other => {
+                    warn!(
+                        venue = self.venue.id,
+                        symbol = %raw.symbol,
+                        raw = %raw.min_base_amount,
+                        ok = other.is_ok(),
+                        "skip market: bad min_qty"
+                    );
+                    continue;
+                }
+            };
             out.push(VenueMarket {
                 venue: self.venue_id(),
                 raw_symbol: raw.symbol,
@@ -191,17 +205,20 @@ impl ExchangePort for LighterAdapter {
             .iter()
             .map(|m| (m.market_index, m.pair_id.clone()))
             .collect();
+        let fp: String = {
+            let mut ids: Vec<_> = id_to_pair.iter().map(|(i, p)| format!("{i}:{p}")).collect();
+            ids.sort();
+            ids.join(",")
+        };
+        let Some((gen, rx)) = self.feeds.begin(&fp) else {
+            return Ok(());
+        };
         let ws_url = self.venue.ws.clone();
         let venue = self.venue_id();
-        tokio::spawn(async move {
-            loop {
-                if let Err(err) = run_ws(ws_url.clone(), venue.clone(), id_to_pair.clone(), tx.clone()).await
-                {
-                    warn!(venue = venue.as_str(), error = %err, "lighter ws stopped");
-                }
-                tokio::time::sleep(Duration::from_secs(3)).await;
-            }
+        spawn_feed_loop(rx, gen, "lighter ws", move || {
+            run_ws(ws_url.clone(), venue.clone(), id_to_pair.clone(), tx.clone())
         });
+        info!(venue = self.venue.id, n = markets.len(), "subscribed order_book");
         Ok(())
     }
 
@@ -289,9 +306,7 @@ async fn run_ws(
     markets: Vec<(i32, String)>,
     tx: mpsc::UnboundedSender<(VenueId, String, Bbo)>,
 ) -> Result<()> {
-    let (ws, _) = connect_async(&url)
-        .await
-        .with_context(|| format!("ws connect {url}"))?;
+    let ws = connect_ws(&url).await?;
     let (mut write, mut read) = ws.split();
     let mut books: HashMap<i32, LocalBook> = HashMap::new();
     let mut subscribed = false;

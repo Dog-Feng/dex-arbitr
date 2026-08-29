@@ -38,6 +38,14 @@ stdout：
 
 与 `dex-arbitr` 同机、同仓库根目录运行；Rust 默认查找 `scripts/exchange_sidecar/exchange_sidecar`。
 
+Lighter `place` 会在 stderr 打一行耗时（Rust 以 info 转发，并填配置页「签名→确认」）：
+
+```
+lighter place rtt venue=lighter order=… sign_ms=… send_ms=… sign_to_ack_ms=… result=ok
+```
+
+从 Go 签名开始到 `sendTx` 确认回包。不含拉 `/api/v1/nextNonce`、等 `submitMu`、IOC 成交回查。JSON 同时带 `sign_ms` / `send_ms` / `sign_to_ack_ms`。
+
 ## fill_pnl
 
 平仓后读该所已实现盈亏。params：`{symbol, order_id}`。返回 `{realized_pnl, per_fill, found}`。
