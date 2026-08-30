@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 
-use crate::app::balance::{fetch_pair_equity, refresh_accounts, BalanceCache, VenueAccountCache};
+use crate::app::balance::{refresh_accounts, BalanceCache, VenueAccountCache};
 use crate::app::control::ArbitrageControl;
 use crate::config::AppConfig;
 use crate::domain::Books;
@@ -72,23 +72,9 @@ pub fn spawn_run_plan(
     plan: HedgePlan,
 ) {
     tokio::spawn(async move {
-        let equity_before = if plan.is_open {
-            fetch_pair_equity(&adapters, &plan.first.venue, &plan.second.venue).await
-        } else {
-            None
-        };
-        let mut result = HedgeExecutor::run_plan(&cfg, &adapters, &plan, &books, false)
+        let result = HedgeExecutor::run_plan(&cfg, &adapters, &plan, &books, false)
             .await
             .map_err(|e| e.to_string());
-        if let Ok(r) = &mut result {
-            r.equity_before = equity_before;
-            if !plan.is_open {
-                // 成交后权益入账有延迟；等一小会再拉，比立刻读更接近实际。
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                r.equity_after =
-                    fetch_pair_equity(&adapters, &plan.first.venue, &plan.second.venue).await;
-            }
-        }
         let _ = tx.send(ExecEvent::RunPlan(RunPlanMsg {
             slot: plan.slot.clone(),
             pair_i,

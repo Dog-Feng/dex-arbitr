@@ -17,4 +17,5 @@ label { font-size: 12px; color: #b8cce0; }
 .field :deep(.n-input),
 .field :deep(.n-input-number),
 .field :deep(.n-select) { width: 100%; max-width: 100%; }
+.field :deep(.n-switch) { align-self: flex-start; width: auto; }
 </style>

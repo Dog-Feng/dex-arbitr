@@ -516,7 +516,7 @@ func (s *entropySession) place(ctx context.Context, params map[string]any) (map[
 	if !px.GreaterThan(decimal.Zero) {
 		return nil, fmt.Errorf("invalid limit price")
 	}
-	rawCloid := paramString(params, "client_order_id", fmt.Sprintf("arb-%d", time.Now().UnixMilli()))
+	rawCloid := paramString(params, "client_order_id", nextArbClientOrderID())
 	cloid := rawCloid
 	if !isHLCloid(cloid) {
 		cloid = hlCloid(rawCloid)
@@ -849,23 +849,17 @@ func (s *entropySession) lookupOrder(ctx context.Context, oid int64, cloid strin
 }
 
 func (s *entropySession) waitOrderFill(ctx context.Context, oid int64, cloid string, qty decimal.Decimal) (decimal.Decimal, string, string) {
-	deadline := time.Now().Add(entropyFillWait)
-	var last hlOrderView
-	ok := false
+	deadline := time.Now().Add(iocFillWait)
 	for time.Now().Before(deadline) {
 		if ctx.Err() != nil {
 			break
 		}
-		if f, px, hit := s.wsFill(oid, cloid); hit && qty.GreaterThan(decimal.Zero) && f.GreaterThanOrEqual(qty) {
-			return f, px, "filled"
-		}
-		if v, found := s.lookupOrder(ctx, oid, cloid); found {
-			last, ok = v, true
-			st := strings.ToLower(v.status)
-			if v.filledQty().GreaterThan(decimal.Zero) || strings.Contains(st, "fill") || strings.Contains(st, "cancel") {
-				filled, avg, status := v.filledAndStatus(qty, true)
-				return filled, avg, status
+		if f, px, hit := s.wsFill(oid, cloid); hit && f.GreaterThan(decimal.Zero) {
+			st := "partial"
+			if qty.GreaterThan(decimal.Zero) && f.GreaterThanOrEqual(qty) {
+				st = "filled"
 			}
+			return f, px, st
 		}
 		tightFillPoll(deadline)
 	}
@@ -876,8 +870,8 @@ func (s *entropySession) waitOrderFill(ctx context.Context, oid int64, cloid str
 		}
 		return f, px, st
 	}
-	if ok {
-		filled, avg, status := last.filledAndStatus(qty, true)
+	if v, found := s.lookupOrder(ctx, oid, cloid); found {
+		filled, avg, status := v.filledAndStatus(qty, true)
 		return filled, avg, status
 	}
 	return decimal.Zero, "", "unknown"

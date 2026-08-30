@@ -1,6 +1,15 @@
 <template>
   <div class="g">
-    <Field label="target_bp（目标净利）" hint="一格开平扣完四腿市价费和两所点差中枢平均后的目标（bp）。1 bp = 0.01%。运行时反推 Δ">
+    <Field label="symmetric_limit" hint="阶段 2：满窗后在 μ±Δ 挂邻档第一腿，成交推进 STEP。关=阶段 1 撞线双市价">
+      <n-switch v-model:value="store.params.symmetric_limit" />
+    </Field>
+    <Field label="quote_reprice_ratio" hint="空仓 |μ_live−μ_quote| ≥ 此×Δ 才撤重挂">
+      <n-input :value="String(store.params.quote_reprice_ratio)" @update:value="store.params.quote_reprice_ratio = $event" />
+    </Field>
+    <Field label="min_quote_gap_ratio" hint="加仓档离当前可执行价差至少这么多格才挂。减仓档不限">
+      <n-input :value="String(store.params.min_quote_gap_ratio)" @update:value="store.params.min_quote_gap_ratio = $event" />
+    </Field>
+    <Field label="target_bp（目标净利）" hint="一格开平扣完费和点差后的目标（bp）。1 bp = 0.01%。阶段 2：F=2×(挂单所 maker + 市价所 taker)，C=市价所点差中枢；阶段 1 仍用四腿 taker + 两所平均">
       <n-input :value="str('target_bp')" @update:value="set('target_bp', $event)" />
     </Field>
     <Field label="max_segments（max_step）" hint="|STEP| 上限。到 ±N 停加不停减。过零必须先回 0">

@@ -83,8 +83,8 @@ pub fn detect_naked_exposures(pairs: &[Pair], accounts: &VenueAccountCache) -> V
 
 /// 内存持仓 vs 交易所实盘的数量偏差。返回 `(内存量, 实盘重叠对冲量)`。
 ///
-/// 两腿同号且都非零时对冲量视为 0。数量偏差交给 `PositionStore::reconcile_qty`
-/// 按实盘校正（少则缩、多则在上限内抬）。
+/// 只有一腿非零时不当成「对冲量 = 0」：第二腿账户快照经常晚几秒，
+/// 这时缩内存会把刚成交的仓抹掉。两腿同号且都非零时对冲量视为 0。
 pub fn audit_position_qty(
     pair: &Pair,
     accounts: &VenueAccountCache,
@@ -95,6 +95,9 @@ pub fn audit_position_qty(
     }
     let a = venue_position_qty(accounts, &pair.legs[0]);
     let b = venue_position_qty(accounts, &pair.legs[1]);
+    if a.is_zero() ^ b.is_zero() {
+        return None;
+    }
     if !a.is_zero() && !b.is_zero() && a.is_sign_positive() == b.is_sign_positive() {
         return Some((memory_qty, Decimal::ZERO));
     }
@@ -104,6 +107,76 @@ pub fn audit_position_qty(
         return None;
     }
     Some((memory_qty, hedged))
+}
+
+/// 两所已有反向仓时的重叠对冲量（内存为空时用来把库存捡回来）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OppositeHedge {
+    pub qty: Decimal,
+    pub buy: String,
+    pub sell: String,
+    pub buy_px: Decimal,
+    pub sell_px: Decimal,
+}
+
+pub fn exchange_opposite_hedge(
+    pair: &Pair,
+    accounts: &VenueAccountCache,
+) -> Option<OppositeHedge> {
+    if !accounts.all_fresh() {
+        return None;
+    }
+    let (a_qty, a_px) = venue_leg(accounts, &pair.legs[0]);
+    let (b_qty, b_px) = venue_leg(accounts, &pair.legs[1]);
+    if a_qty.is_zero() || b_qty.is_zero() {
+        return None;
+    }
+    if a_qty.is_sign_positive() == b_qty.is_sign_positive() {
+        return None;
+    }
+    let qty = a_qty.abs().min(b_qty.abs());
+    if qty <= Decimal::ZERO {
+        return None;
+    }
+    let (buy, sell, buy_px, sell_px) = if a_qty > Decimal::ZERO {
+        (
+            pair.legs[0].venue.to_string(),
+            pair.legs[1].venue.to_string(),
+            a_px,
+            b_px,
+        )
+    } else {
+        (
+            pair.legs[1].venue.to_string(),
+            pair.legs[0].venue.to_string(),
+            b_px,
+            a_px,
+        )
+    };
+    Some(OppositeHedge {
+        qty,
+        buy,
+        sell,
+        buy_px,
+        sell_px,
+    })
+}
+
+/// 按重叠量反推有符号 STEP。至少 ±1，不超过 `max_step`。
+pub fn hedge_grid_step(qty: Decimal, base_qty: Decimal, max_step: i32, plus: bool) -> i32 {
+    let cap = max_step.max(1);
+    let steps = if base_qty > Decimal::ZERO {
+        (qty / base_qty).round()
+    } else {
+        Decimal::ONE
+    };
+    let n = i32::try_from(steps.trunc().mantissa().max(1)).unwrap_or(1);
+    let k = n.clamp(1, cap);
+    if plus {
+        k
+    } else {
+        -k
+    }
 }
 
 fn group_by_pair(pairs: &[Pair]) -> Vec<(String, Vec<(String, VenueMarket)>)> {
@@ -156,14 +229,34 @@ pub fn hedge_qty(naked_qty: Decimal) -> Decimal {
 }
 
 fn venue_position_qty(accounts: &VenueAccountCache, leg: &VenueMarket) -> Decimal {
+    venue_leg(accounts, leg).0
+}
+
+fn venue_leg(accounts: &VenueAccountCache, leg: &VenueMarket) -> (Decimal, Decimal) {
     let Some(acct) = accounts.get(leg.venue.as_str()) else {
-        return Decimal::ZERO;
+        return (Decimal::ZERO, Decimal::ZERO);
     };
-    acct.positions
+    let mut qty = Decimal::ZERO;
+    let mut px_qty = Decimal::ZERO;
+    let mut px_notional = Decimal::ZERO;
+    for p in acct
+        .positions
         .iter()
         .filter(|p| symbol_matches(&p.symbol, leg))
-        .map(|p| p.qty)
-        .sum()
+    {
+        qty += p.qty;
+        if let Some(px) = p.entry_price.filter(|x| *x > Decimal::ZERO) {
+            let w = p.qty.abs();
+            px_qty += w;
+            px_notional += px * w;
+        }
+    }
+    let px = if px_qty > Decimal::ZERO {
+        px_notional / px_qty
+    } else {
+        Decimal::ZERO
+    };
+    (qty, px)
 }
 
 fn symbol_matches(pos_symbol: &str, leg: &VenueMarket) -> bool {
@@ -311,6 +404,30 @@ mod tests {
             audit_position_qty(&p, &accounts, dec!(5)),
             Some((dec!(5), Decimal::ZERO))
         );
+    }
+
+    #[test]
+    fn audit_skips_one_legged_snapshot() {
+        let accounts = cache(vec![
+            snap("sodex", Some(dec!(0.0005)), true),
+            snap("lighter", None, true),
+        ]);
+        let p = pair("sodex", "lighter");
+        assert_eq!(audit_position_qty(&p, &accounts, dec!(0.0005)), None);
+    }
+
+    #[test]
+    fn opposite_hedge_uses_overlap() {
+        let accounts = cache(vec![
+            snap("lighter", Some(dec!(0.0005)), true),
+            snap("lighter_rh", Some(dec!(-0.00056)), true),
+        ]);
+        let p = pair("lighter", "lighter_rh");
+        let h = exchange_opposite_hedge(&p, &accounts).unwrap();
+        assert_eq!(h.qty, dec!(0.0005));
+        assert_eq!(h.buy, "lighter");
+        assert_eq!(h.sell, "lighter_rh");
+        assert_eq!(hedge_grid_step(h.qty, dec!(0.0005), 3, false), -1);
     }
 
     #[test]

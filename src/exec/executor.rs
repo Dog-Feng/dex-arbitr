@@ -2,22 +2,18 @@ use anyhow::{bail, Result};
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::time::sleep;
 use tracing::{info, warn};
 
-use crate::app::reconcile::symbol_matches_symbol;
 use crate::config::{AppConfig, OrderStyle};
 use crate::domain::spread::realized_slip_pct;
 use crate::domain::{read_book, Bbo, Books};
 use crate::exec::{fill_slip_overrun, HedgeLeg, HedgePlan};
-use crate::exchange::{CancelReq, ExchangePort, FillPnl, OrderAck, OrderReq, OrderStatus};
+use crate::exchange::{CancelReq, ExchangePort, OrderAck, OrderReq, OrderStatus};
 
 pub type Adapters = HashMap<String, Arc<dyn ExchangePort>>;
 
-/// 激进限价兜底的滑点放大倍数。对齐参考 `_place_aggressive_limit_retry_order`
-/// 里写死的 `multiplier = Decimal("2")`。
-const AGGRESSIVE_SLIPPAGE_MULT: Decimal = Decimal::TWO;
+/// 回滚市价最多发几次。每次 sidecar 等该单推送 1 秒再查一次；仍不明算这次失败。
+const ROLLBACK_ATTEMPTS: u32 = 3;
 
 #[derive(Debug, Clone)]
 pub struct ExecFill {
@@ -36,13 +32,6 @@ pub struct ExecResult {
     pub orphan_order: Option<String>,
     /// 第一腿比第二腿多成交的量（> 0 表示存在未对冲的单边敞口）。
     pub unhedged_qty: Decimal,
-    /// 平仓前各所仓位上的累计 realized（仅 Lighter/SoDEX 这种 per_fill=false 的所）。
-    /// 平仓后用 after − before 得到本笔。Entropy 用成交 closedPnl，不进这张表。
-    pub realized_before: HashMap<String, Decimal>,
-    /// 开仓下单前两所账户权益。key = venue id。
-    pub equity_before: Option<HashMap<String, Decimal>>,
-    /// 平仓成交后两所账户权益（稍等结算再拉）。
-    pub equity_after: Option<HashMap<String, Decimal>>,
 }
 
 impl ExecResult {
@@ -66,9 +55,6 @@ impl ExecResult {
             second,
             orphan_order,
             unhedged_qty,
-            realized_before: HashMap::new(),
-            equity_before: None,
-            equity_after: None,
         }
     }
 
@@ -102,8 +88,7 @@ impl HedgeExecutor {
         books: &Books,
         paper: bool,
     ) -> Result<ExecResult> {
-        let before = snapshot_realized_before(adapters, plan, paper).await;
-        let mut result = match plan.style {
+        let result = match plan.style {
             OrderStyle::LimitThenMarket => {
                 let post = Self::post_first_leg(cfg, adapters, plan, books, paper).await?;
                 if post.resting && !paper {
@@ -124,15 +109,13 @@ impl HedgeExecutor {
                 }
                 result
             }
-            // AggressiveLimit 只由 `hedge_second_leg` 内部构造，不会出现在
-            // 配置里；真配上了就按双吃处理。
+            // AggressiveLimit 只给 live-test 手工发 IOC；跑计划时按双吃。
             OrderStyle::LimitMaker
             | OrderStyle::MarketTaker
             | OrderStyle::AggressiveLimit => {
                 Self::dual_taker(cfg, adapters, plan, books, paper).await?
             }
         };
-        result.realized_before = before;
         Ok(result)
     }
 
@@ -144,7 +127,10 @@ impl HedgeExecutor {
         paper: bool,
     ) -> Result<PostFirstResult> {
         let first_bbo = book_for(books, &plan.first.venue, &plan.pair_id)?;
-        let first_price = maker_limit_price(cfg, &plan.first, &first_bbo);
+        let first_price = plan
+            .first
+            .limit_price
+            .unwrap_or_else(|| maker_limit_price(cfg, &plan.first, &first_bbo));
         if paper {
             return Ok(PostFirstResult {
                 first: ExecFill {
@@ -275,7 +261,6 @@ impl HedgeExecutor {
                 adapters,
                 &plan.first,
                 qty,
-                plan.is_open,
                 &first_bbo,
                 paper,
             )
@@ -328,60 +313,6 @@ impl HedgeExecutor {
         Ok(ExecResult::finished(first, second, None))
     }
 
-    /// 激进限价兜底：市价腿失败后，用**放大后的**滑点当限价挂一张 IOC。
-    ///
-    /// 对齐参考 `_place_aggressive_limit_retry_order`：价格取
-    /// `信号价 × (1 ± 2×slippage)`，倍数写死 2 和参考一致。
-    ///
-    /// 相比再发一张市价单的好处是滑点有硬上限——IOC 最差成交在这个价，
-    /// 吃不到就整单撤销，不会像市价那样在薄盘口吃穿好几档。代价是不保证
-    /// 成交，所以调用方失败后仍要走 emergency_close。
-    async fn aggressive_limit_retry(
-        cfg: &AppConfig,
-        adapters: &Adapters,
-        plan: &HedgePlan,
-        qty: Decimal,
-        second_bbo: &Bbo,
-    ) -> Result<ExecFill> {
-        let mut leg = plan.second.clone();
-        leg.style = OrderStyle::AggressiveLimit;
-
-        // 基准用决策信号价（市价腿同款），不用当前盘口——盘口正是刚才没吃到
-        // 的那个，拿它当基准等于自我实现。
-        let base = market_price(&plan.second, second_bbo);
-        let slip = cfg.cost.max_slippage_pct * AGGRESSIVE_SLIPPAGE_MULT;
-        let ratio = slip / Decimal::from(100);
-        let price = if leg.is_buy {
-            base * (Decimal::ONE + ratio)
-        } else {
-            base * (Decimal::ONE - ratio)
-        };
-        if price <= Decimal::ZERO {
-            bail!("aggressive limit price non-positive");
-        }
-
-        info!(
-            pair = %plan.pair_id,
-            venue = %leg.venue,
-            qty = %qty,
-            price = %price,
-            slippage_pct = %slip,
-            "aggressive limit retry"
-        );
-        Self::send_leg(
-            cfg,
-            adapters,
-            &leg,
-            qty,
-            price,
-            !plan.is_open,
-            false,
-            second_bbo,
-            false,
-        )
-        .await
-    }
-
     async fn dual_taker(
         cfg: &AppConfig,
         adapters: &Adapters,
@@ -393,7 +324,7 @@ impl HedgeExecutor {
         let b1 = book_for(books, &plan.second.venue, &plan.pair_id)?;
         let p0 = market_price(&plan.first, &b0);
         let p1 = market_price(&plan.second, &b1);
-        let first = Self::send_leg(
+        let first = match Self::send_leg(
             cfg,
             adapters,
             &plan.first,
@@ -404,7 +335,36 @@ impl HedgeExecutor {
             &b0,
             false,
         )
-        .await?;
+        .await
+        {
+            Ok(f) => f,
+            Err(err) if is_unverifiable(&err) => {
+                // 第一腿结果不明：可能已经成交。立刻市价回滚，不再发第二腿。
+                warn!(
+                    pair = %plan.pair_id,
+                    error = %err,
+                    "first leg unverifiable; market-closing it"
+                );
+                return match Self::emergency_close(
+                    cfg,
+                    adapters,
+                    &plan.first,
+                    plan.qty,
+                    &b0,
+                    paper,
+                )
+                .await
+                {
+                    Ok(()) => Err(anyhow::anyhow!(
+                        "EMERGENCY_CLOSED: first leg unverifiable ({err}); rolled back"
+                    )),
+                    Err(eclose) => Err(anyhow::anyhow!(
+                        "NAKED_FIRST_LEG: first leg unverifiable ({err}); close failed ({eclose})"
+                    )),
+                };
+            }
+            Err(err) => return Err(err),
+        };
         let second = Self::fill_second_leg(
             cfg,
             adapters,
@@ -421,8 +381,8 @@ impl HedgeExecutor {
         Ok(ExecResult::finished(first, second, None))
     }
 
-    /// 第二腿：市价一次 → 明确失败再激进限价 → 仍不确定则等 `second_leg_verify_ms`
-    /// 查该所实仓。没有仓就市价平第一腿；查到仓当第二腿已成交。
+    /// 第二腿市价一次。sidecar 已等该单推送 1 秒再查一次；
+    /// `filled_qty=0` 或失败 → 立刻市价平第一腿（不做激进限价）。
     async fn fill_second_leg(
         cfg: &AppConfig,
         adapters: &Adapters,
@@ -449,169 +409,35 @@ impl HedgeExecutor {
         {
             Ok(f) => Ok(f),
             Err(err) if is_unverifiable(&err) => {
-                warn!(
-                    pair = %plan.pair_id,
-                    error = %err,
-                    "second leg market unverifiable; skipping aggressive limit, verifying position"
-                );
-                Self::verify_second_or_close_first(
-                    cfg, adapters, plan, first, first_bbo, paper, &err,
-                )
-                .await
+                // 第二腿 sendTx 成功但查不到量：可能已经成交。不能再市价平第一腿，
+                // 否则两边都成会留下反向裸仓，随后裸腿补单还会无限加仓。
+                Err(err)
             }
             Err(err) => {
                 warn!(
                     pair = %plan.pair_id,
                     error = %err,
-                    "second leg market failed; trying aggressive limit"
+                    "second leg failed; market-closing first leg"
                 );
-                match Self::aggressive_limit_retry(cfg, adapters, plan, qty, second_bbo).await {
-                    Ok(f) => Ok(f),
-                    Err(retry_err) => {
-                        warn!(
-                            pair = %plan.pair_id,
-                            market_error = %err,
-                            retry_error = %retry_err,
-                            "aggressive limit failed; waiting to verify second-leg position"
-                        );
-                        Self::verify_second_or_close_first(
-                            cfg, adapters, plan, first, first_bbo, paper, &retry_err,
-                        )
-                        .await
-                    }
+                match Self::emergency_close(
+                    cfg,
+                    adapters,
+                    &plan.first,
+                    first.qty,
+                    first_bbo,
+                    paper,
+                )
+                .await
+                {
+                    Ok(()) => Err(anyhow::anyhow!(
+                        "EMERGENCY_CLOSED: second leg failed ({err}); first leg market-closed"
+                    )),
+                    Err(eclose) => Err(anyhow::anyhow!(
+                        "NAKED_FIRST_LEG: second leg failed ({err}); close failed ({eclose})"
+                    )),
                 }
             }
         }
-    }
-
-    /// 等超时后拉第二所持仓。有同向实仓 → 记成交；没有 → 市价平第一腿。
-    /// 持仓接口失败仍不明，不平第一腿，交人工。
-    async fn verify_second_or_close_first(
-        cfg: &AppConfig,
-        adapters: &Adapters,
-        plan: &HedgePlan,
-        first: &ExecFill,
-        first_bbo: &Bbo,
-        paper: bool,
-        prior: &anyhow::Error,
-    ) -> Result<ExecFill> {
-        let wait_ms = cfg.order.second_leg_verify_ms;
-        if wait_ms > 0 {
-            info!(
-                pair = %plan.pair_id,
-                venue = %plan.second.venue,
-                wait_ms,
-                "waiting to verify second-leg position"
-            );
-            sleep(Duration::from_millis(wait_ms)).await;
-        }
-        if paper {
-            return Self::close_first_after_verify(
-                cfg, adapters, plan, first, first_bbo, paper, prior,
-            )
-            .await;
-        }
-        match Self::fetch_second_leg_qty(adapters, plan).await {
-            Ok(qty)
-                if second_qty_confirms_fill(
-                    qty,
-                    plan.second.is_buy,
-                    first.qty,
-                    plan.second.min_qty,
-                ) =>
-            {
-                let filled = qty.abs().min(first.qty);
-                info!(
-                    pair = %plan.pair_id,
-                    venue = %plan.second.venue,
-                    qty = %filled,
-                    "second leg confirmed by exchange position"
-                );
-                Ok(ExecFill {
-                    venue: plan.second.venue.clone(),
-                    qty: filled,
-                    price: Decimal::ZERO,
-                    is_buy: plan.second.is_buy,
-                    order_id: None,
-                })
-            }
-            Ok(qty) => {
-                info!(
-                    pair = %plan.pair_id,
-                    venue = %plan.second.venue,
-                    qty = %qty,
-                    "second venue has no matching position; market-closing first leg"
-                );
-                Self::close_first_after_verify(
-                    cfg, adapters, plan, first, first_bbo, paper, prior,
-                )
-                .await
-            }
-            Err(query) => {
-                warn!(
-                    pair = %plan.pair_id,
-                    venue = %plan.second.venue,
-                    prior = %prior,
-                    error = %query,
-                    "position query failed after wait; not closing first leg"
-                );
-                Err(anyhow::anyhow!(
-                    "SECOND_LEG_UNKNOWN: leg {} fill unverifiable ({prior}); \
-                     position query failed ({query})",
-                    plan.second.venue
-                ))
-            }
-        }
-    }
-
-    async fn close_first_after_verify(
-        cfg: &AppConfig,
-        adapters: &Adapters,
-        plan: &HedgePlan,
-        first: &ExecFill,
-        first_bbo: &Bbo,
-        paper: bool,
-        prior: &anyhow::Error,
-    ) -> Result<ExecFill> {
-        match Self::emergency_close(
-            cfg,
-            adapters,
-            &plan.first,
-            first.qty,
-            plan.is_open,
-            first_bbo,
-            paper,
-        )
-        .await
-        {
-            Ok(()) => Err(anyhow::anyhow!(
-                "EMERGENCY_CLOSED: second leg unconfirmed ({prior}); \
-                 no position on {}; first leg market-closed",
-                plan.second.venue
-            )),
-            Err(eclose) => Err(anyhow::anyhow!(
-                "NAKED_FIRST_LEG: second leg unconfirmed ({prior}); \
-                 no position on {}; emergency close failed ({eclose})",
-                plan.second.venue
-            )),
-        }
-    }
-
-    async fn fetch_second_leg_qty(adapters: &Adapters, plan: &HedgePlan) -> Result<Decimal> {
-        let adapter = adapters
-            .get(&plan.second.venue)
-            .ok_or_else(|| anyhow::anyhow!("unknown venue {}", plan.second.venue))?;
-        let positions = adapter.positions().await?;
-        let base = plan
-            .pair_id
-            .split('-')
-            .next()
-            .unwrap_or(plan.pair_id.as_str());
-        Ok(positions
-            .iter()
-            .filter(|p| symbol_matches_symbol(&p.symbol, &plan.second.symbol, base))
-            .map(|p| p.qty)
-            .sum())
     }
 
     pub(crate) async fn emergency_close(
@@ -619,7 +445,6 @@ impl HedgeExecutor {
         adapters: &Adapters,
         leg: &HedgeLeg,
         qty: Decimal,
-        reduce_only: bool,
         bbo: &Bbo,
         paper: bool,
     ) -> Result<()> {
@@ -630,21 +455,48 @@ impl HedgeExecutor {
         reverse.is_buy = !leg.is_buy;
         reverse.style = OrderStyle::MarketTaker;
         let price = market_price(&reverse, bbo);
-        // emergency=true：放宽滑点上限。平不掉才是真风险，穿档只是成本。
-        Self::send_leg(
-            cfg,
-            adapters,
-            &reverse,
-            qty,
-            price,
-            reduce_only,
-            paper,
-            bbo,
-            true,
-        )
-        .await?;
-        info!(venue = %leg.venue, qty = %qty, "emergency close first leg");
-        Ok(())
+        let mut last_err: Option<anyhow::Error> = None;
+        for attempt in 1..=ROLLBACK_ATTEMPTS {
+            match Self::send_leg(
+                cfg,
+                adapters,
+                &reverse,
+                qty,
+                price,
+                false,
+                paper,
+                bbo,
+                true,
+            )
+            .await
+            {
+                Ok(_) => {
+                    info!(
+                        venue = %leg.venue,
+                        qty = %qty,
+                        attempt,
+                        "emergency close first leg"
+                    );
+                    return Ok(());
+                }
+                Err(err) => {
+                    warn!(
+                        venue = %leg.venue,
+                        qty = %qty,
+                        attempt,
+                        max = ROLLBACK_ATTEMPTS,
+                        error = %err,
+                        "emergency close attempt unconfirmed"
+                    );
+                    if is_unverifiable(&err) {
+                        // place 已成功、只是认不到成交。再发就是叠仓。
+                        return Err(err);
+                    }
+                    last_err = Some(err);
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("emergency close failed")))
     }
 
     /// `price`：市价腿的**决策信号价**（滑点保护基准）；maker 腿的挂单价。
@@ -728,14 +580,9 @@ impl HedgeExecutor {
         // 这里同样不推断——查不到数量就当没确认，往下走 Unknown 分支。
         let filled = effective_filled_qty(&ack);
         if filled <= Decimal::ZERO {
-            // 「确定没成交」和「不知道有没有成交」必须分开：
-            // Canceled/Rejected 是交易所的终态回复，反手平第一腿是安全的；
-            // Unknown 意味着连 sidecar 也没能确认，此时紧急平仓可能在
-            // 第二腿其实已成交的情况下造出一条无人记账的反向裸仓。
-            //
-            // Filled/Partial 却查不到数量属于同一类：交易所说成交了，
-            // 数量没确认。这种情况**更**不能反手平第一腿——第二腿很可能
-            // 真的成交了。一律交人工介入。
+            // sidecar 已等该单推送 1 秒再查一次。没量就当失败，由上层市价平另一腿。
+            // Unknown/Filled/Partial 仍单独报 SECOND_LEG_UNKNOWN，双市价第一腿
+            // 用它区分「可能已成交要回滚」和「确定没成交不用回滚」。
             if matches!(
                 ack.status,
                 OrderStatus::Unknown | OrderStatus::Filled | OrderStatus::Partial
@@ -807,95 +654,6 @@ fn ack_order_id(ack: &OrderAck) -> Option<String> {
     }
 }
 
-/// 平仓下单前记下各所累计 realized。Entropy 是逐笔 closedPnl，不必记。
-pub async fn snapshot_realized_before(
-    adapters: &Adapters,
-    plan: &HedgePlan,
-    paper: bool,
-) -> HashMap<String, Decimal> {
-    let mut out = HashMap::new();
-    if paper || plan.is_open {
-        return out;
-    }
-    for leg in [&plan.first, &plan.second] {
-        let Some(adapter) = adapters.get(&leg.venue) else {
-            continue;
-        };
-        match adapter.fill_realized_pnl(&leg.symbol, None).await {
-            Ok(p) if p.found && !p.per_fill => {
-                out.insert(leg.venue.clone(), p.realized_pnl);
-            }
-            Ok(_) => {}
-            Err(err) => {
-                warn!(venue = %leg.venue, error = %err, "realized_pnl snapshot failed");
-            }
-        }
-    }
-    out
-}
-
-async fn query_leg_close_pnl(
-    adapters: &Adapters,
-    leg: &HedgeLeg,
-    order_id: Option<&str>,
-    before: Option<Decimal>,
-) -> Option<Decimal> {
-    let adapter = adapters.get(&leg.venue)?;
-    for attempt in 0..4u32 {
-        let after = match adapter.fill_realized_pnl(&leg.symbol, order_id).await {
-            Ok(v) => v,
-            Err(err) => {
-                warn!(venue = %leg.venue, error = %err, "fill_pnl query failed");
-                FillPnl::missing()
-            }
-        };
-        if let Some(pnl) = after.this_close_pnl(before) {
-            return Some(pnl);
-        }
-        if after.found {
-            return None;
-        }
-        if attempt + 1 < 4 {
-            sleep(Duration::from_millis(250)).await;
-        }
-    }
-    None
-}
-
-/// 平仓后向两所取已实现盈亏再相加。缺任一腿则整笔 None（执行带显示 —）。
-pub async fn dex_close_pnl_usdc(
-    adapters: &Adapters,
-    plan: &HedgePlan,
-    result: &ExecResult,
-) -> Option<Decimal> {
-    let (a, b) = tokio::join!(
-        query_leg_close_pnl(
-            adapters,
-            &plan.first,
-            result.first.order_id.as_deref(),
-            result.realized_before.get(&plan.first.venue).copied(),
-        ),
-        query_leg_close_pnl(
-            adapters,
-            &plan.second,
-            result.second.order_id.as_deref(),
-            result.realized_before.get(&plan.second.venue).copied(),
-        ),
-    );
-    match (a, b) {
-        (Some(x), Some(y)) => Some(x + y),
-        _ => {
-            warn!(
-                pair = %plan.pair_id,
-                first_ok = a.is_some(),
-                second_ok = b.is_some(),
-                "venue realized pnl missing on at least one leg; tape shows —"
-            );
-            None
-        }
-    }
-}
-
 pub fn book_for(books: &Books, venue: &str, pair_id: &str) -> Result<Bbo> {
     read_book(books, venue, pair_id)
         .ok_or_else(|| anyhow::anyhow!("missing book {venue}/{pair_id}"))
@@ -936,10 +694,8 @@ fn market_price(leg: &HedgeLeg, bbo: &Bbo) -> Decimal {
     }
 }
 
-/// 第二腿是否「结果不明」。不明时禁止紧急平仓——见 `Cause::SecondLegUnknown`。
-///
-/// 除 sidecar 显式返回 SECOND_LEG_UNKNOWN 外，网络层超时和连接失败同样不可知：
-/// 交易所可能已收到并成交，此时 emergency_close 反而造出裸仓。
+/// 下单结果不明（sidecar 超时、连接断、查不到成交量）。
+/// 双市价第一腿碰上这个时立刻市价回滚，不再发第二腿。
 pub(crate) fn is_unverifiable(err: &anyhow::Error) -> bool {
     let s = err.to_string();
     s.contains("SECOND_LEG_UNKNOWN")
@@ -949,21 +705,6 @@ pub(crate) fn is_unverifiable(err: &anyhow::Error) -> bool {
         || s.contains("connection refused")
         || s.contains("broken pipe")
         || s.contains("timed out")
-}
-
-/// 第二所仓位是否足以认定第二腿已成交。方向要和本腿一致。
-fn second_qty_confirms_fill(
-    qty: Decimal,
-    is_buy: bool,
-    planned: Decimal,
-    min_qty: Decimal,
-) -> bool {
-    let need = planned.abs().min(min_qty.max(Decimal::new(1, 8)));
-    if is_buy {
-        qty >= need
-    } else {
-        qty <= -need
-    }
 }
 
 fn effective_filled_qty(ack: &OrderAck) -> Decimal {
@@ -1071,6 +812,7 @@ mod tests {
             is_buy,
             style: OrderStyle::LimitMaker,
             min_qty: dec!(0.0001),
+            limit_price: None,
         }
     }
 
@@ -1094,28 +836,17 @@ mod tests {
         );
     }
 
-    /// 「不确定」必须与「确定没成交」走不同的错误路径：
-    /// 只有后者允许紧急平第一腿。前者反手平仓可能在第二腿其实已成交时
-    /// 造出一条无人记账的反向裸仓。
+    /// 「不确定」与「确定没成交」错误串不同：双市价第一腿不明才立刻回滚。
     #[test]
     fn unverifiable_is_distinct_from_confirmed_no_fill() {
         let unknown = anyhow::anyhow!("SECOND_LEG_UNKNOWN: leg lighter fill unverifiable");
         let rejected = anyhow::anyhow!("leg lighter not filled (status Rejected)");
         assert!(is_unverifiable(&unknown));
         assert!(!is_unverifiable(&rejected));
-    }
-
-    #[test]
-    fn second_qty_confirms_fill_needs_matching_sign_and_min() {
-        let min = dec!(0.007);
-        let planned = dec!(0.015);
-        assert!(second_qty_confirms_fill(dec!(0.015), true, planned, min));
-        assert!(second_qty_confirms_fill(dec!(0.007), true, planned, min));
-        assert!(!second_qty_confirms_fill(dec!(0.001), true, planned, min));
-        assert!(!second_qty_confirms_fill(Decimal::ZERO, true, planned, min));
-        assert!(!second_qty_confirms_fill(dec!(-0.015), true, planned, min));
-        assert!(second_qty_confirms_fill(dec!(-0.015), false, planned, min));
-        assert!(!second_qty_confirms_fill(dec!(0.015), false, planned, min));
+        let nested = anyhow::anyhow!(
+            "NAKED_FIRST_LEG: QUOTE_LOST_RACE close failed (SECOND_LEG_UNKNOWN: leg lighter_rh fill unverifiable)"
+        );
+        assert!(is_unverifiable(&nested));
     }
 
     fn book(bid: Decimal, ask: Decimal) -> Bbo {
@@ -1148,12 +879,8 @@ mod tests {
         assert_eq!(effective_filled_qty(&ack(Decimal::ZERO, OrderStatus::Filled)), Decimal::ZERO);
     }
 
-    /// 第二腿零成交时的分流：确定没成交 → 可以反手平第一腿；
-    /// 成交量未确认 → 只能人工介入。
-    ///
-    /// 关键是 `Filled` 落在「未确认」一侧：交易所说成交了却不给数量，
-    /// 按请求量记账就是幻影成交，反手平第一腿更会造出反向裸仓。
-    /// 对齐参考对市价单关闭 `_infer_fill_from_status` 兜底。
+    /// 零成交时不把 Filled/Unknown 推断成请求量。sidecar 1 秒+查一次仍没量
+    /// 就当失败，由上层市价平另一腿。
     #[test]
     fn zero_fill_only_auto_closes_on_terminal_no_fill() {
         let unconfirmed = |s| {

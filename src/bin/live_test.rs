@@ -228,7 +228,5 @@ fn log_journal(
         detail: detail.to_string(),
         grid_from: None,
         grid_to: None,
-        pnl_pct: None,
-        pnl_usdc: None,
     })
 }

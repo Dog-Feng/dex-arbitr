@@ -132,9 +132,6 @@ pub struct LiveSnapshot {
     /// 启动时加载的交集全集（不订阅、不进决策）。
     #[serde(default)]
     pub available: Vec<AvailableSymbol>,
-    /// 本次进程执行带上各笔平仓实际盈亏之和（两所账户权益差）。
-    #[serde(default)]
-    pub session_pnl_usdc: String,
     /// 扫描表。执行带的 `pairs` 不要复用。
     #[serde(default)]
     pub scan: ScanSnapshot,
@@ -259,6 +256,9 @@ impl ApiHub {
     }
 
     pub fn push_execution(&self, rec: ExecRecord) {
+        if !rec.is_fill() {
+            return;
+        }
         let mut v = self.session_execs.lock().unwrap_or_else(|e| {
             tracing::warn!("executions lock poisoned; recovering");
             e.into_inner()
@@ -275,25 +275,6 @@ impl ApiHub {
             .lock()
             .map(|v| v.iter().take(limit).cloned().collect())
             .unwrap_or_else(|e| e.into_inner().iter().take(limit).cloned().collect())
-    }
-
-    /// 本次运行已记账的平仓实际盈亏之和（执行带 close 记录的 pnl_usdc）。
-    pub fn session_pnl_usdc(&self) -> Decimal {
-        self.session_execs
-            .lock()
-            .map(|v| {
-                v.iter()
-                    .filter(|r| r.action == "close")
-                    .filter_map(|r| r.pnl_usdc)
-                    .sum()
-            })
-            .unwrap_or_else(|e| {
-                e.into_inner()
-                    .iter()
-                    .filter(|r| r.action == "close")
-                    .filter_map(|r| r.pnl_usdc)
-                    .sum()
-            })
     }
 
     pub fn spawn(self: Arc<Self>, bind: &str) -> tokio::task::JoinHandle<()> {
@@ -444,8 +425,6 @@ struct ExecRow {
     detail: String,
     grid_from: Option<i32>,
     grid_to: Option<i32>,
-    pnl_usdc: Option<String>,
-    pnl_pct: Option<String>,
 }
 
 impl From<ExecRecord> for ExecRow {
@@ -462,8 +441,6 @@ impl From<ExecRecord> for ExecRow {
             detail: r.detail,
             grid_from: r.grid_from,
             grid_to: r.grid_to,
-            pnl_usdc: r.pnl_usdc.map(|v| format!("{:.4}", v.round_dp(4))),
-            pnl_pct: r.pnl_pct.map(|v| format!("{:.6}", v.round_dp(6))),
         }
     }
 }

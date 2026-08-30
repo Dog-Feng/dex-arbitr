@@ -7,13 +7,21 @@
 </template>
 
 <script setup lang="ts">
-import { h } from "vue";
+import { computed, h } from "vue";
 import { NTag } from "naive-ui";
 import type { DataTableColumns } from "naive-ui";
 import type { ExecRow } from "../types";
 import { statusKind, tapeResultLabel } from "../format";
 
-defineProps<{ rows: ExecRow[] }>();
+const props = defineProps<{ rows: ExecRow[] }>();
+
+/** 只保留真实成交：双腿成交、裸仓补成交、紧急平第一腿。 */
+function isFill(r: ExecRow): boolean {
+  const res = String(r.result || "");
+  return res === "both_filled" || res === "filled" || res === "emergency_closed";
+}
+
+const rows = computed(() => (props.rows || []).filter(isFill));
 
 function gridStep(r: ExecRow): string {
   if (r.grid_from == null && r.grid_to == null) return "—";
@@ -31,23 +39,6 @@ function qtyText(v: unknown): string {
   let frac = (m[3] || "").replace(/0+$/, "");
   if (frac.length > 8) frac = frac.slice(0, 8).replace(/0+$/, "");
   return frac ? `${m[1]}${m[2]}.${frac}` : `${m[1]}${m[2]}`;
-}
-
-function pnlText(r: ExecRow): string {
-  if (r.action !== "close" || r.pnl_usdc == null || r.pnl_usdc === "") return "—";
-  const n = parseFloat(r.pnl_usdc);
-  if (Number.isNaN(n)) return "—";
-  const body = Math.abs(n).toFixed(2);
-  if (n > 0) return `+${body}`;
-  if (n < 0) return `-${body}`;
-  return "0.00";
-}
-
-function pnlCls(r: ExecRow): string {
-  if (r.action !== "close" || r.pnl_usdc == null || r.pnl_usdc === "") return "mu";
-  const n = parseFloat(r.pnl_usdc);
-  if (Number.isNaN(n) || n === 0) return "mu";
-  return n > 0 ? "up" : "dn";
 }
 
 const cols: DataTableColumns<ExecRow> = [
@@ -77,12 +68,6 @@ const cols: DataTableColumns<ExecRow> = [
     key: "grid",
     width: 90,
     render: (r) => h("span", { class: "tabular mu" }, gridStep(r)),
-  },
-  {
-    title: "本次收益",
-    key: "pnl",
-    width: 110,
-    render: (r) => h("span", { class: `tabular ${pnlCls(r)}` }, pnlText(r)),
   },
   {
     title: "结果",

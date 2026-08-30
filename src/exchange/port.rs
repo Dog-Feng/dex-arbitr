@@ -83,17 +83,6 @@ impl FillPnl {
             found: false,
         }
     }
-
-    /// 本笔平仓在该所的已实现盈亏。缺数据则 None，不要当成 0。
-    pub fn this_close_pnl(&self, cumulative_before: Option<Decimal>) -> Option<Decimal> {
-        if !self.found {
-            return None;
-        }
-        if self.per_fill {
-            return Some(self.realized_pnl);
-        }
-        Some(self.realized_pnl - cumulative_before?)
-    }
 }
 
 /// 单市场的当期资金费率。`symbol` 是**该所的原始符号**，跨所匹配靠
@@ -155,38 +144,5 @@ pub trait ExchangePort: Send + Sync {
     async fn fill_realized_pnl(&self, symbol: &str, order_id: Option<&str>) -> Result<FillPnl> {
         let _ = (symbol, order_id);
         Ok(FillPnl::missing())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use rust_decimal_macros::dec;
-
-    #[test]
-    fn entropy_style_uses_fill_directly() {
-        let p = FillPnl {
-            realized_pnl: dec!(1.25),
-            per_fill: true,
-            found: true,
-        };
-        assert_eq!(p.this_close_pnl(None), Some(dec!(1.25)));
-        assert_eq!(p.this_close_pnl(Some(dec!(9))), Some(dec!(1.25)));
-    }
-
-    #[test]
-    fn lighter_style_subtracts_cached_cumulative() {
-        let p = FillPnl {
-            realized_pnl: dec!(10.5),
-            per_fill: false,
-            found: true,
-        };
-        assert_eq!(p.this_close_pnl(Some(dec!(10))), Some(dec!(0.5)));
-        assert!(p.this_close_pnl(None).is_none());
-    }
-
-    #[test]
-    fn missing_fill_is_none_not_zero() {
-        assert!(FillPnl::missing().this_close_pnl(Some(dec!(1))).is_none());
     }
 }

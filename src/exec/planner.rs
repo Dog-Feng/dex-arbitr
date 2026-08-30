@@ -1,7 +1,8 @@
 use rust_decimal::Decimal;
 
 use crate::config::{AppConfig, OrderStyle};
-use crate::domain::{slot_key, Intent, Pair, Position, VenueId};
+use crate::domain::{slot_key, AdjacentQuote, Intent, Pair, Position, VenueId};
+use crate::exec::sequence::first_limit_venue_all_in_or_left;
 
 #[derive(Debug, Clone)]
 pub struct HedgeLeg {
@@ -12,6 +13,8 @@ pub struct HedgeLeg {
     pub style: OrderStyle,
     /// 该所该市场的最小下单量。第二腿用它做前置校验。
     pub min_qty: Decimal,
+    /// 阶段 2 邻档：第一腿绝对限价。None 则用盘口 maker_inside。
+    pub limit_price: Option<Decimal>,
 }
 
 #[derive(Debug, Clone)]
@@ -39,10 +42,12 @@ pub struct HedgePlan {
     /// 成交前 / 后有符号 STEP。
     pub grid_from: i32,
     pub grid_to: i32,
-    /// 仅平仓：决策时的往返净利 %。
-    pub pnl_pct: Option<Decimal>,
     pub first: HedgeLeg,
     pub second: HedgeLeg,
+    /// 阶段 2 邻档侧。None = 阶段 1 市价计划。
+    pub quote_side: Option<crate::domain::QuoteSide>,
+    /// 邻档挂着等事件，不按 2s 超时。
+    pub rest_quote: bool,
 }
 
 impl HedgePlan {
@@ -69,6 +74,70 @@ pub fn plan_hedge(
             build(pair, cfg, *qty, false, &pos.sell, &pos.buy)
         }
     }
+}
+
+/// 阶段 2：邻档第一腿限价 + 第二腿市价。
+pub fn plan_adjacent(
+    pair: &Pair,
+    q: &AdjacentQuote,
+    cfg: &AppConfig,
+    left: &VenueId,
+    first_limit: Decimal,
+    k: i32,
+    base_qty: Decimal,
+    buy_spread_pct: Option<Decimal>,
+    sell_spread_pct: Option<Decimal>,
+) -> Option<HedgePlan> {
+    let mut plan = build(pair, cfg, q.qty, q.is_open, &q.buy, &q.sell)?;
+    let (first_v, second_v) =
+        first_limit_venue_all_in_or_left(cfg, &q.buy, &q.sell, left, buy_spread_pct, sell_spread_pct);
+    let first_is_buy = first_v.as_str() == q.buy.as_str();
+    let mut first = if first_is_buy {
+        plan.first.clone()
+    } else {
+        plan.second.clone()
+    };
+    let mut second = if first_is_buy {
+        plan.second.clone()
+    } else {
+        plan.first.clone()
+    };
+    first.is_buy = first_is_buy;
+    first.style = OrderStyle::LimitMaker;
+    first.limit_price = Some(first_limit);
+    second.is_buy = !first_is_buy;
+    second.style = OrderStyle::MarketTaker;
+    second.limit_price = None;
+    // sequenced_legs 按 buy/sell 填了 first=buy, second=sell。邻档挂在「maker+对面 taker+对面点差」更便宜的所。
+    let buy_leg = pair.leg(q.buy.as_str())?;
+    let sell_leg = pair.leg(q.sell.as_str())?;
+    first.venue = first_v.as_str().to_string();
+    second.venue = second_v.as_str().to_string();
+    if first_is_buy {
+        first.symbol = buy_leg.raw_symbol.clone();
+        first.market_index = buy_leg.market_index;
+        first.min_qty = buy_leg.min_qty;
+        second.symbol = sell_leg.raw_symbol.clone();
+        second.market_index = sell_leg.market_index;
+        second.min_qty = sell_leg.min_qty;
+    } else {
+        first.symbol = sell_leg.raw_symbol.clone();
+        first.market_index = sell_leg.market_index;
+        first.min_qty = sell_leg.min_qty;
+        second.symbol = buy_leg.raw_symbol.clone();
+        second.market_index = buy_leg.market_index;
+        second.min_qty = buy_leg.min_qty;
+    }
+    plan.slot = pair.slot_key();
+    plan.style = OrderStyle::LimitThenMarket;
+    plan.first = first;
+    plan.second = second;
+    plan.grid_from = k;
+    plan.grid_to = q.grid_to;
+    plan.base_qty = if q.is_open { base_qty } else { Decimal::ZERO };
+    plan.quote_side = Some(q.side);
+    plan.rest_quote = true;
+    Some(plan)
 }
 
 fn build(
@@ -99,9 +168,10 @@ fn build(
         base_qty: Decimal::ZERO, // 由 controller 从配置填入
         grid_from: 0,
         grid_to: 0,
-        pnl_pct: None,
         first,
         second,
+        quote_side: None,
+        rest_quote: false,
     })
 }
 
@@ -118,6 +188,7 @@ fn sequenced_legs(
         is_buy: true,
         style: OrderStyle::MarketTaker,
         min_qty: buy_leg.min_qty,
+        limit_price: None,
     };
     let sell_h = HedgeLeg {
         venue: sell.as_str().to_string(),
@@ -126,6 +197,7 @@ fn sequenced_legs(
         is_buy: false,
         style: OrderStyle::MarketTaker,
         min_qty: sell_leg.min_qty,
+        limit_price: None,
     };
     (buy_h, sell_h)
 }
@@ -133,7 +205,7 @@ fn sequenced_legs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{CloseReason, VenueId, VenueMarket};
+    use crate::domain::{adjacent_quotes, CloseReason, VenueId, VenueMarket};
     use rust_decimal_macros::dec;
 
     fn pair() -> Pair {
@@ -229,5 +301,86 @@ mod tests {
         assert!(!plan.second.is_buy);
         assert_eq!(plan.second.style, OrderStyle::MarketTaker);
         assert_eq!(plan.hedgeable_min_qty(), dec!(0.0003));
+    }
+
+    #[test]
+    fn adjacent_plan_is_limit_then_market_on_pair_slot() {
+        let cfg = AppConfig::load_from(std::path::Path::new("config/default.yaml")).unwrap();
+        let p = pair();
+        let left = p.legs[0].venue.clone();
+        let right = p.legs[1].venue.clone();
+        let q = adjacent_quotes(
+            0,
+            dec!(0),
+            dec!(0.02),
+            3,
+            Decimal::ZERO,
+            &left,
+            &right,
+            dec!(0.001),
+            Decimal::ZERO,
+        );
+        let plus = q.iter().find(|x| x.side == crate::domain::QuoteSide::Plus).unwrap();
+        let plan = plan_adjacent(
+            &p,
+            plus,
+            &cfg,
+            &left,
+            dec!(100.05),
+            0,
+            dec!(0.001),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(plan.rest_quote);
+        assert_eq!(plan.style, OrderStyle::LimitThenMarket);
+        assert_eq!(plan.slot, p.slot_key());
+        assert_eq!(plan.quote_side, Some(crate::domain::QuoteSide::Plus));
+        assert_eq!(plan.first.style, OrderStyle::LimitMaker);
+        assert_eq!(plan.first.limit_price, Some(dec!(100.05)));
+        assert_eq!(plan.second.style, OrderStyle::MarketTaker);
+        assert!(plan.second.limit_price.is_none());
+        assert!(plan.is_open);
+        assert_eq!(plan.grid_from, 0);
+        assert_eq!(plan.grid_to, 1);
+        assert_eq!(plan.base_qty, dec!(0.001));
+    }
+
+    #[test]
+    fn adjacent_first_leg_is_wider_spread_venue() {
+        let cfg = AppConfig::load_from(std::path::Path::new("config/default.yaml")).unwrap();
+        let p = pair();
+        let left = p.legs[0].venue.clone();
+        let right = p.legs[1].venue.clone();
+        let q = adjacent_quotes(
+            0,
+            dec!(0),
+            dec!(0.02),
+            3,
+            Decimal::ZERO,
+            &left,
+            &right,
+            dec!(0.001),
+            Decimal::ZERO,
+        );
+        let plus = q.iter().find(|x| x.side == crate::domain::QuoteSide::Plus).unwrap();
+        // plus: 卖 L 买 R。R 点差更宽 → 第一腿挂 R（买）。
+        let plan = plan_adjacent(
+            &p,
+            plus,
+            &cfg,
+            &left,
+            dec!(100.05),
+            0,
+            dec!(0.001),
+            Some(dec!(0.05)),
+            Some(dec!(0.01)),
+        )
+        .unwrap();
+        assert_eq!(plan.first.venue, right.as_str());
+        assert!(plan.first.is_buy);
+        assert_eq!(plan.second.venue, left.as_str());
+        assert!(!plan.second.is_buy);
     }
 }

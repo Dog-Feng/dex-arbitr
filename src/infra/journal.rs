@@ -20,10 +20,16 @@ pub struct ExecRecord {
     pub grid_from: Option<i32>,
     /// 成交后格子（有符号 STEP）。
     pub grid_to: Option<i32>,
-    /// 仅关仓/减格：两所账户权益差之和（开仓前快照 vs 平仓后）。开仓为空。
-    pub pnl_usdc: Option<Decimal>,
-    /// 已不再用于执行带展示；保留字段以免旧客户端崩。
-    pub pnl_pct: Option<Decimal>,
+}
+
+impl ExecRecord {
+    /// 执行带只展示真实成交，撤单/超时/介入不进列表。
+    pub fn is_fill(&self) -> bool {
+        matches!(
+            self.result.as_str(),
+            "both_filled" | "filled" | "emergency_closed"
+        )
+    }
 }
 
 pub struct ExecJournal {
@@ -92,8 +98,6 @@ impl ExecJournal {
                 detail: row.get(8)?,
                 grid_from: None,
                 grid_to: None,
-                pnl_usdc: None,
-                pnl_pct: None,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)

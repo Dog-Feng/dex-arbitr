@@ -310,6 +310,15 @@ pub struct GridConfig {
     /// STEP 滞后（格）。加仓 raw ≥ k+1−h，减仓 raw ≤ k−1+h。
     #[serde(default = "default_step_hysteresis")]
     pub step_hysteresis: Decimal,
+    /// true = 阶段 2 邻档限价；false = 阶段 1 撞线双市价。
+    #[serde(default)]
+    pub symmetric_limit: bool,
+    /// 空仓 |μ_live−μ_quote| ≥ 此比例×Δ 才改挂单价。
+    #[serde(default = "default_quote_reprice_ratio")]
+    pub quote_reprice_ratio: Decimal,
+    /// 加仓档与当前可执行价差至少隔这么多格（×Δ）才挂。减仓档不限制。
+    #[serde(default = "default_min_quote_gap_ratio")]
+    pub min_quote_gap_ratio: Decimal,
 }
 
 fn default_window_samples() -> usize {
@@ -324,15 +333,22 @@ fn default_step_hysteresis() -> Decimal {
     Decimal::new(25, 2)
 }
 
+fn default_quote_reprice_ratio() -> Decimal {
+    Decimal::new(2, 1)
+}
+
+fn default_min_quote_gap_ratio() -> Decimal {
+    Decimal::new(3, 1)
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct OrderConfig {
-    /// 第一腿限价最长等待。超时未成交则撤。阶段 2 用。
+    /// 追逐型限价（第二腿 IOC / 非邻档）单轮最长等待。邻档不走这个。
     #[serde(default = "default_limit_timeout_ms")]
     pub limit_timeout_ms: u64,
-    /// 第二腿激进限价（或市价结果不明）之后，等这么久再查该所实仓。
-    /// 没有对应仓位则市价平掉第一腿。0 = 不等，立刻查。
-    #[serde(default = "default_second_leg_verify_ms")]
-    pub second_leg_verify_ms: u64,
+    /// 邻档第一腿存活。0 = 只按事件撤，不按秒超时。
+    #[serde(default)]
+    pub adjacent_timeout_ms: u64,
     /// maker 腿往点差内侧挪几个 tick。0 = 贴自家盘口（队尾，几乎不成交）。
     #[serde(default = "default_maker_inside_ticks")]
     pub maker_inside_ticks: u32,
@@ -342,10 +358,6 @@ pub struct OrderConfig {
 }
 
 fn default_limit_timeout_ms() -> u64 {
-    2000
-}
-
-fn default_second_leg_verify_ms() -> u64 {
     2000
 }
 
@@ -799,6 +811,10 @@ mod tests {
         assert_eq!(cfg.grid.window_samples, 1000);
         assert_eq!(cfg.grid.sample_interval_ms, 1000);
         assert_eq!(cfg.grid.step_hysteresis, Decimal::ZERO);
+        assert!(!cfg.grid.symmetric_limit);
+        assert_eq!(cfg.grid.quote_reprice_ratio, dec!(0.2));
+        assert_eq!(cfg.grid.min_quote_gap_ratio, dec!(0.3));
+        assert_eq!(cfg.order.adjacent_timeout_ms, 0);
         assert_eq!(cfg.pairs.defaults.target_bp, dec!(1));
         assert_eq!(cfg.sizing.leverage_multiplier, dec!(5));
         let sodex = cfg.load_venue("sodex").unwrap();

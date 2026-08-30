@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/gorilla/websocket"
 	"github.com/shopspring/decimal"
 	sodexclient "github.com/sodex-tech/sodex-go-sdk-public/client"
 	"github.com/sodex-tech/sodex-go-sdk-public/common/enums"
@@ -51,9 +52,18 @@ type sodexSession struct {
 }
 
 type sodexFillNote struct {
-	qty decimal.Decimal
-	px  string
-	at  time.Time
+	// accountOrderUpdate.z 是累计；accountTrade.q 是增量。取较大值，避免双计。
+	fromOrder decimal.Decimal
+	fromFills decimal.Decimal
+	px        string
+	at        time.Time
+}
+
+func (n sodexFillNote) qty() decimal.Decimal {
+	if n.fromOrder.GreaterThan(n.fromFills) {
+		return n.fromOrder
+	}
+	return n.fromFills
 }
 
 func (s *sodexSession) close() {
@@ -108,7 +118,7 @@ func dispatchSodex(ctx context.Context, reg *registry, req request) (any, error)
 	case "cancel":
 		return cancelOrder(ctx, s.client, s.accountID, params)
 	case "order_status":
-		return orderStatus(ctx, s.client, s.accountID, s.addr, params)
+		return orderStatus(ctx, s, params)
 	case "funding":
 		return s.funding(ctx)
 	case "watch":
@@ -148,30 +158,52 @@ func (s *sodexSession) runOrderStream(ctx context.Context) {
 }
 
 func (s *sodexSession) orderStreamOnce(ctx context.Context) error {
-	c, err := sodexws.NewClient(sodexWSBase(s.venue.Rest), "perps")
+	d := websocket.Dialer{HandshakeTimeout: 10 * time.Second}
+	c, _, err := d.DialContext(ctx, sodexWSURL(s.venue.Rest), nil)
 	if err != nil {
 		return err
 	}
 	defer c.Close()
-	if err := c.Connect(ctx); err != nil {
-		return err
+	// 官方 schema：accountID 缺省=主账户。SDK SubscribeParams 没有这个字段，
+	// yaml 配了子账户时必须自己带上，否则 REST 下单 6222、WS 订到主账户。
+	subs := []map[string]any{
+		{"op": "subscribe", "params": sodexAccountSubParams(sodexws.ChannelAccountOrderUpd, s.addr, s.accountID)},
+		{"op": "subscribe", "params": sodexAccountSubParams(sodexws.ChannelAccountTrade, s.addr, s.accountID)},
 	}
-	// SDK 自带断线重订与 ping/pong 保活。
-	if _, err := c.Subscribe(
-		sodexws.SubscribeParams{Channel: sodexws.ChannelAccountOrderUpd, User: s.addr},
-		func(p sodexws.Push) {
-			var upd sodexws.AccountOrderUpdate
-			if json.Unmarshal(p.Data, &upd) != nil {
+	for _, sub := range subs {
+		if err := c.WriteJSON(sub); err != nil {
+			return err
+		}
+	}
+	done := make(chan struct{})
+	go func() {
+		t := time.NewTicker(30 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
 				return
+			case <-done:
+				return
+			case <-t.C:
+				_ = c.WriteJSON(map[string]string{"op": "ping"})
 			}
-			s.noteOrderUpdate(upd)
-			emitPush("sodex", upd)
-		},
-	); err != nil {
-		return err
+		}
+	}()
+	defer close(done)
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		_ = c.SetReadDeadline(time.Now().Add(90 * time.Second))
+		_, msg, err := c.ReadMessage()
+		if err != nil {
+			return err
+		}
+		s.noteWsMsg(msg)
 	}
-	<-ctx.Done()
-	return ctx.Err()
 }
 
 func sodexWSBase(rest string) string {
@@ -179,6 +211,96 @@ func sodexWSBase(rest string) string {
 	base = strings.TrimPrefix(base, "https://")
 	base = strings.TrimPrefix(base, "http://")
 	return "wss://" + strings.TrimRight(base, "/")
+}
+
+func sodexWSURL(rest string) string {
+	return sodexWSBase(rest) + "/ws/perps"
+}
+
+func sodexAccountSubParams(channel, user string, accountID uint64) map[string]any {
+	p := map[string]any{"channel": channel, "user": user}
+	if accountID > 0 {
+		p["accountID"] = accountID
+	}
+	return p
+}
+
+func (s *sodexSession) noteWsMsg(msg []byte) {
+	var env struct {
+		Op      string          `json:"op"`
+		Channel string          `json:"channel"`
+		Data    json.RawMessage `json:"data"`
+	}
+	if json.Unmarshal(msg, &env) != nil {
+		return
+	}
+	if env.Op == "pong" || env.Op == "subscribe" || env.Op == "unsubscribe" {
+		return
+	}
+	switch env.Channel {
+	case sodexws.ChannelAccountOrderUpd:
+		for _, upd := range parseSodexOrderUpdates(env.Data) {
+			s.noteOrderUpdate(upd)
+			emitPush("sodex", upd)
+		}
+	case sodexws.ChannelAccountTrade:
+		for _, tr := range parseSodexTrades(env.Data) {
+			s.noteTrade(tr)
+			emitPush("sodex", tr)
+		}
+	}
+}
+
+func parseSodexOrderUpdates(data json.RawMessage) []sodexws.AccountOrderUpdate {
+	if len(data) == 0 {
+		return nil
+	}
+	// 官方推送 data 是数组；偶发单对象。两种都认。
+	var many []sodexws.AccountOrderUpdate
+	if json.Unmarshal(data, &many) == nil && len(many) > 0 {
+		return many
+	}
+	var one sodexws.AccountOrderUpdate
+	if json.Unmarshal(data, &one) == nil && (one.OrderID != 0 || strings.TrimSpace(one.ClOrdID) != "") {
+		return []sodexws.AccountOrderUpdate{one}
+	}
+	return nil
+}
+
+func parseSodexTrades(data json.RawMessage) []sodexws.AccountTrade {
+	if len(data) == 0 {
+		return nil
+	}
+	var many []sodexws.AccountTrade
+	if json.Unmarshal(data, &many) == nil && len(many) > 0 {
+		return many
+	}
+	var one sodexws.AccountTrade
+	if json.Unmarshal(data, &one) == nil && (one.OrderID != 0 || strings.TrimSpace(one.ClOrdID) != "") {
+		return []sodexws.AccountTrade{one}
+	}
+	return nil
+}
+
+func sanitizeSodexClOrdID(raw string) string {
+	id := strings.TrimSpace(raw)
+	if id == "" {
+		id = nextArbClientOrderID()
+	}
+	var b strings.Builder
+	for _, r := range id {
+		if (r >= '0' && r <= '9') || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || r == '_' || r == '-' {
+			b.WriteRune(r)
+		}
+	}
+	id = b.String()
+	if id == "" {
+		id = "arb"
+	}
+	if len(id) > 36 {
+		id = id[:36]
+	}
+	return id
 }
 
 func loadSodexVenue(path string) (sodexVenueFile, error) {
@@ -399,6 +521,59 @@ func fetchPerpsPositions(ctx context.Context, baseURL, addr, query string) ([]so
 	return wrapper.Data.Positions, nil
 }
 
+func fetchPerpsOrders(ctx context.Context, baseURL, addr, query string) ([]sodexclient.Order, error) {
+	path := strings.TrimRight(baseURL, "/") + "/api/v1/perps/accounts/" + url.PathEscape(addr) + "/orders" + query
+	return fetchPerpsOrderList(ctx, path)
+}
+
+func fetchPerpsOrdersHistory(ctx context.Context, baseURL, addr, query string) ([]sodexclient.Order, error) {
+	path := strings.TrimRight(baseURL, "/") + "/api/v1/perps/accounts/" + url.PathEscape(addr) + "/orders/history" + query
+	return fetchPerpsOrderList(ctx, path)
+}
+
+func fetchPerpsOrderList(ctx context.Context, path string) ([]sodexclient.Order, error) {
+	var wrapper struct {
+		Code    int             `json:"code"`
+		Data    json.RawMessage `json:"data"`
+		Message string          `json:"message"`
+	}
+	if err := httpGetJSON(ctx, path, &wrapper); err != nil {
+		return nil, err
+	}
+	if wrapper.Code != 0 {
+		return nil, fmt.Errorf("sodex orders code=%d msg=%s", wrapper.Code, wrapper.Message)
+	}
+	return unmarshalSodexOrders(wrapper.Data)
+}
+
+func unmarshalSodexOrders(raw json.RawMessage) ([]sodexclient.Order, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil, nil
+	}
+	var nested struct {
+		Orders json.RawMessage `json:"orders"`
+	}
+	if json.Unmarshal(raw, &nested) == nil && len(nested.Orders) > 0 {
+		var orders []sodexclient.Order
+		if err := json.Unmarshal(nested.Orders, &orders); err != nil {
+			return nil, fmt.Errorf("sodex parse orders: %w", err)
+		}
+		return orders, nil
+	}
+	var orders []sodexclient.Order
+	if err := json.Unmarshal(raw, &orders); err != nil {
+		return nil, fmt.Errorf("sodex parse orders: %w", err)
+	}
+	return orders, nil
+}
+
+func appendQuery(query, key, value string) string {
+	if query == "" {
+		return "?" + url.QueryEscape(key) + "=" + url.QueryEscape(value)
+	}
+	return query + "&" + url.QueryEscape(key) + "=" + url.QueryEscape(value)
+}
+
 func fetchPerpsState(ctx context.Context, baseURL, addr, query string) ([]sodexclient.Balance, []sodexclient.Position, error) {
 	var wrapper struct {
 		Code int `json:"code"`
@@ -550,7 +725,6 @@ func lookupSymbol(ctx context.Context, c *sodexclient.Client, symbolID uint64, s
 func placeOrder(ctx context.Context, s *sodexSession, params map[string]any) (map[string]string, error) {
 	c := s.client
 	accountID := s.accountID
-	addr := s.addr
 	symbolID, err := paramUint64(params, "market_index")
 	if err != nil {
 		return nil, err
@@ -565,7 +739,7 @@ func placeOrder(ctx context.Context, s *sodexSession, params map[string]any) (ma
 	// 不驻留的单（market / aggressive_limit 都是 IOC）：下完要么成交要么
 	// 消失，成交量必须轮询回查。驻留的限价单才可以单次查询。
 	ioc := style != "limit"
-	clOrdID := paramString(params, "client_order_id", fmt.Sprintf("arb-%d", time.Now().UnixMilli()))
+	clOrdID := sanitizeSodexClOrdID(paramString(params, "client_order_id", nextArbClientOrderID()))
 	spec, err := lookupSymbol(ctx, c, symbolID, paramString(params, "symbol", ""))
 	if err != nil {
 		return nil, err
@@ -638,11 +812,11 @@ func placeOrder(ctx context.Context, s *sodexSession, params map[string]any) (ma
 		// 直接抛错会让上层丢掉 clOrdID，这张单就再也没人撤了。
 		// clOrdID 是本地生成的，据此回查一次即可确认。对齐参考
 		// 「WS 超时 → 撤单/REST 确认」的前提：上层必须始终握有 order_id。
-		if o, ok := findOrder(ctx, c, addr, 0, clOrdID); ok {
+		if o, ok := findOrder(ctx, s, 0, clOrdID); ok {
 			filled := o.ExecutedQty
 			// 不驻留的单再轮询确认一次：请求虽然报错，单子可能已经落地并成交。
 			if ioc {
-				if f, ap, _ := waitOrderFill(ctx, s, c, addr, o.OrderID, clOrdID, qty); f.GreaterThan(decimalFromString(filled)) {
+				if f, ap, _ := waitOrderFill(ctx, s, o.OrderID, clOrdID, qty); f.GreaterThan(decimalFromString(filled)) {
 					filled = f.String()
 					if ap != "" {
 						o.Price = ap
@@ -688,12 +862,12 @@ func placeOrder(ctx context.Context, s *sodexSession, params map[string]any) (ma
 		if ioc {
 			// IOC 腿要轮询：不驻留，单次查询看到的 0 分不清
 			// 「整单撤销」还是「索引还没跟上」。
-			f, ap, _ := waitOrderFill(ctx, s, c, addr, r.OrderID, id, qty)
+			f, ap, _ := waitOrderFill(ctx, s, r.OrderID, id, qty)
 			filled = f.String()
 			if ap != "" {
 				avgPrice = ap
 			}
-		} else if o, ok := findOrder(ctx, c, addr, r.OrderID, id); ok {
+		} else if o, ok := findOrder(ctx, s, r.OrderID, id); ok {
 			// 限价腿会驻留，成交检测由上层轮询负责，这里单次查询就够。
 			filled = o.ExecutedQty
 			if ap := avgPriceFromOrder(o); ap != "" {
@@ -834,41 +1008,47 @@ func cancelOrder(ctx context.Context, c *sodexclient.Client, accountID uint64, p
 	return map[string]string{"order_id": orderID, "status": "canceled"}, nil
 }
 
-func orderStatus(ctx context.Context, c *sodexclient.Client, accountID uint64, addr string, params map[string]any) (map[string]string, error) {
-	_ = accountID
+func orderStatus(ctx context.Context, s *sodexSession, params map[string]any) (map[string]string, error) {
 	orderID := paramString(params, "order_id", "")
 	qty, _ := paramDecimal(params, "qty")
-	orders, err := c.PerpsOrders(ctx, addr)
-	if err != nil {
-		return nil, err
+	var oid uint64
+	clOrdID := ""
+	if n, err := strconv.ParseUint(orderID, 10, 64); err == nil && n > 0 {
+		oid = n
+	} else {
+		clOrdID = sanitizeSodexClOrdID(orderID)
 	}
-	for _, o := range orders {
-		oid := strconv.FormatUint(o.OrderID, 10)
-		if oid != orderID && o.ClOrdID != orderID {
-			continue
-		}
-		filled := decimalFromString(o.ExecutedQty)
-		st := "accepted"
-		if filled.GreaterThan(decimal.Zero) {
-			if qty.GreaterThan(decimal.Zero) && filled.GreaterThanOrEqual(qty) {
-				st = "filled"
-			} else {
-				st = "partial"
-			}
-		}
+	o, ok := findOrder(ctx, s, oid, firstNonEmpty(clOrdID, paramString(params, "client_order_id", "")))
+	if !ok {
 		return map[string]string{
-			"order_id":   orderID,
-			"filled_qty": filled.String(),
-			"status":     st,
-			"avg_price":  avgPriceFromOrder(o),
+			"order_id":        orderID,
+			"client_order_id": paramString(params, "client_order_id", ""),
+			"filled_qty":      "0",
+			"status":          "unknown",
+			"avg_price":       "",
 		}, nil
 	}
-	// 不在活跃列表：可能是已成交/已撤，也可能是刚下单 API 尚未可见；禁止假定 filled。
+	filled := decimalFromString(o.ExecutedQty)
+	st := strings.ToLower(strings.TrimSpace(o.Status))
+	out := "accepted"
+	switch {
+	case strings.Contains(st, "reject"):
+		out = "unknown"
+	case filled.GreaterThan(decimal.Zero) && qty.GreaterThan(decimal.Zero) && filled.GreaterThanOrEqual(qty):
+		out = "filled"
+	case filled.GreaterThan(decimal.Zero) && (strings.Contains(st, "fill") || filled.GreaterThanOrEqual(decimalFromString(o.OrigQty))):
+		out = "filled"
+	case filled.GreaterThan(decimal.Zero):
+		out = "partial"
+	case strings.Contains(st, "cancel") || strings.Contains(st, "expire"):
+		out = "canceled"
+	}
 	return map[string]string{
-		"order_id":   orderID,
-		"filled_qty": "0",
-		"status":     "unknown",
-		"avg_price":  "",
+		"order_id":        strconv.FormatUint(o.OrderID, 10),
+		"client_order_id": firstNonEmpty(o.ClOrdID, orderID),
+		"filled_qty":      filled.String(),
+		"status":          out,
+		"avg_price":       avgPriceFromOrder(o),
 	}, nil
 }
 
@@ -881,8 +1061,26 @@ func parsePrivateKey(raw string) (*ecdsa.PrivateKey, error) {
 	return pk, nil
 }
 
-func findOrder(ctx context.Context, c *sodexclient.Client, addr string, orderID uint64, clOrdID string) (sodexclient.Order, bool) {
-	orders, err := c.PerpsOrders(ctx, addr)
+func findOrder(ctx context.Context, s *sodexSession, orderID uint64, clOrdID string) (sodexclient.Order, bool) {
+	if s == nil {
+		return sodexclient.Order{}, false
+	}
+	base := gatewayBase(s.venue.Rest)
+	query := accountQuery(s.accountID)
+	if o, ok := matchSodexOrderList(func() ([]sodexclient.Order, error) {
+		return fetchPerpsOrders(ctx, base, s.addr, query)
+	}, orderID, clOrdID); ok {
+		return o, true
+	}
+	// IOC 成交后不在活跃列表，对齐 Lighter inactive。必须带 accountID，SDK 查单默认主账户。
+	hist := appendQuery(query, "limit", "50")
+	return matchSodexOrderList(func() ([]sodexclient.Order, error) {
+		return fetchPerpsOrdersHistory(ctx, base, s.addr, hist)
+	}, orderID, clOrdID)
+}
+
+func matchSodexOrderList(load func() ([]sodexclient.Order, error), orderID uint64, clOrdID string) (sodexclient.Order, bool) {
+	orders, err := load()
 	if err != nil {
 		return sodexclient.Order{}, false
 	}
@@ -897,14 +1095,7 @@ func findOrder(ctx context.Context, c *sodexclient.Client, addr string, orderID 
 	return sodexclient.Order{}, false
 }
 
-// waitOrderFill 轮询订单直到查到成交量或窗口用尽。
-//
-// 对齐参考 `_wait_for_order_fill_rest`：下单响应里的数量不可信，成交量必须
-// 回查，且**单次查询不够**——撮合与订单索引之间有延迟，刚下的市价单常在
-// 第一次查询时还显示 ExecutedQty=0。单次查询会把「已成交」误判成
-// 「查不到」，上层随即当成未对冲，正是幻影成交的反向版本。
-//
-// 返回 (已确认成交量, 均价, 是否至少查到过这张单)。
+// waitOrderFill：等该单 WS 1 秒，没有再 REST 查一次。返回 (量, 均价, 是否见过这张单)。
 func (s *sodexSession) noteOrderUpdate(upd sodexws.AccountOrderUpdate) {
 	qty := decimalFromString(upd.FilledQty)
 	if !qty.GreaterThan(decimal.Zero) {
@@ -914,20 +1105,57 @@ func (s *sodexSession) noteOrderUpdate(upd sodexws.AccountOrderUpdate) {
 	if px == "" {
 		px = upd.Price
 	}
+	s.setOrderFill(upd.ClOrdID, strconv.FormatInt(upd.OrderID, 10), qty, px)
+}
+
+func (s *sodexSession) noteTrade(tr sodexws.AccountTrade) {
+	qty := decimalFromString(tr.Quantity)
+	if !qty.GreaterThan(decimal.Zero) {
+		return
+	}
+	s.addTradeFill(tr.ClOrdID, strconv.FormatInt(tr.OrderID, 10), qty, tr.Price)
+}
+
+func (s *sodexSession) setOrderFill(clOrdID, oid string, qty decimal.Decimal, px string) {
 	s.fillMu.Lock()
 	defer s.fillMu.Unlock()
 	if s.fills == nil {
 		s.fills = make(map[string]sodexFillNote)
 	}
-	note := sodexFillNote{qty: qty, px: px, at: time.Now()}
-	for _, k := range []string{upd.ClOrdID, strconv.FormatInt(upd.OrderID, 10)} {
+	for _, k := range []string{clOrdID, oid} {
 		if k == "" || k == "0" {
 			continue
 		}
-		if prev, ok := s.fills[k]; ok && prev.qty.GreaterThan(qty) {
+		n := s.fills[k]
+		if qty.GreaterThan(n.fromOrder) {
+			n.fromOrder = qty
+		}
+		if px != "" {
+			n.px = px
+		}
+		n.at = time.Now()
+		s.fills[k] = n
+	}
+	pruneFillCache(s.fills, func(v sodexFillNote) time.Time { return v.at })
+}
+
+func (s *sodexSession) addTradeFill(clOrdID, oid string, qty decimal.Decimal, px string) {
+	s.fillMu.Lock()
+	defer s.fillMu.Unlock()
+	if s.fills == nil {
+		s.fills = make(map[string]sodexFillNote)
+	}
+	for _, k := range []string{clOrdID, oid} {
+		if k == "" || k == "0" {
 			continue
 		}
-		s.fills[k] = note
+		n := s.fills[k]
+		n.fromFills = n.fromFills.Add(qty)
+		if px != "" {
+			n.px = px
+		}
+		n.at = time.Now()
+		s.fills[k] = n
 	}
 	pruneFillCache(s.fills, func(v sodexFillNote) time.Time { return v.at })
 }
@@ -939,8 +1167,10 @@ func (s *sodexSession) wsFill(orderID uint64, clOrdID string) (decimal.Decimal, 
 		if k == "" || k == "0" {
 			continue
 		}
-		if n, ok := s.fills[k]; ok && n.qty.GreaterThan(decimal.Zero) {
-			return n.qty, n.px, true
+		if n, ok := s.fills[k]; ok {
+			if q := n.qty(); q.GreaterThan(decimal.Zero) {
+				return q, n.px, true
+			}
 		}
 	}
 	return decimal.Zero, "", false
@@ -949,13 +1179,11 @@ func (s *sodexSession) wsFill(orderID uint64, clOrdID string) (decimal.Decimal, 
 func waitOrderFill(
 	ctx context.Context,
 	s *sodexSession,
-	c *sodexclient.Client,
-	addr string,
 	orderID uint64,
 	clOrdID string,
 	want decimal.Decimal,
 ) (decimal.Decimal, string, bool) {
-	deadline := time.Now().Add(sodexFillWait)
+	deadline := time.Now().Add(iocFillWait)
 	best := decimal.Zero
 	avg := ""
 	seen := false
@@ -974,23 +1202,32 @@ func waitOrderFill(
 				}
 			}
 		}
-		if o, ok := findOrder(ctx, c, addr, orderID, clOrdID); ok {
-			seen = true
-			if f := decimalFromString(o.ExecutedQty); f.GreaterThan(best) {
-				best = f
-				if ap := avgPriceFromOrder(o); ap != "" {
-					avg = ap
-				}
-			}
-			if want.GreaterThan(decimal.Zero) && best.GreaterThanOrEqual(want) {
-				return best, avg, true
-			}
-		}
 		if time.Now().After(deadline) || ctx.Err() != nil {
-			return best, avg, seen
+			break
 		}
 		tightFillPoll(deadline)
 	}
+	if s != nil {
+		if f, px, ok := s.wsFill(orderID, clOrdID); ok {
+			seen = true
+			if f.GreaterThan(best) {
+				best = f
+				if px != "" {
+					avg = px
+				}
+			}
+		}
+	}
+	if o, ok := findOrder(ctx, s, orderID, clOrdID); ok {
+		seen = true
+		if f := decimalFromString(o.ExecutedQty); f.GreaterThan(best) {
+			best = f
+			if ap := avgPriceFromOrder(o); ap != "" {
+				avg = ap
+			}
+		}
+	}
+	return best, avg, seen
 }
 
 func avgPriceFromOrder(o sodexclient.Order) string {

@@ -130,30 +130,29 @@ match venue.id.as_str() {
 **禁止用请求量 `qty` 顶替 `filled_qty`。**
 
 - 限价单会驻留，下单后单次查询可确认
-- IOC 市价单**不驻留**，单次查询看到的 0 分不清「整单撤销」还是「索引没跟上」→ 必须轮询
-- 查不到 → 报 `unknown`，交上层走仓位对账／人工介入
+- IOC 市价单**不驻留**，下单响应里的量不可信 → 等该单 WS 最多 1 秒，没有再 REST 查一次该单
+- 查不到 → 报 `unknown` / `filled_qty=0`，上层当作失败，立刻市价平另一腿
 
-轮询窗口按所分档（`main.go`），对齐参考项目的 `order_execution` 配置：
+确认窗口三所相同（`main.go` `iocFillWait`）：
 
-| 常量 | 值 | 对应参考项 |
+| 常量 | 值 | 作用 |
 |---|---|---|
-| `lighterFillWait` | 60s | `lighter_market_order_timeout` |
-| `sodexFillWait` | 3s | `limit_order_timeout` |
-| `entropyFillWait` | 3s | 同 SoDEX：`orderStatus` 能看到已终结单 |
-| `marketFillPoll` | 2s | `poll_interval` → `safe_interval = max(1, poll)` |
-| `minFillPoll` | 500ms | 最后一轮夹到 deadline 的下限 |
+| `iocFillWait` | 1s | 等该单私有 WS |
+| 之后 | 查一次该单 | 仍没有量 → 失败 |
 
-`fillPollSleep()` 复刻参考的 `min(safe_interval, max(0.5, deadline − now))`：最后一轮不睡过 deadline，窗口末尾还能再查一次。
+Lighter 查单：活跃列表没有则再查 `accountInactiveOrders`（IOC 成交后不在活跃列表）。成交量用 `initial − remaining`。不用持仓 delta。
 
-新所要判断自己属于哪一档。确认方式也分两种：Lighter 靠**持仓 delta**（`accountActiveOrders` 看不到已成交单），SoDEX 靠**历史订单查询**。新所选哪种取决于它的查询接口能否看到已终结的单。
+Lighter 私有 WS：必须订 `account_all_orders` **和** `account_all_trades`。`orders` 按市场 id 分组是 **map**（`{"1":[Order]}`），不是数组；真正成交常在 trades（`ask_client_id` / `size`）。`rawList` 只展开这类 map；**禁止**递归拆账户快照、`orderBookDetails`——会变成 `decimals unknown`（挂单失败、面板邻档但 DEX 无单）和 `account snapshot unavailable`。
 
-**加长窗口要连带改三处超时**，否则窗口跑不满：sidecar `requestTimeout`（`main.go`）、Rust `WRITE_SIDECAR_TIMEOUT`（`src/exchange/bridge.rs`）、以及该所的 fill wait 本身。任一处先到期都会打断回查，成交量白白退化成 `unknown`。
+Lighter `client_order_id` 是整数，上限 \(2^{48}-1\)。现网 `ms*100 + n%100`。同一毫秒两档不能撞号；`ms*1000+seq` 会超上限被拒。SoDEX / Entropy 用字符串 `arb-{ms}-{seq}`。
+
+**加长窗口要连带改两处超时**：sidecar `requestTimeout`（`iocFillWait + 15s`）、Rust `WRITE_SIDECAR_TIMEOUT`（`src/exchange/bridge.rs`，当前 80s）。任一处先到期都会打断回查。
 
 ### 4.2 市价腿关闭 status 推断
 
 参考对限价单允许「`status=FILLED` 但缺 `filled` → 推断为全额成交」（`_infer_fill_from_status`），对市价单**显式关掉**（`allow_fallback = not is_market_order`）。市价腿的 status 来自下单响应而非成交确认，拿它推断数量就是幻影成交。
 
-Rust 侧同样不推断：`src/exec/executor.rs` `effective_filled_qty()` 只认回查到的量。`Filled`／`Partial` 却查不到数量，归入「未确认」→ 人工介入，**不反手平第一腿**（第二腿很可能真成交了，反手会造出无账的反向裸仓）。
+Rust 侧同样不推断：`src/exec/executor.rs` `effective_filled_qty()` 只认回查到的量。`Filled`／`Partial`／`Unknown` 却查不到数量，一律当失败 → 立刻市价平另一腿（最多 3 次）；3 次仍未确认才人工介入。
 
 ### 4.3 拒单必须报错
 

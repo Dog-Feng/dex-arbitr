@@ -50,8 +50,11 @@ export interface ArbitrageParams {
   window_samples: number;
   sample_interval_ms: number;
   step_hysteresis: string | number;
+  symmetric_limit: boolean;
+  quote_reprice_ratio: string | number;
+  min_quote_gap_ratio: string | number;
   limit_timeout_ms: number;
-  second_leg_verify_ms: number;
+  adjacent_timeout_ms: number;
   maker_inside_ticks: number;
   limit_retry_count: number;
   default_slip_pct: string | number;
@@ -147,7 +150,6 @@ export interface LiveSnapshot {
   arbitrage_enabled: boolean;
   matching: boolean;
   available: AvailableSymbol[];
-  session_pnl_usdc?: string;
   scan?: ScanSnapshot;
   scan_running?: boolean;
   updated_at: number;
@@ -205,8 +207,6 @@ export interface ExecRow {
   detail: string;
   grid_from?: number | null;
   grid_to?: number | null;
-  pnl_usdc?: string | null;
-  pnl_pct?: string | null;
 }
 
 export interface PairDraft {

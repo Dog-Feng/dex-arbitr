@@ -62,6 +62,8 @@ struct SlotWindow {
     sum: Decimal,
     current_bucket: Option<u64>,
     frozen: Option<Decimal>,
+    /// 空仓挂单价中枢。满窗后钉住，直到 |live−sticky| 够大才换。
+    sticky: Option<Decimal>,
 }
 
 impl SlotWindow {
@@ -73,7 +75,7 @@ impl SlotWindow {
     }
 
     fn quote_mu(&self, cap: usize) -> Option<Decimal> {
-        self.frozen.or_else(|| self.live_mu(cap))
+        self.frozen.or(self.sticky).or_else(|| self.live_mu(cap))
     }
 
     fn trim(&mut self, cap: usize) {
@@ -133,6 +135,7 @@ impl WindowBook {
             sum: Decimal::ZERO,
             current_bucket: None,
             frozen: None,
+            sticky: None,
         });
         if st.current_bucket == Some(bucket) {
             if let Some(last) = st.buf.back_mut() {
@@ -150,6 +153,9 @@ impl WindowBook {
         st.buf.push_back(s);
         st.sum += s;
         st.current_bucket = Some(bucket);
+        if st.sticky.is_none() {
+            st.sticky = st.live_mu(cap);
+        }
     }
 
     pub fn sample_count(&self, slot: &str) -> usize {
@@ -166,9 +172,33 @@ impl WindowBook {
         self.slots.get(slot).and_then(|s| s.live_mu(self.cap))
     }
 
-    /// 有仓冻 μ；空仓用 live。未满窗且未冻则为 `None`。
+    /// 有仓冻 μ；空仓用 sticky（未设则 live）。未满窗且未冻则为 `None`。
     pub fn quote_mu(&self, slot: &str) -> Option<Decimal> {
         self.slots.get(slot).and_then(|s| s.quote_mu(self.cap))
+    }
+
+    /// 空仓 |live−sticky| ≥ `min_move` 才把挂单价换成 live。冻仓时不换。
+    pub fn maybe_advance_quote(&mut self, slot: &str, min_move: Decimal) -> bool {
+        let cap = self.cap;
+        let Some(st) = self.slots.get_mut(slot) else {
+            return false;
+        };
+        if st.frozen.is_some() {
+            return false;
+        }
+        let Some(live) = st.live_mu(cap) else {
+            return false;
+        };
+        let Some(sticky) = st.sticky else {
+            st.sticky = Some(live);
+            return false;
+        };
+        if min_move > Decimal::ZERO && (live - sticky).abs() >= min_move {
+            st.sticky = Some(live);
+            true
+        } else {
+            false
+        }
     }
 
     /// 丢掉空闲槽位的窗口（停止套利后不再算 μ）。
@@ -193,13 +223,15 @@ impl WindowBook {
         if st.frozen.is_some() {
             return;
         }
-        st.frozen = st.live_mu(cap);
+        st.frozen = st.sticky.or_else(|| st.live_mu(cap));
     }
 
-    /// 回到 STEP=0 后解冻。
+    /// 回到 STEP=0 后解冻，并把 sticky 锚在当前 live。
     pub fn unfreeze(&mut self, slot: &str) {
+        let cap = self.cap;
         if let Some(st) = self.slots.get_mut(slot) {
             st.frozen = None;
+            st.sticky = st.live_mu(cap);
         }
     }
 }
@@ -416,6 +448,20 @@ mod tests {
         assert_eq!(book.quote_mu("s"), Some(dec!(1)));
         book.unfreeze("s");
         assert_eq!(book.quote_mu("s"), Some(dec!(5)));
+    }
+
+    #[test]
+    fn sticky_quote_ignores_small_live_drift() {
+        let mut book = WindowBook::new(2, 1000);
+        book.observe("s", 0, dec!(0));
+        book.observe("s", 1000, dec!(0));
+        assert_eq!(book.quote_mu("s"), Some(dec!(0)));
+        book.observe("s", 2000, dec!(0.2));
+        assert_eq!(book.live_mu("s"), Some(dec!(0.1)));
+        assert_eq!(book.quote_mu("s"), Some(dec!(0)));
+        assert!(!book.maybe_advance_quote("s", dec!(0.2)));
+        assert!(book.maybe_advance_quote("s", dec!(0.05)));
+        assert_eq!(book.quote_mu("s"), Some(dec!(0.1)));
     }
 
     #[test]

@@ -80,65 +80,6 @@ impl VenueAccountCache {
     }
 }
 
-/// 账户权益：优先稳定币 total（含占用保证金），否则 available。
-/// 开仓会锁保证金，用 available 会把锁仓当成亏损。
-pub fn account_equity(snap: &crate::exchange::AccountSnapshot) -> Decimal {
-    let total = stable_total(&snap.balances);
-    let available = stable_available(&snap.balances);
-    if total > Decimal::ZERO {
-        total.max(available)
-    } else {
-        available
-    }
-}
-
-/// 并行拉两所权益。任一所失败则整笔 None，不要把缺数当成 0。
-pub async fn fetch_pair_equity(
-    adapters: &HashMap<String, Arc<dyn ExchangePort>>,
-    venue_a: &str,
-    venue_b: &str,
-) -> Option<HashMap<String, Decimal>> {
-    let fa = fetch_one_equity(adapters, venue_a);
-    let fb = fetch_one_equity(adapters, venue_b);
-    let (a, b) = tokio::join!(fa, fb);
-    let a = a?;
-    let b = b?;
-    let mut out = HashMap::new();
-    out.insert(venue_a.to_string(), a);
-    out.insert(venue_b.to_string(), b);
-    Some(out)
-}
-
-async fn fetch_one_equity(
-    adapters: &HashMap<String, Arc<dyn ExchangePort>>,
-    venue: &str,
-) -> Option<Decimal> {
-    let adapter = adapters.get(venue)?;
-    match adapter.account().await {
-        Ok(snap) => Some(account_equity(&snap)),
-        Err(err) => {
-            warn!(venue, error = %err, "equity snapshot failed");
-            None
-        }
-    }
-}
-
-/// 按所对齐后相加：`(after − before)` 两所之和。缺所则 None。
-pub fn equity_delta(
-    before: &HashMap<String, Decimal>,
-    after: &HashMap<String, Decimal>,
-) -> Option<Decimal> {
-    if before.is_empty() {
-        return None;
-    }
-    let mut sum = Decimal::ZERO;
-    for (venue, old) in before {
-        let now = after.get(venue)?;
-        sum += *now - *old;
-    }
-    Some(sum)
-}
-
 #[derive(Debug, Clone)]
 pub struct BalanceCache {
     pub by_venue: HashMap<String, Decimal>,
@@ -290,26 +231,5 @@ mod tests {
         assert!(v.fresh);
         assert_eq!(v.available, dec!(100));
         assert_eq!(cache.to_balance_map().get("lighter").copied(), Some(dec!(100)));
-    }
-
-    #[test]
-    fn equity_delta_sums_both_venues() {
-        let mut before = HashMap::new();
-        before.insert("lighter".into(), dec!(1000));
-        before.insert("entropy".into(), dec!(800));
-        let mut after = HashMap::new();
-        after.insert("lighter".into(), dec!(1001.25));
-        after.insert("entropy".into(), dec!(799.50));
-        assert_eq!(equity_delta(&before, &after), Some(dec!(0.75)));
-    }
-
-    #[test]
-    fn equity_delta_none_if_venue_missing() {
-        let mut before = HashMap::new();
-        before.insert("lighter".into(), dec!(1));
-        before.insert("entropy".into(), dec!(1));
-        let mut after = HashMap::new();
-        after.insert("lighter".into(), dec!(2));
-        assert!(equity_delta(&before, &after).is_none());
     }
 }

@@ -34,16 +34,6 @@
         <div class="sub">{{ exDetail }}</div>
       </div>
       <div class="stat">
-        <div class="lbl">本次套利收益</div>
-        <div class="val tabular" :class="sessionPnlCls">{{ sessionPnlText }}</div>
-        <div class="sub">执行带合计 · USDC</div>
-      </div>
-      <div class="stat">
-        <div class="lbl">今日成交</div>
-        <div class="val tabular">{{ execCount }}</div>
-        <div class="sub">本次运行</div>
-      </div>
-      <div class="stat">
         <div class="lbl">模式</div>
         <div class="val">{{ modeLabel }}</div>
         <div class="sub">状态</div>
@@ -84,30 +74,6 @@ const offline = ref(false);
 const msg = useMessage();
 let pollFail = 0;
 let toldOffline = false;
-const execCount = computed(() => execs.value.length);
-const sessionPnl = computed(() => {
-  const raw = snap.value?.session_pnl_usdc;
-  if (raw != null && raw !== "") {
-    const n = parseFloat(raw);
-    if (!Number.isNaN(n)) return n;
-  }
-  return execs.value
-    .filter((r) => r.action === "close" && r.pnl_usdc != null && r.pnl_usdc !== "")
-    .reduce((s, r) => s + (parseFloat(r.pnl_usdc as string) || 0), 0);
-});
-const sessionPnlText = computed(() => {
-  const n = sessionPnl.value;
-  const body = Math.abs(n).toFixed(2);
-  if (n > 0) return `+${body}`;
-  if (n < 0) return `-${body}`;
-  return "0.00";
-});
-const sessionPnlCls = computed(() => {
-  const n = sessionPnl.value;
-  if (n > 0) return "up";
-  if (n < 0) return "dn";
-  return "mu";
-});
 const venues = computed(() => store.venues);
 const venueIds = computed(() => {
   const ids = store.venues.map((v) => v.id);

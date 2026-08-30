@@ -1,13 +1,17 @@
-//! 对齐参考 `execute_limit_market_mode`：单任务内完成
-//! 第一腿限价 → **挂单所私有 WS 成交推送**立刻发第二腿市价（REST 兜底）→
-//! 不足则撤单重挂 → 第二腿失败回滚。
+//! 第一腿限价 → **该单 WS 成交推送**立刻发第二腿市价。
+//! 等推送 1 秒没有则 REST 查一次该单；撤单之后同一套：听 1 秒再查一次。
+//! 不用账户缓存仓位差。
 //!
-//! 三个关键不变量：
-//! 1. 任何退出路径上，第一腿都不能留下状态不明的挂单（撤不掉就上报 orphan 并停止重试）。
-//! 2. 第二腿的量严格等于第一腿累计实际成交量。
-//! 3. 累计成交量低于第二腿最小下单量时，反向平掉第一腿而不是发一张注定被拒的单。
+//! 邻档（`rest_until_event`）：部分成交立刻对冲该增量，余量继续挂到吃满。
+//! 不因未吃满而把已成交部分紧急平掉。改价撤单在已有成交时让余量继续挂。
+//! 对面档先成才撤本档并对未对冲量回滚。
 //!
-//! 先挂后吃两边对称：谁先挂限价，谁的成交推送驱动另一所市价，不绑死 entropy 或 lighter。
+//! 阶段 1 超时重挂：不足则撤余量再挂，第二腿失败回滚。
+//!
+//! 不变量：
+//! 1. 任何退出路径上，第一腿都不能留下状态不明的挂单（撤不掉就上报 orphan）。
+//! 2. 第二腿各次对冲量之和等于第一腿累计实际成交量（已对冲部分）。
+//! 3. 增量低于第二腿最小下单量时先攒着；退出时仍不够才平掉这一截灰尘。
 
 use anyhow::{bail, Result};
 use rust_decimal::Decimal;
@@ -17,16 +21,16 @@ use std::time::{Duration, Instant};
 use tokio::time::sleep;
 use tracing::{info, warn};
 
-use crate::app::reconcile::{first_leg_fill_delta, symbol_matches_symbol};
 use crate::config::AppConfig;
 use crate::domain::Books;
+use crate::exchange::OrderPush;
 use crate::exec::executor::Adapters;
-use crate::exec::{HedgeExecutor, HedgePlan};
+use crate::exec::{ExecFill, ExecResult, HedgeExecutor, HedgePlan};
+use tokio::sync::broadcast;
 
-const POLL_INTERVAL_MS: u64 = 50;
-const CANCEL_RACE_MS: u64 = 500;
-/// 刚 post 后 sidecar/交易所可能尚未把挂单列入活跃订单。
-const POST_SETTLE_MS: u64 = 400;
+/// 等该单 WS 这么久；没有再 REST 查一次该单。挂着的限价循环此周期直到成交或撤。
+/// 撤单之后同一窗口：发撤 → 听该单 1 秒 → 没有再查一次。
+const POLL_INTERVAL_MS: u64 = 1000;
 
 fn json_id_eq(v: Option<&serde_json::Value>, order_id: &str) -> bool {
     match v {
@@ -49,49 +53,55 @@ fn json_decimal(v: Option<&serde_json::Value>) -> Option<Decimal> {
 /// 字段名因所而异：
 /// - SoDEX `AccountOrderUpdate`：`c`=ClOrdID, `i`=OrderID, `z`=累计成交量
 /// - Lighter `account_all_orders`：`client_order_index` / `order_index` / `filled_base_amount`
+///   推送是按市场 id 分组的 map，不是数组；成交还走 `account_all_trades`
+///   （`ask_client_id` / `bid_client_id` / `size`）。
 /// - Entropy/HL `orderUpdates` / `userFills`：嵌套 `order.oid` / `fills[].oid`
 fn push_matches_order(data: &serde_json::Value, order_id: &str) -> bool {
     if order_id.is_empty() {
         return false;
     }
-    for key in [
-        "c",
-        "i",
-        "oid",
-        "client_order_index",
-        "order_index",
-        "client_order_id",
-        "order_id",
-    ] {
-        if json_id_eq(data.get(key), order_id) {
-            return true;
-        }
+    if node_id_matches(data, order_id) {
+        return true;
     }
-    if let Some(order) = data.get("order") {
-        if push_matches_order(order, order_id) {
-            return true;
-        }
+    match data {
+        serde_json::Value::Array(arr) => arr.iter().any(|o| push_matches_order(o, order_id)),
+        serde_json::Value::Object(map) => map.values().any(|v| push_matches_order(v, order_id)),
+        _ => false,
     }
-    for key in ["orders", "fills", "data"] {
-        match data.get(key) {
-            Some(serde_json::Value::Array(arr)) => {
-                if arr.iter().any(|o| push_matches_order(o, order_id)) {
-                    return true;
-                }
-            }
-            Some(inner) => {
-                if push_matches_order(inner, order_id) {
-                    return true;
-                }
-            }
-            None => {}
-        }
-    }
-    false
 }
 
 fn venue_matches_first(push_venue: &str, first_venue: &str) -> bool {
     push_venue.is_empty() || push_venue.eq_ignore_ascii_case(first_venue)
+}
+
+/// 等到该 `order_id` 的一条推送，或超时 / channel 关闭。
+async fn recv_matching_push(
+    rx: &mut broadcast::Receiver<OrderPush>,
+    venue: &str,
+    order_id: &str,
+    wait: Duration,
+) -> Option<serde_json::Value> {
+    if order_id.is_empty() {
+        return None;
+    }
+    tokio::time::timeout(wait, async {
+        loop {
+            match rx.recv().await {
+                Ok(p)
+                    if venue_matches_first(&p.venue, venue)
+                        && push_matches_order(&p.data, order_id) =>
+                {
+                    return Some(p.data);
+                }
+                Ok(_) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(_) => return None,
+            }
+        }
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 /// 推送数量必须和挂单目标一个量级。Lighter 偶发用 size_decimals 整数上报，
@@ -153,19 +163,18 @@ fn walk_generic_fills(
             }
         }
     }
-    if let Some(order) = data.get("order") {
-        walk_generic_fills(order, order_id, best);
-    }
-    for key in ["orders", "fills", "data"] {
-        match data.get(key) {
-            Some(serde_json::Value::Array(arr)) => {
-                for item in arr {
-                    walk_generic_fills(item, order_id, best);
-                }
+    match data {
+        serde_json::Value::Array(arr) => {
+            for item in arr {
+                walk_generic_fills(item, order_id, best);
             }
-            Some(inner) => walk_generic_fills(inner, order_id, best),
-            None => {}
         }
+        serde_json::Value::Object(map) => {
+            for v in map.values() {
+                walk_generic_fills(v, order_id, best);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -178,18 +187,34 @@ fn node_id_matches(data: &serde_json::Value, order_id: &str) -> bool {
         "order_index",
         "client_order_id",
         "order_id",
+        "ask_id",
+        "bid_id",
+        "ask_id_str",
+        "bid_id_str",
+        "ask_client_id",
+        "bid_client_id",
+        "ask_client_id_str",
+        "bid_client_id_str",
     ]
     .iter()
     .any(|k| json_id_eq(data.get(k), order_id))
 }
 
 fn node_filled_qty(data: &serde_json::Value) -> Option<Decimal> {
-    json_decimal(data.get("z"))
+    if let Some(q) = json_decimal(data.get("z"))
         .or_else(|| json_decimal(data.get("filled_base_amount")))
         .or_else(|| json_decimal(data.get("filled_amount")))
         .or_else(|| json_decimal(data.get("filled_qty")))
         .or_else(|| json_decimal(data.get("filledQty")))
+        .or_else(|| json_decimal(data.get("size")))
         .filter(|q| *q > Decimal::ZERO)
+    {
+        return Some(q);
+    }
+    let init = json_decimal(data.get("initial_base_amount"))?;
+    let rem = json_decimal(data.get("remaining_base_amount"))?;
+    let filled = init - rem;
+    (filled > Decimal::ZERO).then_some(filled)
 }
 
 fn entropy_order_update_fill(
@@ -276,12 +301,19 @@ fn entropy_user_fills(
 }
 
 pub struct LimitMarketRun {
-    /// 下单前该所该市场的真实持仓。**必须**是查询成功的值，不能用 0 兜底：
-    /// 该所已有仓位时 baseline=0 会把既有仓位误判成第一腿成交。
+    /// 保留字段；第一腿成交只认该单 WS / 查单，不再用持仓 baseline。
     pub baseline: Decimal,
     /// 判定「有新成交」的最小 delta。
     pub min_qty: Decimal,
     pub cancel: Arc<AtomicBool>,
+    /// 邻档：等到成交或 cancel，不按 `limit_timeout_ms`。
+    pub rest_until_event: bool,
+    /// 邻档：本档成交后立刻撤对面。
+    pub peer_cancel: Option<Arc<AtomicBool>>,
+    /// 邻档：先成的一档抢到，对面若也成了则不平第二腿。
+    pub winner: Option<Arc<AtomicBool>>,
+    /// 套利开关。停止后邻档已发出的单可以听到成交，但不再市价对冲 / 紧急平。
+    pub orders_live: Arc<AtomicBool>,
 }
 
 struct AttemptOutcome {
@@ -293,6 +325,75 @@ struct AttemptOutcome {
     order_id: Option<String>,
 }
 
+/// 邻档限价还要不要继续挂。
+///
+/// `claimed`：已经对冲过至少一截（本档赢了）。此后改价撤单忽略，挂到吃满。
+/// 还没对冲时改价/对面赢都停，退出时再对冲或回滚未对冲量。
+fn should_keep_resting(
+    own_cancel: bool,
+    peer_lost: bool,
+    seen: Decimal,
+    target: Decimal,
+    claimed: bool,
+) -> bool {
+    if peer_lost && !claimed {
+        return false;
+    }
+    if target > Decimal::ZERO && seen >= target {
+        return false;
+    }
+    if seen <= Decimal::ZERO {
+        return !own_cancel;
+    }
+    if own_cancel && !claimed {
+        return false;
+    }
+    true
+}
+
+fn claim_adjacent_winner(ctx: &LimitMarketRun) -> bool {
+    match &ctx.winner {
+        Some(w) => w
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok(),
+        None => true,
+    }
+}
+
+fn orders_live(ctx: &LimitMarketRun) -> bool {
+    ctx.orders_live.load(Ordering::Acquire)
+}
+
+fn add_exec_fill(dst: &mut ExecFill, src: &ExecFill) {
+    if src.qty <= Decimal::ZERO {
+        return;
+    }
+    let total = dst.qty + src.qty;
+    if total > Decimal::ZERO && dst.price > Decimal::ZERO && src.price > Decimal::ZERO {
+        dst.price = (dst.price * dst.qty + src.price * src.qty) / total;
+    } else if src.price > Decimal::ZERO {
+        dst.price = src.price;
+    }
+    dst.qty = total;
+    if dst.order_id.is_none() {
+        dst.order_id = src.order_id.clone();
+    }
+}
+
+fn merge_hedge_result(acc: &mut Option<ExecResult>, piece: ExecResult) {
+    match acc {
+        None => *acc = Some(piece),
+        Some(a) => {
+            add_exec_fill(&mut a.first, &piece.first);
+            add_exec_fill(&mut a.second, &piece.second);
+            a.unhedged_qty += piece.unhedged_qty;
+            if a.orphan_order.is_none() {
+                a.orphan_order = piece.orphan_order;
+            }
+        }
+    }
+}
+
 impl HedgeExecutor {
     pub async fn execute_limit_market(
         cfg: &AppConfig,
@@ -301,11 +402,12 @@ impl HedgeExecutor {
         books: &Books,
         ctx: &LimitMarketRun,
     ) -> Result<crate::exec::ExecResult> {
-        let before = crate::exec::snapshot_realized_before(adapters, plan, false).await;
+        if ctx.rest_until_event {
+            return Self::execute_resting_adjacent(cfg, adapters, plan, books, ctx).await;
+        }
         let attempts = cfg.order.limit_retry_count.max(1);
         let hedge_floor = plan.hedgeable_min_qty();
         let mut accumulated = Decimal::ZERO;
-        let mut baseline = ctx.baseline;
         let mut orphan: Option<String> = None;
         let mut last_first_oid: Option<String> = None;
         // 第一腿各轮成交按量加权，得到真实均价。
@@ -324,9 +426,8 @@ impl HedgeExecutor {
             let mut attempt_plan = plan.clone();
             attempt_plan.qty = remaining;
 
-            let out =
-                Self::run_limit_attempt(cfg, adapters, &attempt_plan, books, ctx, baseline, attempt)
-                    .await?;
+            let out = Self::run_limit_attempt(cfg, adapters, &attempt_plan, books, ctx, attempt)
+                .await?;
             accumulated += out.filled;
             if out.filled > Decimal::ZERO {
                 last_first_oid = out.order_id.or(last_first_oid);
@@ -335,12 +436,6 @@ impl HedgeExecutor {
                 first_notional += px * out.filled;
                 first_priced += out.filled;
             }
-            // 下一轮的 baseline 要把本轮成交算进去，否则会把它当成新成交重复计数。
-            baseline += if plan.first.is_buy {
-                out.filled
-            } else {
-                -out.filled
-            };
 
             if out.orphan.is_some() {
                 orphan = out.orphan;
@@ -385,7 +480,6 @@ impl HedgeExecutor {
                 adapters,
                 &plan.first,
                 accumulated,
-                plan.is_open,
                 &first_bbo,
                 false,
             )
@@ -424,8 +518,380 @@ impl HedgeExecutor {
         if result.first.order_id.is_none() {
             result.first.order_id = last_first_oid;
         }
-        result.realized_before = before;
         Ok(result)
+    }
+
+    /// 邻档：WS/REST 看到增量成交就立刻市价对冲，限价余量继续挂到吃满。
+    async fn execute_resting_adjacent(
+        cfg: &AppConfig,
+        adapters: &Adapters,
+        plan: &HedgePlan,
+        books: &Books,
+        ctx: &LimitMarketRun,
+    ) -> Result<crate::exec::ExecResult> {
+        let hedge_floor = plan.hedgeable_min_qty();
+        let mut pushes = crate::exchange::subscribe_order_pushes();
+        let post = Self::post_first_leg(cfg, adapters, plan, books, false).await?;
+        let posted_at = Instant::now();
+        let order_id = post.order_id.clone().filter(|s| !s.is_empty());
+        info!(
+            pair = %plan.pair_id,
+            first = %plan.first.venue,
+            attempt = 1,
+            qty = %plan.qty,
+            resting = post.resting,
+            filled_qty = %post.first.qty,
+            order_id = ?order_id,
+            "limit_market: first leg posted"
+        );
+
+        let timeout = {
+            let ms = cfg.order.adjacent_timeout_ms;
+            if ms == 0 {
+                Duration::from_secs(24 * 3600)
+            } else {
+                Duration::from_millis(ms.max(200))
+            }
+        };
+        let deadline = posted_at + timeout;
+        let want_id = order_id.clone().unwrap_or_default();
+        let mut seen = post.first.qty.min(plan.qty);
+        let mut fill_price = (seen > Decimal::ZERO).then_some(post.first.price);
+        let mut hedged = Decimal::ZERO;
+        let mut written_off = Decimal::ZERO;
+        let mut acc: Option<ExecResult> = None;
+        let mut claimed = false;
+        let mut ignore_cancel_logged = false;
+        let mut orphan: Option<String> = None;
+
+        loop {
+            let own_cancel = ctx.cancel.load(Ordering::Relaxed);
+            let peer_lost = ctx
+                .peer_cancel
+                .as_ref()
+                .is_some_and(|p| p.load(Ordering::Relaxed));
+            let timed_out = Instant::now() >= deadline;
+            if timed_out
+                || !should_keep_resting(
+                    own_cancel,
+                    peer_lost,
+                    seen,
+                    plan.qty,
+                    claimed,
+                )
+            {
+                break;
+            }
+            if own_cancel && claimed && !ignore_cancel_logged {
+                info!(
+                    pair = %plan.pair_id,
+                    filled = %seen,
+                    target = %plan.qty,
+                    "limit_market: reprice cancel ignored; riding limit until filled"
+                );
+                ignore_cancel_logged = true;
+            }
+
+            Self::hedge_seen_increments(
+                cfg,
+                adapters,
+                plan,
+                books,
+                ctx,
+                seen,
+                fill_price,
+                hedge_floor,
+                false,
+                &mut hedged,
+                &mut written_off,
+                &mut acc,
+                &mut claimed,
+            )
+            .await?;
+            if seen >= plan.qty {
+                break;
+            }
+
+            if let Some((qty, px)) = Self::detect_first_fill(
+                adapters,
+                plan,
+                order_id.as_deref(),
+            )
+            .await?
+            {
+                let qty = qty.min(plan.qty);
+                if qty > seen {
+                    seen = qty;
+                    fill_price = px.or(fill_price);
+                    continue;
+                }
+            }
+
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let nap = remaining.min(Duration::from_millis(POLL_INTERVAL_MS));
+            if nap.is_zero() {
+                break;
+            }
+            match pushes.as_mut() {
+                Some(rx) => {
+                    if let Some(data) =
+                        recv_matching_push(rx, &plan.first.venue, &want_id, nap).await
+                    {
+                        if let Some((qty, px)) = fill_from_push(&data, &want_id) {
+                            match plausible_ws_fill(qty, plan.qty) {
+                                Some(qty) => {
+                                    let qty = qty.min(plan.qty);
+                                    if qty > seen {
+                                        info!(
+                                            pair = %plan.pair_id,
+                                            first = %plan.first.venue,
+                                            order_id = %want_id,
+                                            filled = %qty,
+                                            target = %plan.qty,
+                                            "limit_market: first-leg fill from ws push"
+                                        );
+                                        seen = qty;
+                                        fill_price = px.or(fill_price);
+                                    }
+                                }
+                                None => {
+                                    warn!(
+                                        pair = %plan.pair_id,
+                                        first = %plan.first.venue,
+                                        filled = %qty,
+                                        target = %plan.qty,
+                                        "limit_market: ws fill qty implausible; waiting REST"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                None => sleep(nap).await,
+            }
+        }
+
+        if seen < plan.qty || order_id.is_some() {
+            orphan = Self::cancel_leftover(adapters, plan, order_id.as_deref()).await;
+            if seen < plan.qty {
+                let (qty, px) = Self::confirm_fill_after_action(
+                    adapters,
+                    plan,
+                    order_id.as_deref(),
+                    &mut pushes,
+                    seen,
+                    fill_price,
+                )
+                .await?;
+                seen = qty;
+                fill_price = px;
+            }
+        }
+
+        let unhedged = (seen - hedged - written_off).max(Decimal::ZERO);
+        if !orders_live(ctx) && unhedged > Decimal::ZERO {
+            warn!(
+                pair = %plan.pair_id,
+                qty = %unhedged,
+                "limit_market: arbitrage stopped; not hedging first-leg fill"
+            );
+            bail!("ARB_STOPPED: first-leg fill after stop; not hedging");
+        }
+        if !claimed && unhedged > Decimal::ZERO && !claim_adjacent_winner(ctx) {
+            let first_bbo =
+                crate::exec::executor::book_for(books, &plan.first.venue, &plan.pair_id)?;
+            warn!(
+                pair = %plan.pair_id,
+                side = plan.quote_side.map(|s| s.as_str()).unwrap_or("?"),
+                qty = %unhedged,
+                "limit_market: lost adjacent race; closing unhedged first-leg fill"
+            );
+            match Self::emergency_close(
+                cfg,
+                adapters,
+                &plan.first,
+                unhedged,
+                &first_bbo,
+                false,
+            )
+            .await
+            {
+                Ok(()) => bail!("QUOTE_LOST_RACE: opposite quote filled first; closed"),
+                Err(e) => bail!("NAKED_FIRST_LEG: QUOTE_LOST_RACE close failed ({e})"),
+            }
+        }
+        if !claimed && unhedged > Decimal::ZERO {
+            claimed = true;
+            if let Some(peer) = &ctx.peer_cancel {
+                peer.store(true, Ordering::Release);
+            }
+        }
+
+        Self::hedge_seen_increments(
+            cfg,
+            adapters,
+            plan,
+            books,
+            ctx,
+            seen,
+            fill_price,
+            hedge_floor,
+            true,
+            &mut hedged,
+            &mut written_off,
+            &mut acc,
+            &mut claimed,
+        )
+        .await?;
+
+        if let Some(oid) = &orphan {
+            warn!(
+                pair = %plan.pair_id,
+                venue = %plan.first.venue,
+                order_id = %oid,
+                "limit_market: resting limit could not be canceled; it may fill later"
+            );
+        }
+
+        let Some(mut result) = acc else {
+            let note = orphan
+                .as_deref()
+                .map(|o| format!(" ORPHAN_ORDER={o}"))
+                .unwrap_or_default();
+            bail!("limit_zero_fill: first leg no fill after wait{note}");
+        };
+        result.orphan_order = orphan.or(result.orphan_order);
+        if result.first.order_id.is_none() {
+            result.first.order_id = order_id;
+        }
+        info!(
+            pair = %plan.pair_id,
+            first = %plan.first.venue,
+            second = %plan.second.venue,
+            filled = %seen,
+            hedged = %result.hedged_qty(),
+            target = %plan.qty,
+            "limit_market: resting limit done; second leg hedged incrementally"
+        );
+        Ok(result)
+    }
+
+    async fn hedge_seen_increments(
+        cfg: &AppConfig,
+        adapters: &Adapters,
+        plan: &HedgePlan,
+        books: &Books,
+        ctx: &LimitMarketRun,
+        seen: Decimal,
+        fill_price: Option<Decimal>,
+        hedge_floor: Decimal,
+        flushing: bool,
+        hedged: &mut Decimal,
+        written_off: &mut Decimal,
+        acc: &mut Option<ExecResult>,
+        claimed: &mut bool,
+    ) -> Result<()> {
+        let pending = (seen - *hedged - *written_off).max(Decimal::ZERO);
+        if pending <= Decimal::ZERO {
+            return Ok(());
+        }
+        let ready = pending >= hedge_floor || seen >= plan.qty || flushing;
+        if !ready {
+            return Ok(());
+        }
+        if pending < hedge_floor {
+            if !flushing {
+                return Ok(());
+            }
+            if !orders_live(ctx) {
+                warn!(
+                    pair = %plan.pair_id,
+                    filled = %pending,
+                    "limit_market: arbitrage stopped; not closing dust"
+                );
+                bail!("ARB_STOPPED: first-leg fill after stop; not hedging");
+            }
+            let first_bbo =
+                crate::exec::executor::book_for(books, &plan.first.venue, &plan.pair_id)?;
+            warn!(
+                pair = %plan.pair_id,
+                filled = %pending,
+                second_min_qty = %hedge_floor,
+                "limit_market: leftover dust below min qty; closing it"
+            );
+            match Self::emergency_close(
+                cfg,
+                adapters,
+                &plan.first,
+                pending,
+                &first_bbo,
+                false,
+            )
+            .await
+            {
+                Ok(()) => {
+                    *written_off += pending;
+                    Ok(())
+                }
+                Err(e) => Err(anyhow::anyhow!(
+                    "NAKED_FIRST_LEG: dust {pending} close failed ({e})"
+                )),
+            }
+        } else {
+            if !orders_live(ctx) {
+                warn!(
+                    pair = %plan.pair_id,
+                    increment = %pending,
+                    "limit_market: arbitrage stopped; not hedging second leg"
+                );
+                bail!("ARB_STOPPED: first-leg fill after stop; not hedging");
+            }
+            if !*claimed {
+                if !claim_adjacent_winner(ctx) {
+                    return Ok(());
+                }
+                *claimed = true;
+                if let Some(peer) = &ctx.peer_cancel {
+                    peer.store(true, Ordering::Release);
+                }
+            }
+            info!(
+                pair = %plan.pair_id,
+                first = %plan.first.venue,
+                second = %plan.second.venue,
+                increment = %pending,
+                cumulative = %seen,
+                target = %plan.qty,
+                "limit_market: partial fill; hedging increment on second leg now"
+            );
+            match Self::hedge_second_leg(cfg, adapters, plan, books, false, pending, fill_price)
+                .await
+            {
+                Ok(piece) => {
+                    *hedged += piece.second.qty.min(pending);
+                    if piece.unhedged_qty > Decimal::ZERO {
+                        *written_off += piece.unhedged_qty;
+                    }
+                    merge_hedge_result(acc, piece);
+                    Ok(())
+                }
+                Err(err) => {
+                    let msg = err.to_string();
+                    if msg.contains("EMERGENCY_CLOSED") {
+                        warn!(
+                            pair = %plan.pair_id,
+                            increment = %pending,
+                            error = %msg,
+                            "limit_market: increment hedge rolled back; not retrying this slice"
+                        );
+                        *written_off += pending;
+                        Ok(())
+                    } else {
+                        Err(err)
+                    }
+                }
+            }
+        }
     }
 
     async fn run_limit_attempt(
@@ -434,7 +900,6 @@ impl HedgeExecutor {
         plan: &HedgePlan,
         books: &Books,
         ctx: &LimitMarketRun,
-        baseline: Decimal,
         attempt: u32,
     ) -> Result<AttemptOutcome> {
         let mut pushes = crate::exchange::subscribe_order_pushes();
@@ -453,22 +918,45 @@ impl HedgeExecutor {
         );
 
         if post.first.qty > Decimal::ZERO {
-            let filled = post.first.qty.min(plan.qty);
-            // 立刻部分成交时余量还挂着，必须撤。
+            let mut filled = post.first.qty.min(plan.qty);
+            let mut price = Some(post.first.price);
+            // 立刻部分成交时余量还挂着，必须撤；撤后再听 1 秒 WS + 查一次。
             let orphan = if filled < plan.qty {
-                Self::cancel_leftover(adapters, plan, order_id.as_deref()).await
+                let leftover =
+                    Self::cancel_leftover(adapters, plan, order_id.as_deref()).await;
+                let (qty, px) = Self::confirm_fill_after_action(
+                    adapters,
+                    plan,
+                    order_id.as_deref(),
+                    &mut pushes,
+                    filled,
+                    price,
+                )
+                .await?;
+                filled = qty;
+                price = px;
+                leftover
             } else {
                 None
             };
             return Ok(AttemptOutcome {
                 filled,
-                price: Some(post.first.price),
+                price,
                 orphan,
                 order_id: order_id.clone(),
             });
         }
 
-        let timeout = Duration::from_millis(cfg.order.limit_timeout_ms.max(200));
+        let timeout = if ctx.rest_until_event {
+            let ms = cfg.order.adjacent_timeout_ms;
+            if ms == 0 {
+                Duration::from_secs(24 * 3600)
+            } else {
+                Duration::from_millis(ms.max(200))
+            }
+        } else {
+            Duration::from_millis(cfg.order.limit_timeout_ms.max(200))
+        };
         let deadline = posted_at + timeout;
         let mut filled = Decimal::ZERO;
         let mut fill_price: Option<Decimal> = None;
@@ -479,16 +967,18 @@ impl HedgeExecutor {
         let want_id = order_id.clone().unwrap_or_default();
 
         while Instant::now() < deadline {
-            if ctx.cancel.load(Ordering::Relaxed) {
+            if ctx.cancel.load(Ordering::Relaxed)
+                || ctx
+                    .peer_cancel
+                    .as_ref()
+                    .is_some_and(|p| p.load(Ordering::Relaxed))
+            {
                 break;
             }
             if let Some((qty, px)) = Self::detect_first_fill(
                 adapters,
                 plan,
                 order_id.as_deref(),
-                baseline,
-                ctx.min_qty,
-                posted_at,
             )
             .await?
             {
@@ -504,28 +994,9 @@ impl HedgeExecutor {
             }
             match pushes.as_mut() {
                 Some(rx) => {
-                    // 等推送或超时，谁先到算谁。
-                    let woke = tokio::time::timeout(nap, async {
-                        loop {
-                            match rx.recv().await {
-                                Ok(p)
-                                    if venue_matches_first(&p.venue, &plan.first.venue)
-                                        && push_matches_order(&p.data, &want_id) =>
-                                {
-                                    return Some(p.data)
-                                }
-                                Ok(_) => continue,
-                                // 慢消费者会丢消息；丢掉的成交靠 REST 轮询补，
-                                // 不能把 channel 当成死掉。
-                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                                    continue
-                                }
-                                Err(_) => return None,
-                            }
-                        }
-                    })
-                    .await;
-                    if let Ok(Some(data)) = woke {
+                    if let Some(data) =
+                        recv_matching_push(rx, &plan.first.venue, &want_id, nap).await
+                    {
                         // 只有足额才按推送量立刻对冲。部分成交可能只是
                         // userFills 的一截增量，写进 filled 会把累计冲掉。
                         if let Some((qty, px)) = fill_from_push(&data, &want_id) {
@@ -570,8 +1041,7 @@ impl HedgeExecutor {
             });
         }
 
-        // 未成交或部分成交：撤单前再查一次，撤单后再查竞态窗口
-        // （对齐参考 `_wait_fill_after_cancel_failure`）。
+        // 未成交或部分成交：撤单前再查一次；撤单后听该单 WS 1 秒，没有再查一次。
         let Some(oid) = order_id else {
             return Ok(AttemptOutcome {
                 filled,
@@ -584,9 +1054,6 @@ impl HedgeExecutor {
             adapters,
             plan,
             Some(&oid),
-            baseline,
-            ctx.min_qty,
-            posted_at,
         )
         .await?
         {
@@ -614,26 +1081,24 @@ impl HedgeExecutor {
                 orphan = Some(oid.clone());
             }
         }
-        sleep(Duration::from_millis(CANCEL_RACE_MS)).await;
-        if let Some((qty, px)) = Self::detect_first_fill(
+        let before = filled;
+        let (qty, px) = Self::confirm_fill_after_action(
             adapters,
             plan,
             Some(&oid),
-            baseline,
-            ctx.min_qty,
-            posted_at,
+            &mut pushes,
+            filled,
+            fill_price,
         )
-        .await?
-        {
-            if qty > filled {
-                warn!(
-                    pair = %plan.pair_id,
-                    qty = %qty,
-                    "limit_market: filled around cancel; hedging"
-                );
-                filled = qty;
-                fill_price = px.or(fill_price);
-            }
+        .await?;
+        filled = qty;
+        fill_price = px;
+        if filled > before {
+            warn!(
+                pair = %plan.pair_id,
+                qty = %filled,
+                "limit_market: filled around cancel; hedging"
+            );
         }
         if filled >= plan.qty {
             orphan = None;
@@ -644,6 +1109,70 @@ impl HedgeExecutor {
             orphan,
             order_id: Some(oid),
         })
+    }
+
+    /// 撤单（或任何已发到 DEX 的动作）之后：等该单 WS 最多 1 秒，没有再 REST 查一次。
+    /// 有推送也再查一次，避免 WS 只带了部分累计。
+    async fn confirm_fill_after_action(
+        adapters: &Adapters,
+        plan: &HedgePlan,
+        order_id: Option<&str>,
+        pushes: &mut Option<broadcast::Receiver<OrderPush>>,
+        mut seen: Decimal,
+        mut fill_price: Option<Decimal>,
+    ) -> Result<(Decimal, Option<Decimal>)> {
+        let oid = order_id.filter(|s| !s.is_empty()).unwrap_or("");
+        let wait = Duration::from_millis(POLL_INTERVAL_MS);
+        if let Some(rx) = pushes.as_mut() {
+            let deadline = Instant::now() + wait;
+            while Instant::now() < deadline {
+                let remain = deadline.saturating_duration_since(Instant::now());
+                let Some(data) =
+                    recv_matching_push(rx, &plan.first.venue, oid, remain).await
+                else {
+                    break;
+                };
+                if let Some((qty, px)) = fill_from_push(&data, oid) {
+                    match plausible_ws_fill(qty, plan.qty) {
+                        Some(qty) => {
+                            let qty = qty.min(plan.qty);
+                            if qty > seen {
+                                info!(
+                                    pair = %plan.pair_id,
+                                    first = %plan.first.venue,
+                                    order_id = %oid,
+                                    filled = %qty,
+                                    "limit_market: fill from ws after cancel"
+                                );
+                                seen = qty;
+                                fill_price = px.or(fill_price);
+                                if seen >= plan.qty {
+                                    break;
+                                }
+                            }
+                        }
+                        None => {
+                            warn!(
+                                pair = %plan.pair_id,
+                                first = %plan.first.venue,
+                                filled = %qty,
+                                target = %plan.qty,
+                                "limit_market: ws fill after cancel implausible; querying REST"
+                            );
+                        }
+                    }
+                }
+            }
+        } else {
+            sleep(wait).await;
+        }
+        if let Some((qty, px)) = Self::detect_first_fill(adapters, plan, order_id).await? {
+            if qty > seen {
+                seen = qty.min(plan.qty);
+                fill_price = px.or(fill_price);
+            }
+        }
+        Ok((seen, fill_price))
     }
 
     /// 部分成交后撤掉余量。撤不掉返回 order_id 作为 orphan。
@@ -666,46 +1195,25 @@ impl HedgeExecutor {
         }
     }
 
+    /// 只认该 `order_id` 的查单结果。不用账户缓存仓位差。
     async fn detect_first_fill(
         adapters: &Adapters,
         plan: &HedgePlan,
         order_id: Option<&str>,
-        baseline: Decimal,
-        min_qty: Decimal,
-        posted_at: Instant,
     ) -> Result<Option<(Decimal, Option<Decimal>)>> {
-        if let Some(oid) = order_id.filter(|s| !s.is_empty()) {
-            match Self::fetch_first_leg_ack(adapters, &plan.first, plan.qty, oid).await {
-                Ok(ack) if ack.filled_qty > Decimal::ZERO => {
-                    return Ok(Some((ack.filled_qty.min(plan.qty), ack.avg_price)));
-                }
-                Ok(ack) if Self::first_leg_still_resting(&ack) => {
-                    return Ok(None);
-                }
-                Ok(_) => {}
-                Err(err) => {
-                    warn!(pair = %plan.pair_id, error = %err, "detect_first_fill: order_status");
-                }
+        let Some(oid) = order_id.filter(|s| !s.is_empty()) else {
+            return Ok(None);
+        };
+        match Self::fetch_first_leg_ack(adapters, &plan.first, plan.qty, oid).await {
+            Ok(ack) if ack.filled_qty > Decimal::ZERO => {
+                Ok(Some((ack.filled_qty.min(plan.qty), ack.avg_price)))
+            }
+            Ok(_) => Ok(None),
+            Err(err) => {
+                warn!(pair = %plan.pair_id, error = %err, "detect_first_fill: order_status");
+                Ok(None)
             }
         }
-        if posted_at.elapsed() < Duration::from_millis(POST_SETTLE_MS) {
-            return Ok(None);
-        }
-        let leg = &plan.first;
-        let adapter = adapters
-            .get(&leg.venue)
-            .ok_or_else(|| anyhow::anyhow!("unknown venue {}", leg.venue))?;
-        let positions = adapter.positions().await?;
-        let current: Decimal = positions
-            .iter()
-            .filter(|p| symbol_matches_symbol(&p.symbol, &leg.symbol, &leg.symbol))
-            .map(|p| p.qty)
-            .sum();
-        // 仓位 delta 兜底路径拿不到成交价，只能回 None 让上层退回挂价。
-        Ok(
-            first_leg_fill_delta(baseline, current, leg.is_buy, plan.qty, min_qty)
-                .map(|q| (q, None)),
-        )
     }
 }
 
@@ -713,30 +1221,6 @@ impl HedgeExecutor {
 mod tests {
     use super::*;
     use rust_decimal_macros::dec;
-
-    #[test]
-    fn min_qty_tolerance() {
-        assert_eq!(
-            first_leg_fill_delta(dec!(0), dec!(32.43), true, dec!(32.43), dec!(0.1)),
-            Some(dec!(32.43))
-        );
-    }
-
-    /// 重试时 baseline 要滚动，否则第二轮会把第一轮的成交再算一遍。
-    #[test]
-    fn rolling_baseline_does_not_double_count() {
-        let first_round = first_leg_fill_delta(dec!(0), dec!(0.5), true, dec!(1), dec!(0.01));
-        assert_eq!(first_round, Some(dec!(0.5)));
-        let rolled = dec!(0) + dec!(0.5);
-        assert_eq!(
-            first_leg_fill_delta(rolled, dec!(0.5), true, dec!(0.5), dec!(0.01)),
-            None
-        );
-        assert_eq!(
-            first_leg_fill_delta(rolled, dec!(0.9), true, dec!(0.5), dec!(0.01)),
-            Some(dec!(0.4))
-        );
-    }
 
     /// 多轮重挂时第一腿均价必须按量加权，不能只取最后一轮的价。
     /// 建仓净边只有 0.03%~0.05% 量级，几个 tick 的偏差就会让止盈误判。
@@ -768,21 +1252,95 @@ mod tests {
         assert!(avg.is_none());
     }
 
-    /// 对齐参考：第一腿没填满就整单放弃（平掉已成交部分），不带半仓去对冲。
-    /// 多格网格要求持仓量精确落在 n × base_qty 上，半仓会让按格减仓算错格数。
+    /// 阶段 1 超时重挂：第一腿没填满就整单放弃（平掉已成交部分）。
+    /// 邻档不走这条，见 `partial_fill_increment_is_hedged_not_abandoned`。
     #[test]
-    fn underfill_is_abandoned_not_hedged() {
+    fn stage1_underfill_threshold() {
         let eps = Decimal::new(1, 8);
         let target = dec!(1.0);
-        // 部分成交 → 放弃
         let partial = dec!(0.6);
-        assert!(partial + eps < target, "0.6/1.0 必须判定为未填满");
-        // 全额成交 → 继续第二腿
+        assert!(partial + eps < target);
         let full = dec!(1.0);
-        assert!(!(full + eps < target), "足额不应被判成未填满");
-        // 浮点尾差不应误判成未填满
+        assert!(!(full + eps < target));
         let dust_short = target - Decimal::new(1, 9);
-        assert!(!(dust_short + eps < target), "1e-9 的尾差应被 epsilon 吸收");
+        assert!(!(dust_short + eps < target));
+    }
+
+    /// 邻档：部分成交立刻对冲该增量，不把整单当失败去紧急平。
+    #[test]
+    fn partial_fill_increment_is_hedged_not_abandoned() {
+        let target = dec!(0.0005);
+        let seen = dec!(0.00029);
+        let hedged = Decimal::ZERO;
+        let increment = (seen - hedged).max(Decimal::ZERO);
+        assert_eq!(increment, dec!(0.00029));
+        assert!(increment < target);
+        let min_qty = dec!(0.0001);
+        assert!(increment >= min_qty, "增量够第二腿最小量就应对冲，而不是平掉");
+        let remaining = target - seen;
+        assert_eq!(remaining, dec!(0.00021));
+    }
+
+    #[test]
+    fn keep_resting_until_full_after_claim() {
+        let target = dec!(0.0005);
+        let partial = dec!(0.00029);
+        // 空单改价：撤
+        assert!(!should_keep_resting(true, false, Decimal::ZERO, target, false));
+        // 有成交但还没对冲：停，退出时对冲这一截
+        assert!(!should_keep_resting(true, false, partial, target, false));
+        // 已对冲：忽略改价，挂到吃满
+        assert!(should_keep_resting(true, false, partial, target, true));
+        // 对面先成且自己还没对冲：停
+        assert!(!should_keep_resting(false, true, partial, target, false));
+        // 吃满：停
+        assert!(!should_keep_resting(false, false, target, target, true));
+        // 正常挂着
+        assert!(should_keep_resting(false, false, Decimal::ZERO, target, false));
+    }
+
+    #[test]
+    fn merge_partial_hedges_sums_qty() {
+        let a = ExecResult::finished(
+            ExecFill {
+                venue: "rh".into(),
+                qty: dec!(0.00029),
+                price: dec!(100),
+                is_buy: true,
+                order_id: None,
+            },
+            ExecFill {
+                venue: "l".into(),
+                qty: dec!(0.00029),
+                price: dec!(100),
+                is_buy: false,
+                order_id: None,
+            },
+            None,
+        );
+        let b = ExecResult::finished(
+            ExecFill {
+                venue: "rh".into(),
+                qty: dec!(0.00021),
+                price: dec!(101),
+                is_buy: true,
+                order_id: None,
+            },
+            ExecFill {
+                venue: "l".into(),
+                qty: dec!(0.00021),
+                price: dec!(101),
+                is_buy: false,
+                order_id: None,
+            },
+            None,
+        );
+        let mut acc = Some(a);
+        merge_hedge_result(&mut acc, b);
+        let r = acc.unwrap();
+        assert_eq!(r.first.qty, dec!(0.0005));
+        assert_eq!(r.second.qty, dec!(0.0005));
+        assert_eq!(r.hedged_qty(), dec!(0.0005));
     }
 
     /// WS 推送匹配：两个所字段名不同，都要能认出来。
@@ -805,7 +1363,37 @@ mod tests {
             "222"
         ));
 
-        // 别人的单不能误匹配
+        // Lighter 按市场 id 分组的 map（真实 WS 格式）
+        assert!(push_matches_order(
+            &json!({"type": "update/account_all_orders", "orders": {"1": [{"client_order_index": 555}]}}),
+            "555"
+        ));
+        let mapped = json!({
+            "type": "update/account_all_orders",
+            "orders": {"1": [{
+                "client_order_index": 555,
+                "initial_base_amount": "0.0005",
+                "remaining_base_amount": "0",
+                "filled_base_amount": "0"
+            }]}
+        });
+        let (qty, _) = fill_from_push(&mapped, "555").expect("map-keyed remaining fill");
+        assert_eq!(qty, dec!(0.0005));
+
+        // Lighter 成交在 account_all_trades
+        let trade = json!({
+            "type": "update/account_all_trades",
+            "trades": {"1": [{
+                "ask_client_id": 555,
+                "bid_client_id": 999,
+                "size": "0.0005",
+                "price": "78500"
+            }]}
+        });
+        assert!(push_matches_order(&trade, "555"));
+        let (qty, px) = fill_from_push(&trade, "555").expect("trade fill");
+        assert_eq!(qty, dec!(0.0005));
+        assert_eq!(px, Some(dec!(78500)));
         assert!(!push_matches_order(&json!({"c": "arb-999"}), "arb-123"));
         // 空 order_id 永远不匹配，否则会被任意推送唤醒
         assert!(!push_matches_order(&json!({"c": "arb-123"}), ""));

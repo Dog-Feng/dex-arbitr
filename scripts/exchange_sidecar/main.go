@@ -33,6 +33,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/shopspring/decimal"
@@ -42,24 +43,11 @@ import (
 // 市价单（IOC）成交确认的等待窗口与轮询间隔，逐项对齐参考项目。
 //
 // 下单响应不带可信成交量，必须回查，且单次查询不够——撮合与查询接口之间
-// 有延迟。参考 `_wait_for_order_fill_rest`（order_monitor.go 对应的 py
-// 文件 :356）就是这么轮询的，参数取自它的签名和 order_execution 配置：
-//
-//	poll_interval = 2.0，safe_interval = max(1.0, poll_interval)  → 2s
-//	limit_order_timeout: 3            → 非 Lighter 市价腿的窗口
-//	lighter_market_order_timeout: 60  → Lighter 市价腿专用窗口
-//
-// 窗口按所区分不是随意加的：参考里 `lighter_retry_mode` 只在
-// `exchange_name == "lighter"` 时置位（order_strategy_executor.py:459），
-// 命中才用 60s，否则一律回落 `limit_order_timeout`。Lighter 需要长窗口是
-// 因为它的成交确认最慢——我们这边同样得靠持仓 delta 回查，序列器收下
-// 交易到持仓快照更新之间的延迟不可控。
+// 市价 / IOC 成交确认：等该单 WS 推送 1 秒；没有就 REST 查一次该单；
+// 仍没有量就当失败。三所同一窗口，不再按所持仓 delta 空等 3s/60s。
 const (
-	sodexFillWait = 3 * time.Second
-	// Entropy/HL 的 orderStatus 能看到已终结单，窗口对齐 SoDEX。
-	entropyFillWait = 3 * time.Second
-	lighterFillWait = 60 * time.Second
-	marketFillPoll  = 2 * time.Second
+	iocFillWait    = time.Second
+	marketFillPoll = 2 * time.Second
 	// 参考在最后一轮把休眠夹到 deadline：`min(safe_interval,
 	// max(0.5, deadline - now))`。0.5s 是它的下限。
 	minFillPoll = 500 * time.Millisecond
@@ -69,6 +57,34 @@ const (
 	maxInflightRequests = 32
 	nonceFetchTimeout   = 5 * time.Second
 )
+
+// 同毫秒多笔下单（邻档 plus/minus）不能共用一个 client_order_id。
+// Lighter 的 ClientOrderIndex 上限是 2^48-1；毫秒×1000 会超（约 1.76e15）。
+const lighterMaxClientOrderIndex int64 = 281474976710655
+
+var clientOrderSeq atomic.Int64
+
+func nextLighterClientOrderID() int64 {
+	n := clientOrderSeq.Add(1)
+	ms := time.Now().UnixMilli()
+	if ms < 0 {
+		ms = 0
+	}
+	// 毫秒约 1.76e12，×100 后约 1.76e14，仍低于 2^48-1；末两位区分同毫秒多单。
+	id := ms*100 + n%100
+	if id <= 0 || id > lighterMaxClientOrderIndex {
+		id = n % lighterMaxClientOrderIndex
+		if id <= 0 {
+			id = 1
+		}
+	}
+	return id
+}
+
+func nextArbClientOrderID() string {
+	n := clientOrderSeq.Add(1)
+	return fmt.Sprintf("arb-%d-%d", time.Now().UnixMilli(), n)
+}
 
 // fillPollSleep 复刻参考的 `await asyncio.sleep(min(safe_interval,
 // max(0.5, deadline - loop.time())))`：最后一轮不睡过 deadline，
@@ -137,10 +153,9 @@ type push struct {
 	Data  any    `json:"data"`
 }
 
-// 单次请求的处理超时。必须留在 lighterFillWait 之上：place 会在进程内
-// 阻塞轮询整个成交确认窗口，ctx 先到期的话回查会被打断，成交量查不到就
-// 白白退化成 unknown。留 15s 余量给下单本身的往返和签名。
-const requestTimeout = lighterFillWait + 15*time.Second
+// 单次请求的处理超时。必须留在 iocFillWait 之上：place 会在进程内
+// 等推送再查一次该单，ctx 先到期的话回查会被打断。留 15s 给下单往返和签名。
+const requestTimeout = iocFillWait + 15*time.Second
 
 var (
 	// stdout 必须串行写：响应和 WS 推送来自不同 goroutine。

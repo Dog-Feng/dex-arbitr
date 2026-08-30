@@ -24,11 +24,11 @@
     <Field label="loop_interval_ms" hint="决策环 tick 间隔">
       <n-input-number v-model:value="p.loop_interval_ms" :min="10" :step="10" />
     </Field>
-    <Field label="limit_timeout_ms" hint="第一腿限价最多挂多久（阶段 2）">
+    <Field label="limit_timeout_ms" hint="非邻档追逐型限价单轮最长等待。邻档第一腿不走这个">
       <n-input-number v-model:value="p.limit_timeout_ms" :min="100" :step="100" />
     </Field>
-    <Field label="second_leg_verify_ms" hint="第二腿激进限价失败后，等这么久再查实仓；没有仓则市价平第一腿">
-      <n-input-number v-model:value="p.second_leg_verify_ms" :min="0" :step="100" />
+    <Field label="adjacent_timeout_ms" hint="邻档第一腿存活。0 = 只按事件撤（对面先成 / 边没了 / 改价），不按秒转市价">
+      <n-input-number v-model:value="p.adjacent_timeout_ms" :min="0" :step="1000" />
     </Field>
     <Field label="maker_inside_ticks" hint="maker 腿往点差内侧挪几个 tick">
       <n-input-number v-model:value="p.maker_inside_ticks" :min="0" />

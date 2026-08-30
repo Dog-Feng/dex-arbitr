@@ -28,8 +28,12 @@ fn default_step_hysteresis() -> Decimal {
     Decimal::ZERO
 }
 
-fn default_second_leg_verify_ms() -> u64 {
-    2000
+fn default_quote_reprice_ratio() -> Decimal {
+    Decimal::new(2, 1)
+}
+
+fn default_min_quote_gap_ratio() -> Decimal {
+    Decimal::new(3, 1)
 }
 
 /// default.yaml 里**全部**可在 UI 热改的参数。
@@ -82,11 +86,17 @@ pub struct ArbitrageParams {
     pub sample_interval_ms: u64,
     #[serde(default = "default_step_hysteresis")]
     pub step_hysteresis: Decimal,
+    #[serde(default)]
+    pub symmetric_limit: bool,
+    #[serde(default = "default_quote_reprice_ratio")]
+    pub quote_reprice_ratio: Decimal,
+    #[serde(default = "default_min_quote_gap_ratio")]
+    pub min_quote_gap_ratio: Decimal,
 
     // ═══ order ═══
     pub limit_timeout_ms: u64,
-    #[serde(default = "default_second_leg_verify_ms")]
-    pub second_leg_verify_ms: u64,
+    #[serde(default)]
+    pub adjacent_timeout_ms: u64,
     pub maker_inside_ticks: u32,
     pub limit_retry_count: u32,
 
@@ -130,9 +140,12 @@ impl ArbitrageParams {
             window_samples: cfg.grid.window_samples,
             sample_interval_ms: cfg.grid.sample_interval_ms,
             step_hysteresis: cfg.grid.step_hysteresis,
+            symmetric_limit: cfg.grid.symmetric_limit,
+            quote_reprice_ratio: cfg.grid.quote_reprice_ratio,
+            min_quote_gap_ratio: cfg.grid.min_quote_gap_ratio,
 
             limit_timeout_ms: cfg.order.limit_timeout_ms,
-            second_leg_verify_ms: cfg.order.second_leg_verify_ms,
+            adjacent_timeout_ms: cfg.order.adjacent_timeout_ms,
             maker_inside_ticks: cfg.order.maker_inside_ticks,
             limit_retry_count: cfg.order.limit_retry_count,
 
@@ -178,9 +191,12 @@ impl ArbitrageParams {
         cfg.grid.window_samples = self.window_samples.max(1);
         cfg.grid.sample_interval_ms = self.sample_interval_ms.max(1);
         cfg.grid.step_hysteresis = self.step_hysteresis.max(Decimal::ZERO);
+        cfg.grid.symmetric_limit = self.symmetric_limit;
+        cfg.grid.quote_reprice_ratio = self.quote_reprice_ratio.max(Decimal::ZERO);
+        cfg.grid.min_quote_gap_ratio = self.min_quote_gap_ratio.max(Decimal::ZERO);
 
         cfg.order.limit_timeout_ms = self.limit_timeout_ms;
-        cfg.order.second_leg_verify_ms = self.second_leg_verify_ms;
+        cfg.order.adjacent_timeout_ms = self.adjacent_timeout_ms;
         cfg.order.maker_inside_ticks = self.maker_inside_ticks;
         cfg.order.limit_retry_count = self.limit_retry_count.max(1);
 
@@ -292,6 +308,16 @@ mod tests {
         assert_eq!(cfg.pairs.defaults.max_segments, 5);
         assert_eq!(cfg.sizing.leverage_multiplier, dec!(3));
         assert_eq!(cfg.pairs.enabled[0].symbol, "SNDK");
+        assert!(!cfg.grid.symmetric_limit);
+        p.symmetric_limit = true;
+        p.quote_reprice_ratio = dec!(0.25);
+        p.min_quote_gap_ratio = dec!(0.4);
+        p.adjacent_timeout_ms = 0;
+        p.apply_to(&mut cfg);
+        assert!(cfg.grid.symmetric_limit);
+        assert_eq!(cfg.grid.quote_reprice_ratio, dec!(0.25));
+        assert_eq!(cfg.grid.min_quote_gap_ratio, dec!(0.4));
+        assert_eq!(cfg.order.adjacent_timeout_ms, 0);
     }
 
     #[test]

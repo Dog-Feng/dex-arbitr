@@ -53,8 +53,8 @@ type lighterSession struct {
 	// 刻意只覆盖到 sendTx 返回：之后的成交回查是 REST 轮询，把它圈进来会让
 	// 并发的撤单排在后面等，而撤单在超时路径上是要抢时间的。
 	submitMu sync.Mutex
-	// IOC 确认窗口：baseline → sendTx → waitMarketFill。同市场串行，避免
-	// REST 持仓 delta 把别人的成交算进自己。
+	// IOC：sendTx → 等该单 WS 1 秒 → 查一次订单。同市场串行，避免并发
+	// 市价单的确认窗口叠在一起。
 	marketLocks sync.Map // marketIndex -> *sync.Mutex
 
 	// 市场精度缓存。A3：marketDecimals 原来每次下单都打一遍
@@ -68,7 +68,7 @@ type lighterSession struct {
 	wsStop context.CancelFunc
 
 	// WS 推送的成交量，按 client_order_index / order_index 索引。
-	// waitMarketFill 命中后立刻返回，不必再等 REST 持仓快照（原先 2s 一轮）。
+	// waitMarketFill 命中 WS 后立刻返回；1 秒没有再查一次订单。
 	fillMu sync.Mutex
 	fills  map[string]lighterFill
 }
@@ -289,66 +289,54 @@ func (s *lighterSession) marketPositionSize(ctx context.Context, marketIndex int
 
 // waitMarketFill 确认市价腿真实成交量。
 //
-// 优先看私有 WS（account_all_orders 推送到就认），REST 持仓 delta 兜底。
-// 轮询间隔 100ms：旧实现复刻参考的 2s sleep，市价其实已经成交，本地却要
-// 再等一轮才返回——日志上就是「第一腿成交后 3–4 秒第二腿才成功」。
+// 只认该 order_id：先等私有 WS（最多 1 秒），没有再 REST 查一次
+// 活跃单 / 非活跃单。不用持仓 delta。
 func (s *lighterSession) waitMarketFill(
 	ctx context.Context,
 	marketIndex int,
-	symbol string,
-	baseline decimal.Decimal,
-	isBuy bool,
 	want decimal.Decimal,
 	orderID string,
 ) decimal.Decimal {
-	deadline := time.Now().Add(lighterFillWait)
-	best := decimal.Zero
+	deadline := time.Now().Add(iocFillWait)
 	sizeDec := 0
 	if d, err := s.marketDecimals(ctx, marketIndex); err == nil {
 		sizeDec = d.sizeDec
 	}
 	for {
 		if orderID != "" {
-			if f, ok := s.wsFilled(orderID, want, sizeDec); ok && f.GreaterThan(best) {
-				best = f
-				if best.GreaterThanOrEqual(want) {
+			if f, ok := s.wsFilled(orderID, want, sizeDec); ok {
+				if want.GreaterThan(decimal.Zero) && f.GreaterThan(want) {
 					return want
 				}
-			}
-		}
-		if cur, err := s.marketPositionSize(ctx, marketIndex, symbol); err == nil {
-			delta := cur.Sub(baseline)
-			if !isBuy {
-				delta = delta.Neg()
-			}
-			if delta.GreaterThan(best) {
-				best = delta
-			}
-			if best.GreaterThanOrEqual(want) {
-				return want
+				return f
 			}
 		}
 		if time.Now().After(deadline) || ctx.Err() != nil {
-			return best
+			break
 		}
-		remain := time.Until(deadline)
-		nap := 100 * time.Millisecond
-		if remain < nap {
-			nap = remain
-		}
-		if nap <= 0 {
-			return best
-		}
-		time.Sleep(nap)
+		tightFillPoll(deadline)
 	}
+	if orderID != "" {
+		if f, ok := s.wsFilled(orderID, want, sizeDec); ok {
+			if want.GreaterThan(decimal.Zero) && f.GreaterThan(want) {
+				return want
+			}
+			return f
+		}
+		if found, ok := s.lookupOrder(ctx, marketIndex, orderID); ok && found.filled.GreaterThan(decimal.Zero) {
+			if want.GreaterThan(decimal.Zero) && found.filled.GreaterThan(want) {
+				return want
+			}
+			return found.filled
+		}
+	}
+	return decimal.Zero
 }
 
 func (s *lighterSession) noteWsFills(msg map[string]any) {
-	orders := rawList(firstValue(msg, "orders"))
-	if len(orders) == 0 {
-		if firstValue(msg, "client_order_index", "order_index", "filled_base_amount") != nil {
-			orders = []map[string]any{msg}
-		}
+	orders := rawList(firstValue(msg, "orders", "trades"))
+	if len(orders) == 0 && looksLikeOrderOrTrade(msg) {
+		orders = []map[string]any{msg}
 	}
 	if len(orders) == 0 {
 		return
@@ -360,22 +348,56 @@ func (s *lighterSession) noteWsFills(msg map[string]any) {
 	}
 	now := time.Now()
 	for _, raw := range orders {
-		filled := decimalValue(firstValue(raw, "filled_base_amount", "filled_amount"))
+		filled := orderFilledQty(raw)
 		if !filled.GreaterThan(decimal.Zero) {
 			continue
 		}
-		for _, key := range []string{
-			stringValue(firstValue(raw, "client_order_index", "client_order_id")),
-			stringValue(firstValue(raw, "order_index", "order_id")),
-		} {
-			if key != "" && key != "0" {
-				if prev, ok := s.fills[key]; !ok || filled.GreaterThan(prev.qty) {
-					s.fills[key] = lighterFill{qty: filled, at: now}
-				}
+		tradeInc := firstValue(raw, "trade_id", "trade_id_str") != nil
+		for _, key := range orderIdKeys(raw) {
+			if key == "" || key == "0" {
+				continue
 			}
+			qty := filled
+			if tradeInc {
+				if prev, ok := s.fills[key]; ok {
+					qty = prev.qty.Add(filled)
+				}
+			} else if prev, ok := s.fills[key]; ok && prev.qty.GreaterThan(qty) {
+				continue
+			}
+			s.fills[key] = lighterFill{qty: qty, at: now}
 		}
 	}
 	pruneFillCache(s.fills, func(v lighterFill) time.Time { return v.at })
+}
+
+func orderFilledQty(raw map[string]any) decimal.Decimal {
+	filled := decimalValue(firstValue(raw, "filled_base_amount", "filled_amount", "size"))
+	if filled.GreaterThan(decimal.Zero) {
+		return filled
+	}
+	init := decimalValue(raw["initial_base_amount"])
+	rem := decimalValue(raw["remaining_base_amount"])
+	if init.GreaterThan(rem) && rem.GreaterThanOrEqual(decimal.Zero) {
+		return init.Sub(rem)
+	}
+	return decimal.Zero
+}
+
+func orderIdKeys(raw map[string]any) []string {
+	// 官方 Order/Trade：整数 id 另有 *_str。优先字符串，避免 JSON 整数走 float64。
+	return []string{
+		stringValue(firstValue(raw, "client_order_id", "client_order_index")),
+		stringValue(firstValue(raw, "order_id", "order_index")),
+		stringValue(firstValue(raw, "ask_client_id_str", "ask_client_id")),
+		stringValue(firstValue(raw, "bid_client_id_str", "bid_client_id")),
+		stringValue(firstValue(raw, "ask_id_str", "ask_id")),
+		stringValue(firstValue(raw, "bid_id_str", "bid_id")),
+	}
+}
+
+func looksLikeOrderOrTrade(m map[string]any) bool {
+	return firstValue(m, "client_order_index", "order_index", "filled_base_amount", "trade_id", "ask_id", "bid_id", "size") != nil
 }
 
 func (s *lighterSession) wsFilled(orderID string, want decimal.Decimal, sizeDec int) (decimal.Decimal, bool) {
@@ -480,13 +502,15 @@ func (s *lighterSession) orderStreamOnce(ctx context.Context, venueID string) er
 	if err != nil {
 		return fmt.Errorf("auth token: %w", err)
 	}
-	sub := map[string]any{
-		"type":    "subscribe",
-		"channel": fmt.Sprintf("account_all_orders/%d", s.venue.AccountIndex),
-		"auth":    token,
-	}
-	if err := conn.WriteJSON(sub); err != nil {
-		return fmt.Errorf("subscribe: %w", err)
+	acct := s.venue.AccountIndex
+	for _, ch := range []string{
+		fmt.Sprintf("account_all_orders/%d", acct),
+		fmt.Sprintf("account_all_trades/%d", acct),
+	} {
+		sub := map[string]any{"type": "subscribe", "channel": ch, "auth": token}
+		if err := conn.WriteJSON(sub); err != nil {
+			return fmt.Errorf("subscribe %s: %w", ch, err)
+		}
 	}
 
 	done := make(chan struct{})
@@ -524,7 +548,9 @@ func (s *lighterSession) orderStreamOnce(ctx context.Context, venueID string) er
 		}
 		_ = conn.SetReadDeadline(time.Now().Add(90 * time.Second))
 		kind := stringValue(msg["type"])
-		if !strings.Contains(kind, "order") {
+		ch := stringValue(msg["channel"])
+		if !strings.Contains(kind, "order") && !strings.Contains(kind, "trade") &&
+			!strings.Contains(ch, "order") && !strings.Contains(ch, "trade") {
 			continue
 		}
 		s.noteWsFills(msg)
@@ -567,7 +593,7 @@ func (s *lighterSession) place(ctx context.Context, params map[string]any) (map[
 		return nil, fmt.Errorf("qty too small after scale: %s", qty)
 	}
 
-	coidStr := paramString(params, "client_order_id", fmt.Sprintf("%d", time.Now().UnixMilli()))
+	coidStr := paramString(params, "client_order_id", fmt.Sprintf("%d", nextLighterClientOrderID()))
 	coid, err := strconv.ParseInt(coidStr, 10, 64)
 	if err != nil || coid <= 0 {
 		// client_order_id 无法解析为正 int64（如 UUID 字符串）时明确报错，
@@ -656,29 +682,12 @@ func (s *lighterSession) place(ctx context.Context, params map[string]any) (map[
 		return nil, err
 	}
 
-	// IOC 腿：下单**前**取持仓基线，成交量只能靠 delta 确认。
-	// 基线查询要一次 REST，可能失败，所以必须排在 nonce **之前**：
-	// 对齐参考 `_place_market_order`「只有在所有前置条件都满足后，才获取nonce，
-	// 这样可以避免nonce被消耗但订单没有发送的情况」。
-	//
-	// per-market 锁罩住 baseline → sendTx → waitMarketFill，避免同市场
-	// 并发 IOC 把对方的仓变算进自己的 REST delta。
+	// IOC：per-market 锁罩住 sendTx → waitMarketFill，避免同市场并发
+	// 市价确认窗口叠在一起。
 	if ioc {
 		lk := s.marketLock(marketIndex)
 		lk.Lock()
 		defer lk.Unlock()
-	}
-	baseline := decimal.Zero
-	haveBaseline := false
-	if ioc {
-		if b, berr := s.marketPositionSize(ctx, marketIndex, paramString(params, "symbol", "")); berr == nil {
-			baseline = b
-			haveBaseline = true
-		} else {
-			// 拿不到基线就无法确认成交；上报 unknown 让上层走自己的对账，
-			// 绝不能假定全额成交。
-			return nil, fmt.Errorf("market baseline unavailable: %w", berr)
-		}
 	}
 
 	if err := s.syncNonce(ctx); err != nil {
@@ -757,24 +766,21 @@ func (s *lighterSession) place(ctx context.Context, params map[string]any) (map[
 			}
 			return nil, sendErr
 		}
-		// IOC 腿：撤不了也查不到活跃单（不驻留），只能看持仓 delta。
-		// 有成交就必须上报，否则上层按「未下单」记账 → 裸仓。
-		if haveBaseline {
-			filled := s.waitMarketFill(ctx, marketIndex, paramString(params, "symbol", ""), baseline, isBuy, qty, coidStr)
-			if filled.GreaterThan(decimal.Zero) {
-				status := "filled"
-				if filled.LessThan(qty) {
-					status = "partial"
-				}
-				fmt.Fprintf(os.Stderr, "lighter place: sendTx failed (%v) but position moved %s; reporting %s\n", sendErr, filled, status)
-				return mergePlaceRTT(map[string]string{
-					"order_id":        coidStr,
-					"client_order_id": coidStr,
-					"filled_qty":      filled.String(),
-					"status":          status,
-					"avg_price":       "",
-				}, signMs, sendMs, totalMs), nil
+		// IOC 腿：sendTx 报错仍可能已上链。等该单 WS / 查一次订单。
+		filled := s.waitMarketFill(ctx, marketIndex, qty, coidStr)
+		if filled.GreaterThan(decimal.Zero) {
+			status := "filled"
+			if filled.LessThan(qty) {
+				status = "partial"
 			}
+			fmt.Fprintf(os.Stderr, "lighter place: sendTx failed (%v) but order %s filled %s; reporting %s\n", sendErr, coidStr, filled, status)
+			return mergePlaceRTT(map[string]string{
+				"order_id":        coidStr,
+				"client_order_id": coidStr,
+				"filled_qty":      filled.String(),
+				"status":          status,
+				"avg_price":       "",
+			}, signMs, sendMs, totalMs), nil
 		}
 		return nil, sendErr
 	}
@@ -788,19 +794,11 @@ func (s *lighterSession) place(ctx context.Context, params map[string]any) (map[
 			"avg_price":       limitPriceStr,
 		}, signMs, sendMs, totalMs), nil
 	}
-	// IOC 腿：用持仓 delta 确认真实成交量。sendTx 成功 ≠ 撮合成交——
-	// IOC 在限价（市价是保护价 ±5%，激进限价是上层算的价）内吃不到量会整单
-	// 撤销，此时若上报 filled=请求量，上层会按幻影成交记账，平仓时会把实际
-	// 还在的仓位清零成裸仓。
-	if !haveBaseline {
-		return nil, errors.New("market fill unverifiable: no baseline")
-	}
-	filled := s.waitMarketFill(ctx, marketIndex, paramString(params, "symbol", ""), baseline, isBuy, qty, coidStr)
+	// IOC：sendTx 成功 ≠ 撮合成交。等该单 WS 1 秒，没有再查一次。
+	filled := s.waitMarketFill(ctx, marketIndex, qty, coidStr)
 	status := "filled"
 	switch {
 	case filled.LessThanOrEqual(decimal.Zero):
-		// 没观察到任何成交：可能确实整单撤销，也可能是快照延迟。
-		// 报 unknown 而不是 filled/rejected，让上层用自己的仓位对账兜底。
 		status = "unknown"
 	case filled.LessThan(qty):
 		status = "partial"
@@ -904,38 +902,44 @@ func (s *lighterSession) orderStatus(ctx context.Context, params map[string]any)
 	orderID := paramString(params, "order_id", "")
 	qty, _ := paramDecimal(params, "qty")
 
-	token, err := s.txClient.GetAuthToken(time.Now().Add(10 * time.Minute))
-	if err != nil {
-		return nil, fmt.Errorf("lighter auth token: %w", err)
-	}
-	result, err := s.get(ctx, "/api/v1/accountActiveOrders", url.Values{
-		"account_index": {strconv.FormatInt(s.venue.AccountIndex, 10)},
-		"market_id":     {strconv.Itoa(marketIndex)},
-	}, http.Header{"authorization": {token}})
-	if err != nil {
-		return nil, err
-	}
-	if found, ok := matchActiveOrder(result, orderID); ok {
-		status := "accepted"
-		if found.filled.GreaterThan(decimal.Zero) {
-			if qty.GreaterThan(decimal.Zero) && found.filled.GreaterThanOrEqual(qty) {
-				status = "filled"
-			} else {
-				status = "partial"
+	found, ok := s.lookupOrder(ctx, marketIndex, orderID)
+	if !ok {
+		if qty.GreaterThan(decimal.Zero) {
+			if dec, err := s.marketDecimals(ctx, marketIndex); err == nil {
+				if f, hit := s.wsFilled(orderID, qty, dec.sizeDec); hit {
+					status := "partial"
+					if f.GreaterThanOrEqual(qty) {
+						status = "filled"
+					}
+					return map[string]string{
+						"order_id":   orderID,
+						"filled_qty": f.String(),
+						"status":     status,
+						"avg_price":  "",
+					}, nil
+				}
 			}
 		}
 		return map[string]string{
 			"order_id":   orderID,
-			"filled_qty": found.filled.String(),
-			"status":     status,
-			"avg_price":  found.price,
+			"filled_qty": "0",
+			"status":     "unknown",
+			"avg_price":  "",
 		}, nil
+	}
+	status := "accepted"
+	if found.filled.GreaterThan(decimal.Zero) {
+		if qty.GreaterThan(decimal.Zero) && found.filled.GreaterThanOrEqual(qty) {
+			status = "filled"
+		} else {
+			status = "partial"
+		}
 	}
 	return map[string]string{
 		"order_id":   orderID,
-		"filled_qty": "0",
-		"status":     "unknown",
-		"avg_price":  "",
+		"filled_qty": found.filled.String(),
+		"status":     status,
+		"avg_price":  found.price,
 	}, nil
 }
 
@@ -952,9 +956,41 @@ func matchActiveOrder(result map[string]any, orderID string) (activeOrder, bool)
 			continue
 		}
 		return activeOrder{
-			filled: decimalValue(firstValue(raw, "filled_base_amount", "filled_amount")),
-			price:  stringValue(raw["price"]),
+			filled: orderFilledQty(raw),
+			price:  stringValue(firstValue(raw, "price", "avg_price")),
 		}, true
+	}
+	return activeOrder{}, false
+}
+
+// lookupOrder 查一次该单：先活跃列表，没有再查非活跃（IOC 成交后不在活跃列表）。
+func (s *lighterSession) lookupOrder(ctx context.Context, marketIndex int, orderID string) (activeOrder, bool) {
+	if orderID == "" {
+		return activeOrder{}, false
+	}
+	token, err := s.txClient.GetAuthToken(time.Now().Add(10 * time.Minute))
+	if err != nil {
+		return activeOrder{}, false
+	}
+	hdr := http.Header{"authorization": {token}}
+	acct := strconv.FormatInt(s.venue.AccountIndex, 10)
+	mid := strconv.Itoa(marketIndex)
+	if result, err := s.get(ctx, "/api/v1/accountActiveOrders", url.Values{
+		"account_index": {acct},
+		"market_id":     {mid},
+	}, hdr); err == nil {
+		if found, ok := matchActiveOrder(result, orderID); ok {
+			return found, true
+		}
+	}
+	if result, err := s.get(ctx, "/api/v1/accountInactiveOrders", url.Values{
+		"account_index": {acct},
+		"market_id":     {mid},
+		"limit":         {"50"},
+	}, hdr); err == nil {
+		if found, ok := matchActiveOrder(result, orderID); ok {
+			return found, true
+		}
 	}
 	return activeOrder{}, false
 }
@@ -1178,6 +1214,22 @@ func rawList(value any) []map[string]any {
 			}
 		}
 		return out
+	case map[string]any:
+		// Lighter WS：{"1": [order, ...]} 按市场 id 分组。账户 / orderBookDetails
+		// 是对象数组，走上面 []any，不能把对象内部字段拆开，否则丢 market_id。
+		var out []map[string]any
+		for _, item := range v {
+			if arr, ok := item.([]any); ok {
+				out = append(out, rawList(arr)...)
+			}
+		}
+		if len(out) > 0 {
+			return out
+		}
+		if looksLikeOrderOrTrade(v) {
+			return []map[string]any{v}
+		}
+		return nil
 	default:
 		return nil
 	}
@@ -1187,7 +1239,29 @@ func stringValue(v any) string {
 	if v == nil {
 		return ""
 	}
-	return strings.TrimSpace(fmt.Sprint(v))
+	switch n := v.(type) {
+	case string:
+		return strings.TrimSpace(n)
+	case json.Number:
+		return n.String()
+	case float64:
+		// encoding/json 把整数解成 float64；%v/%g 对 >1e6 的 client_order_id
+		// 会打成科学计数法，WS 对不上下单时的十进制字符串，市价腿就永远 unknown。
+		if n == math.Trunc(n) && n >= -1e15 && n <= 1e15 {
+			return strconv.FormatInt(int64(n), 10)
+		}
+		return strconv.FormatFloat(n, 'f', -1, 64)
+	case float32:
+		return stringValue(float64(n))
+	case int:
+		return strconv.Itoa(n)
+	case int64:
+		return strconv.FormatInt(n, 10)
+	case uint64:
+		return strconv.FormatUint(n, 10)
+	default:
+		return strings.TrimSpace(fmt.Sprint(v))
+	}
 }
 
 func firstValue(m map[string]any, keys ...string) any {
@@ -1372,14 +1446,10 @@ func (s *lighterSession) fetchAccountTrades(ctx context.Context) ([]map[string]a
 
 func tradeMatchesOrder(t map[string]any, orderID string) bool {
 	for _, k := range []string{
-		"ask_id", "bid_id", "ask_id_str", "bid_id_str",
-		"ask_client_id", "bid_client_id", "ask_client_id_str", "bid_client_id_str",
+		"ask_client_id_str", "bid_client_id_str", "ask_id_str", "bid_id_str",
+		"ask_client_id", "bid_client_id", "ask_id", "bid_id",
 	} {
-		v := firstValue(t, k)
-		if v == nil {
-			continue
-		}
-		if strings.TrimSpace(fmt.Sprint(v)) == orderID {
+		if stringValue(firstValue(t, k)) == orderID {
 			return true
 		}
 	}

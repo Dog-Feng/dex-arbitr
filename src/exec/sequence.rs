@@ -1,4 +1,5 @@
 use rust_decimal::Decimal;
+use std::cmp::Ordering;
 use std::time::Duration;
 
 use crate::config::AppConfig;
@@ -43,30 +44,128 @@ pub fn watch_resting_limit(
     LimitWatch::StillWait
 }
 
-/// 吃单费率更高的那所先挂限价，另一所后市价。
-/// taker 相同：挂在 maker 更低的一侧。maker 也相同：两边都市价（返回 None）。
+/// 比较「A 挂限价（付 maker）+ B 市价（付 taker 并吃 B 点差）」和反过来哪边更便宜。
+///
+/// `Less` = A 做第一腿更便宜；`Greater` = B 做第一腿更便宜；`Equal` 打平。
+pub fn limit_then_hedge_cost_cmp(
+    a_maker: Decimal,
+    a_taker: Decimal,
+    a_spread: Decimal,
+    b_maker: Decimal,
+    b_taker: Decimal,
+    b_spread: Decimal,
+) -> Ordering {
+    let a_makes = a_maker + b_taker + b_spread.max(Decimal::ZERO);
+    let b_makes = b_maker + a_taker + a_spread.max(Decimal::ZERO);
+    a_makes.cmp(&b_makes)
+}
+
+/// 限价挂在「自己做 maker、对面 taker」总成本更低的一侧；打平返回 None。
 pub fn first_limit_venue<'a>(
     cfg: &AppConfig,
     buy: &'a VenueId,
     sell: &'a VenueId,
 ) -> Option<(&'a VenueId, &'a VenueId)> {
-    let buy_t = cfg.taker_fee(buy);
-    let sell_t = cfg.taker_fee(sell);
-    if buy_t > sell_t {
-        return Some((buy, sell));
+    match limit_then_hedge_cost_cmp(
+        cfg.maker_fee(buy),
+        cfg.taker_fee(buy),
+        Decimal::ZERO,
+        cfg.maker_fee(sell),
+        cfg.taker_fee(sell),
+        Decimal::ZERO,
+    ) {
+        Ordering::Less => Some((buy, sell)),
+        Ordering::Greater => Some((sell, buy)),
+        Ordering::Equal => None,
     }
-    if sell_t > buy_t {
-        return Some((sell, buy));
+}
+
+pub fn first_limit_venue_or_left<'a>(
+    cfg: &AppConfig,
+    buy: &'a VenueId,
+    sell: &'a VenueId,
+    left: &'a VenueId,
+) -> (&'a VenueId, &'a VenueId) {
+    first_limit_venue(cfg, buy, sell).unwrap_or_else(|| fallback_left(buy, sell, left))
+}
+
+/// 对称挂单：比较两种挂法的单边成本，取更便宜的。
+///
+/// 成本 = 挂单所 maker + 市价所 taker + 市价所点差中枢（限价所点差不进）。
+/// `*_spread_pct` 两侧都有才把点差加进比较；缺一侧或打平则回退 [`first_limit_venue`]。
+pub fn first_limit_venue_all_in<'a>(
+    cfg: &AppConfig,
+    buy: &'a VenueId,
+    sell: &'a VenueId,
+    buy_spread_pct: Option<Decimal>,
+    sell_spread_pct: Option<Decimal>,
+) -> Option<(&'a VenueId, &'a VenueId)> {
+    if let (Some(cb), Some(cs)) = (buy_spread_pct, sell_spread_pct) {
+        match limit_then_hedge_cost_cmp(
+            cfg.maker_fee(buy),
+            cfg.taker_fee(buy),
+            cb,
+            cfg.maker_fee(sell),
+            cfg.taker_fee(sell),
+            cs,
+        ) {
+            Ordering::Less => return Some((buy, sell)),
+            Ordering::Greater => return Some((sell, buy)),
+            Ordering::Equal => {}
+        }
     }
-    let buy_m = cfg.maker_fee(buy);
-    let sell_m = cfg.maker_fee(sell);
-    if buy_m < sell_m {
-        return Some((buy, sell));
+    first_limit_venue(cfg, buy, sell)
+}
+
+/// 阶段 2 一格开平：\(F=2\times(\mathrm{maker}_{挂}+\mathrm{taker}_{市})\)，\(C=\) 市价所点差中枢。
+///
+/// 返回 `(F, 市价所 C)`。点差未满时 C 为 `None`（Δ 里当 0）。
+pub fn symmetric_grid_costs(
+    cfg: &AppConfig,
+    left: &VenueId,
+    right: &VenueId,
+    left_spread_pct: Option<Decimal>,
+    right_spread_pct: Option<Decimal>,
+) -> (Decimal, Option<Decimal>) {
+    let (first, second) = first_limit_venue_all_in_or_left(
+        cfg,
+        left,
+        right,
+        left,
+        left_spread_pct,
+        right_spread_pct,
+    );
+    let fee = (cfg.maker_fee(first) + cfg.taker_fee(second)) * Decimal::from(2);
+    let hedge_c = if second.as_str() == left.as_str() {
+        left_spread_pct
+    } else {
+        right_spread_pct
+    };
+    (fee, hedge_c)
+}
+
+pub fn first_limit_venue_all_in_or_left<'a>(
+    cfg: &AppConfig,
+    buy: &'a VenueId,
+    sell: &'a VenueId,
+    left: &'a VenueId,
+    buy_spread_pct: Option<Decimal>,
+    sell_spread_pct: Option<Decimal>,
+) -> (&'a VenueId, &'a VenueId) {
+    first_limit_venue_all_in(cfg, buy, sell, buy_spread_pct, sell_spread_pct)
+        .unwrap_or_else(|| fallback_left(buy, sell, left))
+}
+
+fn fallback_left<'a>(
+    buy: &'a VenueId,
+    sell: &'a VenueId,
+    left: &'a VenueId,
+) -> (&'a VenueId, &'a VenueId) {
+    if buy.as_str() == left.as_str() {
+        (buy, sell)
+    } else {
+        (sell, buy)
     }
-    if sell_m < buy_m {
-        return Some((sell, buy));
-    }
-    None
 }
 
 pub fn sequenced_fee(cfg: &AppConfig, buy: &VenueId, sell: &VenueId) -> Decimal {
@@ -147,6 +246,7 @@ pub fn best_sequenced_spread(
 mod tests {
     use super::*;
     use rust_decimal_macros::dec;
+    use std::cmp::Ordering;
     use std::time::Instant;
 
     #[test]
@@ -202,6 +302,83 @@ mod tests {
         // 当前 yaml 两所 maker/taker 都是 0，先挂后吃没有优先腿。
         assert!(first_limit_venue(&cfg, &buy, &sell).is_none());
         assert_eq!(book(dec!(100), dec!(100.01)).ask, dec!(100.01));
+    }
+
+    #[test]
+    fn all_in_prefers_wider_own_spread_when_fees_equal() {
+        let cfg = AppConfig::load_from(std::path::Path::new("config/default.yaml")).unwrap();
+        let buy = VenueId::from("lighter");
+        let sell = VenueId::from("lighter_rh");
+        assert!(first_limit_venue(&cfg, &buy, &sell).is_none());
+        let (first, second) = first_limit_venue_all_in(
+            &cfg,
+            &buy,
+            &sell,
+            Some(dec!(0.01)),
+            Some(dec!(0.04)),
+        )
+        .unwrap();
+        assert_eq!(first.as_str(), "lighter_rh");
+        assert_eq!(second.as_str(), "lighter");
+    }
+
+    #[test]
+    fn all_in_missing_spread_falls_back_to_fee() {
+        let cfg = AppConfig::load_from(std::path::Path::new("config/default.yaml")).unwrap();
+        let buy = VenueId::from("lighter");
+        let sell = VenueId::from("lighter_rh");
+        assert!(first_limit_venue_all_in(&cfg, &buy, &sell, Some(dec!(0.04)), None).is_none());
+        let left = VenueId::from("lighter");
+        let (first, _) = first_limit_venue_all_in_or_left(
+            &cfg,
+            &buy,
+            &sell,
+            &left,
+            Some(dec!(0.04)),
+            None,
+        );
+        assert_eq!(first.as_str(), "lighter");
+    }
+
+    #[test]
+    fn all_in_spread_can_override_fee_rank() {
+        let cfg = AppConfig::load_from(std::path::Path::new("config/default.yaml")).unwrap();
+        let cheap = VenueId::from("lighter");
+        let rich = VenueId::from("sodex");
+        // 费率单独比：挂 sodex（maker）+ 吃 lighter（taker）更便宜。
+        let (first, _) = first_limit_venue(&cfg, &cheap, &rich).unwrap();
+        assert_eq!(first.as_str(), "sodex");
+        // 市价吃 lighter 的点差中枢大到超过费率差 → 改挂 lighter、吃 sodex。
+        let (first, second) = first_limit_venue_all_in(
+            &cfg,
+            &cheap,
+            &rich,
+            Some(dec!(0.05)),
+            Some(dec!(0.01)),
+        )
+        .unwrap();
+        assert_eq!(first.as_str(), "lighter");
+        assert_eq!(second.as_str(), "sodex");
+    }
+
+    #[test]
+    fn limit_then_hedge_uses_maker_on_posting_side() {
+        // A taker 0.03 / maker 0.01；B taker 0.009 / maker 0.005。
+        // A 挂：0.01 + 0.009 = 0.019；B 挂：0.005 + 0.03 = 0.035 → 挂 A。
+        assert_eq!(
+            limit_then_hedge_cost_cmp(
+                dec!(0.01),
+                dec!(0.03),
+                Decimal::ZERO,
+                dec!(0.005),
+                dec!(0.009),
+                Decimal::ZERO,
+            ),
+            Ordering::Less
+        );
+        // 开平一格 F = 2 × 0.019 = 0.038（不再用 2 × (0.03+0.009)=0.078）。
+        let one_way = dec!(0.01) + dec!(0.009);
+        assert_eq!(one_way * Decimal::from(2), dec!(0.038));
     }
 
     #[test]

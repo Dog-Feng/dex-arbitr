@@ -15,7 +15,7 @@ venues:
 pairs:
   defaults:
     max_segments: 3
-    # 一格开平目标净利（bp）。1 bp = 0.01%。运行时 Δ = (目标% + 四腿市价费 + 两所点差中枢平均) / (1−2h)
+    # 一格开平目标净利（bp）。1 bp = 0.01%。阶段 1：Δ = 目标% + 四腿 taker + 两所点差平均。阶段 2：Δ = 目标% + 2×(挂单所 maker + 市价所 taker) + 市价所点差中枢。
     target_bp: "1"
     split_order_size: "0"
   # HTTP 开着时这里只是页面初始行，启动进程不会去各所拉市场。
@@ -37,7 +37,7 @@ sizing:
   depth_pct: "50"
   # 余额和交易所持仓一起拉。1 = 顶栏 DEX 余额与「交易所持仓」每秒更新。
   # 停止套利后仍继续刷新，不依赖套利开关。
-  refresh_balance_secs: 1
+  refresh_balance_secs: 5
   margin_utilization_pct: "90"
   # SoDEX 公开余额接口可能为空；有真实余额时以 bridge 为准
   fallback_available_usdc: "500"
@@ -84,19 +84,21 @@ grid:
   sample_interval_ms: 1000
   # STEP 滞后（格）。加仓 raw ≥ k+1−h，减仓 raw ≤ k−1+h。
   step_hysteresis: "0"
+  # true = 阶段 2：满窗后在 μ±Δ 挂邻档第一腿，成交推进 STEP。
+  symmetric_limit: false
+  quote_reprice_ratio: "0.2"
+  min_quote_gap_ratio: "0.3"
 
-# 策略固定双腿市价。下面几项只给市价失败后的激进限价兜底 / 看门狗用。
+# 邻档不走 limit_timeout_ms。市价确认写死：等该单推送 1 秒，没有再查一次。
 order:
   limit_timeout_ms: 2000
+  adjacent_timeout_ms: 0
   # maker 腿往点差内侧挪几个 tick。0 = 贴自家 bid/ask（队尾，2 秒超时几乎
   # 不可能成交）。参考项目的 tick 模式就是买 Ask1−1tick、卖 Bid1+1tick。
   maker_inside_ticks: 1
   # 第一腿限价最多挂几轮：每轮用最新盘口重算价格，部分成交累积，
   # 每轮结束一定撤掉余量。撤不掉会上报 orphan 并停止重试。
   limit_retry_count: 3
-  # 第二腿激进限价失败（或市价结果不明）后等这么久，再查该所实仓。
-  # 没有对应仓位则市价平掉第一腿。0 = 不等立刻查。
-  second_leg_verify_ms: 2000
 
 cost:
   # 决策不预扣滑点（小额只看卖一/买一）。成交后按实际成交价扣；超过本值记 overrun。

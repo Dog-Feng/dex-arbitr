@@ -100,3 +100,106 @@ func TestFormatLighterPlaceRTT(t *testing.T) {
 		t.Fatalf("merge: %+v", out)
 	}
 }
+
+func TestNextLighterClientOrderIDFits48Bits(t *testing.T) {
+	seen := map[int64]struct{}{}
+	for i := 0; i < 8; i++ {
+		id := nextLighterClientOrderID()
+		if id <= 0 || id > lighterMaxClientOrderIndex {
+			t.Fatalf("id %d out of range (max %d)", id, lighterMaxClientOrderIndex)
+		}
+		if _, dup := seen[id]; dup {
+			t.Fatalf("duplicate client_order_id %d", id)
+		}
+		seen[id] = struct{}{}
+	}
+}
+
+func TestRawListFlattensMarketKeyedOrders(t *testing.T) {
+	orders := map[string]any{
+		"1": []any{
+			map[string]any{"client_order_index": float64(555), "filled_base_amount": "0.0005"},
+		},
+		"type": "update",
+	}
+	got := rawList(orders)
+	if len(got) != 1 {
+		t.Fatalf("len %d", len(got))
+	}
+	if orderFilledQty(got[0]).String() != "0.0005" {
+		t.Fatalf("filled %s", orderFilledQty(got[0]))
+	}
+	single := map[string]any{"order_index": float64(9), "filled_base_amount": "0.1"}
+	got = rawList(single)
+	if len(got) != 1 || orderFilledQty(got[0]).String() != "0.1" {
+		t.Fatalf("single order: %+v", got)
+	}
+}
+
+func TestRawListKeepsAccountAndMarketRows(t *testing.T) {
+	accounts := []any{
+		map[string]any{
+			"available_balance": "10",
+			"collateral":        "10",
+			"positions": []any{
+				map[string]any{"symbol": "BTC", "position": "0.0005", "size": "0.0005"},
+			},
+		},
+	}
+	got := rawList(accounts)
+	if len(got) != 1 || stringValue(got[0]["collateral"]) != "10" {
+		t.Fatalf("account row flattened: %+v", got)
+	}
+	markets := []any{
+		map[string]any{"market_id": float64(1), "supported_size_decimals": float64(4)},
+	}
+	got = rawList(markets)
+	if len(got) != 1 || intOr(got[0]["market_id"], -1) != 1 {
+		t.Fatalf("market row flattened: %+v", got)
+	}
+}
+
+func TestStringValueKeepsClientOrderID(t *testing.T) {
+	id := float64(178809551281403)
+	got := stringValue(id)
+	if got != "178809551281403" {
+		t.Fatalf("got %q (would miss WS fill match)", got)
+	}
+	if stringValue("178809551281403") != "178809551281403" {
+		t.Fatal("string id")
+	}
+}
+
+func TestOrderIdKeysPrefersStrFields(t *testing.T) {
+	raw := map[string]any{
+		"ask_client_id":     float64(1.78809551281403e14),
+		"ask_client_id_str": "178809551281403",
+		"size":              "0.0005",
+	}
+	keys := orderIdKeys(raw)
+	found := false
+	for _, k := range keys {
+		if k == "178809551281403" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("keys %+v", keys)
+	}
+	if !tradeMatchesOrder(raw, "178809551281403") {
+		t.Fatal("trade should match str client id")
+	}
+}
+
+func TestOrderFilledQtyFromRemaining(t *testing.T) {
+	raw := map[string]any{
+		"initial_base_amount":   "0.0005",
+		"remaining_base_amount": "0",
+		"filled_base_amount":    "0",
+	}
+	got := orderFilledQty(raw)
+	if !got.Equal(decimal.RequireFromString("0.0005")) {
+		t.Fatalf("got %s", got)
+	}
+}
