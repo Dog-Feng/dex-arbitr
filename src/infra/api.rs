@@ -124,8 +124,6 @@ pub struct LiveSnapshot {
     #[serde(default)]
     pub venue_matches: Vec<VenueMatchRow>,
     pub stats: ApiStats,
-    pub monitor_only: bool,
-    pub paper_trading: bool,
     /// 套利开关当前状态（供 UI 轮询用）。
     pub arbitrage_enabled: bool,
     /// 正在按所选 DEX 拉市场并匹配。

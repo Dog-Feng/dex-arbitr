@@ -1,13 +1,7 @@
 <template>
   <div class="g">
-    <Field label="data_freshness_ms" hint="盘口超过此毫秒未更新视为过期">
-      <n-input-number v-model:value="p.data_freshness_ms" :min="100" :step="100" />
-    </Field>
-    <Field label="hedge_failed_legs" hint="第二腿失败时自动补市价对冲">
-      <n-switch v-model:value="p.hedge_failed_legs" />
-    </Field>
-    <Field label="loop_interval_ms" hint="决策环 tick 间隔">
-      <n-input-number v-model:value="p.loop_interval_ms" :min="10" :step="10" />
+    <Field label="leverage_multiplier" hint="容量校验杠杆。占用保证金 = 名义 / 杠杆">
+      <n-input :value="String(p.leverage_multiplier)" @update:value="p.leverage_multiplier = $event" />
     </Field>
     <Field label="depth_pct" hint="单笔不得超过 L1 数量的这个比例">
       <n-input :value="String(p.depth_pct)" @update:value="p.depth_pct = $event" />
@@ -20,6 +14,15 @@
     </Field>
     <Field label="fallback_available_usdc" hint="余额接口为空时的回退值">
       <n-input :value="String(p.fallback_available_usdc)" @update:value="p.fallback_available_usdc = $event" />
+    </Field>
+    <Field label="data_freshness_ms" hint="盘口超过此毫秒未更新视为过期">
+      <n-input-number v-model:value="p.data_freshness_ms" :min="100" :step="100" />
+    </Field>
+    <Field label="hedge_failed_legs" hint="第二腿失败时自动补市价对冲">
+      <n-switch v-model:value="p.hedge_failed_legs" />
+    </Field>
+    <Field label="loop_interval_ms" hint="决策环 tick 间隔">
+      <n-input-number v-model:value="p.loop_interval_ms" :min="10" :step="10" />
     </Field>
     <Field label="limit_timeout_ms" hint="第一腿限价最多挂多久（阶段 2）">
       <n-input-number v-model:value="p.limit_timeout_ms" :min="100" :step="100" />

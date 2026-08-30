@@ -23,12 +23,17 @@ const busy = ref(false);
 
 function issues() {
   const d = store.params.pair_defaults;
-  return collectPairIssues(
+  const iss = collectPairIssues(
     store.drafts,
     store.params.active_venues,
     parseNum(d.target_bp) ?? 1,
-    parseNum(store.params.step_hysteresis) ?? 0.25
+    parseNum(store.params.step_hysteresis) ?? 0
   );
+  const lev = parseNum(store.params.leverage_multiplier);
+  if (lev == null || !(lev > 0)) {
+    iss.errors.push("leverage_multiplier 必须 > 0");
+  }
+  return iss;
 }
 
 function formatList(list: string[]) {

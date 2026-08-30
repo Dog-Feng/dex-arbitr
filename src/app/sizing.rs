@@ -69,8 +69,7 @@ mod tests {
 
     fn cfg() -> SizingConfig {
         SizingConfig {
-            max_concurrent_pairs: 1,
-            leverage_multiplier: dec!(2),
+            leverage_multiplier: dec!(5),
             depth_pct: dec!(50),
             refresh_balance_secs: 60,
             fallback_available_usdc: None,

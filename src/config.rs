@@ -97,9 +97,6 @@ pub struct ExecutionConfig {
     pub enabled: bool,
     #[serde(default = "default_loop_interval_ms")]
     pub loop_interval_ms: u64,
-    /// 无密钥或未接 REST 余额时，用 paper 模拟成交更新内存持仓。
-    #[serde(default = "default_true")]
-    pub paper_trading: bool,
     /// 本进程第二腿失败后自动在 counterparty 补市价对冲（不对启动前已有仓位操作）。
     #[serde(default = "default_true")]
     pub hedge_failed_legs: bool,
@@ -113,22 +110,19 @@ fn default_execution() -> ExecutionConfig {
     ExecutionConfig {
         enabled: false,
         loop_interval_ms: 100,
-        paper_trading: true,
         hedge_failed_legs: true,
     }
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SizingConfig {
-    #[serde(default = "default_max_concurrent_pairs")]
-    pub max_concurrent_pairs: u32,
     #[serde(default = "default_leverage")]
     pub leverage_multiplier: Decimal,
     #[serde(default = "default_depth_pct")]
     pub depth_pct: Decimal,
     #[serde(default = "default_refresh_balance_secs")]
     pub refresh_balance_secs: u64,
-    /// REST 余额未接线时的回退可用 USDC（paper / 联调）。
+    /// REST 余额未接线时的回退可用 USDC（联调）。
     pub fallback_available_usdc: Option<Decimal>,
     /// 可用保证金使用比例（%），留 buffer 防强平/手续费。
     #[serde(default = "default_margin_utilization_pct")]
@@ -142,12 +136,8 @@ fn default_margin_utilization_pct() -> Decimal {
     Decimal::from(90)
 }
 
-fn default_max_concurrent_pairs() -> u32 {
-    5
-}
-
 fn default_leverage() -> Decimal {
-    Decimal::from(2)
+    Decimal::from(5)
 }
 
 fn default_depth_pct() -> Decimal {
@@ -160,8 +150,7 @@ fn default_refresh_balance_secs() -> u64 {
 
 fn default_sizing() -> SizingConfig {
     SizingConfig {
-        max_concurrent_pairs: 5,
-        leverage_multiplier: Decimal::from(2),
+        leverage_multiplier: Decimal::from(5),
         depth_pct: Decimal::from(50),
         refresh_balance_secs: 1,
         fallback_available_usdc: None,
@@ -228,7 +217,6 @@ fn default_coarse_refresh_secs() -> u64 {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SystemConfig {
-    pub monitor_only: bool,
     pub data_freshness_ms: u64,
     /// 文本日志目录。按天滚动 `dex-arbitr.YYYY-MM-DD.log`。空 = 只打 stderr。
     #[serde(default = "default_log_dir")]
@@ -805,7 +793,7 @@ mod tests {
         assert_eq!(cfg.history.refresh_interval_secs, 1800);
         assert_eq!(cfg.scan.watch_top, 20);
         assert_eq!(cfg.scan.analysis_interval_ms, 50);
-        assert_eq!(cfg.scan.window_samples, 60);
+        assert_eq!(cfg.scan.window_samples, 120);
         assert_eq!(cfg.grid.persistence_ms, 1000);
         assert_eq!(cfg.grid.persistence_min_hits, 7);
         assert_eq!(cfg.grid.window_samples, 1000);

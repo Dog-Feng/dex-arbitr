@@ -7,7 +7,6 @@ pub struct IntentStats {
     pub hold: u64,
     pub open: u64,
     pub close: u64,
-    pub skip_send: u64,
     pub skip_stale: u64,
     pub skip_thin: u64,
     pub skip_invalid: u64,
@@ -49,8 +48,8 @@ impl IntentStats {
     fn lines(&self) -> [String; 2] {
         [
             format!(
-                "decide  hold={}  open={}  close={}  skip_send={}",
-                self.hold, self.open, self.close, self.skip_send
+                "decide  hold={}  open={}  close={}",
+                self.hold, self.open, self.close
             ),
             format!(
                 "filter  stale={}  thin={}  wide={}  spread={}  size={}  base={}  cancel_gone={}  cancel_to={}",

@@ -28,24 +28,6 @@ impl PositionStore {
             .count()
     }
 
-    pub fn active_slots(&self) -> usize {
-        let mut n = self.open_count();
-        for slot in &self.pending_opens {
-            if !self
-                .positions
-                .get(slot)
-                .is_some_and(|p| p.qty > Decimal::ZERO)
-            {
-                n += 1;
-            }
-        }
-        n
-    }
-
-    pub fn can_open(&self, max_concurrent_pairs: u32) -> bool {
-        self.active_slots() < max_concurrent_pairs.max(1) as usize
-    }
-
     pub fn reserve_open(&mut self, slot: &str) {
         self.pending_opens.insert(slot.to_string());
     }
@@ -295,30 +277,6 @@ mod tests {
             Decimal::ZERO,
             Decimal::ZERO,
         );
-    }
-
-    /// 开仓后槽位仍被占着：max_concurrent_pairs=1 时不能再开第二条。
-    #[test]
-    fn slot_limit_counts_open_and_pending() {
-        let mut store = PositionStore::default();
-        assert!(store.can_open(1));
-        store.reserve_open(BTC_LS);
-        assert!(!store.can_open(1));
-        open(&mut store, BTC_LS, dec!(0.001), dec!(100), dec!(0.05));
-        assert!(!store.can_open(1));
-        assert_eq!(store.active_slots(), 1);
-        assert!(store.can_open(2));
-    }
-
-    /// 已有仓再补仓：挂单占用同一槽，不额外占 max_concurrent_pairs。
-    #[test]
-    fn topping_up_existing_slot_does_not_consume_another() {
-        let mut store = PositionStore::default();
-        open(&mut store, BTC_LS, dec!(0.001), dec!(100), dec!(0.05));
-        store.reserve_open(BTC_LS);
-        assert_eq!(store.active_slots(), 1);
-        assert!(!store.can_open(1));
-        assert!(store.can_open(2));
     }
 
     #[test]

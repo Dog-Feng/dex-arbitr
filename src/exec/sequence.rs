@@ -195,13 +195,12 @@ mod tests {
     }
 
     #[test]
-    fn higher_taker_is_first() {
+    fn equal_taker_and_maker_has_no_limit_first() {
         let cfg = AppConfig::load_from(std::path::Path::new("config/default.yaml")).unwrap();
         let buy = VenueId::from("lighter");
         let sell = VenueId::from("lighter_rh");
-        let (first, second) = first_limit_venue(&cfg, &buy, &sell).expect("rh taker higher");
-        assert_eq!(first.as_str(), "lighter_rh");
-        assert_eq!(second.as_str(), "lighter");
+        // 当前 yaml 两所 maker/taker 都是 0，先挂后吃没有优先腿。
+        assert!(first_limit_venue(&cfg, &buy, &sell).is_none());
         assert_eq!(book(dec!(100), dec!(100.01)).ask, dec!(100.01));
     }
 

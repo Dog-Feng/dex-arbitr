@@ -150,7 +150,7 @@ impl Controller {
                     );
                 }
             } else {
-                info!(venue = id, "no signing keys; monitor_only still works");
+                info!(venue = id, "no signing keys; market data still works");
             }
             // 白名单跟页面走：适配器列出全部永续，匹配时再用 live/yaml 过滤。
             let adapter = make_adapter(venue, Vec::new());
@@ -294,18 +294,15 @@ impl Controller {
         // - 裸仓补对冲 / 先平后开调度都不跑
         if this.cfg.http.enabled || this.cfg.execution.enabled {
             // 私有 WS 订单流：成交检测靠它从轮询变成事件驱动。
-            // 只在真正要下单时启动；paper / monitor_only 不需要。
-            if !this.cfg.system.monitor_only && !this.cfg.execution.paper_trading {
-                for id in &this.cfg.venues {
-                    let path = crate::exchange::venue_yaml_path(id);
-                    match crate::exchange::bridge_watch(&path).await {
-                        Ok(()) => info!(venue = id, "private order stream started"),
-                        Err(err) => warn!(
-                            venue = id,
-                            error = %err,
-                            "private order stream unavailable; falling back to REST polling"
-                        ),
-                    }
+            for id in &this.cfg.venues {
+                let path = crate::exchange::venue_yaml_path(id);
+                match crate::exchange::bridge_watch(&path).await {
+                    Ok(()) => info!(venue = id, "private order stream started"),
+                    Err(err) => warn!(
+                        venue = id,
+                        error = %err,
+                        "private order stream unavailable; falling back to REST polling"
+                    ),
                 }
             }
             this.loop_unified().await
@@ -1071,9 +1068,6 @@ impl Controller {
     }
 
     async fn start_private_streams(&self, venues: &[String]) {
-        if self.cfg.system.monitor_only || self.cfg.execution.paper_trading {
-            return;
-        }
         for id in venues {
             let path = crate::exchange::venue_yaml_path(id);
             match crate::exchange::bridge_watch(&path).await {
@@ -1354,9 +1348,7 @@ impl Controller {
     }
 
     async fn try_hedge_naked_exposures(&mut self) {
-        if self.cfg.system.monitor_only
-            || self.cfg.execution.paper_trading
-            || !self.cfg.execution.hedge_failed_legs
+        if !self.cfg.execution.hedge_failed_legs
             || self.naked_exposures.is_empty()
             || !self.venue_accounts.all_fresh()
         {
@@ -1502,7 +1494,7 @@ impl Controller {
         self.sync_enabled_edge();
         self.sync_page_config();
         // ① 有持仓的先跑（先平后开），② 挂单/对冲中的必跑（否则监视会停），
-        // ③ 剩下的才考虑开新仓，受槽位和 in-flight 限制。未启动则第三段跳过。
+        // ③ 剩下的才考虑开新仓，受 in-flight 串行限制。未启动则第三段跳过。
         let mut active: HashSet<usize> = HashSet::new();
         let mut must_run: Vec<usize> = Vec::new();
         for (pi, pair) in self.pairs.iter().enumerate() {
@@ -1527,9 +1519,6 @@ impl Controller {
                     continue;
                 }
                 if self.execution_in_flight() {
-                    break;
-                }
-                if !self.positions.can_open(self.cfg.sizing.max_concurrent_pairs) {
                     break;
                 }
                 self.process_pair(pi).await;
@@ -2240,15 +2229,6 @@ impl Controller {
                 return;
             }
         }
-        if matches!(intent, Intent::Open { .. })
-            && pos.is_none()
-            && !self.positions.can_open(self.cfg.sizing.max_concurrent_pairs)
-        {
-            self.panel.stats.bump_skip("slots");
-            self.paint_skip_with_books(&slot, &pair, &v0, &v1, &b0, &b1, pos.as_ref(), "slots");
-            return;
-        }
-
         let Some(mut plan) = plan_hedge(&pair, &intent, pos.as_ref(), &self.cfg) else {
             self.paint_skip_with_books(&slot, &pair, &v0, &v1, &b0, &b1, pos.as_ref(), "no_plan");
             return;
@@ -2277,10 +2257,7 @@ impl Controller {
             Intent::Hold => {}
         }
         force_market_taker(&mut plan);
-        if self.cfg.live_test.dex_test_mode
-            && !self.cfg.execution.paper_trading
-            && plan.qty > self.cfg.live_test.max_qty
-        {
+        if self.cfg.live_test.dex_test_mode && plan.qty > self.cfg.live_test.max_qty {
             plan.qty = self.cfg.live_test.max_qty;
         }
         info!(
@@ -2295,34 +2272,6 @@ impl Controller {
             "window-step: dual market taker"
         );
 
-        // monitor_only：到规划为止。**不能**登记 pending——旧实现登记完就 return，
-        // 而 pending 只在执行回调里清理，于是第一个 open 信号就把整个决策环卡死。
-        if self.cfg.system.monitor_only {
-            self.panel.stats.skip_send += 1;
-            self.paint_skip_with_books(
-                &slot, &pair, &v0, &v1, &b0, &b1, pos.as_ref(), "monitor_only",
-            );
-            return;
-        }
-
-        if self.cfg.execution.paper_trading {
-            if matches!(intent, Intent::Open { .. }) {
-                self.positions.reserve_open(&slot);
-            }
-            self.hedging.insert(slot.clone());
-            spawn_run_plan(
-                self.exec_tx.clone(),
-                self.cfg.clone(),
-                self.adapters_by_id.clone(),
-                self.books.clone(),
-                pair_i,
-                plan,
-                true,
-            );
-            return;
-        }
-
-        // 阶段 1 固定双腿市价。
         self.publish_api_snapshot();
         if matches!(intent, Intent::Open { .. }) {
             self.positions.reserve_open(&slot);
@@ -2335,7 +2284,6 @@ impl Controller {
             self.books.clone(),
             pair_i,
             plan,
-            false,
         );
     }
 
@@ -3420,8 +3368,6 @@ impl Controller {
                 open_positions: self.positions.open_count(),
                 best_net_pct: best.map(api::fmt_pct),
             },
-            monitor_only: self.cfg.system.monitor_only,
-            paper_trading: self.cfg.execution.paper_trading,
             arbitrage_enabled: self
                 .control
                 .as_ref()
@@ -3563,10 +3509,8 @@ fn skip_reason_label(reason: &str) -> String {
         "no_size" => "数量无效".into(),
         "in_flight" => "排队".into(),
         "intervention" => "人工介入".into(),
-        "slots" => "槽位满".into(),
-        "no_baseline" => "无底仓".into(),
         "no_plan" => "无法规划".into(),
-        "monitor_only" => "监控".into(),
+        "no_baseline" => "无底仓".into(),
         other => other.to_string(),
     }
 }

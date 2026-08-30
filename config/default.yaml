@@ -1,7 +1,6 @@
 system:
   # HTTP 开着时本文件只给页面反显默认值；点启动/保存后策略跟页面走。
   # HTTP 关着时本文件就是运行时配置（纯后端测试）。
-  monitor_only: false
   data_freshness_ms: 3000
   # 文本日志按天滚动。Linux 拷回：scp user@host:/opt/dex-arbitr/data/logs/*.log .
   log_dir: data/logs
@@ -34,7 +33,6 @@ pairs:
 # 定仓已取消。这里只校验「按配置的每格数量开得起吗」。
 # depth_pct：单笔下单量不得超过一档量的这个比例。
 sizing:
-  max_concurrent_pairs: 1
   leverage_multiplier: "5"
   depth_pct: "50"
   # 余额和交易所持仓一起拉。1 = 顶栏 DEX 余额与「交易所持仓」每秒更新。
@@ -50,7 +48,6 @@ sizing:
 execution:
   enabled: false
   loop_interval_ms: 100
-  paper_trading: false
   # 仅本进程第二腿失败后补对冲；启动前已有仓位只告警、不自动下单
   hedge_failed_legs: true
 

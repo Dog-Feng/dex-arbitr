@@ -41,9 +41,9 @@ function set(k: keyof PairDefaults, v: string | null) {
   (store.params.pair_defaults as Record<string, unknown>)[k] = v ?? "";
 }
 
-const hystStr = computed(() => String(store.params.step_hysteresis ?? "0.25"));
+const hystStr = computed(() => String(store.params.step_hysteresis ?? "0"));
 function setHyst(v: string | null) {
-  store.params.step_hysteresis = v ?? "0.25";
+  store.params.step_hysteresis = v ?? "0";
 }
 </script>
 

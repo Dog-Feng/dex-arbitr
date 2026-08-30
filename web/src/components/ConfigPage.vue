@@ -6,7 +6,7 @@
         <template #header-extra>
           <CtrlAside :enabled="enabled" :snap="snap" @saved="emit('saved')" @started="emit('started')" @stopped="emit('stopped')" />
         </template>
-        <p class="lead">每天开盘要碰的只有这三项。其余参数在下方「高级」。</p>
+        <p class="lead">每天开盘要碰的只有交易所和交易对。其余参数在下方「高级」。</p>
 
         <h4>参与套利的交易所</h4>
         <p class="hint">至少选两个。未选的所不参与开仓，已有持仓会正常平。</p>
@@ -39,23 +39,6 @@
         <h4>交易对</h4>
         <p class="hint">手填交易对（如 BTC）和每格数量。启动后才按所选交易所去各所匹配、订阅。</p>
         <PairList />
-
-        <n-divider />
-
-        <div class="quick">
-          <Field label="paper_trading" hint="模拟成交，不向交易所发单">
-            <n-switch v-model:value="store.params.paper_trading" />
-          </Field>
-          <Field label="monitor_only" hint="只监控价差、不发单">
-            <n-switch v-model:value="store.params.monitor_only" />
-          </Field>
-          <Field label="max_concurrent_pairs" hint="同时持仓槽位数">
-            <n-input-number v-model:value="store.params.max_concurrent_pairs" :min="1" :step="1" />
-          </Field>
-          <Field label="leverage_multiplier" hint="容量校验杠杆">
-            <n-input :value="String(store.params.leverage_multiplier)" @update:value="store.params.leverage_multiplier = $event" />
-          </Field>
-        </div>
       </n-card>
 
       <n-card size="small" title="高级" :bordered="true">
@@ -77,7 +60,6 @@
 <script setup lang="ts">
 import type { LiveSnapshot } from "../types";
 import { store } from "../store";
-import Field from "./Field.vue";
 import PairList from "./PairList.vue";
 import CtrlAside from "./CtrlAside.vue";
 import LiveLists from "./LiveLists.vue";
@@ -128,7 +110,6 @@ h4 { margin: 0 0 6px; font-size: 13px; }
 .vm { font-size: 11px; color: #8fa5c0; display: flex; align-items: center; gap: 4px; }
 .dot { width: 7px; height: 7px; border-radius: 50%; background: #344d6e; display: inline-block; }
 .dot.ready { background: #22c55e; }
-.quick { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 10px 16px; }
 .adv { background: transparent; }
 .adv :deep(.n-collapse-item__header-main) { min-width: 0; }
 @media (max-width: 1100px) {

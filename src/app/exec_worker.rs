@@ -70,20 +70,19 @@ pub fn spawn_run_plan(
     books: Books,
     pair_i: usize,
     plan: HedgePlan,
-    paper: bool,
 ) {
     tokio::spawn(async move {
-        let equity_before = if plan.is_open && !paper {
+        let equity_before = if plan.is_open {
             fetch_pair_equity(&adapters, &plan.first.venue, &plan.second.venue).await
         } else {
             None
         };
-        let mut result = HedgeExecutor::run_plan(&cfg, &adapters, &plan, &books, paper)
+        let mut result = HedgeExecutor::run_plan(&cfg, &adapters, &plan, &books, false)
             .await
             .map_err(|e| e.to_string());
         if let Ok(r) = &mut result {
             r.equity_before = equity_before;
-            if !plan.is_open && !paper {
+            if !plan.is_open {
                 // 成交后权益入账有延迟；等一小会再拉，比立刻读更接近实际。
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 r.equity_after =

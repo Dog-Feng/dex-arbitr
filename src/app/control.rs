@@ -13,11 +13,11 @@ use serde::{Deserialize, Serialize};
 use crate::config::{AppConfig, PairDefaults, PairSetting};
 
 fn default_window_samples() -> usize {
-    10_000
+    1_000
 }
 
 fn default_scan_window_samples() -> usize {
-    60
+    120
 }
 
 fn default_sample_interval_ms() -> u64 {
@@ -25,7 +25,7 @@ fn default_sample_interval_ms() -> u64 {
 }
 
 fn default_step_hysteresis() -> Decimal {
-    Decimal::new(25, 2)
+    Decimal::ZERO
 }
 
 fn default_second_leg_verify_ms() -> u64 {
@@ -45,7 +45,6 @@ pub struct ArbitrageParams {
     pub scan_venues: Vec<String>,
 
     // ═══ system ═══
-    pub monitor_only: bool,
     pub data_freshness_ms: u64,
 
     // ═══ pairs ═══
@@ -55,12 +54,10 @@ pub struct ArbitrageParams {
     pub pairs: Vec<PairSetting>,
 
     // ═══ execution ═══
-    pub paper_trading: bool,
     pub loop_interval_ms: u64,
     pub hedge_failed_legs: bool,
 
     // ═══ sizing ═══
-    pub max_concurrent_pairs: u32,
     pub leverage_multiplier: Decimal,
     pub depth_pct: Decimal,
     pub refresh_balance_secs: u64,
@@ -109,17 +106,14 @@ impl ArbitrageParams {
             active_venues: Vec::new(),
             scan_venues: Vec::new(),
 
-            monitor_only: cfg.system.monitor_only,
             data_freshness_ms: cfg.system.data_freshness_ms,
 
             pair_defaults: cfg.pairs.defaults.clone(),
             pairs: cfg.pairs.enabled.clone(),
 
-            paper_trading: cfg.execution.paper_trading,
             loop_interval_ms: cfg.execution.loop_interval_ms,
             hedge_failed_legs: cfg.execution.hedge_failed_legs,
 
-            max_concurrent_pairs: cfg.sizing.max_concurrent_pairs,
             leverage_multiplier: cfg.sizing.leverage_multiplier,
             depth_pct: cfg.sizing.depth_pct,
             refresh_balance_secs: cfg.sizing.refresh_balance_secs,
@@ -153,17 +147,14 @@ impl ArbitrageParams {
     /// 把页面（或 API）当前参数写进 `AppConfig`。费率、密钥、`venues` 列表
     /// 仍来自 yaml：页面改不了私钥，所列表是进程启动时装进适配器的。
     pub fn apply_to(&self, cfg: &mut AppConfig) {
-        cfg.system.monitor_only = self.monitor_only;
         cfg.system.data_freshness_ms = self.data_freshness_ms;
 
         cfg.pairs.defaults = self.pair_defaults.clone();
         cfg.pairs.enabled = self.pairs.clone();
 
-        cfg.execution.paper_trading = self.paper_trading;
         cfg.execution.loop_interval_ms = self.loop_interval_ms;
         cfg.execution.hedge_failed_legs = self.hedge_failed_legs;
 
-        cfg.sizing.max_concurrent_pairs = self.max_concurrent_pairs;
         cfg.sizing.leverage_multiplier = self.leverage_multiplier;
         cfg.sizing.depth_pct = self.depth_pct;
         cfg.sizing.refresh_balance_secs = self.refresh_balance_secs;
@@ -231,8 +222,8 @@ pub fn validate(p: &ArbitrageParams) -> ValidationResult {
     if p.step_hysteresis >= Decimal::new(5, 1) {
         errors.push("step_hysteresis 必须 < 0.5，否则一格锁不住价差".into());
     }
-    if p.max_concurrent_pairs == 0 {
-        errors.push("max_concurrent_pairs 必须 >= 1".into());
+    if p.leverage_multiplier <= Decimal::ZERO {
+        errors.push("leverage_multiplier 必须 > 0".into());
     }
     for s in &p.pairs {
         if s.symbol.trim().is_empty() {
@@ -287,7 +278,7 @@ mod tests {
         let mut p = ArbitrageParams::from_config(&cfg);
         p.pair_defaults.target_bp = dec!(1);
         p.pair_defaults.max_segments = 5;
-        p.paper_trading = true;
+        p.leverage_multiplier = dec!(3);
         p.pairs = vec![crate::config::PairSetting {
             symbol: "SNDK".into(),
             base_qty: dec!(0.01),
@@ -299,7 +290,7 @@ mod tests {
         p.apply_to(&mut cfg);
         assert_eq!(cfg.pairs.defaults.target_bp, dec!(1));
         assert_eq!(cfg.pairs.defaults.max_segments, 5);
-        assert!(cfg.execution.paper_trading);
+        assert_eq!(cfg.sizing.leverage_multiplier, dec!(3));
         assert_eq!(cfg.pairs.enabled[0].symbol, "SNDK");
     }
 

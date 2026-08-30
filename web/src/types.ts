@@ -31,14 +31,11 @@ export interface PairSetting {
 export interface ArbitrageParams {
   active_venues: string[];
   scan_venues: string[];
-  monitor_only: boolean;
   data_freshness_ms: number;
   pair_defaults: PairDefaults;
   pairs: PairSetting[];
-  paper_trading: boolean;
   loop_interval_ms: number;
   hedge_failed_legs: boolean;
-  max_concurrent_pairs: number;
   leverage_multiplier: string | number;
   depth_pct: string | number;
   refresh_balance_secs: number;
@@ -147,8 +144,6 @@ export interface LiveSnapshot {
   naked_exposures: NakedExposureRow[];
   venue_matches: VenueMatchRow[];
   stats: { matched_pairs: number; open_positions: number; best_net_pct?: string | null };
-  monitor_only: boolean;
-  paper_trading: boolean;
   arbitrage_enabled: boolean;
   matching: boolean;
   available: AvailableSymbol[];

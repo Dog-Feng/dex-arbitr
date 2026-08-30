@@ -117,8 +117,7 @@ const venueIds = computed(() => {
 
 const modeLabel = computed(() => {
   if (!snap.value) return "—";
-  if (snap.value.monitor_only) return "监控";
-  return snap.value.paper_trading ? "Paper" : "实盘";
+  return "实盘";
 });
 
 const scanOn = computed(() => !!snap.value?.scan_running);
