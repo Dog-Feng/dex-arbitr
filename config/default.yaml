@@ -61,9 +61,9 @@ http:
   enabled: true
   # auth_token 为空时程序会拒绝对外监听，自动回落到 127.0.0.1
   # （/api/positions 会暴露余额、持仓、裸敞口）。要公网访问就设 token。
-  bind: "0.0.0.0:8090"
+  bind: "127.0.0.1:8090"
   web_root: web/dist
-  auth_token: "2386c2ca1dcd8e46061259a587480e247fea43b3fed437694ee32ea454748864f9eca21da657a971"
+  auth_token: ""
 
 scan:
   enabled: false
