@@ -2845,7 +2845,12 @@ impl Controller {
             }
             Err(err) => {
                 if err.contains("EMERGENCY_CLOSED") {
-                    warn!(pair = %msg.plan.pair_id, error = %err, "second leg failed; first emergency closed");
+                    let recovered = if msg.plan.rest_quote {
+                        "second leg failed; first emergency closed"
+                    } else {
+                        "dual-market unhedged leg closed"
+                    };
+                    warn!(pair = %msg.plan.pair_id, error = %err, "{recovered}");
                     self.log_plan_record(&msg.plan, "exec_fail", "emergency_closed", &err);
                     // 紧急平仓**成功**，敞口已经收掉，仓位状态是干净的，
                     // 所以不挂起。但这算一次单腿成交：参考的规则是连续 3 次
@@ -2867,58 +2872,79 @@ impl Controller {
                         );
                     }
                 } else if err.contains("SECOND_LEG_UNKNOWN") {
-                    warn!(
-                        pair = %msg.plan.pair_id,
-                        error = %err,
-                        "second leg outcome unknown; first leg left in place on purpose"
-                    );
-                    self.log_plan_record(&msg.plan, "exec_fail", "second_leg_unknown", &err);
-                    // 第一腿确实成交了，第二腿成没成不知道。按裸腿登记以便对账
-                    // 能看见它，但绝不自动补——补错方向会变成双倍敞口。
-                    // 用 SecondLegUnknown source 与 BotFailure 区分，
-                    // try_hedge_naked_exposures 只处理 BotFailure，不碰这类。
-                    let signed = if msg.plan.first.is_buy {
-                        msg.plan.qty
-                    } else {
-                        -msg.plan.qty
-                    };
-                    let exposure = crate::app::reconcile::NakedExposure {
-                        pair_id: msg.plan.pair_id.clone(),
-                        venue: msg.plan.first.venue.clone(),
-                        qty: signed,
-                        counterparty: msg.plan.second.venue.clone(),
-                        source: NakedSource::SecondLegUnknown,
-                    };
-                    if !self.naked_exposures.iter().any(|n| {
-                        n.pair_id == exposure.pair_id && n.venue == exposure.venue
-                    }) {
+                    if msg.plan.rest_quote {
                         warn!(
-                            pair = %exposure.pair_id,
-                            venue = %exposure.venue,
-                            qty = %exposure.qty,
-                            "second leg unknown — manual check required before resuming"
+                            pair = %msg.plan.pair_id,
+                            error = %err,
+                            "second leg outcome unknown; first leg left in place on purpose"
                         );
-                        self.naked_exposures.push(exposure);
+                        self.log_plan_record(&msg.plan, "exec_fail", "second_leg_unknown", &err);
+                        let signed = if msg.plan.first.is_buy {
+                            msg.plan.qty
+                        } else {
+                            -msg.plan.qty
+                        };
+                        let exposure = crate::app::reconcile::NakedExposure {
+                            pair_id: msg.plan.pair_id.clone(),
+                            venue: msg.plan.first.venue.clone(),
+                            qty: signed,
+                            counterparty: msg.plan.second.venue.clone(),
+                            source: NakedSource::SecondLegUnknown,
+                        };
+                        if !self.naked_exposures.iter().any(|n| {
+                            n.pair_id == exposure.pair_id && n.venue == exposure.venue
+                        }) {
+                            warn!(
+                                pair = %exposure.pair_id,
+                                venue = %exposure.venue,
+                                qty = %exposure.qty,
+                                "second leg unknown — manual check required before resuming"
+                            );
+                            self.naked_exposures.push(exposure);
+                        }
+                        self.mark_intervention(
+                            &msg.slot,
+                            &msg.plan,
+                            Cause::SecondLegUnknown,
+                            format!(
+                                "second leg on {} unverifiable; check venue before resuming",
+                                msg.plan.second.venue
+                            ),
+                        );
+                    } else {
+                        warn!(
+                            pair = %msg.plan.pair_id,
+                            error = %err,
+                            "dual-market fill unverifiable; not sending more"
+                        );
+                        self.log_plan_record(&msg.plan, "exec_fail", "second_leg_unknown", &err);
+                        self.mark_intervention(
+                            &msg.slot,
+                            &msg.plan,
+                            Cause::SecondLegUnknown,
+                            "dual-market fill unverifiable; check both venues before resuming"
+                                .into(),
+                        );
                     }
-                    self.mark_intervention(
-                        &msg.slot,
-                        &msg.plan,
-                        Cause::SecondLegUnknown,
-                        format!(
-                            "second leg on {} unverifiable; check venue before resuming",
-                            msg.plan.second.venue
-                        ),
-                    );
                 } else if err.contains("NAKED_FIRST_LEG") {
                     warn!(pair = %msg.plan.pair_id, error = %err, "naked first leg");
                     self.log_plan_record(&msg.plan, "exec_fail", "naked", &err);
-                    self.record_naked_from_failed_hedge(&msg.plan, msg.plan.qty);
-                    self.mark_intervention(
-                        &msg.slot,
-                        &msg.plan,
-                        Cause::NakedLegUnrecoverable,
-                        format!("naked leg on {} and emergency close failed", msg.plan.first.venue),
-                    );
+                    if msg.plan.rest_quote {
+                        self.record_naked_from_failed_hedge(&msg.plan, msg.plan.qty);
+                        self.mark_intervention(
+                            &msg.slot,
+                            &msg.plan,
+                            Cause::NakedLegUnrecoverable,
+                            format!("naked leg on {} and emergency close failed", msg.plan.first.venue),
+                        );
+                    } else {
+                        self.mark_intervention(
+                            &msg.slot,
+                            &msg.plan,
+                            Cause::NakedLegUnrecoverable,
+                            format!("dual-market emergency close failed; {err}"),
+                        );
+                    }
                 } else if err.contains("QUOTE_LOST_RACE") {
                     info!(pair = %msg.plan.pair_id, "adjacent quote lost race; extra fill closed");
                     self.log_plan_record(&msg.plan, "cancel", "quote_lost_race", &err);

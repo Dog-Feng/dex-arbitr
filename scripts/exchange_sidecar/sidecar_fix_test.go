@@ -5,6 +5,7 @@ import (
 	"math"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/shopspring/decimal"
 )
@@ -201,5 +202,26 @@ func TestOrderFilledQtyFromRemaining(t *testing.T) {
 	got := orderFilledQty(raw)
 	if !got.Equal(decimal.RequireFromString("0.0005")) {
 		t.Fatalf("got %s", got)
+	}
+}
+
+func TestFillWaitOf(t *testing.T) {
+	if fillWaitOf(nil) != time.Second {
+		t.Fatal("nil should default to 1s")
+	}
+	if fillWaitOf(map[string]any{}) != time.Second {
+		t.Fatal("empty should default to 1s")
+	}
+	if got := fillWaitOf(map[string]any{"fill_wait_ms": float64(2000)}); got != 2*time.Second {
+		t.Fatalf("2000 got %v", got)
+	}
+	if got := fillWaitOf(map[string]any{"fill_wait_ms": "3000"}); got != 3*time.Second {
+		t.Fatalf("3000 got %v", got)
+	}
+	if got := fillWaitOf(map[string]any{"fill_wait_ms": float64(1)}); got != 100*time.Millisecond {
+		t.Fatalf("clamp min got %v", got)
+	}
+	if got := fillWaitOf(map[string]any{"fill_wait_ms": float64(60_000)}); got != 30*time.Second {
+		t.Fatalf("clamp max got %v", got)
 	}
 }

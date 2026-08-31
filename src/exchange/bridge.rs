@@ -541,6 +541,7 @@ pub async fn bridge_place(venue_yaml: &Path, req: &OrderReq) -> Result<OrderAck>
         // 市价单滑点保护：基准是决策信号价，超出交易所拒单。
         "target_price": req.target_price.map(|p| p.to_string()),
         "slippage_pct": req.slippage_pct.map(|p| p.to_string()),
+        "fill_wait_ms": req.fill_wait_ms,
     });
     let t0 = Instant::now();
     let data = bridge_call(venue_yaml, "place", params).await?;

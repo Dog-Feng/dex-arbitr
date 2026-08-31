@@ -355,10 +355,29 @@ pub struct OrderConfig {
     /// 第一腿限价最多挂几轮（每轮用最新盘口重算价格，部分成交累积）。
     #[serde(default = "default_limit_retry_count")]
     pub limit_retry_count: u32,
+    /// 市价 / IOC / 撤单后：等该单私有 WS 这么久，没有再 REST 查一次。
+    /// sidecar 与 Rust 撤后确认共用。页面可热改，下次 place 生效。
+    #[serde(default = "default_ioc_fill_wait_ms")]
+    pub ioc_fill_wait_ms: u64,
+}
+
+impl OrderConfig {
+    /// 夹在 100ms–30s，避免把 sidecar 请求超时拖垮。
+    pub fn ioc_fill_wait(&self) -> Duration {
+        Duration::from_millis(self.ioc_fill_wait_ms.clamp(100, 30_000))
+    }
+
+    pub fn ioc_fill_wait_ms_clamped(&self) -> u64 {
+        self.ioc_fill_wait_ms.clamp(100, 30_000)
+    }
 }
 
 fn default_limit_timeout_ms() -> u64 {
     2000
+}
+
+pub fn default_ioc_fill_wait_ms() -> u64 {
+    1000
 }
 
 fn default_maker_inside_ticks() -> u32 {
@@ -815,6 +834,7 @@ mod tests {
         assert_eq!(cfg.grid.quote_reprice_ratio, dec!(0.2));
         assert_eq!(cfg.grid.min_quote_gap_ratio, dec!(0.3));
         assert_eq!(cfg.order.adjacent_timeout_ms, 0);
+        assert_eq!(cfg.order.ioc_fill_wait_ms, 1000);
         assert_eq!(cfg.pairs.defaults.target_bp, dec!(1));
         assert_eq!(cfg.sizing.leverage_multiplier, dec!(5));
         let sodex = cfg.load_venue("sodex").unwrap();

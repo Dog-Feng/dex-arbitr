@@ -99,6 +99,9 @@ pub struct ArbitrageParams {
     pub adjacent_timeout_ms: u64,
     pub maker_inside_ticks: u32,
     pub limit_retry_count: u32,
+    /// 市价 / IOC / 撤后等该单 WS 的毫秒数。默认 1000，可改 2000/3000。
+    #[serde(default = "crate::config::default_ioc_fill_wait_ms")]
+    pub ioc_fill_wait_ms: u64,
 
     // ═══ cost ═══
     pub default_slip_pct: Decimal,
@@ -148,6 +151,7 @@ impl ArbitrageParams {
             adjacent_timeout_ms: cfg.order.adjacent_timeout_ms,
             maker_inside_ticks: cfg.order.maker_inside_ticks,
             limit_retry_count: cfg.order.limit_retry_count,
+            ioc_fill_wait_ms: cfg.order.ioc_fill_wait_ms_clamped(),
 
             default_slip_pct: cfg.cost.default_slip_pct,
             max_slippage_pct: cfg.cost.max_slippage_pct,
@@ -199,6 +203,7 @@ impl ArbitrageParams {
         cfg.order.adjacent_timeout_ms = self.adjacent_timeout_ms;
         cfg.order.maker_inside_ticks = self.maker_inside_ticks;
         cfg.order.limit_retry_count = self.limit_retry_count.max(1);
+        cfg.order.ioc_fill_wait_ms = self.ioc_fill_wait_ms.clamp(100, 30_000);
 
         cfg.cost.default_slip_pct = self.default_slip_pct;
         cfg.cost.max_slippage_pct = self.max_slippage_pct;
@@ -231,6 +236,9 @@ pub fn validate(p: &ArbitrageParams) -> ValidationResult {
     }
     if p.sample_interval_ms == 0 {
         errors.push("sample_interval_ms 必须 >= 1".into());
+    }
+    if !(100..=30_000).contains(&p.ioc_fill_wait_ms) {
+        errors.push("ioc_fill_wait_ms 必须在 100–30000".into());
     }
     if p.step_hysteresis < Decimal::ZERO {
         errors.push("step_hysteresis 不能为负".into());
@@ -313,11 +321,13 @@ mod tests {
         p.quote_reprice_ratio = dec!(0.25);
         p.min_quote_gap_ratio = dec!(0.4);
         p.adjacent_timeout_ms = 0;
+        p.ioc_fill_wait_ms = 2000;
         p.apply_to(&mut cfg);
         assert!(cfg.grid.symmetric_limit);
         assert_eq!(cfg.grid.quote_reprice_ratio, dec!(0.25));
         assert_eq!(cfg.grid.min_quote_gap_ratio, dec!(0.4));
         assert_eq!(cfg.order.adjacent_timeout_ms, 0);
+        assert_eq!(cfg.order.ioc_fill_wait_ms, 2000);
     }
 
     #[test]

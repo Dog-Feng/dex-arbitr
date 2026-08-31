@@ -68,7 +68,7 @@ type lighterSession struct {
 	wsStop context.CancelFunc
 
 	// WS 推送的成交量，按 client_order_index / order_index 索引。
-	// waitMarketFill 命中 WS 后立刻返回；1 秒没有再查一次订单。
+	// waitMarketFill 命中 WS 后立刻返回；fill_wait_ms 没有再查一次订单。
 	fillMu sync.Mutex
 	fills  map[string]lighterFill
 }
@@ -289,15 +289,19 @@ func (s *lighterSession) marketPositionSize(ctx context.Context, marketIndex int
 
 // waitMarketFill 确认市价腿真实成交量。
 //
-// 只认该 order_id：先等私有 WS（最多 1 秒），没有再 REST 查一次
+// 只认该 order_id：先等私有 WS（fill_wait_ms，默认 1 秒），没有再 REST 查一次
 // 活跃单 / 非活跃单。不用持仓 delta。
 func (s *lighterSession) waitMarketFill(
 	ctx context.Context,
 	marketIndex int,
 	want decimal.Decimal,
 	orderID string,
+	fillWait time.Duration,
 ) decimal.Decimal {
-	deadline := time.Now().Add(iocFillWait)
+	if fillWait <= 0 {
+		fillWait = iocFillWait
+	}
+	deadline := time.Now().Add(fillWait)
 	sizeDec := 0
 	if d, err := s.marketDecimals(ctx, marketIndex); err == nil {
 		sizeDec = d.sizeDec
@@ -767,7 +771,7 @@ func (s *lighterSession) place(ctx context.Context, params map[string]any) (map[
 			return nil, sendErr
 		}
 		// IOC 腿：sendTx 报错仍可能已上链。等该单 WS / 查一次订单。
-		filled := s.waitMarketFill(ctx, marketIndex, qty, coidStr)
+		filled := s.waitMarketFill(ctx, marketIndex, qty, coidStr, fillWaitOf(params))
 		if filled.GreaterThan(decimal.Zero) {
 			status := "filled"
 			if filled.LessThan(qty) {
@@ -794,8 +798,8 @@ func (s *lighterSession) place(ctx context.Context, params map[string]any) (map[
 			"avg_price":       limitPriceStr,
 		}, signMs, sendMs, totalMs), nil
 	}
-	// IOC：sendTx 成功 ≠ 撮合成交。等该单 WS 1 秒，没有再查一次。
-	filled := s.waitMarketFill(ctx, marketIndex, qty, coidStr)
+	// IOC：sendTx 成功 ≠ 撮合成交。等该单 WS fill_wait_ms，没有再查一次。
+	filled := s.waitMarketFill(ctx, marketIndex, qty, coidStr, fillWaitOf(params))
 	status := "filled"
 	switch {
 	case filled.LessThanOrEqual(decimal.Zero):

@@ -40,11 +40,8 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// 市价单（IOC）成交确认的等待窗口与轮询间隔，逐项对齐参考项目。
-//
-// 下单响应不带可信成交量，必须回查，且单次查询不够——撮合与查询接口之间
-// 市价 / IOC 成交确认：等该单 WS 推送 1 秒；没有就 REST 查一次该单；
-// 仍没有量就当失败。三所同一窗口，不再按所持仓 delta 空等 3s/60s。
+// 市价 / IOC 成交确认：等该单 WS；没有就 REST 查一次该单；仍没有量当失败。
+// 窗口默认 1 秒，可由 place params.fill_wait_ms 覆盖（Rust order.ioc_fill_wait_ms）。
 const (
 	iocFillWait    = time.Second
 	marketFillPoll = 2 * time.Second
@@ -153,9 +150,33 @@ type push struct {
 	Data  any    `json:"data"`
 }
 
-// 单次请求的处理超时。必须留在 iocFillWait 之上：place 会在进程内
-// 等推送再查一次该单，ctx 先到期的话回查会被打断。留 15s 给下单往返和签名。
-const requestTimeout = iocFillWait + 15*time.Second
+// 单次请求处理超时 = 成交确认窗口 + 15s（下单往返和签名）。
+// place 带 fill_wait_ms 时按该窗口加长，避免 ctx 先到期打断回查。
+func handlerTimeout(req request) time.Duration {
+	const extra = 15 * time.Second
+	if req.Cmd == "place" {
+		return fillWaitOf(req.Params) + extra
+	}
+	return iocFillWait + extra
+}
+
+// fillWaitOf 读 place 的 fill_wait_ms；缺省或 0 用 1 秒。夹在 100ms–30s。
+func fillWaitOf(params map[string]any) time.Duration {
+	if params == nil {
+		return iocFillWait
+	}
+	n, err := paramUint64(params, "fill_wait_ms")
+	if err != nil || n == 0 {
+		return iocFillWait
+	}
+	if n < 100 {
+		n = 100
+	}
+	if n > 30_000 {
+		n = 30_000
+	}
+	return time.Duration(n) * time.Millisecond
+}
 
 var (
 	// stdout 必须串行写：响应和 WS 推送来自不同 goroutine。
@@ -219,7 +240,7 @@ func main() {
 					respond(req.ID, false, nil, fmt.Sprintf("internal panic: %v", rec))
 				}
 			}()
-			ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+			ctx, cancel := context.WithTimeout(context.Background(), handlerTimeout(req))
 			defer cancel()
 			data, err := dispatch(ctx, reg, req)
 			if err != nil {

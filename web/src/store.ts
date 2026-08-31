@@ -40,6 +40,7 @@ export function emptyParams(): ArbitrageParams {
     adjacent_timeout_ms: 0,
     maker_inside_ticks: 1,
     limit_retry_count: 3,
+    ioc_fill_wait_ms: 1000,
     default_slip_pct: "0.01",
     max_slippage_pct: "1",
     emergency_slippage_multiplier: "50",

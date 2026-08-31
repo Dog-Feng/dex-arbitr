@@ -30,6 +30,9 @@
     <Field label="adjacent_timeout_ms" hint="邻档第一腿存活。0 = 只按事件撤（对面先成 / 边没了 / 改价），不按秒转市价">
       <n-input-number v-model:value="p.adjacent_timeout_ms" :min="0" :step="1000" />
     </Field>
+    <Field label="ioc_fill_wait_ms" hint="市价 / IOC / 撤后：等该单 WS 这么久，没有再 REST 查一次。可改 2000 或 3000">
+      <n-input-number v-model:value="p.ioc_fill_wait_ms" :min="100" :max="30000" :step="500" />
+    </Field>
     <Field label="maker_inside_ticks" hint="maker 腿往点差内侧挪几个 tick">
       <n-input-number v-model:value="p.maker_inside_ticks" :min="0" />
     </Field>

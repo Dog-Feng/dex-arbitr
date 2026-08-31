@@ -816,7 +816,7 @@ func placeOrder(ctx context.Context, s *sodexSession, params map[string]any) (ma
 			filled := o.ExecutedQty
 			// 不驻留的单再轮询确认一次：请求虽然报错，单子可能已经落地并成交。
 			if ioc {
-				if f, ap, _ := waitOrderFill(ctx, s, o.OrderID, clOrdID, qty); f.GreaterThan(decimalFromString(filled)) {
+				if f, ap, _ := waitOrderFill(ctx, s, o.OrderID, clOrdID, qty, fillWaitOf(params)); f.GreaterThan(decimalFromString(filled)) {
 					filled = f.String()
 					if ap != "" {
 						o.Price = ap
@@ -862,7 +862,7 @@ func placeOrder(ctx context.Context, s *sodexSession, params map[string]any) (ma
 		if ioc {
 			// IOC 腿要轮询：不驻留，单次查询看到的 0 分不清
 			// 「整单撤销」还是「索引还没跟上」。
-			f, ap, _ := waitOrderFill(ctx, s, r.OrderID, id, qty)
+			f, ap, _ := waitOrderFill(ctx, s, r.OrderID, id, qty, fillWaitOf(params))
 			filled = f.String()
 			if ap != "" {
 				avgPrice = ap
@@ -1095,7 +1095,7 @@ func matchSodexOrderList(load func() ([]sodexclient.Order, error), orderID uint6
 	return sodexclient.Order{}, false
 }
 
-// waitOrderFill：等该单 WS 1 秒，没有再 REST 查一次。返回 (量, 均价, 是否见过这张单)。
+// waitOrderFill：等该单 WS fill_wait_ms，没有再 REST 查一次。返回 (量, 均价, 是否见过这张单)。
 func (s *sodexSession) noteOrderUpdate(upd sodexws.AccountOrderUpdate) {
 	qty := decimalFromString(upd.FilledQty)
 	if !qty.GreaterThan(decimal.Zero) {
@@ -1182,8 +1182,12 @@ func waitOrderFill(
 	orderID uint64,
 	clOrdID string,
 	want decimal.Decimal,
+	fillWait time.Duration,
 ) (decimal.Decimal, string, bool) {
-	deadline := time.Now().Add(iocFillWait)
+	if fillWait <= 0 {
+		fillWait = iocFillWait
+	}
+	deadline := time.Now().Add(fillWait)
 	best := decimal.Zero
 	avg := ""
 	seen := false

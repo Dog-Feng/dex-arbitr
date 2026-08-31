@@ -145,6 +145,7 @@ async fn main() -> Result<()> {
                 // 手工验证工具：不设保护价，交给 sidecar 的默认保护。
                 target_price: None,
                 slippage_pct: None,
+                fill_wait_ms: cfg.order.ioc_fill_wait_ms_clamped(),
             })
             .await?;
             println!(

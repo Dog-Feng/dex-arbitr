@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -12,7 +12,7 @@ use crate::exchange::{CancelReq, ExchangePort, OrderAck, OrderReq, OrderStatus};
 
 pub type Adapters = HashMap<String, Arc<dyn ExchangePort>>;
 
-/// 回滚市价最多发几次。每次 sidecar 等该单推送 1 秒再查一次；仍不明算这次失败。
+/// 回滚市价最多发几次。每次 sidecar 等该单推送 `ioc_fill_wait_ms` 再查一次；仍不明算这次失败。
 const ROLLBACK_ATTEMPTS: u32 = 3;
 
 #[derive(Debug, Clone)]
@@ -160,6 +160,7 @@ impl HedgeExecutor {
                 // maker 挂单本身就是限价，不需要额外的滑点保护。
                 target_price: None,
                 slippage_pct: None,
+                fill_wait_ms: cfg.order.ioc_fill_wait_ms_clamped(),
             })
             .await?;
         let filled_qty = effective_filled_qty(&ack);
@@ -313,6 +314,9 @@ impl HedgeExecutor {
         Ok(ExecResult::finished(first, second, None))
     }
 
+    /// 阶段 1：两腿同时市价 `place`，各自认成交后再按结果回滚。
+    ///
+    /// 不走 [`Self::fill_second_leg`]（那是阶段 2：限价确认后才发对冲市价）。
     async fn dual_taker(
         cfg: &AppConfig,
         adapters: &Adapters,
@@ -324,65 +328,125 @@ impl HedgeExecutor {
         let b1 = book_for(books, &plan.second.venue, &plan.pair_id)?;
         let p0 = market_price(&plan.first, &b0);
         let p1 = market_price(&plan.second, &b1);
-        let first = match Self::send_leg(
-            cfg,
-            adapters,
-            &plan.first,
-            plan.qty,
-            p0,
-            !plan.is_open,
-            paper,
-            &b0,
-            false,
-        )
-        .await
-        {
-            Ok(f) => f,
-            Err(err) if is_unverifiable(&err) => {
-                // 第一腿结果不明：可能已经成交。立刻市价回滚，不再发第二腿。
+        let reduce = !plan.is_open;
+        let (r0, r1) = tokio::join!(
+            Self::send_leg(
+                cfg, adapters, &plan.first, plan.qty, p0, reduce, paper, &b0, false,
+            ),
+            Self::send_leg(
+                cfg, adapters, &plan.second, plan.qty, p1, reduce, paper, &b1, false,
+            ),
+        );
+        match (dual_leg_from(r0), dual_leg_from(r1)) {
+            (DualLeg::Filled(mut a), DualLeg::Filled(mut b)) => {
+                let hedged = a.qty.min(b.qty);
+                if a.qty > hedged {
+                    Self::rollback_dual_extra(
+                        cfg, adapters, plan, paper, &a, a.qty - hedged, &b0, &b1,
+                    )
+                    .await?;
+                    a.qty = hedged;
+                }
+                if b.qty > hedged {
+                    Self::rollback_dual_extra(
+                        cfg, adapters, plan, paper, &b, b.qty - hedged, &b0, &b1,
+                    )
+                    .await?;
+                    b.qty = hedged;
+                }
+                Self::log_overrun(cfg, &plan.first, p0, &a);
+                Self::log_overrun(cfg, &plan.second, p1, &b);
+                Ok(ExecResult::finished(a, b, None))
+            }
+            (DualLeg::Miss, DualLeg::Miss) => {
+                bail!("dual-market neither leg filled pair={}", plan.pair_id)
+            }
+            (DualLeg::Filled(f), DualLeg::Miss) | (DualLeg::Miss, DualLeg::Filled(f)) => {
                 warn!(
                     pair = %plan.pair_id,
-                    error = %err,
-                    "first leg unverifiable; market-closing it"
+                    venue = %f.venue,
+                    qty = %f.qty,
+                    "dual-market one leg filled; closing it"
                 );
-                return match Self::emergency_close(
-                    cfg,
-                    adapters,
-                    &plan.first,
-                    plan.qty,
-                    &b0,
-                    paper,
-                )
-                .await
-                {
-                    Ok(()) => Err(anyhow::anyhow!(
-                        "EMERGENCY_CLOSED: first leg unverifiable ({err}); rolled back"
+                match Self::rollback_filled_leg(cfg, adapters, plan, paper, &f, &b0, &b1).await {
+                    Ok(()) => Err(anyhow!(
+                        "EMERGENCY_CLOSED: dual-market unhedged {} qty={}; closed",
+                        f.venue,
+                        f.qty
                     )),
-                    Err(eclose) => Err(anyhow::anyhow!(
-                        "NAKED_FIRST_LEG: first leg unverifiable ({err}); close failed ({eclose})"
-                    )),
-                };
+                    Err(eclose) => Err(eclose),
+                }
             }
-            Err(err) => return Err(err),
-        };
-        let second = Self::fill_second_leg(
+            (DualLeg::Unknown(e), _) | (_, DualLeg::Unknown(e)) => {
+                // place 已发出；认不到 ≠ 没成交。两边都不再发（含紧急平）。
+                warn!(
+                    pair = %plan.pair_id,
+                    error = %e,
+                    "dual-market fill unverifiable; not sending more"
+                );
+                Err(anyhow!(
+                    "SECOND_LEG_UNKNOWN: dual-market fill unverifiable ({e})"
+                ))
+            }
+        }
+    }
+
+    async fn rollback_filled_leg(
+        cfg: &AppConfig,
+        adapters: &Adapters,
+        plan: &HedgePlan,
+        paper: bool,
+        filled: &ExecFill,
+        first_bbo: &Bbo,
+        second_bbo: &Bbo,
+    ) -> Result<()> {
+        Self::rollback_dual_extra(
             cfg,
             adapters,
             plan,
-            &first,
-            &b0,
-            &b1,
             paper,
-            p1,
+            filled,
+            filled.qty,
+            first_bbo,
+            second_bbo,
         )
-        .await?;
-        Self::log_overrun(cfg, &plan.first, p0, &first);
-        Self::log_overrun(cfg, &plan.second, p1, &second);
-        Ok(ExecResult::finished(first, second, None))
+        .await
     }
 
-    /// 第二腿市价一次。sidecar 已等该单推送 1 秒再查一次；
-    /// `filled_qty=0` 或失败 → 立刻市价平第一腿（不做激进限价）。
+    async fn rollback_dual_extra(
+        cfg: &AppConfig,
+        adapters: &Adapters,
+        plan: &HedgePlan,
+        paper: bool,
+        filled: &ExecFill,
+        qty: Decimal,
+        first_bbo: &Bbo,
+        second_bbo: &Bbo,
+    ) -> Result<()> {
+        if qty <= Decimal::ZERO {
+            return Ok(());
+        }
+        let (leg, bbo) = if filled.venue == plan.first.venue {
+            (&plan.first, first_bbo)
+        } else {
+            (&plan.second, second_bbo)
+        };
+        match Self::emergency_close(cfg, adapters, leg, qty, bbo, paper).await {
+            Ok(()) => Ok(()),
+            Err(err) if is_unverifiable(&err) => Err(anyhow!(
+                "SECOND_LEG_UNKNOWN: dual-market close unverifiable venue {} ({err})",
+                filled.venue
+            )),
+            Err(err) => Err(anyhow!(
+                "NAKED_FIRST_LEG: dual-market venue {} qty={} close failed ({err})",
+                filled.venue,
+                qty
+            )),
+        }
+    }
+
+    /// 阶段 2：限价第一腿已确认后的第二腿市价。
+    /// `filled_qty=0` 或失败 → 立刻市价平第一腿；认不到则不再发。
     async fn fill_second_leg(
         cfg: &AppConfig,
         adapters: &Adapters,
@@ -559,6 +623,7 @@ impl HedgeExecutor {
                 client_order_id: None,
                 target_price,
                 slippage_pct,
+                fill_wait_ms: cfg.order.ioc_fill_wait_ms_clamped(),
             })
             .await?;
         if matches!(leg.style, OrderStyle::LimitMaker) && ack.filled_qty <= Decimal::ZERO {
@@ -580,9 +645,8 @@ impl HedgeExecutor {
         // 这里同样不推断——查不到数量就当没确认，往下走 Unknown 分支。
         let filled = effective_filled_qty(&ack);
         if filled <= Decimal::ZERO {
-            // sidecar 已等该单推送 1 秒再查一次。没量就当失败，由上层市价平另一腿。
-            // Unknown/Filled/Partial 仍单独报 SECOND_LEG_UNKNOWN，双市价第一腿
-            // 用它区分「可能已成交要回滚」和「确定没成交不用回滚」。
+            // sidecar 已等该单推送 ioc_fill_wait_ms 再查一次。没量就当失败。
+            // Unknown/Filled/Partial 报 SECOND_LEG_UNKNOWN：认不到 ≠ 没成交。
             if matches!(
                 ack.status,
                 OrderStatus::Unknown | OrderStatus::Filled | OrderStatus::Partial
@@ -694,8 +758,24 @@ fn market_price(leg: &HedgeLeg, bbo: &Bbo) -> Decimal {
     }
 }
 
+#[derive(Debug)]
+enum DualLeg {
+    Filled(ExecFill),
+    Miss,
+    Unknown(anyhow::Error),
+}
+
+fn dual_leg_from(r: Result<ExecFill, anyhow::Error>) -> DualLeg {
+    match r {
+        Ok(f) if f.qty > Decimal::ZERO => DualLeg::Filled(f),
+        Ok(_) => DualLeg::Miss,
+        Err(e) if is_unverifiable(&e) => DualLeg::Unknown(e),
+        Err(_) => DualLeg::Miss,
+    }
+}
+
 /// 下单结果不明（sidecar 超时、连接断、查不到成交量）。
-/// 双市价第一腿碰上这个时立刻市价回滚，不再发第二腿。
+/// 阶段 1 双市价：不再发任何新单（含紧急平）。阶段 2 第二腿：不平已确认的限价腿。
 pub(crate) fn is_unverifiable(err: &anyhow::Error) -> bool {
     let s = err.to_string();
     s.contains("SECOND_LEG_UNKNOWN")
@@ -836,7 +916,8 @@ mod tests {
         );
     }
 
-    /// 「不确定」与「确定没成交」错误串不同：双市价第一腿不明才立刻回滚。
+    /// 「不确定」与「确定没成交」错误串不同。
+    /// 阶段 1 双市价：不明则停手。阶段 2 第二腿：不明则不平已确认的限价腿。
     #[test]
     fn unverifiable_is_distinct_from_confirmed_no_fill() {
         let unknown = anyhow::anyhow!("SECOND_LEG_UNKNOWN: leg lighter fill unverifiable");
@@ -847,6 +928,38 @@ mod tests {
             "NAKED_FIRST_LEG: QUOTE_LOST_RACE close failed (SECOND_LEG_UNKNOWN: leg lighter_rh fill unverifiable)"
         );
         assert!(is_unverifiable(&nested));
+    }
+
+    #[test]
+    fn dual_leg_treats_unverifiable_as_unknown_not_miss() {
+        let fill = ExecFill {
+            venue: "a".into(),
+            qty: dec!(0.001),
+            price: dec!(1),
+            is_buy: true,
+            order_id: None,
+        };
+        assert!(matches!(dual_leg_from(Ok(fill)), DualLeg::Filled(_)));
+        assert!(matches!(
+            dual_leg_from(Ok(ExecFill {
+                venue: "a".into(),
+                qty: Decimal::ZERO,
+                price: dec!(1),
+                is_buy: true,
+                order_id: None,
+            })),
+            DualLeg::Miss
+        ));
+        assert!(matches!(
+            dual_leg_from(Err(anyhow::anyhow!("leg a not filled (status Rejected)"))),
+            DualLeg::Miss
+        ));
+        assert!(matches!(
+            dual_leg_from(Err(anyhow::anyhow!(
+                "SECOND_LEG_UNKNOWN: leg a fill unverifiable (status Unknown)"
+            ))),
+            DualLeg::Unknown(_)
+        ));
     }
 
     fn book(bid: Decimal, ask: Decimal) -> Bbo {

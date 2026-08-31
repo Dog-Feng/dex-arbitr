@@ -130,14 +130,14 @@ match venue.id.as_str() {
 **禁止用请求量 `qty` 顶替 `filled_qty`。**
 
 - 限价单会驻留，下单后单次查询可确认
-- IOC 市价单**不驻留**，下单响应里的量不可信 → 等该单 WS 最多 1 秒，没有再 REST 查一次该单
+- IOC 市价单**不驻留**，下单响应里的量不可信 → 等该单 WS 最多 `fill_wait_ms`（默认 1 秒），没有再 REST 查一次该单
 - 查不到 → 报 `unknown` / `filled_qty=0`，上层当作失败，立刻市价平另一腿
 
-确认窗口三所相同（`main.go` `iocFillWait`）：
+确认窗口三所相同（`main.go` `fillWaitOf`，默认 `iocFillWait=1s`）：
 
-| 常量 | 值 | 作用 |
+| 来源 | 默认 | 作用 |
 |---|---|---|
-| `iocFillWait` | 1s | 等该单私有 WS |
+| `order.ioc_fill_wait_ms` / place `fill_wait_ms` | 1000 | 等该单私有 WS |
 | 之后 | 查一次该单 | 仍没有量 → 失败 |
 
 Lighter 查单：活跃列表没有则再查 `accountInactiveOrders`（IOC 成交后不在活跃列表）。成交量用 `initial − remaining`。不用持仓 delta。
@@ -146,7 +146,7 @@ Lighter 私有 WS：必须订 `account_all_orders` **和** `account_all_trades`�
 
 Lighter `client_order_id` 是整数，上限 \(2^{48}-1\)。现网 `ms*100 + n%100`。同一毫秒两档不能撞号；`ms*1000+seq` 会超上限被拒。SoDEX / Entropy 用字符串 `arb-{ms}-{seq}`。
 
-**加长窗口要连带改两处超时**：sidecar `requestTimeout`（`iocFillWait + 15s`）、Rust `WRITE_SIDECAR_TIMEOUT`（`src/exchange/bridge.rs`，当前 80s）。任一处先到期都会打断回查。
+**加长窗口**：改 yaml / 页面 `order.ioc_fill_wait_ms`（100–30000）。sidecar 单次 `place` 超时 = 该窗口 + 15s；Rust `WRITE_SIDECAR_TIMEOUT`（`src/exchange/bridge.rs`，当前 80s）仍盖得住 30s 上限。任一处先到期都会打断回查。
 
 ### 4.2 市价腿关闭 status 推断
 

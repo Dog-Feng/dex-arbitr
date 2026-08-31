@@ -53,10 +53,11 @@ export interface ArbitrageParams {
   symmetric_limit: boolean;
   quote_reprice_ratio: string | number;
   min_quote_gap_ratio: string | number;
-  limit_timeout_ms: number;
-  adjacent_timeout_ms: number;
-  maker_inside_ticks: number;
-  limit_retry_count: number;
+    limit_timeout_ms: number;
+    adjacent_timeout_ms: number;
+    maker_inside_ticks: number;
+    limit_retry_count: number;
+    ioc_fill_wait_ms: number;
   default_slip_pct: string | number;
   max_slippage_pct: string | number;
   emergency_slippage_multiplier: string | number;

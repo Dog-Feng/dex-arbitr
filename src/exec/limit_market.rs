@@ -1,5 +1,5 @@
 //! 第一腿限价 → **该单 WS 成交推送**立刻发第二腿市价。
-//! 等推送 1 秒没有则 REST 查一次该单；撤单之后同一套：听 1 秒再查一次。
+//! 市价/IOC/撤后：等该单 WS `order.ioc_fill_wait_ms`（默认 1 秒），没有再 REST 查一次。
 //! 不用账户缓存仓位差。
 //!
 //! 邻档（`rest_until_event`）：部分成交立刻对冲该增量，余量继续挂到吃满。
@@ -28,8 +28,8 @@ use crate::exec::executor::Adapters;
 use crate::exec::{ExecFill, ExecResult, HedgeExecutor, HedgePlan};
 use tokio::sync::broadcast;
 
-/// 等该单 WS 这么久；没有再 REST 查一次该单。挂着的限价循环此周期直到成交或撤。
-/// 撤单之后同一窗口：发撤 → 听该单 1 秒 → 没有再查一次。
+/// 挂着的限价：每轮最多听 WS 这么久再 REST 兜底。不是市价确认窗口；
+/// 市价 / 撤后确认用 `order.ioc_fill_wait_ms`。
 const POLL_INTERVAL_MS: u64 = 1000;
 
 fn json_id_eq(v: Option<&serde_json::Value>, order_id: &str) -> bool {
@@ -681,6 +681,7 @@ impl HedgeExecutor {
                     &mut pushes,
                     seen,
                     fill_price,
+                    cfg.order.ioc_fill_wait(),
                 )
                 .await?;
                 seen = qty;
@@ -920,7 +921,7 @@ impl HedgeExecutor {
         if post.first.qty > Decimal::ZERO {
             let mut filled = post.first.qty.min(plan.qty);
             let mut price = Some(post.first.price);
-            // 立刻部分成交时余量还挂着，必须撤；撤后再听 1 秒 WS + 查一次。
+            // 立刻部分成交时余量还挂着，必须撤；撤后再听 WS + 查一次。
             let orphan = if filled < plan.qty {
                 let leftover =
                     Self::cancel_leftover(adapters, plan, order_id.as_deref()).await;
@@ -931,6 +932,7 @@ impl HedgeExecutor {
                     &mut pushes,
                     filled,
                     price,
+                    cfg.order.ioc_fill_wait(),
                 )
                 .await?;
                 filled = qty;
@@ -1041,7 +1043,7 @@ impl HedgeExecutor {
             });
         }
 
-        // 未成交或部分成交：撤单前再查一次；撤单后听该单 WS 1 秒，没有再查一次。
+        // 未成交或部分成交：撤单前再查一次；撤单后听该单 WS，没有再查一次。
         let Some(oid) = order_id else {
             return Ok(AttemptOutcome {
                 filled,
@@ -1089,6 +1091,7 @@ impl HedgeExecutor {
             &mut pushes,
             filled,
             fill_price,
+            cfg.order.ioc_fill_wait(),
         )
         .await?;
         filled = qty;
@@ -1111,7 +1114,7 @@ impl HedgeExecutor {
         })
     }
 
-    /// 撤单（或任何已发到 DEX 的动作）之后：等该单 WS 最多 1 秒，没有再 REST 查一次。
+    /// 撤单（或任何已发到 DEX 的动作）之后：等该单 WS `wait`，没有再 REST 查一次。
     /// 有推送也再查一次，避免 WS 只带了部分累计。
     async fn confirm_fill_after_action(
         adapters: &Adapters,
@@ -1120,9 +1123,9 @@ impl HedgeExecutor {
         pushes: &mut Option<broadcast::Receiver<OrderPush>>,
         mut seen: Decimal,
         mut fill_price: Option<Decimal>,
+        wait: Duration,
     ) -> Result<(Decimal, Option<Decimal>)> {
         let oid = order_id.filter(|s| !s.is_empty()).unwrap_or("");
-        let wait = Duration::from_millis(POLL_INTERVAL_MS);
         if let Some(rx) = pushes.as_mut() {
             let deadline = Instant::now() + wait;
             while Instant::now() < deadline {

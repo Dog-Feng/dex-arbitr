@@ -204,7 +204,9 @@ c = (\mathrm{ask}-\mathrm{bid})/\mathrm{mid}\times 100
 数量 = `base_qty`（拆单配置仍生效）。  
 然后走现有容量校验（只拦 Open）、一档厚度（Close 不够则丢意图）、`plan_hedge`。
 
-**发单固定双腿市价**：`force_market_taker` 改 `plan.style`，`HedgeExecutor::run_plan` 匹配 **plan** 不是 yaml。页面默认 LTM 时阶段 1 也不会挂 Post-only。先挂后吃省的 maker 换不来「边还在」的确定性。阶段 2 再挂限价。
+**发单固定双腿同时市价**：`force_market_taker` 改 `plan.style`，两腿并行 `place`，各自认成交后再回滚。不把阶段 2 的「先确认限价再发市价」套进来。yaml/页面 `order.style` 默认仍是 LTM，**发单跟 plan**。
+
+**开仓条件仍是本节 3.1–3.8**（μ 满窗、空仓点差中枢满、可执行价差跨格、持续性、容量/深度）。`symmetric_limit=true` 时 `process_pair` 提前进邻档，不会走 `WindowGridEngine`。F=0、离格线够远、改价撤都是阶段 2，不拦阶段 1。市价确认窗口是 `order.ioc_fill_wait_ms`（默认 1000，页面可热改）。
 
 强制离场（超时、余额、费率）：一次平 \(\lvert k\rvert\) 格，不受 ±1 限制。
 
@@ -216,7 +218,7 @@ c = (\mathrm{ask}-\mathrm{bid})/\mathrm{mid}\times 100
 4. `forget` 持续性。  
 5. journal：`grid_from`/`grid_to` 允许负数。
 
-单腿失败：沿用现有紧急对冲，不能留裸腿。
+单腿失败：已确认有量、另一腿确定没成 → 市价平掉已成的那腿。任一腿认不到 → 不再发单，人工看两所。两腿都成但数量不等：按 `min` 记账，多的一截市价平掉；若这次平仓认不到，当前实现整轮不写入内存（所上可能已有重叠仓，等对账）。
 
 ---
 

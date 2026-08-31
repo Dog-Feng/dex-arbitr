@@ -89,7 +89,8 @@ grid:
   quote_reprice_ratio: "0.2"
   min_quote_gap_ratio: "0.3"
 
-# 邻档不走 limit_timeout_ms。市价确认写死：等该单推送 1 秒，没有再查一次。
+# 邻档不走 limit_timeout_ms。市价 / IOC / 撤后确认：等该单推送
+# ioc_fill_wait_ms，没有再查一次。页面可热改（2000 / 3000 均可）。
 order:
   limit_timeout_ms: 2000
   adjacent_timeout_ms: 0
@@ -99,6 +100,7 @@ order:
   # 第一腿限价最多挂几轮：每轮用最新盘口重算价格，部分成交累积，
   # 每轮结束一定撤掉余量。撤不掉会上报 orphan 并停止重试。
   limit_retry_count: 3
+  ioc_fill_wait_ms: 1000
 
 cost:
   # 决策不预扣滑点（小额只看卖一/买一）。成交后按实际成交价扣；超过本值记 overrun。

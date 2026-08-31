@@ -560,7 +560,7 @@ func (s *entropySession) place(ctx context.Context, params map[string]any) (map[
 	filled := st.filled
 	avg := st.avgPx
 	if ioc {
-		f, ap, _ := s.waitOrderFill(ctx, oid, cloid, qty)
+		f, ap, _ := s.waitOrderFill(ctx, oid, cloid, qty, fillWaitOf(params))
 		if f.GreaterThan(filled) {
 			filled = f
 		}
@@ -848,8 +848,11 @@ func (s *entropySession) lookupOrder(ctx context.Context, oid int64, cloid strin
 	}, true
 }
 
-func (s *entropySession) waitOrderFill(ctx context.Context, oid int64, cloid string, qty decimal.Decimal) (decimal.Decimal, string, string) {
-	deadline := time.Now().Add(iocFillWait)
+func (s *entropySession) waitOrderFill(ctx context.Context, oid int64, cloid string, qty decimal.Decimal, fillWait time.Duration) (decimal.Decimal, string, string) {
+	if fillWait <= 0 {
+		fillWait = iocFillWait
+	}
+	deadline := time.Now().Add(fillWait)
 	for time.Now().Before(deadline) {
 		if ctx.Err() != nil {
 			break

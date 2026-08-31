@@ -37,6 +37,8 @@ pub struct OrderReq {
     pub target_price: Option<Decimal>,
     /// 允许的滑点上限（%）。超出交易所直接拒单。
     pub slippage_pct: Option<Decimal>,
+    /// 市价 / IOC：sidecar 等该单 WS 的毫秒数。0 = sidecar 默认 1 秒。
+    pub fill_wait_ms: u64,
 }
 
 #[derive(Debug, Clone)]
