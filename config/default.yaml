@@ -14,7 +14,7 @@ venues:
 
 pairs:
   defaults:
-    max_segments: 3
+    max_segments: 5
     # 一格开平目标净利（bp）。1 bp = 0.01%。阶段 1：Δ = 目标% + 四腿 taker + 两所点差平均。阶段 2：Δ = 目标% + 2×(挂单所 maker + 市价所 taker) + 市价所点差中枢。
     target_bp: "1"
     split_order_size: "0"
@@ -80,7 +80,7 @@ grid:
   persistence_ms: 1000
   persistence_min_hits: 7
   # 满这么多个秒级点才有 μ（跨所 mid 价差）和各所点差中枢。1000 ≈ 17 分钟；代码默认 10000 ≈ 2h47m。两所中枢平均折进 Δ。
-  window_samples: 1000
+  window_samples: 300
   sample_interval_ms: 1000
   # STEP 滞后（格）。加仓 raw ≥ k+1−h，减仓 raw ≤ k−1+h。
   step_hysteresis: "0"
@@ -100,11 +100,11 @@ order:
   # 第一腿限价最多挂几轮：每轮用最新盘口重算价格，部分成交累积，
   # 每轮结束一定撤掉余量。撤不掉会上报 orphan 并停止重试。
   limit_retry_count: 3
-  ioc_fill_wait_ms: 1000
+  ioc_fill_wait_ms: 2000
 
 cost:
   # 决策不预扣滑点（小额只看卖一/买一）。成交后按实际成交价扣；超过本值记 overrun。
-  default_slip_pct: "0.01"
+  default_slip_pct: "0.1"
   # ── 市价单滑点保护（对齐参考 order_execution.max_slippage）──
   # 以**决策信号价**为基准，超出这个幅度交易所直接拒单。
   # 这是唯一的穿档保护：不在本地遍历订单簿估 VWAP，而是把限价交给交易所
