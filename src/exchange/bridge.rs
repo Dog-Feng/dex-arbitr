@@ -158,7 +158,8 @@ pub fn note_lighter_place_rtt(venue_id: &str, rtt: LighterPlaceRtt) {
 
 pub fn parse_lighter_place_rtt_line(line: &str) -> Option<(String, LighterPlaceRtt)> {
     let line = line.trim();
-    if !line.starts_with("lighter place rtt ") {
+    // `{venue} place rtt venue=... sign_ms=... send_ms=... sign_to_ack_ms=...`
+    if !line.contains(" place rtt ") {
         return None;
     }
     let mut venue = None;
@@ -687,6 +688,16 @@ mod tests {
             }
         );
         assert!(parse_lighter_place_rtt_line("sidecar panic").is_none());
+        let sodex = "sodex place rtt venue=sodex order=abc sign_ms=2 send_ms=30 sign_to_ack_ms=32 result=ok";
+        let (v, r) = parse_lighter_place_rtt_line(sodex).expect("sodex");
+        assert_eq!(v, "sodex");
+        assert_eq!(r.sign_ms, 2);
+        assert_eq!(r.send_ms, 30);
+        assert_eq!(r.sign_to_ack_ms, 32);
+        let entropy = "entropy place rtt venue=entropy order=7 sign_ms=1 send_ms=10 sign_to_ack_ms=11 result=err";
+        let (v, r) = parse_lighter_place_rtt_line(entropy).expect("entropy");
+        assert_eq!(v, "entropy");
+        assert_eq!(r.sign_to_ack_ms, 11);
     }
 
     #[test]

@@ -77,9 +77,9 @@ match venue.id.as_str() {
 | cmd | params | data |
 |---|---|---|
 | `account` | — | `{balances:[{asset,available,total}], positions:[{symbol,qty,entry_price,realized_pnl?}]}` |
-| `place` | 见 §2.2 | `{order_id, client_order_id, filled_qty, status, avg_price}` |
+| `place` | 见 §2.2 | `{order_id, client_order_id, filled_qty, status, avg_price, sign_ms, send_ms, sign_to_ack_ms}`。后三字段见 §4.9 |
 | `cancel` | `order_id, symbol, market_index` | `{order_id, status}` |
-| `order_status` | `order_id, symbol, market_index, qty` | 同 `place` |
+| `order_status` | `order_id, symbol, market_index, qty` | 同 `place` 的成交字段（无 `sign_ms` 三分量） |
 | `funding` | — | `{rates:[{symbol, rate, interval_secs}]}` |
 | `watch` | — | `{status:"watching"}`，启私有订单流，**幂等** |
 | `fill_pnl` | `symbol, order_id` | `{realized_pnl, per_fill, found}`。盘口没有盈亏。Entropy 用成交 `closedPnl`（`per_fill=true`）；Lighter 用成交 `ask_account_pnl`/`bid_account_pnl`（`per_fill=true`）；SoDEX 用持仓累计 `realizedPnL`（`per_fill=false`，本笔=平后−平前）。`found=false` 时上层显示 `—`，不要当成 0 |
@@ -94,6 +94,8 @@ match venue.id.as_str() {
  "limit_price":"42000","client_order_id":"arb-...",
  "target_price":"41900","slippage_pct":"0.1"}
 ```
+
+应答必须带 `sign_ms` / `send_ms` / `sign_to_ack_ms`（§4.9）。stderr 同时打 `{id} place rtt venue=...`。
 
 ### 2.3 `funding` 的结算周期
 
@@ -188,6 +190,29 @@ Lighter 需要：「取 nonce → 签名 → sendTx」整段原子化（`lighter
 ### 4.8 `reduce_only`
 
 直接传给交易所，语义是仅平仓。所有所都要支持——`max_position_hours`、余额清仓线、探针解闸都依赖它。若交易所回报 reduce-only 相关错误（SoDEX 是 `code=21740`），错误串要能被 `src/app/reduce_only.rs` `is_reduce_only_error()` 识别，否则拉闸机制失效。
+
+### 4.9 下单链路耗时（三所同一口径）
+
+配置页「交易所持仓」**签名→确认**列，格式 `{sign}+{send}={ack}ms · 全链路{wall}ms`。未下过单显示 `—`。
+
+| 字段 | 含义 | 不含 |
+|------|------|------|
+| `sign_ms` | 本地签名 | nonce / 等锁 |
+| `send_ms` | HTTP 交到所、收到收单回包 | 成交回查 |
+| `sign_to_ack_ms` | 两者合计（签名开始 → 回包） | nonce / 等锁 / WS 认成交 |
+| 全链路 `wall_ms` | Rust `bridge_place` 墙钟 | —（**含** sidecar 认成交） |
+
+stderr：`{venue} place rtt venue=%s order=%s sign_ms=%d send_ms=%d sign_to_ack_ms=%d result=ok\|err`。Rust 解析任意 `{id} place rtt`，不限 Lighter。place JSON 有三分量则拆开展示，否则只显示 `wall_ms`。
+
+各所量法：
+
+| 所 | sign | send |
+|---|---|---|
+| Lighter | `GetCreateOrderTransaction` | `/api/v1/sendTx` 回包 |
+| Entropy | `hlSignL1` | `POST /exchange` 回包（含读 body） |
+| SoDEX | `PlacePerpsOrder` 合计 − HTTP（SDK 未导出签名） | 该次下单 HTTP（`RoundTripper`） |
+
+新所必须同样拆开并 `mergePlaceRTT`；不要只报全链路。
 
 ---
 

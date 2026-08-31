@@ -31,6 +31,7 @@ import (
 	"fmt"
 	"os"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -330,6 +331,75 @@ func peekVenueID(path string) (string, error) {
 		return "", fmt.Errorf("venue id missing in %s", path)
 	}
 	return id, nil
+}
+
+// placeChainRTT：签名开始 → 交易所收单回包。不含 nonce/锁、不含成交回查。
+type placeChainRTT struct {
+	signMs  int64
+	sendMs  int64
+	totalMs int64
+}
+
+func venueIDOr(id, fallback string) string {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return fallback
+	}
+	return id
+}
+
+func formatPlaceRTT(venue, orderID string, signMs, sendMs, totalMs int64, ok bool) string {
+	result := "ok"
+	if !ok {
+		result = "err"
+	}
+	if venue == "" {
+		venue = "unknown"
+	}
+	if orderID == "" {
+		orderID = "-"
+	}
+	return fmt.Sprintf(
+		"%s place rtt venue=%s order=%s sign_ms=%d send_ms=%d sign_to_ack_ms=%d result=%s",
+		venue, venue, orderID, signMs, sendMs, totalMs, result,
+	)
+}
+
+func logPlaceRTT(venue, orderID string, signMs, sendMs, totalMs int64, ok bool) {
+	if signMs <= 0 && sendMs <= 0 && totalMs <= 0 {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "%s\n", formatPlaceRTT(venue, orderID, signMs, sendMs, totalMs, ok))
+}
+
+func (r placeChainRTT) log(venue, orderID string, ok bool) {
+	logPlaceRTT(venue, orderID, r.signMs, r.sendMs, r.totalMs, ok)
+}
+
+func mergePlaceRTT(out map[string]string, signMs, sendMs, totalMs int64) map[string]string {
+	if out == nil {
+		out = make(map[string]string)
+	}
+	out["sign_ms"] = strconv.FormatInt(signMs, 10)
+	out["send_ms"] = strconv.FormatInt(sendMs, 10)
+	out["sign_to_ack_ms"] = strconv.FormatInt(totalMs, 10)
+	return out
+}
+
+func (r placeChainRTT) merge(out map[string]string) map[string]string {
+	return mergePlaceRTT(out, r.signMs, r.sendMs, r.totalMs)
+}
+
+// 合计墙钟减去 HTTP 得到签名。SDK 没把签名导出时用这个拆（SoDEX）。
+func splitPlaceRTT(totalMs, httpMs int64) placeChainRTT {
+	if httpMs < 0 {
+		httpMs = 0
+	}
+	sign := totalMs - httpMs
+	if sign < 0 {
+		sign = 0
+	}
+	return placeChainRTT{signMs: sign, sendMs: httpMs, totalMs: totalMs}
 }
 
 func fillPnlResult(pnl decimal.Decimal, perFill, found bool) map[string]any {

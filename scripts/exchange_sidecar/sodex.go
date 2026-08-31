@@ -378,7 +378,10 @@ func connect(ctx context.Context, v sodexVenueFile) (*sodexclient.Client, uint64
 		ChainID:    eip712Chain(v),
 		PrivateKey: pk,
 		APIKeyName: strings.TrimSpace(v.APIKeyName),
-		HTTPClient: &http.Client{Timeout: 30 * time.Second},
+		HTTPClient: &http.Client{
+			Timeout:   30 * time.Second,
+			Transport: &timedTransport{base: http.DefaultTransport},
+		},
 	})
 	addr := readAccountAddress(v, client)
 	if addr == "" {
@@ -392,6 +395,31 @@ func connect(ctx context.Context, v sodexVenueFile) (*sodexclient.Client, uint64
 		}
 	}
 	return client, accountID, addr, nil
+}
+
+// SDK PlacePerpsOrder 内部先 Sign 再 HTTP，签名没导出。用 RoundTripper
+// 记下本次 HTTP，sign_ms ≈ 合计 − HTTP。只在带 httpElapsed 的 ctx 上记账。
+type httpElapsedKey struct{}
+
+type httpElapsed struct {
+	ms int64
+}
+
+type timedTransport struct {
+	base http.RoundTripper
+}
+
+func (t *timedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	rt := t.base
+	if rt == nil {
+		rt = http.DefaultTransport
+	}
+	start := time.Now()
+	resp, err := rt.RoundTrip(req)
+	if v, ok := req.Context().Value(httpElapsedKey{}).(*httpElapsed); ok {
+		v.ms += time.Since(start).Milliseconds()
+	}
+	return resp, err
 }
 
 func discoverAccountID(ctx context.Context, base, addr string) (uint64, error) {
@@ -802,11 +830,16 @@ func placeOrder(ctx context.Context, s *sodexSession, params map[string]any) (ma
 			raw.Price = decimalPtr(protected)
 		}
 	}
-	results, err := c.PlacePerpsOrder(ctx, &ptypes.NewOrderRequest{
+	elapsed := &httpElapsed{}
+	placeCtx := context.WithValue(ctx, httpElapsedKey{}, elapsed)
+	t0 := time.Now()
+	results, err := c.PlacePerpsOrder(placeCtx, &ptypes.NewOrderRequest{
 		AccountID: accountID,
 		SymbolID:  spec.SymbolID,
 		Orders:    []*ptypes.RawOrder{raw},
 	})
+	rtt := splitPlaceRTT(time.Since(t0).Milliseconds(), elapsed.ms)
+	rtt.log(venueIDOr(s.venue.ID, "sodex"), clOrdID, err == nil)
 	if err != nil {
 		// 请求报错不代表订单没落地：超时/连接中断时交易所可能已经收单。
 		// 直接抛错会让上层丢掉 clOrdID，这张单就再也没人撤了。
@@ -840,13 +873,13 @@ func placeOrder(ctx context.Context, s *sodexSession, params map[string]any) (ma
 			if ap := avgPriceFromOrder(o); ap != "" {
 				avgPrice = ap
 			}
-			return map[string]string{
+			return rtt.merge(map[string]string{
 				"order_id":        strconv.FormatUint(o.OrderID, 10),
 				"client_order_id": clOrdID,
 				"filled_qty":      filled,
 				"status":          outStatus,
 				"avg_price":       avgPrice,
-			}, nil
+			}), nil
 		}
 		return nil, err
 	}
@@ -913,13 +946,13 @@ func placeOrder(ctx context.Context, s *sodexSession, params map[string]any) (ma
 			outStatus = "unknown"
 		}
 	}
-	return map[string]string{
+	return rtt.merge(map[string]string{
 		"order_id":        strconv.FormatUint(r.OrderID, 10),
 		"client_order_id": firstNonEmpty(r.ClOrdID, clOrdID),
 		"filled_qty":      filled,
 		"status":          outStatus,
 		"avg_price":       avgPrice,
-	}, nil
+	}), nil
 }
 
 // marketProtectPrice 算市价单的限价保护。

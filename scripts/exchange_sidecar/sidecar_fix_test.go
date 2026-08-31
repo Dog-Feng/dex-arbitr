@@ -100,6 +100,20 @@ func TestFormatLighterPlaceRTT(t *testing.T) {
 	if out["sign_to_ack_ms"] != "44" || out["sign_ms"] != "3" || out["send_ms"] != "41" {
 		t.Fatalf("merge: %+v", out)
 	}
+	got = formatPlaceRTT("sodex", "abc", 2, 30, 32, true)
+	want = "sodex place rtt venue=sodex order=abc sign_ms=2 send_ms=30 sign_to_ack_ms=32 result=ok"
+	if got != want {
+		t.Fatalf("sodex: %q", got)
+	}
+	got = formatPlaceRTT("entropy", "7", 1, 10, 11, false)
+	want = "entropy place rtt venue=entropy order=7 sign_ms=1 send_ms=10 sign_to_ack_ms=11 result=err"
+	if got != want {
+		t.Fatalf("entropy: %q", got)
+	}
+	split := splitPlaceRTT(32, 30)
+	if split.signMs != 2 || split.sendMs != 30 || split.totalMs != 32 {
+		t.Fatalf("split: %+v", split)
+	}
 }
 
 func TestNextLighterClientOrderIDFits48Bits(t *testing.T) {

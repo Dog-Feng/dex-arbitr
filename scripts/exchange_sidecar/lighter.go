@@ -742,7 +742,7 @@ func (s *lighterSession) place(ctx context.Context, params map[string]any) (map[
 	}()
 	coidStr = strconv.FormatInt(coid, 10)
 	if signMs > 0 || sendMs > 0 || totalMs > 0 {
-		logLighterPlaceRTT(s.venue.ID, coidStr, signMs, sendMs, totalMs, sendErr == nil && signErr == nil)
+		logPlaceRTT(s.venue.ID, coidStr, signMs, sendMs, totalMs, sendErr == nil && signErr == nil)
 	}
 	if signErr != nil {
 		return nil, fmt.Errorf("sign create order: %w", signErr)
@@ -816,29 +816,8 @@ func (s *lighterSession) place(ctx context.Context, params map[string]any) (map[
 	}, signMs, sendMs, totalMs), nil
 }
 
-func logLighterPlaceRTT(venue, orderID string, signMs, sendMs, totalMs int64, ok bool) {
-	fmt.Fprintf(os.Stderr, "%s\n", formatLighterPlaceRTT(venue, orderID, signMs, sendMs, totalMs, ok))
-}
-
 func formatLighterPlaceRTT(venue, orderID string, signMs, sendMs, totalMs int64, ok bool) string {
-	result := "ok"
-	if !ok {
-		result = "err"
-	}
-	return fmt.Sprintf(
-		"lighter place rtt venue=%s order=%s sign_ms=%d send_ms=%d sign_to_ack_ms=%d result=%s",
-		venue, orderID, signMs, sendMs, totalMs, result,
-	)
-}
-
-func mergePlaceRTT(out map[string]string, signMs, sendMs, totalMs int64) map[string]string {
-	if out == nil {
-		out = make(map[string]string)
-	}
-	out["sign_ms"] = strconv.FormatInt(signMs, 10)
-	out["send_ms"] = strconv.FormatInt(sendMs, 10)
-	out["sign_to_ack_ms"] = strconv.FormatInt(totalMs, 10)
-	return out
+	return formatPlaceRTT(venue, orderID, signMs, sendMs, totalMs, ok)
 }
 
 func (s *lighterSession) lastTradePrice(ctx context.Context, marketIndex int) (decimal.Decimal, error) {

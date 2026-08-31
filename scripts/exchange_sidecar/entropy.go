@@ -534,18 +534,19 @@ func (s *entropySession) place(ctx context.Context, params map[string]any) (map[
 			C: cloid,
 		}},
 	}
-	resp, postErr := s.postAction(ctx, action)
+	resp, rtt, postErr := s.postAction(ctx, action)
+	rtt.log(venueIDOr(s.venue.ID, "entropy"), rawCloid, postErr == nil)
 	if postErr != nil {
 		if view, ok := s.lookupByCloid(ctx, cloid); ok {
 			filled, avg, st := view.filledAndStatus(qty, ioc)
 			fmt.Fprintf(os.Stderr, "entropy place: request failed (%v) but cloid %s is live; reporting %s\n", postErr, cloid, st)
-			return map[string]string{
+			return rtt.merge(map[string]string{
 				"order_id":        view.oidString(),
 				"client_order_id": rawCloid,
 				"filled_qty":      filled.String(),
 				"status":          st,
 				"avg_price":       avg,
-			}, nil
+			}), nil
 		}
 		return nil, postErr
 	}
@@ -592,13 +593,13 @@ func (s *entropySession) place(ctx context.Context, params map[string]any) (map[
 	}
 	// 缺成交均价就留空：上层用决策 BBO。绝不能回填保护限价，否则执行带
 	// 会把每腿 ~max_slippage 记成真实滑点（开+平约 20 bp 假亏）。
-	return map[string]string{
+	return rtt.merge(map[string]string{
 		"order_id":        strconv.FormatInt(oid, 10),
 		"client_order_id": rawCloid,
 		"filled_qty":      filled.String(),
 		"status":          outStatus,
 		"avg_price":       avg,
-	}, nil
+	}), nil
 }
 
 type hlPlaceParsed struct {
@@ -694,7 +695,7 @@ func (s *entropySession) cancel(ctx context.Context, params map[string]any) (map
 			Cancels: []hlCancelCloidItem{{Asset: asset.AssetID, Cloid: cloid}},
 		}
 	}
-	if _, err := s.postAction(ctx, action); err != nil {
+	if _, _, err := s.postAction(ctx, action); err != nil {
 		return nil, err
 	}
 	return map[string]string{"order_id": orderID, "status": "canceled"}, nil
@@ -932,13 +933,17 @@ func (s *entropySession) nextNonce() int64 {
 	return n
 }
 
-func (s *entropySession) postAction(ctx context.Context, action any) (json.RawMessage, error) {
+func (s *entropySession) postAction(ctx context.Context, action any) (json.RawMessage, placeChainRTT, error) {
+	var rtt placeChainRTT
 	s.mu.Lock()
 	nonce := s.nextNonce()
 	s.mu.Unlock()
+	t0 := time.Now()
 	sig, err := hlSignL1(s.pk, action, nonce, true)
+	rtt.signMs = time.Since(t0).Milliseconds()
 	if err != nil {
-		return nil, err
+		rtt.totalMs = rtt.signMs
+		return nil, rtt, err
 	}
 	payload := map[string]any{
 		"action":    action,
@@ -947,26 +952,33 @@ func (s *entropySession) postAction(ctx context.Context, action any) (json.RawMe
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
-		return nil, err
+		rtt.totalMs = time.Since(t0).Milliseconds()
+		return nil, rtt, err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.exch, bytes.NewReader(body))
 	if err != nil {
-		return nil, err
+		rtt.totalMs = time.Since(t0).Milliseconds()
+		return nil, rtt, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	tSend := time.Now()
 	resp, err := s.http.Do(req)
 	if err != nil {
-		return nil, err
+		rtt.sendMs = time.Since(tSend).Milliseconds()
+		rtt.totalMs = time.Since(t0).Milliseconds()
+		return nil, rtt, err
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(resp.Body)
+	rtt.sendMs = time.Since(tSend).Milliseconds()
+	rtt.totalMs = time.Since(t0).Milliseconds()
 	if err != nil {
-		return nil, err
+		return nil, rtt, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("POST /exchange HTTP %s: %s", resp.Status, strings.TrimSpace(string(raw)))
+		return nil, rtt, fmt.Errorf("POST /exchange HTTP %s: %s", resp.Status, strings.TrimSpace(string(raw)))
 	}
-	return json.RawMessage(raw), nil
+	return json.RawMessage(raw), rtt, nil
 }
 
 func (s *entropySession) infoJSON(ctx context.Context, payload any, dest any) error {

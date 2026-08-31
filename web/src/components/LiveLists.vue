@@ -134,7 +134,7 @@ const exCols: DataTableColumns<VenueLiveRow> = [
     render: (r) => moneyFmt(r.volume),
   },
   {
-    title: "操作→确认",
+    title: "签名→确认",
     key: "place_rtt",
     width: 180,
     render: (r) =>
@@ -142,7 +142,7 @@ const exCols: DataTableColumns<VenueLiveRow> = [
         "span",
         {
           class: "tabular mu",
-          title: "从本地下单到交易所回包的链路耗时。Lighter 另给签名+HTTP 分解。",
+          title: "签名开始到交易所收单回包。sign+send=合计；全链路含成交确认。三所同一口径。",
         },
         r.place_rtt || "—"
       ),

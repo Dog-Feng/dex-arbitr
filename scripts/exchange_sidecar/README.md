@@ -38,13 +38,13 @@ stdout：
 
 与 `dex-arbitr` 同机、同仓库根目录运行；Rust 默认查找 `scripts/exchange_sidecar/exchange_sidecar`。
 
-Lighter `place` 会在 stderr 打一行耗时（Rust 以 info 转发，并填配置页「签名→确认」）：
+`place` 会在 stderr 打一行链路耗时（Rust 以 info 转发，并填配置页「签名→确认」）。Lighter / SoDEX / Entropy 同一格式：
 
 ```
-lighter place rtt venue=lighter order=… sign_ms=… send_ms=… sign_to_ack_ms=… result=ok
+{venue} place rtt venue=… order=… sign_ms=… send_ms=… sign_to_ack_ms=… result=ok
 ```
 
-从 Go 签名开始到 `sendTx` 确认回包。不含拉 `/api/v1/nextNonce`、等 `submitMu`、IOC 成交回查。JSON 同时带 `sign_ms` / `send_ms` / `sign_to_ack_ms`。
+`sign` = 本地签名，`send` = HTTP 收到所方收单回包，合计不含拉 nonce、等锁、IOC 成交回查。JSON 同时带 `sign_ms` / `send_ms` / `sign_to_ack_ms`。SoDEX 的 `sign_ms` 是 `PlacePerpsOrder` 合计减 HTTP（SDK 未导出签名）。全链路墙钟由 Rust `bridge_place` 另计（含认成交）。
 
 ## fill_pnl
 
