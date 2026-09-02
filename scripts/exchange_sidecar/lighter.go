@@ -375,10 +375,35 @@ func (s *lighterSession) noteWsFills(msg map[string]any) {
 	pruneFillCache(s.fills, func(v lighterFill) time.Time { return v.at })
 }
 
+func orderIsCanceled(raw map[string]any) bool {
+	s := strings.ToLower(stringValue(raw["status"]))
+	return strings.Contains(s, "cancel") || strings.Contains(s, "reject")
+}
+
+func looksLikeTrade(raw map[string]any) bool {
+	if firstValue(raw, "trade_id", "trade_id_str") != nil {
+		return true
+	}
+	if raw["initial_base_amount"] != nil {
+		return false
+	}
+	return firstValue(raw, "ask_id", "bid_id", "ask_id_str", "bid_id_str", "ask_client_id", "bid_client_id", "ask_client_id_str", "bid_client_id_str") != nil
+}
+
 func orderFilledQty(raw map[string]any) decimal.Decimal {
-	filled := decimalValue(firstValue(raw, "filled_base_amount", "filled_amount", "size"))
+	filled := decimalValue(firstValue(raw, "filled_base_amount", "filled_amount"))
 	if filled.GreaterThan(decimal.Zero) {
 		return filled
+	}
+	if looksLikeTrade(raw) {
+		sz := decimalValue(raw["size"])
+		if sz.GreaterThan(decimal.Zero) {
+			return sz
+		}
+	}
+	// 撤单后 remaining 也会变成 0。订单上的 size 是挂单量，都不能当成交。
+	if orderIsCanceled(raw) {
+		return decimal.Zero
 	}
 	init := decimalValue(raw["initial_base_amount"])
 	rem := decimalValue(raw["remaining_base_amount"])

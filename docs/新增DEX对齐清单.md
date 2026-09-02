@@ -142,7 +142,7 @@ match venue.id.as_str() {
 | `order.ioc_fill_wait_ms` / place `fill_wait_ms` | 1000 | 等该单私有 WS |
 | 之后 | 查一次该单 | 仍没有量 → 失败 |
 
-Lighter 查单：活跃列表没有则再查 `accountInactiveOrders`（IOC 成交后不在活跃列表）。成交量用 `initial − remaining`。不用持仓 delta。
+Lighter 查单：活跃列表没有则再查 `accountInactiveOrders`（IOC 成交后不在活跃列表）。成交量优先 `filled_base_amount`；未撤单时才用 `initial − remaining`。撤单 `filled=0` 不当成交。不用持仓 delta。
 
 Lighter 私有 WS：必须订 `account_all_orders` **和** `account_all_trades`。`orders` 按市场 id 分组是 **map**（`{"1":[Order]}`），不是数组；真正成交常在 trades（`ask_client_id` / `size`）。`rawList` 只展开这类 map；**禁止**递归拆账户快照、`orderBookDetails`——会变成 `decimals unknown`（挂单失败、面板邻档但 DEX 无单）和 `account snapshot unavailable`。
 

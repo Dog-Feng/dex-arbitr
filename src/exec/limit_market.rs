@@ -5,6 +5,8 @@
 //! 邻档（`rest_until_event`）：部分成交立刻对冲该增量，余量继续挂到吃满。
 //! 不因未吃满而把已成交部分紧急平掉。改价撤单在已有成交时让余量继续挂。
 //! 对面档先成才撤本档并对未对冲量回滚。
+//! 撤单后 Lighter `remaining=0` 且 `filled=0` 不是成交（撤单也会把 remaining 打成 0）；
+//! 只认 `filled_base_amount` / trades。不要对幻影成交紧急平，否则会叠在赢家第一腿上。
 //!
 //! 阶段 1 超时重挂：不足则撤余量再挂，第二腿失败回滚。
 //!
@@ -125,6 +127,27 @@ fn plausible_ws_fill(qty: Decimal, target: Decimal) -> Option<Decimal> {
 ///
 /// 快照（`userFills.isSnapshot`）不记账——那是历史回放，不是这笔挂单刚成交。
 fn fill_from_push(data: &serde_json::Value, order_id: &str) -> Option<(Decimal, Option<Decimal>)> {
+    fill_from_push_with(
+        data,
+        order_id,
+        FillParseOpts {
+            remaining_heuristic: true,
+        },
+    )
+}
+
+#[derive(Clone, Copy)]
+struct FillParseOpts {
+    /// Lighter 成交推送有时只把 `remaining` 打成 0、`filled_base_amount` 仍是 0。
+    /// 挂着时可以用 `initial − remaining`。撤单后 remaining 也会变 0，必须关掉。
+    remaining_heuristic: bool,
+}
+
+fn fill_from_push_with(
+    data: &serde_json::Value,
+    order_id: &str,
+    opts: FillParseOpts,
+) -> Option<(Decimal, Option<Decimal>)> {
     if order_id.is_empty() {
         return None;
     }
@@ -141,17 +164,18 @@ fn fill_from_push(data: &serde_json::Value, order_id: &str) -> Option<(Decimal, 
         }
     }
     let mut best: Option<(Decimal, Option<Decimal>)> = None;
-    walk_generic_fills(data, order_id, &mut best);
+    walk_generic_fills(data, order_id, opts, &mut best);
     best
 }
 
 fn walk_generic_fills(
     data: &serde_json::Value,
     order_id: &str,
+    opts: FillParseOpts,
     best: &mut Option<(Decimal, Option<Decimal>)>,
 ) {
     if node_id_matches(data, order_id) {
-        if let Some(qty) = node_filled_qty(data) {
+        if let Some(qty) = node_filled_qty(data, opts) {
             let px = json_decimal(data.get("ap"))
                 .or_else(|| json_decimal(data.get("L")))
                 .or_else(|| json_decimal(data.get("p")))
@@ -166,12 +190,12 @@ fn walk_generic_fills(
     match data {
         serde_json::Value::Array(arr) => {
             for item in arr {
-                walk_generic_fills(item, order_id, best);
+                walk_generic_fills(item, order_id, opts, best);
             }
         }
         serde_json::Value::Object(map) => {
             for v in map.values() {
-                walk_generic_fills(v, order_id, best);
+                walk_generic_fills(v, order_id, opts, best);
             }
         }
         _ => {}
@@ -200,16 +224,52 @@ fn node_id_matches(data: &serde_json::Value, order_id: &str) -> bool {
     .any(|k| json_id_eq(data.get(k), order_id))
 }
 
-fn node_filled_qty(data: &serde_json::Value) -> Option<Decimal> {
+fn node_status_canceled(data: &serde_json::Value) -> bool {
+    data.get("status")
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| {
+            let s = s.to_ascii_lowercase();
+            s.contains("cancel") || s.contains("reject")
+        })
+}
+
+fn is_trade_node(data: &serde_json::Value) -> bool {
+    if data.get("trade_id").is_some() || data.get("trade_id_str").is_some() {
+        return true;
+    }
+    if data.get("initial_base_amount").is_some() {
+        return false;
+    }
+    [
+        "ask_id",
+        "bid_id",
+        "ask_id_str",
+        "bid_id_str",
+        "ask_client_id",
+        "bid_client_id",
+        "ask_client_id_str",
+        "bid_client_id_str",
+    ]
+    .iter()
+    .any(|k| data.get(*k).is_some())
+}
+
+fn node_filled_qty(data: &serde_json::Value, opts: FillParseOpts) -> Option<Decimal> {
     if let Some(q) = json_decimal(data.get("z"))
         .or_else(|| json_decimal(data.get("filled_base_amount")))
         .or_else(|| json_decimal(data.get("filled_amount")))
         .or_else(|| json_decimal(data.get("filled_qty")))
         .or_else(|| json_decimal(data.get("filledQty")))
-        .or_else(|| json_decimal(data.get("size")))
         .filter(|q| *q > Decimal::ZERO)
     {
         return Some(q);
+    }
+    if is_trade_node(data) {
+        return json_decimal(data.get("size")).filter(|q| *q > Decimal::ZERO);
+    }
+    // 订单上的 `size` 是挂单量，不是成交量。撤单后 remaining 也会变成 0。
+    if node_status_canceled(data) || !opts.remaining_heuristic {
+        return None;
     }
     let init = json_decimal(data.get("initial_base_amount"))?;
     let rem = json_decimal(data.get("remaining_base_amount"))?;
@@ -637,7 +697,15 @@ impl HedgeExecutor {
                     if let Some(data) =
                         recv_matching_push(rx, &plan.first.venue, &want_id, nap).await
                     {
-                        if let Some((qty, px)) = fill_from_push(&data, &want_id) {
+                        let own_cancel = ctx.cancel.load(Ordering::Relaxed);
+                        let peer_lost = ctx
+                            .peer_cancel
+                            .as_ref()
+                            .is_some_and(|p| p.load(Ordering::Relaxed));
+                        let opts = FillParseOpts {
+                            remaining_heuristic: !(own_cancel || peer_lost),
+                        };
+                        if let Some((qty, px)) = fill_from_push_with(&data, &want_id, opts) {
                             match plausible_ws_fill(qty, plan.qty) {
                                 Some(qty) => {
                                     let qty = qty.min(plan.qty);
@@ -1135,7 +1203,13 @@ impl HedgeExecutor {
                 else {
                     break;
                 };
-                if let Some((qty, px)) = fill_from_push(&data, oid) {
+                if let Some((qty, px)) = fill_from_push_with(
+                    &data,
+                    oid,
+                    FillParseOpts {
+                        remaining_heuristic: false,
+                    },
+                ) {
                     match plausible_ws_fill(qty, plan.qty) {
                         Some(qty) => {
                             let qty = qty.min(plan.qty);
@@ -1382,6 +1456,14 @@ mod tests {
         });
         let (qty, _) = fill_from_push(&mapped, "555").expect("map-keyed remaining fill");
         assert_eq!(qty, dec!(0.0005));
+        assert!(fill_from_push_with(
+            &mapped,
+            "555",
+            FillParseOpts {
+                remaining_heuristic: false
+            }
+        )
+        .is_none());
 
         // Lighter 成交在 account_all_trades
         let trade = json!({
@@ -1485,5 +1567,50 @@ mod tests {
         });
         assert!(push_matches_order(&open, oid));
         assert!(fill_from_push(&open, oid).is_none());
+    }
+
+    #[test]
+    fn lighter_cancel_update_is_not_a_fill() {
+        use serde_json::json;
+
+        let canceled = json!({
+            "type": "update/account_all_orders",
+            "orders": {"1": [{
+                "client_order_index": 178828420185202_u64,
+                "initial_base_amount": "0.015",
+                "remaining_base_amount": "0",
+                "filled_base_amount": "0",
+                "size": "0.015",
+                "status": "canceled"
+            }]}
+        });
+        assert!(push_matches_order(&canceled, "178828420185202"));
+        assert!(fill_from_push(&canceled, "178828420185202").is_none());
+
+        let cancelled_spelling = json!({
+            "client_order_index": "555",
+            "initial_base_amount": "0.015",
+            "remaining_base_amount": "0",
+            "filled_base_amount": "0",
+            "status": "cancelled"
+        });
+        assert!(fill_from_push(&cancelled_spelling, "555").is_none());
+
+        let cancel_with_real_fill = json!({
+            "client_order_index": "555",
+            "initial_base_amount": "0.015",
+            "remaining_base_amount": "0",
+            "filled_base_amount": "0.015",
+            "status": "canceled"
+        });
+        let (qty, _) = fill_from_push(&cancel_with_real_fill, "555").expect("explicit filled");
+        assert_eq!(qty, dec!(0.015));
+
+        let order_size_only = json!({
+            "client_order_index": "555",
+            "size": "0.015",
+            "filled_base_amount": "0"
+        });
+        assert!(fill_from_push(&order_size_only, "555").is_none());
     }
 }

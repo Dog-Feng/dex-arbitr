@@ -219,6 +219,46 @@ func TestOrderFilledQtyFromRemaining(t *testing.T) {
 	}
 }
 
+func TestOrderFilledQtyCanceledIsNotAFill(t *testing.T) {
+	raw := map[string]any{
+		"initial_base_amount":   "0.015",
+		"remaining_base_amount": "0",
+		"filled_base_amount":    "0",
+		"size":                  "0.015",
+		"status":                "canceled",
+	}
+	got := orderFilledQty(raw)
+	if !got.IsZero() {
+		t.Fatalf("canceled remaining=0 got %s", got)
+	}
+	raw["status"] = "cancelled"
+	if !orderFilledQty(raw).IsZero() {
+		t.Fatal("cancelled spelling")
+	}
+	raw["filled_base_amount"] = "0.015"
+	if !orderFilledQty(raw).Equal(decimal.RequireFromString("0.015")) {
+		t.Fatalf("canceled with explicit fill got %s", orderFilledQty(raw))
+	}
+}
+
+func TestOrderFilledQtyDoesNotUseOrderSize(t *testing.T) {
+	raw := map[string]any{
+		"client_order_index": "555",
+		"size":               "0.015",
+		"filled_base_amount": "0",
+	}
+	if !orderFilledQty(raw).IsZero() {
+		t.Fatalf("order size is not a fill, got %s", orderFilledQty(raw))
+	}
+	trade := map[string]any{
+		"ask_client_id": "555",
+		"size":          "0.015",
+	}
+	if !orderFilledQty(trade).Equal(decimal.RequireFromString("0.015")) {
+		t.Fatalf("trade size got %s", orderFilledQty(trade))
+	}
+}
+
 func TestFillWaitOf(t *testing.T) {
 	if fillWaitOf(nil) != time.Second {
 		t.Fatal("nil should default to 1s")
