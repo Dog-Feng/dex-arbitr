@@ -2611,7 +2611,7 @@ impl Controller {
     /// 骞充粨鍗?*涓?*鍥犱环宸彉鍖栨挙鈥斺€斿钩浠撹璧板畬锛屽惁鍒欎細涓€鐩寸暀鐫€鍗曡吙椋庨櫓銆?
     /// 鍗曡疆瓒呮椂鐢辨墽琛屽櫒鑷繁绠★紱杩欓噷鑻ユ寜鏁磋疆璁″垝璧风偣瓒呮椂骞剁疆 cancel锛?
     /// `limit_retry_count` 鐨勫悗缁噸鎸備細琚洿鎺ヨ烦杩囥€?
-    fn watch_pending_slot(&mut self, pair_i: usize, pair: &Pair, slot: &str) {
+    pub(super) fn watch_pending_slot(&mut self, pair_i: usize, pair: &Pair, slot: &str) {
         if self.pending.contains_key(slot) {
             self.watch_one_pending(pair_i, pair, slot, slot);
         }

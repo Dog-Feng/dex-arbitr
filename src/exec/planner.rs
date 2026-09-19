@@ -350,4 +350,59 @@ mod tests {
         assert_eq!(plan.first.style, OrderStyle::LimitMaker);
         assert_eq!(plan.second.style, OrderStyle::MarketTaker);
     }
+
+    #[test]
+    fn burst_close_reverses_open_legs_like_plan_hedge() {
+        let cfg = AppConfig::load_from(std::path::Path::new("config/default.yaml")).unwrap();
+        let p = pair();
+        let buy = p.legs[0].venue.clone();
+        let sell = p.legs[1].venue.clone();
+        let buy_book = Bbo {
+            bid: dec!(100),
+            ask: dec!(100.1),
+            bid_qty: dec!(1),
+            ask_qty: dec!(1),
+            ts: std::time::Instant::now(),
+            bids: vec![],
+            asks: vec![],
+        };
+        let sell_book = Bbo {
+            bid: dec!(99.9),
+            ask: dec!(100),
+            bid_qty: dec!(1),
+            ask_qty: dec!(1),
+            ts: std::time::Instant::now(),
+            bids: vec![],
+            asks: vec![],
+        };
+        let open = plan_burst(
+            &p,
+            &cfg,
+            dec!(0.001),
+            true,
+            &buy,
+            &sell,
+            &buy_book,
+            &sell_book,
+        )
+        .unwrap();
+        let close = plan_burst(
+            &p,
+            &cfg,
+            dec!(0.001),
+            false,
+            &sell,
+            &buy,
+            &sell_book,
+            &buy_book,
+        )
+        .unwrap();
+        assert!(!close.is_open);
+        assert_eq!(close.buy_venue, "lighter_rh");
+        assert_eq!(close.sell_venue, "lighter");
+        assert_eq!(close.first.venue, open.first.venue);
+        assert_ne!(close.first.is_buy, open.first.is_buy);
+        assert_eq!(close.second.venue, open.second.venue);
+        assert_eq!(close.second.is_buy, !open.second.is_buy);
+    }
 }

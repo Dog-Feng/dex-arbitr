@@ -71,6 +71,8 @@ impl Controller {
         }
 
         if self.slot_has_pending(&slot) || self.hedging.contains(&slot) {
+            // 与阶段 1 一致：挂单期间仍跑 watchdog（Burst 原先直接 return，超时永不 cancel）。
+            self.watch_pending_slot(pair_i, &pair, &slot);
             self.paint_burst_status(pair_i, &pair, &slot, "执行中");
             return;
         }
@@ -270,20 +272,25 @@ impl Controller {
                     self.paint_burst_status(pair_i, &pair, &slot, "平完→冷却");
                     return;
                 }
-                let (buy, sell) = {
+                // 平仓方向与 plan_hedge(Intent::Close) 一致：在原 sell 所买回、原 buy 所卖出。
+                let (close_buy, close_sell) = {
                     let p = self.positions.get(&slot).unwrap();
-                    (p.buy.clone(), p.sell.clone())
+                    (p.sell.clone(), p.buy.clone())
                 };
                 let close_qty = base_qty.min(held);
-                let (buy_book, sell_book) =
-                    super::controller::books_for_direction(&buy, &v0, &b0, &b1);
+                let (buy_book, sell_book) = super::controller::books_for_direction(
+                    &close_buy,
+                    &v0,
+                    &b0,
+                    &b1,
+                );
                 self.spawn_burst_rep(
                     pair_i,
                     &pair,
                     &slot,
                     false,
-                    &buy,
-                    &sell,
+                    &close_buy,
+                    &close_sell,
                     buy_book,
                     sell_book,
                     close_qty,
