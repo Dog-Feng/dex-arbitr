@@ -95,6 +95,7 @@ burst:
   cooldown_ms_max: 300000
   limit_rehang_timeout_ms: 2000
   hedge_max_attempts: 20
+  total_rounds: 0
 
 # 市价 / IOC / 撤后确认：等该单推送
 # ioc_fill_wait_ms，没有再查一次。页面可热改（2000 / 3000 均可）。

@@ -38,6 +38,7 @@ fn default_burst_params() -> BurstConfig {
         cooldown_ms_max: 300_000,
         limit_rehang_timeout_ms: 2000,
         hedge_max_attempts: 20,
+        total_rounds: 0,
     }
 }
 

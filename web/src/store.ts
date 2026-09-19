@@ -42,6 +42,7 @@ export function emptyParams(): ArbitrageParams {
       cooldown_ms_max: 300000,
       limit_rehang_timeout_ms: 2000,
       hedge_max_attempts: 20,
+      total_rounds: 0,
     },
     limit_timeout_ms: 2000,
     maker_inside_ticks: 1,

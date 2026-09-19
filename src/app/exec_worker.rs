@@ -5,11 +5,15 @@ use tokio::sync::mpsc;
 
 use crate::app::balance::{refresh_accounts, BalanceCache, VenueAccountCache};
 use crate::app::control::ArbitrageControl;
-use crate::config::AppConfig;
-use crate::domain::Books;
-use crate::exchange::bridge::take_force_account_refresh;
+use crate::app::reconcile::exchange_legs_to_flatten;
+use rust_decimal::Decimal;
+
+use crate::config::{AppConfig, OrderStyle};
+use crate::domain::{Books, Pair};
+use crate::exchange::bridge::{request_account_refresh, take_force_account_refresh};
 use crate::exchange::ExchangePort;
-use crate::exec::{Adapters, ExecFill, ExecResult, HedgeExecutor, HedgePlan, LimitMarketRun};
+use crate::exec::{Adapters, ExecFill, ExecResult, HedgeExecutor, HedgeLeg, HedgePlan, LimitMarketRun};
+use tracing::{info, warn};
 
 pub enum ExecEvent {
     RunPlan(RunPlanMsg),
@@ -82,6 +86,126 @@ pub fn spawn_run_plan(
             plan,
             result,
         }));
+    });
+}
+
+fn burst_market_flatten_legs(pair: &Pair, accounts: &VenueAccountCache) -> Vec<(HedgeLeg, Decimal, bool)> {
+    let mut legs = Vec::new();
+    for (leg, signed_qty) in exchange_legs_to_flatten(pair, accounts) {
+        let close_qty = signed_qty.abs();
+        if close_qty <= leg.min_qty {
+            warn!(
+                pair = %pair.pair_id,
+                venue = %leg.venue,
+                qty = %signed_qty,
+                min_qty = %leg.min_qty,
+                "exchange residual below min_qty; skip auto flatten"
+            );
+            continue;
+        }
+        let is_buy = signed_qty.is_sign_negative();
+        legs.push((
+            HedgeLeg {
+                venue: leg.venue.to_string(),
+                symbol: leg.raw_symbol.clone(),
+                market_index: leg.market_index,
+                is_buy,
+                style: OrderStyle::MarketTaker,
+                min_qty: leg.min_qty,
+                limit_price: None,
+            },
+            close_qty,
+            is_buy,
+        ));
+    }
+    legs
+}
+
+async fn run_burst_exchange_flatten(
+    cfg: &AppConfig,
+    adapters: &Adapters,
+    books: &Books,
+    pair_id: &str,
+    legs: Vec<(HedgeLeg, Decimal, bool)>,
+) {
+    if legs.is_empty() {
+        return;
+    }
+    let mut tasks = Vec::with_capacity(legs.len());
+    for (leg, qty, is_buy) in legs {
+        let cfg = cfg.clone();
+        let adapters = adapters.clone();
+        let books = books.clone();
+        let pair_id = pair_id.to_string();
+        tasks.push(async move {
+            HedgeExecutor::market_leg(
+                &cfg,
+                &adapters,
+                &pair_id,
+                &leg,
+                qty,
+                is_buy,
+                true,
+                &books,
+                false,
+            )
+            .await
+        });
+    }
+    for result in futures_util::future::join_all(tasks).await {
+        match result {
+            Ok(fill) => info!(
+                pair = %pair_id,
+                venue = %fill.venue,
+                qty = %fill.qty,
+                "burst exchange flatten leg filled"
+            ),
+            Err(err) => warn!(
+                pair = %pair_id,
+                error = %err,
+                "burst exchange flatten leg failed"
+            ),
+        }
+    }
+    request_account_refresh();
+}
+
+/// Burst 平仓 rep 结束后：等待结算 → 拉两所实际持仓 → 仍有仓则并发市价 reduce-only。
+pub fn spawn_burst_post_close_exchange_flatten(
+    cfg: AppConfig,
+    port_adapters: Vec<Arc<dyn ExchangePort>>,
+    hedge_adapters: Adapters,
+    books: Books,
+    pair: Pair,
+    settle_ms: u64,
+) {
+    tokio::spawn(async move {
+        info!(
+            pair = %pair.pair_id,
+            settle_ms,
+            "burst close rep done; waiting before exchange position check"
+        );
+        tokio::time::sleep(Duration::from_millis(settle_ms)).await;
+
+        let (_balance, accounts) = refresh_accounts(&port_adapters, &cfg.sizing).await;
+        if !accounts.all_fresh() {
+            warn!(
+                pair = %pair.pair_id,
+                "burst flatten skipped: account refresh not fresh after settle wait"
+            );
+            request_account_refresh();
+            return;
+        }
+        let legs = burst_market_flatten_legs(&pair, &accounts);
+        if legs.is_empty() {
+            return;
+        }
+        info!(
+            pair = %pair.pair_id,
+            n = legs.len(),
+            "exchange still has position after settle — spawning market flatten"
+        );
+        run_burst_exchange_flatten(&cfg, &hedge_adapters, &books, &pair.pair_id, legs).await;
     });
 }
 

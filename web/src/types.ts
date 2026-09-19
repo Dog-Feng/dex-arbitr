@@ -28,6 +28,8 @@ export interface BurstParams {
   cooldown_ms_max: number;
   limit_rehang_timeout_ms: number;
   hedge_max_attempts: number;
+  /** 大循环次数；0 = 不限。一轮 = open_repeats 开满 + 平到 0 */
+  total_rounds: number;
 }
 
 export interface PairSetting {

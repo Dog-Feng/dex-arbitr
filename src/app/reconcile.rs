@@ -263,6 +263,29 @@ fn venue_position_qty(accounts: &VenueAccountCache, leg: &VenueMarket) -> Decima
     venue_leg(accounts, leg).0
 }
 
+/// 该所在该 symbol 上的带符号持仓（账户快照须 fresh）。
+pub fn leg_exchange_qty(accounts: &VenueAccountCache, leg: &VenueMarket) -> Option<Decimal> {
+    if !accounts.all_fresh() {
+        return None;
+    }
+    Some(venue_position_qty(accounts, leg))
+}
+
+/// Burst 平仓 rep 后：任一所仍有仓则列出需市价 reduce-only 平掉的腿。
+pub fn exchange_legs_to_flatten(pair: &Pair, accounts: &VenueAccountCache) -> Vec<(VenueMarket, Decimal)> {
+    let tol = pair.min_qty();
+    let mut out = Vec::new();
+    for leg in &pair.legs {
+        let Some(q) = leg_exchange_qty(accounts, leg) else {
+            return Vec::new();
+        };
+        if q.abs() > tol {
+            out.push((leg.clone(), q));
+        }
+    }
+    out
+}
+
 fn venue_leg(accounts: &VenueAccountCache, leg: &VenueMarket) -> (Decimal, Decimal) {
     let Some(acct) = accounts.get(leg.venue.as_str()) else {
         return (Decimal::ZERO, Decimal::ZERO);

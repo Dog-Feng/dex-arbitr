@@ -52,6 +52,9 @@ pub struct BurstConfig {
     pub limit_rehang_timeout_ms: u64,
     #[serde(default = "default_burst_hedge_attempts")]
     pub hedge_max_attempts: u32,
+    /// 大循环次数：每轮 = open_repeats 开满 + 平到 0。0 = 不限（与改前一致）。
+    #[serde(default = "default_burst_total_rounds")]
+    pub total_rounds: u32,
 }
 
 fn default_burst() -> BurstConfig {
@@ -64,6 +67,7 @@ fn default_burst() -> BurstConfig {
         cooldown_ms_max: default_burst_cooldown_max(),
         limit_rehang_timeout_ms: default_burst_rehang_ms(),
         hedge_max_attempts: default_burst_hedge_attempts(),
+        total_rounds: default_burst_total_rounds(),
     }
 }
 
@@ -87,6 +91,9 @@ fn default_burst_rehang_ms() -> u64 {
 }
 fn default_burst_hedge_attempts() -> u32 {
     20
+}
+fn default_burst_total_rounds() -> u32 {
+    0
 }
 
 impl BurstConfig {
@@ -115,6 +122,50 @@ impl BurstConfig {
 
     pub fn random_cooldown_ms(&self) -> u64 {
         random_ms(self.cooldown_ms_min, self.cooldown_ms_max)
+    }
+
+    /// 平仓 rep 结束后等待交易所结算，再拉实际持仓并市价清腿（3–5s）。
+    pub fn random_flatten_settle_ms(&self) -> u64 {
+        random_ms(3000, 5000)
+    }
+
+    /// `total_rounds == 0` 表示大循环不限次数。
+    pub fn should_run_another_round(&self, rounds_completed: u32) -> bool {
+        self.total_rounds == 0 || rounds_completed < self.total_rounds
+    }
+}
+
+#[cfg(test)]
+mod burst_round_tests {
+    use super::BurstConfig;
+
+    fn cfg(total_rounds: u32) -> BurstConfig {
+        BurstConfig {
+            total_rounds,
+            enabled: false,
+            open_repeats: 10,
+            pause_ms_min: 3000,
+            pause_ms_max: 10000,
+            cooldown_ms_min: 60_000,
+            cooldown_ms_max: 300_000,
+            limit_rehang_timeout_ms: 2000,
+            hedge_max_attempts: 20,
+        }
+    }
+
+    #[test]
+    fn total_rounds_zero_means_unlimited() {
+        let b = cfg(0);
+        assert!(b.should_run_another_round(0));
+        assert!(b.should_run_another_round(9999));
+    }
+
+    #[test]
+    fn total_rounds_caps_after_close_increments() {
+        let b = cfg(100);
+        assert!(b.should_run_another_round(0));
+        assert!(b.should_run_another_round(99));
+        assert!(!b.should_run_another_round(100));
     }
 }
 

@@ -15,6 +15,7 @@ use crate::infra::dashboard;
 
 use super::controller::PendingLimit;
 use super::controller::Controller;
+use super::exec_worker::spawn_burst_post_close_exchange_flatten;
 use super::exec_worker::spawn_limit_market;
 use super::intervention::Gate;
 use super::risk::{books_quality_ok, books_tradable};
@@ -27,6 +28,8 @@ pub enum BurstPhase {
     Cooldown,
     Closing,
     Stopped,
+    /// 配置的大循环次数已跑满（开+平算一轮），正常结束，非故障停手。
+    Completed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,6 +42,8 @@ enum PauseKind {
 pub struct BurstSlot {
     pub phase: BurstPhase,
     pub open_reps_done: u32,
+    /// 已完成的大循环数（每轮 = open_repeats 开满 + 平到 0）。
+    pub rounds_completed: u32,
     pub wait_until: Option<Instant>,
     pub peak_capacity_checked: bool,
     pause_kind: Option<PauseKind>,
@@ -49,11 +54,27 @@ impl Default for BurstSlot {
         Self {
             phase: BurstPhase::Opening,
             open_reps_done: 0,
+            rounds_completed: 0,
             wait_until: None,
             peak_capacity_checked: false,
             pause_kind: None,
         }
     }
+}
+
+fn burst_round_status_suffix(burst: &crate::config::BurstConfig, st: &BurstSlot) -> String {
+    let total = burst.total_rounds;
+    if total == 0 {
+        if st.rounds_completed == 0 {
+            return String::new();
+        }
+        return format!("已完成 {} 轮", st.rounds_completed);
+    }
+    let cur = match st.phase {
+        BurstPhase::Completed => total,
+        _ => (st.rounds_completed + 1).min(total),
+    };
+    format!("轮 {cur}/{total}")
 }
 
 impl Controller {
@@ -81,6 +102,10 @@ impl Controller {
 
         if st.phase == BurstPhase::Stopped {
             self.paint_burst_status(pair_i, &pair, &slot, "已停止(需人工)");
+            return;
+        }
+        if st.phase == BurstPhase::Completed {
+            self.paint_burst_status(pair_i, &pair, &slot, "大循环已完成");
             return;
         }
 
@@ -123,6 +148,14 @@ impl Controller {
                         .unwrap_or(Decimal::ZERO);
                     if held > Decimal::ZERO {
                         st.phase = BurstPhase::Closing;
+                    } else if !self.cfg.burst.should_run_another_round(st.rounds_completed) {
+                        st.phase = BurstPhase::Completed;
+                        info!(
+                            pair = %pair.pair_id,
+                            rounds = st.rounds_completed,
+                            total = self.cfg.burst.total_rounds,
+                            "burst: all macro rounds completed"
+                        );
                     } else {
                         st.phase = BurstPhase::Opening;
                         st.open_reps_done = 0;
@@ -135,7 +168,7 @@ impl Controller {
         }
 
         let st = self.burst_slots.get(&slot).cloned().unwrap_or_default();
-        if st.phase == BurstPhase::Stopped {
+        if matches!(st.phase, BurstPhase::Stopped | BurstPhase::Completed) {
             return;
         }
         if !self.arbitrage_enabled() {
@@ -180,6 +213,13 @@ impl Controller {
 
         match st.phase {
             BurstPhase::Opening => {
+                if !self.cfg.burst.should_run_another_round(st.rounds_completed) {
+                    let mut st = st;
+                    st.phase = BurstPhase::Completed;
+                    self.burst_slots.insert(slot.clone(), st);
+                    self.paint_burst_status(pair_i, &pair, &slot, "大循环已完成");
+                    return;
+                }
                 if held <= Decimal::ZERO {
                     if self.pair_has_naked(&pair.pair_id) || self.pair_naked_inflight(&pair.pair_id)
                     {
@@ -265,6 +305,13 @@ impl Controller {
             BurstPhase::Closing => {
                 if held <= Decimal::ZERO {
                     let mut st = st;
+                    st.rounds_completed = st.rounds_completed.saturating_add(1);
+                    info!(
+                        pair = %pair.pair_id,
+                        round = st.rounds_completed,
+                        total = self.cfg.burst.total_rounds,
+                        "burst macro round completed (open+close)"
+                    );
                     st.phase = BurstPhase::Cooldown;
                     st.wait_until =
                         Some(Instant::now() + burst_duration(&self.cfg, false));
@@ -296,7 +343,10 @@ impl Controller {
                     close_qty,
                 );
             }
-            BurstPhase::RepPause | BurstPhase::Cooldown | BurstPhase::Stopped => {}
+            BurstPhase::RepPause
+            | BurstPhase::Cooldown
+            | BurstPhase::Stopped
+            | BurstPhase::Completed => {}
         }
     }
 
@@ -419,6 +469,9 @@ impl Controller {
                     hedged = %hedged,
                     "burst rep completed"
                 );
+                if !msg.plan.is_open {
+                    self.burst_flatten_exchange_after_close(&pair);
+                }
             }
             Err(err) => {
                 error!(pair = %msg.plan.pair_id, error = %err, "burst rep failed");
@@ -428,6 +481,19 @@ impl Controller {
                 }
             }
         }
+    }
+
+    /// 挂单平仓 rep 成功后：暂停 3–5s 再拉两所实际持仓，仍有仓则后台市价 reduce-only。
+    fn burst_flatten_exchange_after_close(&mut self, pair: &Pair) {
+        let settle_ms = self.cfg.burst.random_flatten_settle_ms();
+        spawn_burst_post_close_exchange_flatten(
+            self.cfg.clone(),
+            self.adapters.clone(),
+            self.adapters_by_id.clone(),
+            self.books.clone(),
+            pair.clone(),
+            settle_ms,
+        );
     }
 
     fn burst_stop(&mut self, pair: &Pair, slot: &str, detail: &str) {
@@ -453,12 +519,15 @@ impl Controller {
             }
             BurstPhase::Closing => "平仓中".into(),
             BurstPhase::Stopped => "停止".into(),
+            BurstPhase::Completed => "结束".into(),
             _ => String::new(),
         };
-        let ui = if extra.is_empty() {
-            status.to_string()
-        } else {
-            format!("{status} · {extra}")
+        let round_tag = burst_round_status_suffix(&self.cfg.burst, &st);
+        let ui = match (extra.is_empty(), round_tag.is_empty()) {
+            (true, true) => status.to_string(),
+            (false, true) => format!("{status} · {extra}"),
+            (true, false) => format!("{status} · {round_tag}"),
+            (false, false) => format!("{status} · {extra} · {round_tag}"),
         };
         self.mark_ui_status(slot, &ui);
         self.set_spread(pair_i, dashboard::skip_lines(&pair.pair_id, &ui));
@@ -474,6 +543,33 @@ fn burst_leg_margin(
         available_usdc: ctrl.balance.venue_available(venue),
         leverage: ctrl.cfg.leverage_for(venue),
         reserved_usdc: reserved.get(venue).copied().unwrap_or(Decimal::ZERO),
+    }
+}
+
+#[cfg(test)]
+mod round_label_tests {
+    use super::*;
+    use crate::config::BurstConfig;
+
+    #[test]
+    fn round_label_shows_progress_when_capped() {
+        let burst = BurstConfig {
+            total_rounds: 100,
+            enabled: true,
+            open_repeats: 10,
+            pause_ms_min: 3000,
+            pause_ms_max: 10000,
+            cooldown_ms_min: 60_000,
+            cooldown_ms_max: 300_000,
+            limit_rehang_timeout_ms: 2000,
+            hedge_max_attempts: 20,
+        };
+        let st = BurstSlot {
+            rounds_completed: 2,
+            phase: BurstPhase::Opening,
+            ..BurstSlot::default()
+        };
+        assert_eq!(burst_round_status_suffix(&burst, &st), "轮 3/100");
     }
 }
 

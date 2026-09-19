@@ -27,7 +27,11 @@ Opening：连续 open_repeats 次开仓 rep（每次 base_qty）
   → 满 open_repeats → Cooldown（cooldown_ms_min ~ max）
   → Closing：按 base_qty 逐格平到 0
   → 再 Cooldown → Opening（open_reps_done 清零）
+  → 平到 0 时 `rounds_completed += 1`（**开+平 = 1 个大循环**）
+  → `total_rounds > 0` 且已完成轮次 ≥ 配置 → `BurstPhase::Completed`（不再开新轮）
 ```
+
+`total_rounds: 0` 表示大循环**不限**（与改前行为一致）。
 
 停套利：撤所有在途限价（`cancel_all_resting_limits`），已发出的单仍可能成交，但不再发新单 / 不对冲（与阶段 1 停手语义类似）。
 
@@ -40,6 +44,7 @@ Opening：连续 open_repeats 次开仓 rep（每次 base_qty）
 | `cooldown_ms_min` / `max` | 60000 / 300000 | 开满或平完后的随机冷却 |
 | `limit_rehang_timeout_ms` | 2000 | 首腿 L1 挂单最长等待（≥200） |
 | `hedge_max_attempts` | 20 | 第二腿市价失败重试上限 |
+| `total_rounds` | 0 | 大循环总轮次；0 = 不限 |
 
 ## 代码入口
 

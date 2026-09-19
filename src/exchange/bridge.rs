@@ -84,7 +84,7 @@ pub fn take_force_account_refresh() -> bool {
     FORCE_ACCOUNT_REFRESH.swap(false, Ordering::Relaxed)
 }
 
-fn request_account_refresh() {
+pub fn request_account_refresh() {
     FORCE_ACCOUNT_REFRESH.store(true, Ordering::Relaxed);
 }
 

@@ -6,6 +6,9 @@
     <Field label="open_repeats" hint="一轮宏观周期内连续开仓次数，之后进入冷却并平到 0">
       <n-input-number v-model:value="p.burst.open_repeats" :min="1" :max="1000" />
     </Field>
+    <Field label="total_rounds" hint="大循环总轮次：每轮 = 上述开满 + 平到 0 算 1 次。0 = 不限">
+      <n-input-number v-model:value="p.burst.total_rounds" :min="0" :max="100000" />
+    </Field>
     <Field label="pause_ms_min / max" hint="每次开/平 rep 完成后的随机暂停（毫秒）">
       <div class="pair">
         <n-input-number v-model:value="p.burst.pause_ms_min" :min="0" :step="500" />
