@@ -772,7 +772,17 @@ func placeOrder(ctx context.Context, s *sodexSession, params map[string]any) (ma
 	if err != nil {
 		return nil, err
 	}
-	qty = roundToStep(qty, spec.StepSize, false)
+	if reduceOnly {
+		cap := reducePositionCap(params)
+		if !cap.GreaterThan(decimal.Zero) && s != nil {
+			if snap, err := accountSnapshot(ctx, gatewayBase(s.venue.Rest), s.addr, s.accountID); err == nil {
+				cap = absQtyFromPositions(snap["positions"], spec.Symbol)
+			}
+		}
+		qty = clampReduceOnly(qty, spec.StepSize, cap)
+	} else {
+		qty = roundToStep(qty, spec.StepSize, false)
+	}
 	if !qty.GreaterThan(decimal.Zero) {
 		return nil, fmt.Errorf("quantity below step size")
 	}
@@ -869,7 +879,7 @@ func placeOrder(ctx context.Context, s *sodexSession, params map[string]any) (ma
 				outStatus = "unknown"
 			}
 			fmt.Fprintf(os.Stderr, "sodex place: request failed (%v) but order %s is live; reporting %s\n", err, clOrdID, outStatus)
-			avgPrice := paramString(params, "limit_price", "")
+			avgPrice := ""
 			if ap := avgPriceFromOrder(o); ap != "" {
 				avgPrice = ap
 			}
@@ -889,7 +899,7 @@ func placeOrder(ctx context.Context, s *sodexSession, params map[string]any) (ma
 	r := results[0]
 	status := strings.ToLower(strings.TrimSpace(r.Status))
 	filled := "0"
-	avgPrice := paramString(params, "limit_price", "")
+	avgPrice := ""
 	if r.OrderID > 0 || r.ClOrdID != "" {
 		id := firstNonEmpty(r.ClOrdID, clOrdID)
 		if ioc {
@@ -1013,6 +1023,69 @@ func roundToStep(value, step decimal.Decimal, ceil bool) decimal.Decimal {
 		return units.Ceil().Mul(step)
 	}
 	return units.Truncate(0).Mul(step)
+}
+
+// reduce-only：先向上取整，再夹到仓位绝对值（超出则向下取整，避免超仓）。
+func clampReduceOnly(qty, step, posAbs decimal.Decimal) decimal.Decimal {
+	if !qty.GreaterThan(decimal.Zero) {
+		return qty
+	}
+	rounded := roundToStep(qty, step, true)
+	if !posAbs.GreaterThan(decimal.Zero) {
+		return rounded
+	}
+	if rounded.LessThanOrEqual(posAbs) {
+		return rounded
+	}
+	return roundToStep(posAbs, step, false)
+}
+
+func reducePositionCap(params map[string]any) decimal.Decimal {
+	v, err := paramDecimal(params, "position_qty")
+	if err != nil {
+		return decimal.Zero
+	}
+	return v.Abs()
+}
+
+func absQtyFromPositions(positions any, symbol string) decimal.Decimal {
+	want := strings.ToUpper(strings.TrimSpace(symbol))
+	if want == "" {
+		return decimal.Zero
+	}
+	var rows []map[string]any
+	switch v := positions.(type) {
+	case []map[string]any:
+		rows = v
+	case []map[string]string:
+		for _, m := range v {
+			row := make(map[string]any, len(m))
+			for k, val := range m {
+				row[k] = val
+			}
+			rows = append(rows, row)
+		}
+	default:
+		rows = rawList(positions)
+	}
+	best := decimal.Zero
+	for _, raw := range rows {
+		sym := strings.ToUpper(strings.TrimSpace(firstNonEmpty(
+			stringValue(raw["symbol"]),
+			stringValue(raw["coin"]),
+		)))
+		if sym == "" {
+			continue
+		}
+		if sym != want && !strings.Contains(sym, want) && !strings.Contains(want, sym) {
+			continue
+		}
+		q := decimalValue(firstValue(raw, "qty", "position", "szi", "size")).Abs()
+		if q.GreaterThan(best) {
+			best = q
+		}
+	}
+	return best
 }
 
 func cancelOrder(ctx context.Context, c *sodexclient.Client, accountID uint64, params map[string]any) (map[string]string, error) {
@@ -1273,9 +1346,9 @@ func avgPriceFromOrder(o sodexclient.Order) string {
 	if executed.GreaterThan(decimal.Zero) && value.GreaterThan(decimal.Zero) {
 		return value.Div(executed).String()
 	}
-	if o.Price != "" {
-		return o.Price
-	}
+	// 不回落 o.Price：市价单的 Price 就是我们预填的滑点保护限价，
+	// 拿它当均价每腿会多记约 max_slippage 的假亏，和所方历史对不上。
+	// 没有成交名义就返回空，由上层退回决策 BBO。
 	return ""
 }
 

@@ -48,6 +48,10 @@ pub enum Cause {
     /// **不能**紧急平第一腿——万一第二腿其实成交了，反手平仓会留下
     /// 一条系统毫不知情的反向裸仓，比单腿敞口更难收拾。
     SecondLegUnknown,
+    /// 两所同向非零仓，自动对账会把内存抹成空。必须人工核对。
+    SameSignPositions,
+    /// 邻档 watchdog 超时：只置撤单，等执行回执再摘 pending。
+    WatchdogTimeout,
 }
 
 impl Cause {
@@ -59,7 +63,21 @@ impl Cause {
             Self::SingleLegStreak => "single_leg_streak",
             Self::NakedBelowMinQty => "naked_below_min_qty",
             Self::SecondLegUnknown => "second_leg_unknown",
+            Self::SameSignPositions => "same_sign_positions",
+            Self::WatchdogTimeout => "watchdog_timeout",
         }
+    }
+
+    /// 介入态默认挡平仓；这些原因在「内存仓与交易所方向一致」时允许 reduce-only 平到 0。
+    pub fn allows_reduce_only_close(self) -> bool {
+        matches!(
+            self,
+            Self::WatchdogTimeout
+                | Self::NakedBelowMinQty
+                | Self::SingleLegStreak
+                | Self::EmergencyCloseFailed
+                | Self::NakedLegUnrecoverable
+        )
     }
 }
 
@@ -344,5 +362,16 @@ mod tests {
         gd.mark("BTC", Cause::OrphanOrder, "d", None, t);
         assert_eq!(gd.waiting_pairs(), vec!["BTC", "SOL"]);
         assert!(!gd.is_empty());
+    }
+
+    #[test]
+    fn flatten_allowed_causes() {
+        assert!(Cause::WatchdogTimeout.allows_reduce_only_close());
+        assert!(Cause::NakedBelowMinQty.allows_reduce_only_close());
+        assert!(Cause::EmergencyCloseFailed.allows_reduce_only_close());
+        assert!(Cause::NakedLegUnrecoverable.allows_reduce_only_close());
+        assert!(!Cause::OrphanOrder.allows_reduce_only_close());
+        assert!(!Cause::SecondLegUnknown.allows_reduce_only_close());
+        assert!(!Cause::SameSignPositions.allows_reduce_only_close());
     }
 }

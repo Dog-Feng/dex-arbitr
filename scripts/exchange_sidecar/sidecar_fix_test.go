@@ -259,6 +259,20 @@ func TestOrderFilledQtyDoesNotUseOrderSize(t *testing.T) {
 	}
 }
 
+func TestOrderFilledQtyWsIgnoresRemaining(t *testing.T) {
+	raw := map[string]any{
+		"initial_base_amount":   "0.015",
+		"remaining_base_amount": "0",
+		"filled_base_amount":    "0",
+	}
+	if !orderFilledQtyWs(raw).IsZero() {
+		t.Fatalf("ws cache must not use remaining, got %s", orderFilledQtyWs(raw))
+	}
+	if !orderFilledQty(raw).Equal(decimal.RequireFromString("0.015")) {
+		t.Fatalf("rest lookup still uses remaining when not canceled, got %s", orderFilledQty(raw))
+	}
+}
+
 func TestFillWaitOf(t *testing.T) {
 	if fillWaitOf(nil) != time.Second {
 		t.Fatal("nil should default to 1s")
@@ -277,5 +291,37 @@ func TestFillWaitOf(t *testing.T) {
 	}
 	if got := fillWaitOf(map[string]any{"fill_wait_ms": float64(60_000)}); got != 30*time.Second {
 		t.Fatalf("clamp max got %v", got)
+	}
+}
+
+func TestClampReduceOnly(t *testing.T) {
+	step := decimal.RequireFromString("0.001")
+	// 略低于步长：向上取整到 0.001
+	got := clampReduceOnly(decimal.RequireFromString("0.0009"), step, decimal.Zero)
+	if !got.Equal(step) {
+		t.Fatalf("ceil without cap: %s", got)
+	}
+	// 向上取整会超仓：夹到仓位再向下取整
+	got = clampReduceOnly(decimal.RequireFromString("0.0015"), step, decimal.RequireFromString("0.0015"))
+	if !got.Equal(step) {
+		t.Fatalf("clamp to pos: %s", got)
+	}
+	got = clampReduceOnly(decimal.RequireFromString("0.002"), step, decimal.RequireFromString("0.002"))
+	if !got.Equal(decimal.RequireFromString("0.002")) {
+		t.Fatalf("exact pos: %s", got)
+	}
+}
+
+func TestAbsQtyFromPositions(t *testing.T) {
+	pos := []map[string]any{
+		{"symbol": "BTC-USD", "qty": "0.0015"},
+		{"symbol": "ETH", "qty": "0.02"},
+	}
+	got := absQtyFromPositions(pos, "BTC")
+	if !got.Equal(decimal.RequireFromString("0.0015")) {
+		t.Fatalf("got %s", got)
+	}
+	if !absQtyFromPositions(pos, "missing").IsZero() {
+		t.Fatal("missing")
 	}
 }

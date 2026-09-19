@@ -78,6 +78,11 @@ impl SlotWindow {
         self.frozen.or(self.sticky).or_else(|| self.live_mu(cap))
     }
 
+    /// 判 STEP 用的 μ：冻仓用冻结值，空仓跟 live。**不经 sticky**。
+    fn step_mu(&self, cap: usize) -> Option<Decimal> {
+        self.frozen.or_else(|| self.live_mu(cap))
+    }
+
     fn trim(&mut self, cap: usize) {
         while self.buf.len() > cap {
             if let Some(old) = self.buf.pop_front() {
@@ -173,8 +178,19 @@ impl WindowBook {
     }
 
     /// 有仓冻 μ；空仓用 sticky（未设则 live）。未满窗且未冻则为 `None`。
+    ///
+    /// **只给阶段 2 邻档挂单价用。** 判 STEP 走 [`Self::step_mu`]。
     pub fn quote_mu(&self, slot: &str) -> Option<Decimal> {
         self.slots.get(slot).and_then(|s| s.quote_mu(self.cap))
+    }
+
+    /// 判 STEP 用的 μ：冻仓用冻结值，空仓每秒跟 live。
+    ///
+    /// 阶段 1 必须走这条。`quote_mu` 会返回 `sticky`——那是阶段 2 的挂单价锚，
+    /// 首次满窗后就钉住不动，拿它判 STEP 等于一直用最早那份中枢：μ 漂走后
+    /// 该开不开，或相对过时中枢开在错的一边。
+    pub fn step_mu(&self, slot: &str) -> Option<Decimal> {
+        self.slots.get(slot).and_then(|s| s.step_mu(self.cap))
     }
 
     /// 空仓 |live−sticky| ≥ `min_move` 才把挂单价换成 live。冻仓时不换。
@@ -214,8 +230,12 @@ impl WindowBook {
         self.slots.get(slot).is_some_and(|s| s.frozen.is_some())
     }
 
-    /// `0→±1` 成交后调用。冻当时的 live μ；已冻不覆盖。
-    pub fn freeze(&mut self, slot: &str) {
+    /// `0→±1` 成交后调用。已冻不覆盖。
+    ///
+    /// `anchor_sticky`：阶段 2 的成交发生在 `sticky ± Δ` 的格线上，冻 sticky
+    /// 减仓线才与当初挂单的格线对齐。阶段 1 判 STEP 用 live μ，必须冻 live，
+    /// 否则整个持仓周期都锚在首次满窗那份中枢上。
+    pub fn freeze(&mut self, slot: &str, anchor_sticky: bool) {
         let cap = self.cap;
         let Some(st) = self.slots.get_mut(slot) else {
             return;
@@ -223,7 +243,11 @@ impl WindowBook {
         if st.frozen.is_some() {
             return;
         }
-        st.frozen = st.sticky.or_else(|| st.live_mu(cap));
+        st.frozen = if anchor_sticky {
+            st.sticky.or_else(|| st.live_mu(cap))
+        } else {
+            st.live_mu(cap).or(st.sticky)
+        };
     }
 
     /// 回到 STEP=0 后解冻，并把 sticky 锚在当前 live。
@@ -440,14 +464,46 @@ mod tests {
         book.observe("s", 0, dec!(0));
         book.observe("s", 1000, dec!(2));
         assert_eq!(book.quote_mu("s"), Some(dec!(1)));
-        book.freeze("s");
+        book.freeze("s", true);
         book.observe("s", 2000, dec!(8));
         assert_eq!(book.live_mu("s"), Some(dec!(5)));
         assert_eq!(book.quote_mu("s"), Some(dec!(1)));
-        book.freeze("s"); // 已冻不覆盖
+        book.freeze("s", true); // 已冻不覆盖
         assert_eq!(book.quote_mu("s"), Some(dec!(1)));
         book.unfreeze("s");
         assert_eq!(book.quote_mu("s"), Some(dec!(5)));
+    }
+
+    /// 阶段 1 的 μ 必须跟窗口滑动，不能停在首次满窗写下的 sticky。
+    #[test]
+    fn step_mu_tracks_live_while_sticky_stays() {
+        let mut book = WindowBook::new(2, 1000);
+        book.observe("s", 0, dec!(0));
+        book.observe("s", 1000, dec!(2));
+        assert_eq!(book.quote_mu("s"), Some(dec!(1)));
+        assert_eq!(book.step_mu("s"), Some(dec!(1)));
+        book.observe("s", 2000, dec!(8));
+        book.observe("s", 3000, dec!(10));
+        // sticky 钉在 1，live 已经走到 9。
+        assert_eq!(book.quote_mu("s"), Some(dec!(1)));
+        assert_eq!(book.step_mu("s"), Some(dec!(9)));
+    }
+
+    /// 阶段 1 冻的是当时的 live，不是过时的 sticky。
+    #[test]
+    fn freeze_live_anchor_ignores_stale_sticky() {
+        let mut book = WindowBook::new(2, 1000);
+        book.observe("s", 0, dec!(0));
+        book.observe("s", 1000, dec!(2));
+        book.observe("s", 2000, dec!(8));
+        book.observe("s", 3000, dec!(10));
+        book.freeze("s", false);
+        assert_eq!(book.step_mu("s"), Some(dec!(9)));
+        book.observe("s", 4000, dec!(30));
+        // 冻住后不跟 live 走。
+        assert_eq!(book.step_mu("s"), Some(dec!(9)));
+        book.unfreeze("s");
+        assert_eq!(book.step_mu("s"), Some(dec!(20)));
     }
 
     #[test]

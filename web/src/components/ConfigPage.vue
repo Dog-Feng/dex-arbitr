@@ -37,13 +37,16 @@
         <n-divider />
 
         <h4>交易对</h4>
-        <p class="hint">手填交易对（如 BTC）和每格数量。启动后才按所选交易所去各所匹配、订阅。</p>
+        <p class="hint">手填交易对（如 BTC）和每格数量。启动后才按所选交易所去各所匹配、订阅。开启阶段 2 Burst 时此处只能保留 1 个交易对。</p>
         <PairList />
       </n-card>
 
       <n-card size="small" title="高级" :bordered="true">
         <n-collapse class="adv" display-directive="show">
-          <n-collapse-item title="滑动窗口 / STEP" name="grid">
+          <n-collapse-item title="阶段 2 / Burst" name="burst">
+            <AdvancedBurst />
+          </n-collapse-item>
+          <n-collapse-item title="滑动窗口 / STEP（阶段 1）" name="grid">
             <AdvancedGrid />
           </n-collapse-item>
           <n-collapse-item title="容量 / 下单 / 成本" name="exec">
@@ -63,6 +66,7 @@ import { store } from "../store";
 import PairList from "./PairList.vue";
 import CtrlAside from "./CtrlAside.vue";
 import LiveLists from "./LiveLists.vue";
+import AdvancedBurst from "./AdvancedBurst.vue";
 import AdvancedGrid from "./AdvancedGrid.vue";
 import AdvancedExec from "./AdvancedExec.vue";
 

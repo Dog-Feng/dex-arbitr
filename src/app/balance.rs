@@ -144,14 +144,14 @@ pub async fn refresh_accounts(
         let mut available = stable_available(&snap.balances);
         let total = stable_total(&snap.balances);
         if available <= Decimal::ZERO {
-            if let Some(fallback) = fallback {
+            if let Some(fb) = apply_balance_fallback(available, fresh, fallback) {
                 warn!(
                     venue = %id,
-                    fallback = %fallback,
+                    fallback = %fb,
                     fresh,
-                    "no stable balance reported; using sizing.fallback_available_usdc"
+                    "account query failed; using sizing.fallback_available_usdc"
                 );
-                available = fallback;
+                available = fb;
             }
         }
         if available > Decimal::ZERO {
@@ -186,6 +186,23 @@ pub async fn refresh_accounts(
             last_refresh: now,
         },
     )
+}
+
+fn apply_balance_fallback(
+    available: Decimal,
+    fresh: bool,
+    fallback: Option<Decimal>,
+) -> Option<Decimal> {
+    if available > Decimal::ZERO {
+        return None;
+    }
+    // 查询成功（含余额为 0）不假装有钱。只有 account() 失败才允许显式兜底。
+    let fb = fallback.filter(|v| *v > Decimal::ZERO)?;
+    if fresh {
+        None
+    } else {
+        Some(fb)
+    }
 }
 
 fn stable_total(bals: &[Balance]) -> Decimal {
@@ -231,5 +248,25 @@ mod tests {
         assert!(v.fresh);
         assert_eq!(v.available, dec!(100));
         assert_eq!(cache.to_balance_map().get("lighter").copied(), Some(dec!(100)));
+    }
+
+    #[test]
+    fn fallback_only_when_query_failed() {
+        assert_eq!(
+            apply_balance_fallback(Decimal::ZERO, true, Some(dec!(500))),
+            None
+        );
+        assert_eq!(
+            apply_balance_fallback(Decimal::ZERO, false, Some(dec!(500))),
+            Some(dec!(500))
+        );
+        assert_eq!(
+            apply_balance_fallback(Decimal::ZERO, false, Some(Decimal::ZERO)),
+            None
+        );
+        assert_eq!(
+            apply_balance_fallback(dec!(10), false, Some(dec!(500))),
+            None
+        );
     }
 }

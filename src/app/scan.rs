@@ -556,7 +556,7 @@ pub fn select_candidates(
     scored.into_iter().map(|(_, p)| p).collect()
 }
 
-/// 满窗所对 → 每个 base 留 edge 最大的两个所 → 按 eligible / edge 截 watch_top。
+/// 满窗所对 → 每个 base 留 edge 最大的一行（一对所）→ 按 eligible / edge 截 watch_top。
 pub fn rank_bases(
     scored: Vec<ScoredPair>,
     engine: &ScanEngine,

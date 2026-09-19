@@ -50,7 +50,9 @@ type entropySession struct {
 	wsURL string
 	http  *http.Client
 
-	mu        sync.Mutex
+	// submitMu 串行化「取 nonce → 签名 → HTTP 发出」。只锁计数器不够：
+	// 两个 goroutine 各自拿到 N 和 N+1 后并发 POST，N+1 先到会使 N 失败。
+	submitMu  sync.Mutex
 	lastNonce int64
 	assets    map[string]entropyAsset
 	dexIndex  int
@@ -476,12 +478,23 @@ func (s *entropySession) place(ctx context.Context, params map[string]any) (map[
 	if err != nil {
 		return nil, err
 	}
-	qty = roundHlSz(qty, asset.SzDecimals)
+	isBuy := paramBool(params, "is_buy")
+	reduceOnly := paramBool(params, "reduce_only")
+	if reduceOnly {
+		step := decimal.New(1, int32(-asset.SzDecimals))
+		cap := reducePositionCap(params)
+		if !cap.GreaterThan(decimal.Zero) {
+			if acc, err := s.account(ctx); err == nil {
+				cap = absQtyFromPositions(acc["positions"], asset.Coin)
+			}
+		}
+		qty = clampReduceOnly(qty, step, cap)
+	} else {
+		qty = roundHlSz(qty, asset.SzDecimals, false)
+	}
 	if !qty.GreaterThan(decimal.Zero) {
 		return nil, fmt.Errorf("quantity below lot size")
 	}
-	isBuy := paramBool(params, "is_buy")
-	reduceOnly := paramBool(params, "reduce_only")
 	style := paramString(params, "style", "market")
 	ioc := style != "limit"
 	tif := "Gtc"
@@ -935,9 +948,9 @@ func (s *entropySession) nextNonce() int64 {
 
 func (s *entropySession) postAction(ctx context.Context, action any) (json.RawMessage, placeChainRTT, error) {
 	var rtt placeChainRTT
-	s.mu.Lock()
+	s.submitMu.Lock()
+	defer s.submitMu.Unlock()
 	nonce := s.nextNonce()
-	s.mu.Unlock()
 	t0 := time.Now()
 	sig, err := hlSignL1(s.pk, action, nonce, true)
 	rtt.signMs = time.Since(t0).Milliseconds()
@@ -1249,12 +1262,12 @@ func (s *entropySession) orderStreamOnce(ctx context.Context) error {
 	}
 }
 
-func roundHlSz(sz decimal.Decimal, szDecimals int) decimal.Decimal {
+func roundHlSz(sz decimal.Decimal, szDecimals int, ceil bool) decimal.Decimal {
 	if szDecimals < 0 {
 		szDecimals = 0
 	}
 	step := decimal.New(1, int32(-szDecimals))
-	return roundToStep(sz, step, false)
+	return roundToStep(sz, step, ceil)
 }
 
 func roundHlPx(px decimal.Decimal, szDecimals int, roundUp bool) decimal.Decimal {

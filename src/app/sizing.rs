@@ -36,10 +36,14 @@ pub fn check_capacity(
     if add_qty <= Decimal::ZERO {
         return Err("no_size");
     }
-    let need = add_qty * mid_price;
+    let buy_need = add_qty * buy_book.ask;
+    let sell_need = add_qty * sell_book.bid;
+    if buy_book.ask <= Decimal::ZERO || sell_book.bid <= Decimal::ZERO {
+        return Err("no_mid");
+    }
 
     let util = cfg.margin_utilization_pct;
-    if buy.free_notional(util) < need || sell.free_notional(util) < need {
+    if buy.free_notional(util) < buy_need || sell.free_notional(util) < sell_need {
         return Err("no_margin");
     }
 
@@ -75,6 +79,7 @@ mod tests {
             fallback_available_usdc: None,
             margin_utilization_pct: dec!(100),
             leverage_by_venue: Default::default(),
+            balance_floor_usdc: Decimal::ZERO,
         }
     }
 
@@ -214,6 +219,25 @@ mod tests {
                 dec!(100),
             ),
             Err("no_size")
+        );
+    }
+
+    #[test]
+    fn buy_leg_notional_uses_ask_not_mid() {
+        let buy_book = book(dec!(99_000), dec!(120_000), dec!(10));
+        let sell_book = book(dec!(100_000), dec!(101_000), dec!(10));
+        // 买腿 0.001×ask 120000 = 120；可用 55×杠杆 2 = 110。用 mid 100000 只会要 100，会漏拦。
+        assert_eq!(
+            check_capacity(
+                &cfg(),
+                dec!(0.001),
+                margin(dec!(55), dec!(0)),
+                margin(dec!(200), dec!(0)),
+                &buy_book,
+                &sell_book,
+                dec!(100_000),
+            ),
+            Err("no_margin")
         );
     }
 }

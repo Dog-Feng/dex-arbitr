@@ -7,6 +7,7 @@ use crate::app::balance::{refresh_accounts, BalanceCache, VenueAccountCache};
 use crate::app::control::ArbitrageControl;
 use crate::config::AppConfig;
 use crate::domain::Books;
+use crate::exchange::bridge::take_force_account_refresh;
 use crate::exchange::ExchangePort;
 use crate::exec::{Adapters, ExecFill, ExecResult, HedgeExecutor, HedgePlan, LimitMarketRun};
 
@@ -156,6 +157,9 @@ pub fn spawn_account_refresher(
                 }
                 let elapsed = started.elapsed();
                 if elapsed >= period {
+                    break;
+                }
+                if take_force_account_refresh() {
                     break;
                 }
                 tokio::time::sleep((period - elapsed).min(Duration::from_millis(200))).await;

@@ -153,15 +153,23 @@ impl PositionStore {
         );
     }
 
-    pub fn record_close(&mut self, slot: &str, qty: Decimal) {
+    pub fn pending_count(&self) -> usize {
+        self.pending_opens.len()
+    }
+
+    /// 平仓成功用引擎 `grid_to`，不要按剩余 qty 反推 STEP。
+    /// qty 到 0 则删仓（调用方负责 unfreeze）。
+    pub fn record_close(&mut self, slot: &str, qty: Decimal, grid_to: i32) {
         self.pending_opens.remove(slot);
         let Some(pos) = self.positions.get_mut(slot) else {
             return;
         };
-        apply_qty_scale(pos, pos.qty - qty);
+        scale_notional(pos, pos.qty - qty);
         if pos.qty.is_zero() {
             self.positions.remove(slot);
+            return;
         }
+        pos.grid = grid_to;
     }
 
     /// 交易所实盘重叠对冲量与内存不一致时，按实盘校正数量。
@@ -182,9 +190,11 @@ impl PositionStore {
         if target > before && target > reconcile_grow_cap(before, pos.base_qty) {
             return None;
         }
-        apply_qty_scale(pos, target);
+        scale_notional(pos, target);
         if pos.qty.is_zero() {
             self.positions.remove(slot);
+        } else {
+            recompute_grid_from_qty(pos);
         }
         Some((before, target))
     }
@@ -233,7 +243,7 @@ fn reconcile_grow_cap(before: Decimal, base_qty: Decimal) -> Decimal {
     }
 }
 
-fn apply_qty_scale(pos: &mut Position, new_qty: Decimal) {
+fn scale_notional(pos: &mut Position, new_qty: Decimal) {
     let before = pos.qty;
     let new_qty = new_qty.max(Decimal::ZERO);
     if before > Decimal::ZERO {
@@ -241,6 +251,9 @@ fn apply_qty_scale(pos: &mut Position, new_qty: Decimal) {
         pos.entry_notional_usdc = pos.entry_notional_usdc * new_qty / before;
     }
     pos.qty = new_qty;
+}
+
+fn recompute_grid_from_qty(pos: &mut Position) {
     if pos.qty > Decimal::ZERO && pos.base_qty > Decimal::ZERO {
         let ratio = pos.qty / pos.base_qty;
         let ceil = ratio.ceil();
@@ -248,6 +261,15 @@ fn apply_qty_scale(pos: &mut Position, new_qty: Decimal) {
         let sign = if pos.grid < 0 { -1 } else { 1 };
         pos.grid = sign * abs.max(1);
     }
+}
+
+/// 对账反推后 `|grid|×base_qty` 与 qty 的偏差。超过 `min_qty` 应告警。
+pub fn grid_qty_drift(pos: &Position) -> Decimal {
+    if pos.base_qty <= Decimal::ZERO {
+        return Decimal::ZERO;
+    }
+    let expected = Decimal::from(pos.grid.unsigned_abs()) * pos.base_qty;
+    (expected - pos.qty).abs()
 }
 
 #[cfg(test)]
@@ -327,7 +349,7 @@ mod tests {
     fn partial_close_scales_notional() {
         let mut store = PositionStore::default();
         open(&mut store, BTC_LS, dec!(0.01), dec!(400), dec!(0.05));
-        store.record_close(BTC_LS, dec!(0.0075));
+        store.record_close(BTC_LS, dec!(0.0075), 1);
         let pos = store.get(BTC_LS).unwrap();
         assert_eq!(pos.qty, dec!(0.0025));
         assert_eq!(pos.entry_notional_usdc, dec!(100));
@@ -361,10 +383,34 @@ mod tests {
             Decimal::ZERO,
             Decimal::ZERO,
         );
-        store.record_close(BTC_LS, dec!(0.001));
+        store.record_close(BTC_LS, dec!(0.001), 2);
         let pos = store.get(BTC_LS).unwrap();
         assert_eq!(pos.qty, dec!(0.002));
         assert_eq!(pos.grid, 2);
+    }
+
+    #[test]
+    fn record_close_uses_engine_grid_not_qty_ceil() {
+        let mut store = PositionStore::default();
+        store.record_open(
+            BTC_LS,
+            "BTC-USD-PERP",
+            VenueId::from("lighter"),
+            VenueId::from("sodex"),
+            dec!(0.0013),
+            1,
+            dec!(130),
+            dec!(0.05),
+            dec!(0.05),
+            dec!(0.001),
+            Decimal::ZERO,
+            Decimal::ZERO,
+        );
+        // 拆单残量 0.0013；引擎尚未推进到 2。ceil(0.0013/0.001)=2 会错升一格。
+        store.record_close(BTC_LS, dec!(0.0003), 1);
+        let pos = store.get(BTC_LS).unwrap();
+        assert_eq!(pos.qty, dec!(0.001));
+        assert_eq!(pos.grid, 1);
     }
 
     #[test]

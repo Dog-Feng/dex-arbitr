@@ -206,11 +206,11 @@ impl ExchangePort for EntropyAdapter {
     async fn account(&self) -> Result<AccountSnapshot> {
         if !self.venue.keys_ready() {
             warn!(venue = %self.id(), "account skipped: signing keys not loaded");
-            return Ok(AccountSnapshot::default());
+            bail!("account skipped: signing keys not loaded");
         }
         if !bridge::bridge_available().await {
             warn!(venue = %self.id(), "account skipped: exchange sidecar not found");
-            return Ok(AccountSnapshot::default());
+            bail!("account skipped: exchange sidecar not found");
         }
         bridge::bridge_account(&self.venue_path).await
     }

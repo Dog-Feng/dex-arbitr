@@ -471,7 +471,44 @@ impl HedgeExecutor {
         )
         .await
         {
-            Ok(f) => Ok(f),
+            Ok(f) => {
+                // 部分成交也走 Ok：调用方 `finished()` 用 first−second 记 unhedged。
+                // 零成交不能当第二腿成功，否则会把第一腿整笔当成已对冲。
+                if f.qty <= Decimal::ZERO {
+                    warn!(
+                        pair = %plan.pair_id,
+                        venue = %plan.second.venue,
+                        "second leg reported Ok with zero fill; treating as miss"
+                    );
+                    match Self::emergency_close(
+                        cfg,
+                        adapters,
+                        &plan.first,
+                        first.qty,
+                        first_bbo,
+                        paper,
+                    )
+                    .await
+                    {
+                        Ok(()) => Err(anyhow::anyhow!(
+                            "EMERGENCY_CLOSED: second leg zero fill; first leg market-closed"
+                        )),
+                        Err(eclose) => Err(anyhow::anyhow!(
+                            "NAKED_FIRST_LEG: unhedged={qty} second leg zero fill; close failed ({eclose})"
+                        )),
+                    }
+                } else {
+                    if f.qty < qty {
+                        warn!(
+                            pair = %plan.pair_id,
+                            first_qty = %qty,
+                            second_qty = %f.qty,
+                            "second leg partial fill; leftover is unhedged"
+                        );
+                    }
+                    Ok(f)
+                }
+            }
             Err(err) if is_unverifiable(&err) => {
                 // 第二腿 sendTx 成功但查不到量：可能已经成交。不能再市价平第一腿，
                 // 否则两边都成会留下反向裸仓，随后裸腿补单还会无限加仓。
@@ -497,7 +534,7 @@ impl HedgeExecutor {
                         "EMERGENCY_CLOSED: second leg failed ({err}); first leg market-closed"
                     )),
                     Err(eclose) => Err(anyhow::anyhow!(
-                        "NAKED_FIRST_LEG: second leg failed ({err}); close failed ({eclose})"
+                        "NAKED_FIRST_LEG: unhedged={qty} second leg failed ({err}); close failed ({eclose})"
                     )),
                 }
             }
@@ -519,13 +556,16 @@ impl HedgeExecutor {
         reverse.is_buy = !leg.is_buy;
         reverse.style = OrderStyle::MarketTaker;
         let price = market_price(&reverse, bbo);
+        // 只有请求量**全部**平掉才算成功。市价单可能只成交一部分，那时剩下的
+        // 仍是裸的：当成成功会让上层记 EMERGENCY_CLOSED、不挂介入、继续开仓。
+        let mut remaining = qty;
         let mut last_err: Option<anyhow::Error> = None;
         for attempt in 1..=ROLLBACK_ATTEMPTS {
             match Self::send_leg(
                 cfg,
                 adapters,
                 &reverse,
-                qty,
+                remaining,
                 price,
                 false,
                 paper,
@@ -534,19 +574,38 @@ impl HedgeExecutor {
             )
             .await
             {
-                Ok(_) => {
-                    info!(
+                Ok(fill) => {
+                    remaining = (remaining - fill.qty).max(Decimal::ZERO);
+                    if remaining <= Decimal::ZERO {
+                        info!(
+                            venue = %leg.venue,
+                            qty = %qty,
+                            attempt,
+                            "emergency close first leg"
+                        );
+                        return Ok(());
+                    }
+                    warn!(
                         venue = %leg.venue,
-                        qty = %qty,
+                        filled = %fill.qty,
+                        remaining = %remaining,
                         attempt,
-                        "emergency close first leg"
+                        max = ROLLBACK_ATTEMPTS,
+                        "emergency close partially filled; retrying remainder"
                     );
-                    return Ok(());
+                    // 尾巴低于本所最小下单量：再发必被拒，只能上报人工处理。
+                    if leg.min_qty > Decimal::ZERO && remaining < leg.min_qty {
+                        bail!(
+                            "emergency close left dust {remaining} below {} min_qty {}",
+                            leg.venue,
+                            leg.min_qty
+                        );
+                    }
                 }
                 Err(err) => {
                     warn!(
                         venue = %leg.venue,
-                        qty = %qty,
+                        qty = %remaining,
                         attempt,
                         max = ROLLBACK_ATTEMPTS,
                         error = %err,
@@ -560,7 +619,9 @@ impl HedgeExecutor {
                 }
             }
         }
-        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("emergency close failed")))
+        Err(last_err.unwrap_or_else(|| {
+            anyhow::anyhow!("emergency close incomplete; {remaining} of {qty} still open")
+        }))
     }
 
     /// `price`：市价腿的**决策信号价**（滑点保护基准）；maker 腿的挂单价。
@@ -659,12 +720,14 @@ impl HedgeExecutor {
             }
             bail!("leg {} not filled (status {:?})", leg.venue, ack.status);
         }
-        // 紧急平仓把滑点上限放得很宽，保护限价离盘口很远，不要误判成真成交。
-        let fill_px = if emergency {
-            ack.avg_price.unwrap_or(price)
+        // 紧急平仓把滑点上限放大 emergency_slippage_multiplier 倍，保护限价离
+        // 盘口很远。用**放大后**的上限跑同一套识别，否则那条线会被当成真成交价。
+        let slip_cap = if emergency {
+            cfg.cost.max_slippage_pct * cfg.cost.emergency_slippage_multiplier.max(Decimal::ONE)
         } else {
-            fill_price_for_pnl(ack.avg_price, price, leg.is_buy, cfg.cost.max_slippage_pct)
+            cfg.cost.max_slippage_pct
         };
+        let fill_px = fill_price_for_pnl(ack.avg_price, price, leg.is_buy, slip_cap);
         Ok(ExecFill {
             venue: leg.venue.clone(),
             qty: filled.min(qty),

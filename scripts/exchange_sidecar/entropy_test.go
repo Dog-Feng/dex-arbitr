@@ -110,7 +110,7 @@ func TestRoundHlPxDirection(t *testing.T) {
 	if !roundHlPx(hi, 4, false).Equal(decimal.RequireFromString("1472.7")) {
 		t.Fatalf("sigfig floor got %s", roundHlPx(hi, 4, false))
 	}
-	sz := roundHlSz(decimal.RequireFromString("1.23456"), 4)
+	sz := roundHlSz(decimal.RequireFromString("1.23456"), 4, false)
 	if !sz.Equal(decimal.RequireFromString("1.2345")) {
 		t.Fatalf("sz floor got %s", sz)
 	}

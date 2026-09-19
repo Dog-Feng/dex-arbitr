@@ -139,7 +139,7 @@ match venue.id.as_str() {
 
 | 来源 | 默认 | 作用 |
 |---|---|---|
-| `order.ioc_fill_wait_ms` / place `fill_wait_ms` | 1000 | 等该单私有 WS |
+| `order.ioc_fill_wait_ms` / place `fill_wait_ms` | 2000 | 等该单私有 WS |
 | 之后 | 查一次该单 | 仍没有量 → 失败 |
 
 Lighter 查单：活跃列表没有则再查 `accountInactiveOrders`（IOC 成交后不在活跃列表）。成交量优先 `filled_base_amount`；未撤单时才用 `initial − remaining`。撤单 `filled=0` 不当成交。不用持仓 delta。
@@ -148,7 +148,7 @@ Lighter 私有 WS：必须订 `account_all_orders` **和** `account_all_trades`�
 
 Lighter `client_order_id` 是整数，上限 \(2^{48}-1\)。现网 `ms*100 + n%100`。同一毫秒两档不能撞号；`ms*1000+seq` 会超上限被拒。SoDEX / Entropy 用字符串 `arb-{ms}-{seq}`。
 
-**加长窗口**：改 yaml / 页面 `order.ioc_fill_wait_ms`（100–30000）。sidecar 单次 `place` 超时 = 该窗口 + 15s；Rust `WRITE_SIDECAR_TIMEOUT`（`src/exchange/bridge.rs`，当前 80s）仍盖得住 30s 上限。任一处先到期都会打断回查。
+**加长窗口**：改 yaml / 页面 `order.ioc_fill_wait_ms`（100–30000）。sidecar 写操作 `handlerTimeout` 固定 90s（place 若 fill_wait+15s 更长则取更长）；Rust `WRITE_SIDECAR_TIMEOUT`（`src/exchange/bridge.rs`，100s）必须比 Go 长。sidecar **常驻**，超时不杀进程；迟到响应触发账户对账。
 
 ### 4.2 市价腿关闭 status 推断
 

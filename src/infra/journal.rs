@@ -53,16 +53,20 @@ impl ExecJournal {
                 qty TEXT,
                 net_pct TEXT,
                 result TEXT,
-                detail TEXT
+                detail TEXT,
+                grid_from INTEGER,
+                grid_to INTEGER
             );",
         )?;
+        let _ = conn.execute("ALTER TABLE executions ADD COLUMN grid_from INTEGER", []);
+        let _ = conn.execute("ALTER TABLE executions ADD COLUMN grid_to INTEGER", []);
         Ok(Self { conn })
     }
 
     pub fn append(&self, r: &ExecRecord) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO executions (ts, pair_id, action, buy_venue, sell_venue, qty, net_pct, result, detail)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO executions (ts, pair_id, action, buy_venue, sell_venue, qty, net_pct, result, detail, grid_from, grid_to)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 r.ts,
                 r.pair_id,
@@ -73,6 +77,8 @@ impl ExecJournal {
                 r.net_pct.map(|v| v.to_string()),
                 r.result,
                 r.detail,
+                r.grid_from,
+                r.grid_to,
             ],
         )?;
         Ok(())
@@ -80,7 +86,7 @@ impl ExecJournal {
 
     pub fn recent(&self, limit: usize) -> Result<Vec<ExecRecord>> {
         let mut stmt = self.conn.prepare(
-            "SELECT ts, pair_id, action, buy_venue, sell_venue, qty, net_pct, result, detail
+            "SELECT ts, pair_id, action, buy_venue, sell_venue, qty, net_pct, result, detail, grid_from, grid_to
              FROM executions ORDER BY id DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map([limit as i64], |row| {
@@ -96,8 +102,8 @@ impl ExecJournal {
                     .and_then(|s| Decimal::from_str(&s).ok()),
                 result: row.get(7)?,
                 detail: row.get(8)?,
-                grid_from: None,
-                grid_to: None,
+                grid_from: row.get(9)?,
+                grid_to: row.get(10)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)

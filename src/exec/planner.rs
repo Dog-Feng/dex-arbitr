@@ -1,7 +1,7 @@
 use rust_decimal::Decimal;
 
 use crate::config::{AppConfig, OrderStyle};
-use crate::domain::{slot_key, AdjacentQuote, Intent, Pair, Position, VenueId};
+use crate::domain::{slot_key, Intent, Pair, Position, VenueId};
 use crate::exec::sequence::first_limit_venue_all_in_or_left;
 
 #[derive(Debug, Clone)]
@@ -44,10 +44,8 @@ pub struct HedgePlan {
     pub grid_to: i32,
     pub first: HedgeLeg,
     pub second: HedgeLeg,
-    /// 阶段 2 邻档侧。None = 阶段 1 市价计划。
-    pub quote_side: Option<crate::domain::QuoteSide>,
-    /// 邻档挂着等事件，不按 2s 超时。
-    pub rest_quote: bool,
+    /// 阶段 2 Burst：L1 重挂 + 市价对冲循环。
+    pub burst: bool,
 }
 
 impl HedgePlan {
@@ -74,70 +72,6 @@ pub fn plan_hedge(
             build(pair, cfg, *qty, false, &pos.sell, &pos.buy)
         }
     }
-}
-
-/// 阶段 2：邻档第一腿限价 + 第二腿市价。
-pub fn plan_adjacent(
-    pair: &Pair,
-    q: &AdjacentQuote,
-    cfg: &AppConfig,
-    left: &VenueId,
-    first_limit: Decimal,
-    k: i32,
-    base_qty: Decimal,
-    buy_spread_pct: Option<Decimal>,
-    sell_spread_pct: Option<Decimal>,
-) -> Option<HedgePlan> {
-    let mut plan = build(pair, cfg, q.qty, q.is_open, &q.buy, &q.sell)?;
-    let (first_v, second_v) =
-        first_limit_venue_all_in_or_left(cfg, &q.buy, &q.sell, left, buy_spread_pct, sell_spread_pct);
-    let first_is_buy = first_v.as_str() == q.buy.as_str();
-    let mut first = if first_is_buy {
-        plan.first.clone()
-    } else {
-        plan.second.clone()
-    };
-    let mut second = if first_is_buy {
-        plan.second.clone()
-    } else {
-        plan.first.clone()
-    };
-    first.is_buy = first_is_buy;
-    first.style = OrderStyle::LimitMaker;
-    first.limit_price = Some(first_limit);
-    second.is_buy = !first_is_buy;
-    second.style = OrderStyle::MarketTaker;
-    second.limit_price = None;
-    // sequenced_legs 按 buy/sell 填了 first=buy, second=sell。邻档挂在「maker+对面 taker+对面点差」更便宜的所。
-    let buy_leg = pair.leg(q.buy.as_str())?;
-    let sell_leg = pair.leg(q.sell.as_str())?;
-    first.venue = first_v.as_str().to_string();
-    second.venue = second_v.as_str().to_string();
-    if first_is_buy {
-        first.symbol = buy_leg.raw_symbol.clone();
-        first.market_index = buy_leg.market_index;
-        first.min_qty = buy_leg.min_qty;
-        second.symbol = sell_leg.raw_symbol.clone();
-        second.market_index = sell_leg.market_index;
-        second.min_qty = sell_leg.min_qty;
-    } else {
-        first.symbol = sell_leg.raw_symbol.clone();
-        first.market_index = sell_leg.market_index;
-        first.min_qty = sell_leg.min_qty;
-        second.symbol = buy_leg.raw_symbol.clone();
-        second.market_index = buy_leg.market_index;
-        second.min_qty = buy_leg.min_qty;
-    }
-    plan.slot = pair.slot_key();
-    plan.style = OrderStyle::LimitThenMarket;
-    plan.first = first;
-    plan.second = second;
-    plan.grid_from = k;
-    plan.grid_to = q.grid_to;
-    plan.base_qty = if q.is_open { base_qty } else { Decimal::ZERO };
-    plan.quote_side = Some(q.side);
-    plan.rest_quote = true;
-    Some(plan)
 }
 
 fn build(
@@ -170,9 +104,82 @@ fn build(
         grid_to: 0,
         first,
         second,
-        quote_side: None,
-        rest_quote: false,
+        burst: false,
     })
+}
+
+/// Burst 阶段 2：第一腿 L1 限价 + 第二腿市价。
+pub fn plan_burst(
+    pair: &Pair,
+    cfg: &AppConfig,
+    qty: Decimal,
+    is_open: bool,
+    buy: &VenueId,
+    sell: &VenueId,
+    buy_book: &crate::domain::Bbo,
+    sell_book: &crate::domain::Bbo,
+) -> Option<HedgePlan> {
+    let buy_sp = own_spread_mid_pct(buy_book);
+    let sell_sp = own_spread_mid_pct(sell_book);
+    let (first_v, _second_v) = first_limit_venue_all_in_or_left(
+        cfg,
+        buy,
+        sell,
+        &pair.legs[0].venue,
+        buy_sp,
+        sell_sp,
+    );
+    let mut plan = build(pair, cfg, qty, is_open, buy, sell)?;
+    let first_is_buy = first_v.as_str() == buy.as_str();
+    let buy_leg = pair.leg(buy.as_str())?;
+    let sell_leg = pair.leg(sell.as_str())?;
+    let (mut first, mut second) = if first_is_buy {
+        (plan.first.clone(), plan.second.clone())
+    } else {
+        (plan.second.clone(), plan.first.clone())
+    };
+    first.is_buy = first_is_buy;
+    first.style = OrderStyle::LimitMaker;
+    first.limit_price = Some(if first_is_buy {
+        buy_book.bid
+    } else {
+        sell_book.ask
+    });
+    second.is_buy = !first_is_buy;
+    second.style = OrderStyle::MarketTaker;
+    second.limit_price = None;
+    if first_is_buy {
+        first.venue = buy.as_str().to_string();
+        first.symbol = buy_leg.raw_symbol.clone();
+        first.market_index = buy_leg.market_index;
+        first.min_qty = buy_leg.min_qty;
+        second.venue = sell.as_str().to_string();
+        second.symbol = sell_leg.raw_symbol.clone();
+        second.market_index = sell_leg.market_index;
+        second.min_qty = sell_leg.min_qty;
+    } else {
+        first.venue = sell.as_str().to_string();
+        first.symbol = sell_leg.raw_symbol.clone();
+        first.market_index = sell_leg.market_index;
+        first.min_qty = sell_leg.min_qty;
+        second.venue = buy.as_str().to_string();
+        second.symbol = buy_leg.raw_symbol.clone();
+        second.market_index = buy_leg.market_index;
+        second.min_qty = buy_leg.min_qty;
+    }
+    plan.first = first;
+    plan.second = second;
+    plan.style = OrderStyle::LimitThenMarket;
+    plan.burst = true;
+    Some(plan)
+}
+
+fn own_spread_mid_pct(b: &crate::domain::Bbo) -> Option<Decimal> {
+    let mid = (b.bid + b.ask) / Decimal::from(2);
+    if mid <= Decimal::ZERO {
+        return None;
+    }
+    Some((b.ask - b.bid) / mid * Decimal::from(100))
 }
 
 fn sequenced_legs(
@@ -205,7 +212,7 @@ fn sequenced_legs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{adjacent_quotes, CloseReason, VenueId, VenueMarket};
+    use crate::domain::{Bbo, CloseReason, VenueId, VenueMarket};
     use rust_decimal_macros::dec;
 
     fn pair() -> Pair {
@@ -304,83 +311,43 @@ mod tests {
     }
 
     #[test]
-    fn adjacent_plan_is_limit_then_market_on_pair_slot() {
+    fn burst_plan_uses_l1_and_limit_maker() {
+        use std::time::Instant;
         let cfg = AppConfig::load_from(std::path::Path::new("config/default.yaml")).unwrap();
         let p = pair();
-        let left = p.legs[0].venue.clone();
-        let right = p.legs[1].venue.clone();
-        let q = adjacent_quotes(
-            0,
-            dec!(0),
-            dec!(0.02),
-            3,
-            Decimal::ZERO,
-            &left,
-            &right,
-            dec!(0.001),
-            Decimal::ZERO,
-        );
-        let plus = q.iter().find(|x| x.side == crate::domain::QuoteSide::Plus).unwrap();
-        let plan = plan_adjacent(
+        let buy = p.legs[0].venue.clone();
+        let sell = p.legs[1].venue.clone();
+        let buy_book = Bbo {
+            bid: dec!(100),
+            ask: dec!(100.1),
+            bid_qty: dec!(1),
+            ask_qty: dec!(1),
+            ts: Instant::now(),
+            bids: vec![],
+            asks: vec![],
+        };
+        let sell_book = Bbo {
+            bid: dec!(99.9),
+            ask: dec!(100),
+            bid_qty: dec!(1),
+            ask_qty: dec!(1),
+            ts: Instant::now(),
+            bids: vec![],
+            asks: vec![],
+        };
+        let plan = plan_burst(
             &p,
-            plus,
             &cfg,
-            &left,
-            dec!(100.05),
-            0,
             dec!(0.001),
-            None,
-            None,
+            true,
+            &buy,
+            &sell,
+            &buy_book,
+            &sell_book,
         )
         .unwrap();
-        assert!(plan.rest_quote);
-        assert_eq!(plan.style, OrderStyle::LimitThenMarket);
-        assert_eq!(plan.slot, p.slot_key());
-        assert_eq!(plan.quote_side, Some(crate::domain::QuoteSide::Plus));
+        assert!(plan.burst);
         assert_eq!(plan.first.style, OrderStyle::LimitMaker);
-        assert_eq!(plan.first.limit_price, Some(dec!(100.05)));
         assert_eq!(plan.second.style, OrderStyle::MarketTaker);
-        assert!(plan.second.limit_price.is_none());
-        assert!(plan.is_open);
-        assert_eq!(plan.grid_from, 0);
-        assert_eq!(plan.grid_to, 1);
-        assert_eq!(plan.base_qty, dec!(0.001));
-    }
-
-    #[test]
-    fn adjacent_first_leg_is_wider_spread_venue() {
-        let cfg = AppConfig::load_from(std::path::Path::new("config/default.yaml")).unwrap();
-        let p = pair();
-        let left = p.legs[0].venue.clone();
-        let right = p.legs[1].venue.clone();
-        let q = adjacent_quotes(
-            0,
-            dec!(0),
-            dec!(0.02),
-            3,
-            Decimal::ZERO,
-            &left,
-            &right,
-            dec!(0.001),
-            Decimal::ZERO,
-        );
-        let plus = q.iter().find(|x| x.side == crate::domain::QuoteSide::Plus).unwrap();
-        // plus: 卖 L 买 R。R 点差更宽 → 第一腿挂 R（买）。
-        let plan = plan_adjacent(
-            &p,
-            plus,
-            &cfg,
-            &left,
-            dec!(100.05),
-            0,
-            dec!(0.001),
-            Some(dec!(0.05)),
-            Some(dec!(0.01)),
-        )
-        .unwrap();
-        assert_eq!(plan.first.venue, right.as_str());
-        assert!(plan.first.is_buy);
-        assert_eq!(plan.second.venue, left.as_str());
-        assert!(!plan.second.is_buy);
     }
 }

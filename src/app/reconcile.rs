@@ -98,8 +98,9 @@ pub fn audit_position_qty(
     if a.is_zero() ^ b.is_zero() {
         return None;
     }
+    // 同向且都非零：对冲量不是 0，是「不能自动对账」。返回 None 让调用方跳过。
     if !a.is_zero() && !b.is_zero() && a.is_sign_positive() == b.is_sign_positive() {
-        return Some((memory_qty, Decimal::ZERO));
+        return None;
     }
     let hedged = a.abs().min(b.abs());
     let tol = pair.min_qty();
@@ -107,6 +108,36 @@ pub fn audit_position_qty(
         return None;
     }
     Some((memory_qty, hedged))
+}
+
+/// 两腿同向且都非零：不能按重叠量缩内存，否则会当空仓再开、叠在同向仓上。
+pub fn same_sign_open_positions(pair: &Pair, accounts: &VenueAccountCache) -> bool {
+    if !accounts.all_fresh() {
+        return false;
+    }
+    let a = venue_position_qty(accounts, &pair.legs[0]);
+    let b = venue_position_qty(accounts, &pair.legs[1]);
+    !a.is_zero() && !b.is_zero() && a.is_sign_positive() == b.is_sign_positive()
+}
+
+/// 内存对锁仓与交易所方向一致：买腿多为正、卖腿空为负。
+pub fn memory_hedge_matches_exchange(
+    pair: &Pair,
+    pos: &crate::domain::Position,
+    accounts: &VenueAccountCache,
+) -> bool {
+    if !accounts.all_fresh() || pos.qty <= Decimal::ZERO {
+        return false;
+    }
+    let Some(buy_leg) = pair.legs.iter().find(|l| l.venue == pos.buy) else {
+        return false;
+    };
+    let Some(sell_leg) = pair.legs.iter().find(|l| l.venue == pos.sell) else {
+        return false;
+    };
+    let buy_q = venue_position_qty(accounts, buy_leg);
+    let sell_q = venue_position_qty(accounts, sell_leg);
+    buy_q > Decimal::ZERO && sell_q < Decimal::ZERO
 }
 
 /// 两所已有反向仓时的重叠对冲量（内存为空时用来把库存捡回来）。
@@ -394,16 +425,14 @@ mod tests {
     }
 
     #[test]
-    fn audit_same_direction_is_zero_hedge() {
+    fn audit_same_direction_skips_auto_reconcile() {
         let accounts = cache(vec![
             snap("sodex", Some(dec!(10)), true),
             snap("lighter", Some(dec!(5)), true),
         ]);
         let p = pair("sodex", "lighter");
-        assert_eq!(
-            audit_position_qty(&p, &accounts, dec!(5)),
-            Some((dec!(5), Decimal::ZERO))
-        );
+        assert!(same_sign_open_positions(&p, &accounts));
+        assert_eq!(audit_position_qty(&p, &accounts, dec!(5)), None);
     }
 
     #[test]

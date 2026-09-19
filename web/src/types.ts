@@ -19,6 +19,17 @@ export interface PairOverride {
   split_order_size?: string | number | null;
 }
 
+export interface BurstParams {
+  enabled: boolean;
+  open_repeats: number;
+  pause_ms_min: number;
+  pause_ms_max: number;
+  cooldown_ms_min: number;
+  cooldown_ms_max: number;
+  limit_rehang_timeout_ms: number;
+  hedge_max_attempts: number;
+}
+
 export interface PairSetting {
   symbol: string;
   base_qty: string | number;
@@ -50,14 +61,11 @@ export interface ArbitrageParams {
   window_samples: number;
   sample_interval_ms: number;
   step_hysteresis: string | number;
-  symmetric_limit: boolean;
-  quote_reprice_ratio: string | number;
-  min_quote_gap_ratio: string | number;
-    limit_timeout_ms: number;
-    adjacent_timeout_ms: number;
-    maker_inside_ticks: number;
-    limit_retry_count: number;
-    ioc_fill_wait_ms: number;
+  burst: BurstParams;
+  limit_timeout_ms: number;
+  maker_inside_ticks: number;
+  limit_retry_count: number;
+  ioc_fill_wait_ms: number;
   default_slip_pct: string | number;
   max_slippage_pct: string | number;
   emergency_slippage_multiplier: string | number;

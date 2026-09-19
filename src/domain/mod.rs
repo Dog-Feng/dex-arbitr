@@ -1,4 +1,3 @@
-pub mod adjacent;
 pub mod book;
 pub mod funding;
 pub mod grid;
@@ -13,11 +12,7 @@ pub use funding::{
     FundingView, VenueFunding,
 };
 pub use grid::{grid_step_from_target_bp, CloseReason, CloseView, GridParams, Intent};
-pub use adjacent::{
-    add_quote_far_enough, adjacent_quotes, implied_first_limit, limit_moved_ticks, quote_pending_key,
-    AdjacentQuote, QuoteSide,
-};
-pub use window_grid::{WindowGridEngine, WindowGridParams};
+pub use window_grid::{step_after_qty, WindowGridEngine, WindowGridParams};
 pub use position::Position;
 pub use spread::NetSpread;
 pub use symbol::{

@@ -151,14 +151,24 @@ type push struct {
 	Data  any    `json:"data"`
 }
 
-// 单次请求处理超时 = 成交确认窗口 + 15s（下单往返和签名）。
-// place 带 fill_wait_ms 时按该窗口加长，避免 ctx 先到期打断回查。
+// 单次请求处理超时。写操作（place/cancel）固定 90s，盖住 Lighter 市价确认
+// 窗口；Rust 侧写超时 100s，必须比这边长，否则 sidecar 还在跑 Rust 已当失败。
 func handlerTimeout(req request) time.Duration {
+	const writeBudget = 90 * time.Second
+	const queryBudget = 10 * time.Second
 	const extra = 15 * time.Second
-	if req.Cmd == "place" {
-		return fillWaitOf(req.Params) + extra
+	switch req.Cmd {
+	case "place":
+		t := fillWaitOf(req.Params) + extra
+		if t < writeBudget {
+			return writeBudget
+		}
+		return t
+	case "cancel":
+		return writeBudget
+	default:
+		return queryBudget
 	}
-	return iocFillWait + extra
 }
 
 // fillWaitOf 读 place 的 fill_wait_ms；缺省或 0 用 1 秒。夹在 100ms–30s。

@@ -1,6 +1,6 @@
 # dex-arbitr
 
-Lighter 主网 ↔ Lighter Robinhood ↔ SoDEX ↔ Entropy 永续价差套利。主逻辑是分段网格；`execution.enabled: true` 走统一决策环（固定每格数量 + 容量校验 + 先挂后吃）。`paper_trading: false` 且 `monitor_only: false` 时经 Go `exchange_sidecar` 实盘。当前默认 `execution` / `scan` 都关，走事件格子环。详见 [docs/项目说明.md](docs/项目说明.md)。
+Lighter 主网 ↔ Lighter Robinhood ↔ SoDEX ↔ Entropy 永续价差套利。主逻辑是分段网格；`execution.enabled: true` 走统一决策环（固定每格数量 + 容量校验 + 先挂后吃）。进程始终经 Go `exchange_sidecar` 实盘；yaml 不要写已删除的 `paper_trading` / `monitor_only`（会拒绝启动）。当前默认 `execution` / `scan` 都关，走事件格子环。详见 [docs/项目说明.md](docs/项目说明.md)。
 
 ## 文档
 
@@ -22,8 +22,8 @@ Lighter 主网 ↔ Lighter Robinhood ↔ SoDEX ↔ Entropy 永续价差套利。
 
 1. 复制 `config/venues/lighter.example.yaml` → `lighter.yaml`，Robinhood 同理，填入手钥。
 2. 当前默认 `execution.enabled: false`、`scan.enabled: false`。只扫毛价差时打开 `scan.enabled`；跑套利打开 `execution.enabled`。`pairs.enabled` 列出要交易的 base 和每格数量；启动先加载各所交集供页面勾选，点启动才订阅。模板：`config/venues/*.example.yaml`（含 `entropy.example.yaml`）。
-3. 联调决策/容量校验/paper 持仓（仍不发单）：`execution.enabled: true`、`scan.enabled: false`、`monitor_only: false`、`paper_trading: true`，并设 `sizing.fallback_available_usdc`。配置页勾选交易对，数量 ≥ min_qty 且符合精度。
-4. 小额实盘：构建 `scripts/exchange_sidecar` 后 `cargo run --release --bin live-test -- account lighter`，再设 `paper_trading: false`。页面必须打开 **`http://127.0.0.1:8090/`**（不要直接打开 html）。前端是 Vue：`cd web && npm install && npm run build`，产物在 `web/dist`。
+3. 联调决策/容量校验：`execution.enabled: true`、`scan.enabled: false`。配置页勾选交易对，数量 ≥ min_qty 且符合精度。始终实盘，yaml 不要写 `paper_trading` / `monitor_only`（会拒绝启动）。`sizing.fallback_available_usdc` 仅查询失败时才兜底，不要默认 500。
+4. 小额实盘：构建 `scripts/exchange_sidecar` 后 `cargo run --release --bin live-test -- account lighter`。页面必须打开 **`http://127.0.0.1:8090/`**（不要直接打开 html）。前端是 Vue：`cd web && npm install && npm run build`，产物在 `web/dist`。
 5. 仓库根目录编译并运行。日志在控制台和 `data/logs/`。跨 DEX 的 `nat` 在 `data/spreads.sqlite`，重启直接用，默认 30 分钟重算。
 6. 拷回本机后可统计：`python scripts/analyze_scan_log.py dex-arbitr.log.2026-08-24`
 

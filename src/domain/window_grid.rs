@@ -54,6 +54,33 @@ fn split_order_qty(delta: Decimal, params: &WindowGridParams) -> Decimal {
     qty
 }
 
+/// 拆单未凑满目标格时不推进 STEP。
+///
+/// 开仓（`|next| > |k|`）：成交后数量仍 `< |next|×base_qty` 则 `grid` 停在 `k`。
+/// 平仓（`|next| < |k|`）：成交后数量仍 `> |next|×base_qty` 则 `grid` 停在 `k`。
+/// `dex_test_mode` 截断 qty 后也走这里重算 `grid_to`。
+pub fn step_after_qty(k: i32, next: i32, qty_after: Decimal, base_qty: Decimal) -> i32 {
+    if base_qty <= Decimal::ZERO {
+        return next;
+    }
+    let target = Decimal::from(next.unsigned_abs()) * base_qty;
+    if next.abs() > k.abs() {
+        if qty_after < target {
+            k
+        } else {
+            next
+        }
+    } else if next.abs() < k.abs() {
+        if qty_after > target {
+            k
+        } else {
+            next
+        }
+    } else {
+        next
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PersistCfg {
     window: Duration,
@@ -153,40 +180,46 @@ impl WindowGridEngine {
 
         if next > k {
             if k >= 0 {
+                let grid = step_after_qty(k, next, held_qty + one, params.base_qty);
                 Intent::Open {
                     qty: one,
                     buy: right.clone(),
                     sell: left.clone(),
-                    grid: next,
+                    grid,
                 }
             } else {
                 let qty = close_qty(next, held_qty, one);
                 if qty <= Decimal::ZERO {
                     return Intent::Hold;
                 }
+                let remaining = (held_qty - qty).max(Decimal::ZERO);
+                let grid = step_after_qty(k, next, remaining, params.base_qty);
                 Intent::Close {
                     qty,
-                    grid: next,
+                    grid,
                     reason: CloseReason::GridReduce,
                     round_trip_pct: Decimal::ZERO,
                 }
             }
         } else if next < k {
             if k <= 0 {
+                let grid = step_after_qty(k, next, held_qty + one, params.base_qty);
                 Intent::Open {
                     qty: one,
                     buy: left.clone(),
                     sell: right.clone(),
-                    grid: next,
+                    grid,
                 }
             } else {
                 let qty = close_qty(next, held_qty, one);
                 if qty <= Decimal::ZERO {
                     return Intent::Hold;
                 }
+                let remaining = (held_qty - qty).max(Decimal::ZERO);
+                let grid = step_after_qty(k, next, remaining, params.base_qty);
                 Intent::Close {
                     qty,
-                    grid: next,
+                    grid,
                     reason: CloseReason::GridReduce,
                     round_trip_pct: Decimal::ZERO,
                 }
@@ -625,5 +658,116 @@ mod tests {
             Intent::Close { grid, .. } => assert_eq!(grid, 2),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn split_open_does_not_advance_step_until_full_grid() {
+        let mut p = params();
+        p.split_order_size = dec!(0.0003);
+        p.base_qty = dec!(0.001);
+        let mut eng = WindowGridEngine::default();
+        let t = Instant::now();
+        match eng.decide(
+            SLOT,
+            0,
+            dec!(0.375),
+            dec!(0),
+            Decimal::ZERO,
+            &left(),
+            &right(),
+            Decimal::ZERO,
+            &p,
+            t,
+        ) {
+            Intent::Open { qty, grid, .. } => {
+                assert_eq!(qty, dec!(0.0003));
+                assert_eq!(grid, 0);
+            }
+            other => panic!("{other:?}"),
+        }
+        match eng.decide(
+            SLOT,
+            0,
+            dec!(0.375),
+            dec!(0),
+            Decimal::ZERO,
+            &left(),
+            &right(),
+            dec!(0.0008),
+            &p,
+            t,
+        ) {
+            Intent::Open { qty, grid, .. } => {
+                assert_eq!(qty, dec!(0.0003));
+                assert_eq!(grid, 1);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn split_close_does_not_drop_step_until_qty_fits() {
+        let mut p = params();
+        p.split_order_size = dec!(0.0003);
+        p.base_qty = dec!(0.001);
+        let mut eng = WindowGridEngine::default();
+        let t = Instant::now();
+        match eng.decide(
+            SLOT,
+            2,
+            dec!(0),
+            dec!(0),
+            Decimal::ZERO,
+            &left(),
+            &right(),
+            dec!(0.002),
+            &p,
+            t,
+        ) {
+            Intent::Close { qty, grid, .. } => {
+                assert_eq!(qty, dec!(0.0003));
+                assert_eq!(grid, 2);
+            }
+            other => panic!("{other:?}"),
+        }
+        match eng.decide(
+            SLOT,
+            2,
+            dec!(0),
+            dec!(0),
+            Decimal::ZERO,
+            &left(),
+            &right(),
+            dec!(0.0012),
+            &p,
+            t,
+        ) {
+            Intent::Close { qty, grid, .. } => {
+                assert_eq!(qty, dec!(0.0003));
+                assert_eq!(grid, 1);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn step_after_qty_truncates_open_and_close() {
+        assert_eq!(
+            step_after_qty(0, 1, dec!(0.0003), dec!(0.001)),
+            0
+        );
+        assert_eq!(
+            step_after_qty(0, 1, dec!(0.001), dec!(0.001)),
+            1
+        );
+        assert_eq!(
+            step_after_qty(2, 1, dec!(0.0017), dec!(0.001)),
+            2
+        );
+        assert_eq!(
+            step_after_qty(2, 1, dec!(0.001), dec!(0.001)),
+            1
+        );
+        assert_eq!(step_after_qty(1, 0, Decimal::ZERO, dec!(0.001)), 0);
     }
 }

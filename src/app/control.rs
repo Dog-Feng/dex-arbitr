@@ -10,10 +10,10 @@
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
-use crate::config::{AppConfig, PairDefaults, PairSetting};
+use crate::config::{AppConfig, BurstConfig, PairDefaults, PairSetting};
 
 fn default_window_samples() -> usize {
-    1_000
+    300
 }
 
 fn default_scan_window_samples() -> usize {
@@ -28,12 +28,17 @@ fn default_step_hysteresis() -> Decimal {
     Decimal::ZERO
 }
 
-fn default_quote_reprice_ratio() -> Decimal {
-    Decimal::new(2, 1)
-}
-
-fn default_min_quote_gap_ratio() -> Decimal {
-    Decimal::new(3, 1)
+fn default_burst_params() -> BurstConfig {
+    BurstConfig {
+        enabled: false,
+        open_repeats: 10,
+        pause_ms_min: 3000,
+        pause_ms_max: 10000,
+        cooldown_ms_min: 60_000,
+        cooldown_ms_max: 300_000,
+        limit_rehang_timeout_ms: 2000,
+        hedge_max_attempts: 20,
+    }
 }
 
 /// default.yaml 里**全部**可在 UI 热改的参数。
@@ -86,20 +91,16 @@ pub struct ArbitrageParams {
     pub sample_interval_ms: u64,
     #[serde(default = "default_step_hysteresis")]
     pub step_hysteresis: Decimal,
-    #[serde(default)]
-    pub symmetric_limit: bool,
-    #[serde(default = "default_quote_reprice_ratio")]
-    pub quote_reprice_ratio: Decimal,
-    #[serde(default = "default_min_quote_gap_ratio")]
-    pub min_quote_gap_ratio: Decimal,
+
+    // ═══ burst（阶段 2，与阶段 1 互斥）═══
+    #[serde(default = "default_burst_params")]
+    pub burst: BurstConfig,
 
     // ═══ order ═══
     pub limit_timeout_ms: u64,
-    #[serde(default)]
-    pub adjacent_timeout_ms: u64,
     pub maker_inside_ticks: u32,
     pub limit_retry_count: u32,
-    /// 市价 / IOC / 撤后等该单 WS 的毫秒数。默认 1000，可改 2000/3000。
+    /// 市价 / IOC / 撤后等该单 WS 的毫秒数。默认 2000，可改 1000/3000。
     #[serde(default = "crate::config::default_ioc_fill_wait_ms")]
     pub ioc_fill_wait_ms: u64,
 
@@ -143,12 +144,10 @@ impl ArbitrageParams {
             window_samples: cfg.grid.window_samples,
             sample_interval_ms: cfg.grid.sample_interval_ms,
             step_hysteresis: cfg.grid.step_hysteresis,
-            symmetric_limit: cfg.grid.symmetric_limit,
-            quote_reprice_ratio: cfg.grid.quote_reprice_ratio,
-            min_quote_gap_ratio: cfg.grid.min_quote_gap_ratio,
+
+            burst: cfg.burst.clone(),
 
             limit_timeout_ms: cfg.order.limit_timeout_ms,
-            adjacent_timeout_ms: cfg.order.adjacent_timeout_ms,
             maker_inside_ticks: cfg.order.maker_inside_ticks,
             limit_retry_count: cfg.order.limit_retry_count,
             ioc_fill_wait_ms: cfg.order.ioc_fill_wait_ms_clamped(),
@@ -195,12 +194,10 @@ impl ArbitrageParams {
         cfg.grid.window_samples = self.window_samples.max(1);
         cfg.grid.sample_interval_ms = self.sample_interval_ms.max(1);
         cfg.grid.step_hysteresis = self.step_hysteresis.max(Decimal::ZERO);
-        cfg.grid.symmetric_limit = self.symmetric_limit;
-        cfg.grid.quote_reprice_ratio = self.quote_reprice_ratio.max(Decimal::ZERO);
-        cfg.grid.min_quote_gap_ratio = self.min_quote_gap_ratio.max(Decimal::ZERO);
+
+        cfg.burst = self.burst.clone();
 
         cfg.order.limit_timeout_ms = self.limit_timeout_ms;
-        cfg.order.adjacent_timeout_ms = self.adjacent_timeout_ms;
         cfg.order.maker_inside_ticks = self.maker_inside_ticks;
         cfg.order.limit_retry_count = self.limit_retry_count.max(1);
         cfg.order.ioc_fill_wait_ms = self.ioc_fill_wait_ms.clamp(100, 30_000);
@@ -248,6 +245,17 @@ pub fn validate(p: &ArbitrageParams) -> ValidationResult {
     }
     if p.leverage_multiplier <= Decimal::ZERO {
         errors.push("leverage_multiplier 必须 > 0".into());
+    }
+    if p.burst.enabled {
+        if p.pairs.len() != 1 {
+            errors.push("burst.enabled 时 pairs 只能配置 1 个 symbol".into());
+        }
+        if p.active_venues.len() < 2 {
+            errors.push("burst.enabled 时需至少勾选 2 个交易所".into());
+        }
+        if let Err(e) = p.burst.validate() {
+            errors.push(e.to_string());
+        }
     }
     for s in &p.pairs {
         if s.symbol.trim().is_empty() {
@@ -316,17 +324,8 @@ mod tests {
         assert_eq!(cfg.pairs.defaults.max_segments, 5);
         assert_eq!(cfg.sizing.leverage_multiplier, dec!(3));
         assert_eq!(cfg.pairs.enabled[0].symbol, "SNDK");
-        assert!(!cfg.grid.symmetric_limit);
-        p.symmetric_limit = true;
-        p.quote_reprice_ratio = dec!(0.25);
-        p.min_quote_gap_ratio = dec!(0.4);
-        p.adjacent_timeout_ms = 0;
         p.ioc_fill_wait_ms = 2000;
         p.apply_to(&mut cfg);
-        assert!(cfg.grid.symmetric_limit);
-        assert_eq!(cfg.grid.quote_reprice_ratio, dec!(0.25));
-        assert_eq!(cfg.grid.min_quote_gap_ratio, dec!(0.4));
-        assert_eq!(cfg.order.adjacent_timeout_ms, 0);
         assert_eq!(cfg.order.ioc_fill_wait_ms, 2000);
     }
 

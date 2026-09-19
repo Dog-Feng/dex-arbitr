@@ -85,10 +85,10 @@ flowchart TD
 2. \(\mathrm{mid}_L=(\mathrm{bid}_L+\mathrm{ask}_L)/2\)，R 同理。  
 3. \(s_t = (\mathrm{mid}_L-\mathrm{mid}_R)/((\mathrm{mid}_L+\mathrm{mid}_R)/2)\times 100\)（单位 %，与 \(\Delta\) 一致）。  
 4. 本秒尚未写入则 `push(s)`；已写入则忽略本拍。  
-5. 窗口长度上限 `window_samples`（代码默认 10000，当前 yaml 1000），满则丢最老一个。  
+5. 窗口长度上限 `window_samples`（yaml / 代码缺省 300 ≈ 5 分钟），满则丢最老一个。  
 6. 点数未满：\(\mu\) 不存在，**禁止开仓**（有仓的强制平仓仍走现有 CloseReason，不经过格子）。
 
-冷启动：10000 秒 ≈ 2h47m，1000 秒 ≈ 17 分钟。这是攒样本，不是「等满窗秒数才下单」。满窗后每秒都有 \(\mu\)。
+冷启动：300 秒 ≈ 5 分钟。这是攒样本，不是「等满窗秒数才下单」。满窗后每秒都有 \(\mu\)。
 
 同一秒多次 BBO 只保留 **最后一次合法** \(s\)（实现上：该秒第一次写或每次覆盖，在秒结束前以最后一次为准；简单实现可用「该秒第一次合法就写、本秒不再改」——规格取 **该秒最后一次**，实现用「每拍覆盖本秒桶，秒切换时才 commit」或「秒内只写一次」二选一，**推荐秒内覆盖、换秒时窗口里已是该秒最后价**）。
 
@@ -206,7 +206,7 @@ c = (\mathrm{ask}-\mathrm{bid})/\mathrm{mid}\times 100
 
 **发单固定双腿同时市价**：`force_market_taker` 改 `plan.style`，两腿并行 `place`，各自认成交后再回滚。不把阶段 2 的「先确认限价再发市价」套进来。yaml/页面 `order.style` 默认仍是 LTM，**发单跟 plan**。
 
-**开仓条件仍是本节 3.1–3.8**（μ 满窗、空仓点差中枢满、可执行价差跨格、持续性、容量/深度）。`symmetric_limit=true` 时 `process_pair` 提前进邻档，不会走 `WindowGridEngine`。F=0、离格线够远、改价撤都是阶段 2，不拦阶段 1。市价确认窗口是 `order.ioc_fill_wait_ms`（默认 1000，页面可热改）。
+**开仓条件仍是本节 3.1–3.8**（μ 满窗、空仓点差中枢满、可执行价差跨格、持续性、容量/深度）。`burst.enabled=true` 时走阶段 2 Burst，**不会**走 `WindowGridEngine`。市价确认窗口是 `order.ioc_fill_wait_ms`（默认 2000，页面可热改）。
 
 强制离场（超时、余额、费率）：一次平 \(\lvert k\rvert\) 格，不受 ±1 限制。
 

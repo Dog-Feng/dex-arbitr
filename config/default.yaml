@@ -39,8 +39,8 @@ sizing:
   # 停止套利后仍继续刷新，不依赖套利开关。
   refresh_balance_secs: 5
   margin_utilization_pct: "90"
-  # SoDEX 公开余额接口可能为空；有真实余额时以 bridge 为准
-  fallback_available_usdc: "500"
+  # 仅 account 查询失败时的联调兜底。0 / 不写 = 不假装有保证金。查询成功但余额为 0 不走这里。
+  fallback_available_usdc: "0"
 
 # 扫描环：analysis_interval_ms / watch_top。旧毛价差门槛与天然基差已拆。
 # scan.enabled: false 且 execution.enabled: false 时走事件格子环。
@@ -79,21 +79,27 @@ grid:
   # 决策环 100ms 一拍则 1 秒大约查 10 次。min_hits = 这 1 秒里至少几次达标即通过（5 或 7）。0 = 连续不掉线。
   persistence_ms: 1000
   persistence_min_hits: 7
-  # 满这么多个秒级点才有 μ（跨所 mid 价差）和各所点差中枢。1000 ≈ 17 分钟；代码默认 10000 ≈ 2h47m。两所中枢平均折进 Δ。
+  # 满这么多个秒级点才有 μ（跨所 mid 价差）和各所点差中枢。300 ≈ 5 分钟（1Hz）。
   window_samples: 300
   sample_interval_ms: 1000
   # STEP 滞后（格）。加仓 raw ≥ k+1−h，减仓 raw ≤ k−1+h。
   step_hysteresis: "0"
-  # true = 阶段 2：满窗后在 μ±Δ 挂邻档第一腿，成交推进 STEP。
-  symmetric_limit: false
-  quote_reprice_ratio: "0.2"
-  min_quote_gap_ratio: "0.3"
 
-# 邻档不走 limit_timeout_ms。市价 / IOC / 撤后确认：等该单推送
+# 阶段 2：Burst L1 循环（与阶段 1 STEP 互斥，见 burst.enabled）。
+burst:
+  enabled: false
+  open_repeats: 10
+  pause_ms_min: 3000
+  pause_ms_max: 10000
+  cooldown_ms_min: 60000
+  cooldown_ms_max: 300000
+  limit_rehang_timeout_ms: 2000
+  hedge_max_attempts: 20
+
+# 市价 / IOC / 撤后确认：等该单推送
 # ioc_fill_wait_ms，没有再查一次。页面可热改（2000 / 3000 均可）。
 order:
   limit_timeout_ms: 2000
-  adjacent_timeout_ms: 0
   # maker 腿往点差内侧挪几个 tick。0 = 贴自家 bid/ask（队尾，2 秒超时几乎
   # 不可能成交）。参考项目的 tick 模式就是买 Ask1−1tick、卖 Bid1+1tick。
   maker_inside_ticks: 1

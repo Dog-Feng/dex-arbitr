@@ -27,8 +27,107 @@ pub struct AppConfig {
     pub live_test: LiveTestConfig,
     #[serde(default = "default_http")]
     pub http: HttpConfig,
+    #[serde(default = "default_burst")]
+    pub burst: BurstConfig,
     #[serde(skip)]
     pub venue_fees: HashMap<String, VenueFees>,
+}
+
+/// 阶段 2：L1 限价循环 + 市价对冲（与阶段 1 STEP 互斥）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BurstConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_burst_open_repeats")]
+    pub open_repeats: u32,
+    #[serde(default = "default_burst_pause_min")]
+    pub pause_ms_min: u64,
+    #[serde(default = "default_burst_pause_max")]
+    pub pause_ms_max: u64,
+    #[serde(default = "default_burst_cooldown_min")]
+    pub cooldown_ms_min: u64,
+    #[serde(default = "default_burst_cooldown_max")]
+    pub cooldown_ms_max: u64,
+    #[serde(default = "default_burst_rehang_ms")]
+    pub limit_rehang_timeout_ms: u64,
+    #[serde(default = "default_burst_hedge_attempts")]
+    pub hedge_max_attempts: u32,
+}
+
+fn default_burst() -> BurstConfig {
+    BurstConfig {
+        enabled: false,
+        open_repeats: default_burst_open_repeats(),
+        pause_ms_min: default_burst_pause_min(),
+        pause_ms_max: default_burst_pause_max(),
+        cooldown_ms_min: default_burst_cooldown_min(),
+        cooldown_ms_max: default_burst_cooldown_max(),
+        limit_rehang_timeout_ms: default_burst_rehang_ms(),
+        hedge_max_attempts: default_burst_hedge_attempts(),
+    }
+}
+
+fn default_burst_open_repeats() -> u32 {
+    10
+}
+fn default_burst_pause_min() -> u64 {
+    3000
+}
+fn default_burst_pause_max() -> u64 {
+    10000
+}
+fn default_burst_cooldown_min() -> u64 {
+    60_000
+}
+fn default_burst_cooldown_max() -> u64 {
+    300_000
+}
+fn default_burst_rehang_ms() -> u64 {
+    2000
+}
+fn default_burst_hedge_attempts() -> u32 {
+    20
+}
+
+impl BurstConfig {
+    pub fn validate(&self) -> Result<()> {
+        if self.pause_ms_min > self.pause_ms_max {
+            anyhow::bail!("burst.pause_ms_min must be <= pause_ms_max");
+        }
+        if self.cooldown_ms_min > self.cooldown_ms_max {
+            anyhow::bail!("burst.cooldown_ms_min must be <= cooldown_ms_max");
+        }
+        if self.open_repeats == 0 {
+            anyhow::bail!("burst.open_repeats must be >= 1");
+        }
+        if self.hedge_max_attempts == 0 {
+            anyhow::bail!("burst.hedge_max_attempts must be >= 1");
+        }
+        if self.limit_rehang_timeout_ms < 200 {
+            anyhow::bail!("burst.limit_rehang_timeout_ms must be >= 200");
+        }
+        Ok(())
+    }
+
+    pub fn random_pause_ms(&self) -> u64 {
+        random_ms(self.pause_ms_min, self.pause_ms_max)
+    }
+
+    pub fn random_cooldown_ms(&self) -> u64 {
+        random_ms(self.cooldown_ms_min, self.cooldown_ms_max)
+    }
+}
+
+fn random_ms(min: u64, max: u64) -> u64 {
+    if max <= min {
+        return min;
+    }
+    let span = max - min;
+    min + (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0)
+        % (span + 1))
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -130,6 +229,9 @@ pub struct SizingConfig {
     /// 覆盖单所杠杆；未列出的所用 leverage_multiplier。
     #[serde(default)]
     pub leverage_by_venue: HashMap<String, Decimal>,
+    /// 任一腿可用余额低于此值则强制平仓。0 = 关闭。
+    #[serde(default)]
+    pub balance_floor_usdc: Decimal,
 }
 
 fn default_margin_utilization_pct() -> Decimal {
@@ -156,6 +258,7 @@ fn default_sizing() -> SizingConfig {
         fallback_available_usdc: None,
         margin_utilization_pct: Decimal::from(90),
         leverage_by_venue: HashMap::new(),
+        balance_floor_usdc: Decimal::ZERO,
     }
 }
 
@@ -196,7 +299,7 @@ fn default_scan() -> ScanConfig {
 }
 
 fn default_scan_window_samples() -> usize {
-    60
+    120
 }
 
 fn default_max_own_spread_pct() -> Decimal {
@@ -310,19 +413,13 @@ pub struct GridConfig {
     /// STEP 滞后（格）。加仓 raw ≥ k+1−h，减仓 raw ≤ k−1+h。
     #[serde(default = "default_step_hysteresis")]
     pub step_hysteresis: Decimal,
-    /// true = 阶段 2 邻档限价；false = 阶段 1 撞线双市价。
+    /// 持仓超过此时长强制平到 0。0 = 关闭。
     #[serde(default)]
-    pub symmetric_limit: bool,
-    /// 空仓 |μ_live−μ_quote| ≥ 此比例×Δ 才改挂单价。
-    #[serde(default = "default_quote_reprice_ratio")]
-    pub quote_reprice_ratio: Decimal,
-    /// 加仓档与当前可执行价差至少隔这么多格（×Δ）才挂。减仓档不限制。
-    #[serde(default = "default_min_quote_gap_ratio")]
-    pub min_quote_gap_ratio: Decimal,
+    pub max_hold_secs: u64,
 }
 
 fn default_window_samples() -> usize {
-    10_000
+    300
 }
 
 fn default_sample_interval_ms() -> u64 {
@@ -333,22 +430,11 @@ fn default_step_hysteresis() -> Decimal {
     Decimal::new(25, 2)
 }
 
-fn default_quote_reprice_ratio() -> Decimal {
-    Decimal::new(2, 1)
-}
-
-fn default_min_quote_gap_ratio() -> Decimal {
-    Decimal::new(3, 1)
-}
-
 #[derive(Debug, Clone, Deserialize)]
 pub struct OrderConfig {
     /// 追逐型限价（第二腿 IOC / 非邻档）单轮最长等待。邻档不走这个。
     #[serde(default = "default_limit_timeout_ms")]
     pub limit_timeout_ms: u64,
-    /// 邻档第一腿存活。0 = 只按事件撤，不按秒超时。
-    #[serde(default)]
-    pub adjacent_timeout_ms: u64,
     /// maker 腿往点差内侧挪几个 tick。0 = 贴自家盘口（队尾，几乎不成交）。
     #[serde(default = "default_maker_inside_ticks")]
     pub maker_inside_ticks: u32,
@@ -377,7 +463,7 @@ fn default_limit_timeout_ms() -> u64 {
 }
 
 pub fn default_ioc_fill_wait_ms() -> u64 {
-    1000
+    2000
 }
 
 fn default_maker_inside_ticks() -> u32 {
@@ -558,6 +644,28 @@ impl VenueAuth {
     }
 }
 
+/// `paper_trading` / `monitor_only` 已从代码删除。serde 会静默忽略未知字段，
+/// 按文档设 `paper_trading: true` 会直接实盘。启动时拒绝这些键。
+fn reject_removed_trading_flags(raw: &str) -> Result<()> {
+    let value: serde_yaml::Value = serde_yaml::from_str(raw).context("parse yaml")?;
+    if yaml_has_key(&value, "paper_trading") || yaml_has_key(&value, "monitor_only") {
+        anyhow::bail!(
+            "paper_trading / monitor_only were removed; this process always sends live orders. Delete those keys from the yaml."
+        );
+    }
+    Ok(())
+}
+
+fn yaml_has_key(v: &serde_yaml::Value, key: &str) -> bool {
+    match v {
+        serde_yaml::Value::Mapping(m) => {
+            m.keys().any(|k| k.as_str() == Some(key)) || m.values().any(|v| yaml_has_key(v, key))
+        }
+        serde_yaml::Value::Sequence(s) => s.iter().any(|v| yaml_has_key(v, key)),
+        _ => false,
+    }
+}
+
 impl AppConfig {
     pub fn load() -> Result<Self> {
         Self::load_from(Path::new("config/default.yaml"))
@@ -566,8 +674,10 @@ impl AppConfig {
     pub fn load_from(path: &Path) -> Result<Self> {
         let raw = fs::read_to_string(path)
             .with_context(|| format!("read config {}", path.display()))?;
+        reject_removed_trading_flags(&raw)?;
         let mut cfg: AppConfig = serde_yaml::from_str(&raw).context("parse default.yaml")?;
         cfg.hydrate_fees()?;
+        cfg.burst.validate()?;
         Ok(cfg)
     }
 
@@ -827,16 +937,14 @@ mod tests {
         assert_eq!(cfg.scan.window_samples, 120);
         assert_eq!(cfg.grid.persistence_ms, 1000);
         assert_eq!(cfg.grid.persistence_min_hits, 7);
-        assert_eq!(cfg.grid.window_samples, 1000);
+        assert_eq!(cfg.grid.window_samples, 300);
         assert_eq!(cfg.grid.sample_interval_ms, 1000);
         assert_eq!(cfg.grid.step_hysteresis, Decimal::ZERO);
-        assert!(!cfg.grid.symmetric_limit);
-        assert_eq!(cfg.grid.quote_reprice_ratio, dec!(0.2));
-        assert_eq!(cfg.grid.min_quote_gap_ratio, dec!(0.3));
-        assert_eq!(cfg.order.adjacent_timeout_ms, 0);
-        assert_eq!(cfg.order.ioc_fill_wait_ms, 1000);
+        assert_eq!(cfg.order.ioc_fill_wait_ms, 2000);
         assert_eq!(cfg.pairs.defaults.target_bp, dec!(1));
         assert_eq!(cfg.sizing.leverage_multiplier, dec!(5));
+        assert!(!cfg.burst.enabled);
+        assert_eq!(cfg.grid.max_hold_secs, 0);
         let sodex = cfg.load_venue("sodex").unwrap();
         assert_eq!(sodex.chain_id, 623);
         assert_eq!(sodex.id, "sodex");
@@ -862,4 +970,10 @@ mod tests {
         );
     }
 
+    #[test]
+    fn rejects_removed_paper_trading_flag() {
+        let err = reject_removed_trading_flags("execution:\n  paper_trading: true\n").unwrap_err();
+        assert!(err.to_string().contains("paper_trading"));
+        assert!(reject_removed_trading_flags("execution:\n  enabled: false\n").is_ok());
+    }
 }

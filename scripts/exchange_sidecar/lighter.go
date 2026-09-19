@@ -210,18 +210,16 @@ func (s *lighterSession) account(ctx context.Context) (map[string]any, error) {
 	acc := accounts[0]
 	avail := decimalValue(acc["available_balance"])
 	collateral := decimalValue(acc["collateral"])
-	balances := make([]map[string]string, 0)
-	if collateral.GreaterThan(decimal.Zero) {
-		asset := "USDC"
-		if strings.EqualFold(s.venue.Quote, "USDG") {
-			asset = "USDG"
-		}
-		balances = append(balances, map[string]string{
-			"asset":     asset,
-			"available": avail.String(),
-			"total":     collateral.String(),
-		})
+	// collateral=0 也要上报：成功查询到没钱 ≠ 没查到。上层只在 account() 失败时才走 fallback。
+	asset := "USDC"
+	if strings.EqualFold(s.venue.Quote, "USDG") {
+		asset = "USDG"
 	}
+	balances := []map[string]string{{
+		"asset":     asset,
+		"available": avail.String(),
+		"total":     collateral.String(),
+	}}
 	positions := make([]map[string]any, 0)
 	for _, raw := range rawList(acc["positions"]) {
 		size := decimalValue(firstValue(raw, "position", "size"))
@@ -352,7 +350,7 @@ func (s *lighterSession) noteWsFills(msg map[string]any) {
 	}
 	now := time.Now()
 	for _, raw := range orders {
-		filled := orderFilledQty(raw)
+		filled := orderFilledQtyWs(raw)
 		if !filled.GreaterThan(decimal.Zero) {
 			continue
 		}
@@ -391,15 +389,9 @@ func looksLikeTrade(raw map[string]any) bool {
 }
 
 func orderFilledQty(raw map[string]any) decimal.Decimal {
-	filled := decimalValue(firstValue(raw, "filled_base_amount", "filled_amount"))
+	filled := orderFilledQtyWs(raw)
 	if filled.GreaterThan(decimal.Zero) {
 		return filled
-	}
-	if looksLikeTrade(raw) {
-		sz := decimalValue(raw["size"])
-		if sz.GreaterThan(decimal.Zero) {
-			return sz
-		}
 	}
 	// 撤单后 remaining 也会变成 0。订单上的 size 是挂单量，都不能当成交。
 	if orderIsCanceled(raw) {
@@ -409,6 +401,22 @@ func orderFilledQty(raw map[string]any) decimal.Decimal {
 	rem := decimalValue(raw["remaining_base_amount"])
 	if init.GreaterThan(rem) && rem.GreaterThanOrEqual(decimal.Zero) {
 		return init.Sub(rem)
+	}
+	return decimal.Zero
+}
+
+// WS 成交缓存只认明确成交量和 trades。remaining=0 会把撤单写进缓存，
+// 查单若优先命中 inactive 撤单就会漏掉 trades。
+func orderFilledQtyWs(raw map[string]any) decimal.Decimal {
+	filled := decimalValue(firstValue(raw, "filled_base_amount", "filled_amount"))
+	if filled.GreaterThan(decimal.Zero) {
+		return filled
+	}
+	if looksLikeTrade(raw) {
+		sz := decimalValue(raw["size"])
+		if sz.GreaterThan(decimal.Zero) {
+			return sz
+		}
 	}
 	return decimal.Zero
 }
@@ -617,7 +625,25 @@ func (s *lighterSession) place(ctx context.Context, params map[string]any) (map[
 		return nil, err
 	}
 	scale := decimal.New(1, int32(dec.sizeDec))
-	baseAmount := qty.Mul(scale).IntPart()
+	var baseAmount int64
+	if reduceOnly {
+		cap := reducePositionCap(params)
+		if !cap.GreaterThan(decimal.Zero) {
+			if acc, err := s.account(ctx); err == nil {
+				cap = absQtyFromPositions(acc["positions"], paramString(params, "symbol", ""))
+			}
+		}
+		rounded := qty.Mul(scale).Ceil()
+		if cap.GreaterThan(decimal.Zero) {
+			posUnits := cap.Mul(scale).Truncate(0)
+			if rounded.GreaterThan(posUnits) {
+				rounded = posUnits
+			}
+		}
+		baseAmount = rounded.IntPart()
+	} else {
+		baseAmount = qty.Mul(scale).IntPart()
+	}
 	if baseAmount <= 0 {
 		return nil, fmt.Errorf("qty too small after scale: %s", qty)
 	}
@@ -911,23 +937,21 @@ func (s *lighterSession) orderStatus(ctx context.Context, params map[string]any)
 	qty, _ := paramDecimal(params, "qty")
 
 	found, ok := s.lookupOrder(ctx, marketIndex, orderID)
-	if !ok {
-		if qty.GreaterThan(decimal.Zero) {
-			if dec, err := s.marketDecimals(ctx, marketIndex); err == nil {
-				if f, hit := s.wsFilled(orderID, qty, dec.sizeDec); hit {
-					status := "partial"
-					if f.GreaterThanOrEqual(qty) {
-						status = "filled"
-					}
-					return map[string]string{
-						"order_id":   orderID,
-						"filled_qty": f.String(),
-						"status":     status,
-						"avg_price":  "",
-					}, nil
-				}
+	filled := decimal.Zero
+	price := ""
+	if ok {
+		filled = found.filled
+		price = found.price
+	}
+	// inactive 撤单常是 filled=0。真成交在 trades 缓存里，必须并上，否则邻档输家漏平。
+	if qty.GreaterThan(decimal.Zero) {
+		if dec, err := s.marketDecimals(ctx, marketIndex); err == nil {
+			if f, hit := s.wsFilled(orderID, qty, dec.sizeDec); hit && f.GreaterThan(filled) {
+				filled = f
 			}
 		}
+	}
+	if !ok && !filled.GreaterThan(decimal.Zero) {
 		return map[string]string{
 			"order_id":   orderID,
 			"filled_qty": "0",
@@ -936,8 +960,8 @@ func (s *lighterSession) orderStatus(ctx context.Context, params map[string]any)
 		}, nil
 	}
 	status := "accepted"
-	if found.filled.GreaterThan(decimal.Zero) {
-		if qty.GreaterThan(decimal.Zero) && found.filled.GreaterThanOrEqual(qty) {
+	if filled.GreaterThan(decimal.Zero) {
+		if qty.GreaterThan(decimal.Zero) && filled.GreaterThanOrEqual(qty) {
 			status = "filled"
 		} else {
 			status = "partial"
@@ -945,9 +969,9 @@ func (s *lighterSession) orderStatus(ctx context.Context, params map[string]any)
 	}
 	return map[string]string{
 		"order_id":   orderID,
-		"filled_qty": found.filled.String(),
+		"filled_qty": filled.String(),
 		"status":     status,
-		"avg_price":  found.price,
+		"avg_price":  price,
 	}, nil
 }
 
@@ -965,7 +989,10 @@ func matchActiveOrder(result map[string]any, orderID string) (activeOrder, bool)
 		}
 		return activeOrder{
 			filled: orderFilledQty(raw),
-			price:  stringValue(firstValue(raw, "price", "avg_price")),
+			// `price` 是**挂单价**：市价 / IOC 腿上它就是滑点保护限价，
+			// 拿它当成交均价每腿会多记约 max_slippage 的假亏。只认交易所
+			// 明确给的均价字段；没有就留空，由上层退回决策 BBO 记账。
+			price: stringValue(firstValue(raw, "avg_price", "average_price", "avg_filled_price", "filled_avg_price")),
 		}, true
 	}
 	return activeOrder{}, false

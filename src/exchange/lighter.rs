@@ -4,7 +4,7 @@ use futures_util::{SinkExt, StreamExt};
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -264,11 +264,11 @@ impl ExchangePort for LighterAdapter {
     async fn account(&self) -> Result<AccountSnapshot> {
         if !self.venue.keys_ready() {
             warn!(venue = %self.id(), "account skipped: signing keys not loaded");
-            return Ok(AccountSnapshot::default());
+            bail!("account skipped: signing keys not loaded");
         }
         if !bridge::bridge_available().await {
             warn!(venue = %self.id(), "account skipped: exchange sidecar not found");
-            return Ok(AccountSnapshot::default());
+            bail!("account skipped: exchange sidecar not found");
         }
         bridge::bridge_account(&self.venue_path).await
     }
@@ -321,6 +321,7 @@ async fn run_ws(
     let ws = connect_ws(&url).await?;
     let (mut write, mut read) = ws.split();
     let mut books: HashMap<i32, LocalBook> = HashMap::new();
+    let mut snapped: HashSet<i32> = HashSet::new();
     let mut subscribed = false;
     // Lighter 公共流约 120s 无 client ping 就踢连接。日志里是稳定的 124s
     // 一轮（120s 超时 + 3s 重连）。主动 ping，不要靠空闲超时去拆。
@@ -398,6 +399,10 @@ async fn run_ws(
                 let book = books.entry(market_id).or_default();
                 if is_snapshot {
                     book.replace(&raw);
+                    snapped.insert(market_id);
+                } else if !snapped.contains(&market_id) {
+                    // 重连后可能先到 delta。空簿上 apply 会产出残缺 BBO。
+                    continue;
                 } else {
                     book.apply(&raw);
                 }

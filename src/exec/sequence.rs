@@ -144,6 +144,11 @@ pub fn symmetric_grid_costs(
     (fee, hedge_c)
 }
 
+/// 该档当前 F+C 必须盖得住格距：费率为 0 不挂；live 成本涨过 Δ 也不挂。
+pub fn quote_fc_fits_step(fee: Decimal, hedge_c: Decimal, step: Decimal) -> bool {
+    fee > Decimal::ZERO && fee + hedge_c <= step
+}
+
 pub fn first_limit_venue_all_in_or_left<'a>(
     cfg: &AppConfig,
     buy: &'a VenueId,
@@ -362,6 +367,23 @@ mod tests {
     }
 
     #[test]
+    fn symmetric_plus_minus_costs_take_the_dearer_side() {
+        let cfg = AppConfig::load_from(std::path::Path::new("config/default.yaml")).unwrap();
+        let left = VenueId::from("lighter");
+        let right = VenueId::from("sodex");
+        let plus = symmetric_grid_costs(&cfg, &right, &left, Some(dec!(0.01)), Some(dec!(0.05)));
+        let minus = symmetric_grid_costs(&cfg, &left, &right, Some(dec!(0.05)), Some(dec!(0.01)));
+        let plus_fc = plus.0 + plus.1.unwrap_or(Decimal::ZERO);
+        let minus_fc = minus.0 + minus.1.unwrap_or(Decimal::ZERO);
+        let picked = plus_fc.max(minus_fc);
+        assert!(picked >= plus_fc && picked >= minus_fc);
+        assert!(picked > Decimal::ZERO);
+        assert!(quote_fc_fits_step(picked, Decimal::ZERO, picked));
+        assert!(!quote_fc_fits_step(Decimal::ZERO, Decimal::ZERO, picked));
+        assert!(!quote_fc_fits_step(picked, dec!(0.01), picked));
+    }
+
+    #[test]
     fn limit_then_hedge_uses_maker_on_posting_side() {
         // A taker 0.03 / maker 0.01；B taker 0.009 / maker 0.005。
         // A 挂：0.01 + 0.009 = 0.019；B 挂：0.005 + 0.03 = 0.035 → 挂 A。
@@ -391,8 +413,9 @@ mod tests {
         let net = sequenced_spread(&cfg, &buy, &sell, &cheap, &rich, dec!(0.001)).unwrap();
         assert_eq!(net.slip_pct, dec!(0));
         assert_eq!(net.net_pct, net.raw_pct - net.fee_pct);
-        assert!(fill_slip_overrun(&cfg, true, dec!(100), dec!(100.05)).is_some());
-        assert!(fill_slip_overrun(&cfg, true, dec!(100), dec!(100.005)).is_none());
+        // yaml `cost.default_slip_pct` = 0.1%：0.15% 超限，0.05% 不超。
+        assert!(fill_slip_overrun(&cfg, true, dec!(100), dec!(100.15)).is_some());
+        assert!(fill_slip_overrun(&cfg, true, dec!(100), dec!(100.05)).is_none());
     }
 
     /// 平仓视角必须用「原 sell 所的 Ask」和「原 buy 所的 Bid」，
