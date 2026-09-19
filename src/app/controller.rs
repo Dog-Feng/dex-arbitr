@@ -605,10 +605,38 @@ impl Controller {
     fn on_arbitrage_stopped(&mut self) {
         self.orders_live.store(false, Ordering::Release);
         self.cancel_all_resting_limits();
+        self.clear_arbitrage_memory();
         let keep = self.drop_idle_windows();
         self.ui_pairs.retain(|k, _| keep.contains(k));
-        info!("arbitrage stopped; idle mu and venue-spread windows dropped");
+        info!(
+            "arbitrage stopped; strategy memory cleared (positions, burst, grid). \
+             Venue exchange positions unchanged — reconcile still reports foreign/naked from accounts"
+        );
         self.publish_api_snapshot();
+    }
+
+    /// 停止套利：清策略内存。所上真实持仓仍在，页面 `exchange_positions` 仍从账户拉取。
+    fn clear_arbitrage_memory(&mut self) {
+        self.positions.clear_all();
+        self.burst_slots.clear();
+        self.hedging.clear();
+        self.pending.clear();
+        self.ui_pairs.clear();
+        self.naked_exposures
+            .retain(|n| n.source != NakedSource::BotFailure);
+        self.naked_hedging.clear();
+        self.intervention.clear_all();
+        self.dust_since.clear();
+        self.mismatch_log_at.clear();
+        for pair in &self.pairs {
+            let slot = pair.slot_key();
+            self.window_grid.forget(&slot);
+            self.windows.unfreeze(&slot);
+            self.last_flat_at.insert(slot, Instant::now());
+        }
+        let empty: HashSet<String> = HashSet::new();
+        self.windows.drop_except(&empty);
+        self.venue_spreads.drop_except_venues(&empty);
     }
 
     fn on_arbitrage_started(&mut self) {
@@ -1279,6 +1307,9 @@ impl Controller {
         self.naked_exposures
             .retain(|n| n.source == NakedSource::BotFailure);
         self.naked_exposures.extend(foreign);
+        if !self.arbitrage_enabled() {
+            return;
+        }
         self.audit_memory_positions();
         self.restore_memory_from_exchange();
     }
@@ -1299,6 +1330,9 @@ impl Controller {
     /// 鍚庣画骞充粨鎵嶆寜鐪熷疄瀵瑰啿閲忚蛋銆傝烦鍙樿繃澶т笉鎶粨锛岃妭娴佸憡璀︺€?
     /// 鍙湁涓€鑵胯繘璐︺€佹垨鏈Ы浣嶈繕鍦ㄥ鍐蹭腑锛氫笉鍔ㄥ唴瀛樸€?
     fn audit_memory_positions(&mut self) {
+        if !self.arbitrage_enabled() {
+            return;
+        }
         let mut fixes = Vec::new();
         let mut same_sign = Vec::new();
         for pair in &self.pairs {
@@ -1393,6 +1427,9 @@ impl Controller {
 
     /// 鍐呭瓨宸茬┖浣嗕袱鎵€浠嶆湁鍙嶅悜浠擄細鎸夐噸鍙犻噺鎶?STEP 鎹″洖鏉ワ紝閬垮厤褰撶┖浠撶户缁寕閭绘。銆?
     fn restore_memory_from_exchange(&mut self) {
+        if !self.arbitrage_enabled() {
+            return;
+        }
         let mut restores = Vec::new();
         for pair in &self.pairs {
             let slot = pair.slot_key();
@@ -2861,6 +2898,16 @@ impl Controller {
     async fn on_run_plan(&mut self, msg: RunPlanMsg) {
         if msg.plan.burst {
             self.on_burst_run_plan(msg);
+            return;
+        }
+        if !self.arbitrage_enabled() {
+            self.hedging.remove(&msg.slot);
+            self.pending.remove(&msg.slot);
+            self.positions.release_pending(&msg.slot);
+            info!(
+                pair = %msg.plan.pair_id,
+                "exec finished after arbitrage stopped; not updating memory"
+            );
             return;
         }
         self.hedging.remove(&msg.slot);

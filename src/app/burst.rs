@@ -371,6 +371,14 @@ impl Controller {
     pub(super) fn on_burst_run_plan(&mut self, msg: super::exec_worker::RunPlanMsg) {
         self.hedging.remove(&msg.slot);
         self.pending.remove(&msg.slot);
+        if !self.arbitrage_enabled() {
+            self.positions.release_pending(&msg.slot);
+            info!(
+                pair = %msg.plan.pair_id,
+                "burst exec finished after arbitrage stopped; not updating memory"
+            );
+            return;
+        }
         let pair_i = msg.pair_i;
         let slot = msg.slot.clone();
         let Some(pair) = self.pairs.get(pair_i).cloned() else {

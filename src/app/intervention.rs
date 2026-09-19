@@ -226,6 +226,12 @@ impl InterventionGuard {
     pub fn streak(&self, pair_id: &str) -> u32 {
         self.streak.get(pair_id).copied().unwrap_or(0)
     }
+
+    /// 停止套利时清空挂起与连续单腿计数。
+    pub fn clear_all(&mut self) {
+        self.pairs.clear();
+        self.streak.clear();
+    }
 }
 
 #[cfg(test)]

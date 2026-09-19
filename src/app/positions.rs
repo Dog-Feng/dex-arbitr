@@ -230,6 +230,12 @@ impl PositionStore {
             .filter(|p| p.qty > Decimal::ZERO)
             .collect()
     }
+
+    /// 停止套利时丢弃内存持仓与占槽；**不改交易所真实仓位**。
+    pub fn clear_all(&mut self) {
+        self.positions.clear();
+        self.pending_opens.clear();
+    }
 }
 
 /// 单次对账最多把内存抬到 `max(4×当前量, 当前量 + 8×base_qty)`。
