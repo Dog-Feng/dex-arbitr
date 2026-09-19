@@ -1286,7 +1286,10 @@ impl Controller {
         if !self.venue_accounts.all_fresh() {
             return;
         }
-        let foreign = detect_naked_exposures(&self.pairs, &self.venue_accounts);
+        let foreign: Vec<_> = detect_naked_exposures(&self.pairs, &self.venue_accounts)
+            .into_iter()
+            .filter(|n| !self.memory_holds_pair(&n.pair_id))
+            .collect();
         for n in &foreign {
             let new = !self.naked_exposures.iter().any(|e| {
                 e.pair_id == n.pair_id && e.venue == n.venue && e.source == NakedSource::Foreign
@@ -3806,6 +3809,16 @@ impl Controller {
 
     pub(super) fn slot_has_pending(&self, slot: &str) -> bool {
         self.pending.contains_key(slot)
+    }
+
+    fn memory_holds_pair(&self, pair_id: &str) -> bool {
+        self.pairs.iter().any(|pair| {
+            pair.pair_id == pair_id
+                && self
+                    .positions
+                    .get(&pair.slot_key())
+                    .is_some_and(|p| p.qty > Decimal::ZERO)
+        })
     }
 
     /// 宸叉湁鍗曡竟鏁炲彛鏃朵笉鍐嶆寕寮€浠撻偦妗ｏ紝閬垮厤鍦ㄦ湭瀵瑰啿鐨?RH/lighter 浠撲笂缁х画鍔犵爜銆?

@@ -313,26 +313,45 @@ impl Controller {
                     st.peak_capacity_checked = true;
                     self.burst_slots.insert(slot.clone(), st);
                 }
-                let Some(net) =
-                    best_sequenced_spread(&self.cfg, &v0, &v1, &b0, &b1, base_qty)
-                else {
-                    self.paint_burst_status(pair_i, &pair, &slot, "无价差");
-                    return;
+                // 已有对锁仓时方向必须跟内存 buy/sell 一致；否则下一 rep 可能 flip
+                // best_sequenced_spread，在 buy 腿挂 sell = 所上「平多」但内存仍记 open。
+                let (open_buy, open_sell, buy_book, sell_book) = if held > Decimal::ZERO {
+                    let p = self.positions.get(&slot).unwrap();
+                    let (bb, sb) = super::controller::books_for_direction(
+                        &p.buy, &v0, &b0, &b1,
+                    );
+                    (p.buy.clone(), p.sell.clone(), bb, sb)
+                } else {
+                    let Some(net) =
+                        best_sequenced_spread(&self.cfg, &v0, &v1, &b0, &b1, base_qty)
+                    else {
+                        self.paint_burst_status(pair_i, &pair, &slot, "无价差");
+                        return;
+                    };
+                    let (bb, sb) = super::controller::books_for_direction(
+                        &net.buy, &v0, &b0, &b1,
+                    );
+                    (net.buy.clone(), net.sell.clone(), bb, sb)
                 };
                 if books_tradable(&self.cfg, &pair, &b0, &b1, base_qty).is_err() {
                     self.paint_burst_status(pair_i, &pair, &slot, "盘口过薄");
                     return;
                 }
-                let (buy_book, sell_book) = super::controller::books_for_direction(
-                    &net.buy, &v0, &b0, &b1,
-                );
+                if held > Decimal::ZERO {
+                    info!(
+                        pair = %pair.pair_id,
+                        buy = %open_buy,
+                        sell = %open_sell,
+                        "burst open: direction locked to memory (ignore spread flip)"
+                    );
+                }
                 self.spawn_burst_rep(
                     pair_i,
                     &pair,
                     &slot,
                     true,
-                    &net.buy,
-                    &net.sell,
+                    &open_buy,
+                    &open_sell,
                     buy_book,
                     sell_book,
                     base_qty,
