@@ -605,6 +605,7 @@ impl HedgeExecutor {
         let rehang = Duration::from_millis(cfg.burst.limit_rehang_timeout_ms.max(200));
         let target = plan.qty;
         let hedge_floor = plan.hedgeable_min_qty();
+        let first_min = plan.first.min_qty.max(Decimal::new(1, 8));
         let mut accumulated = Decimal::ZERO;
         let mut first_notional = Decimal::ZERO;
         let mut first_priced = Decimal::ZERO;
@@ -618,6 +619,44 @@ impl HedgeExecutor {
             let remaining = target - accumulated;
             if remaining < hedge_floor {
                 break 'fill;
+            }
+            if remaining < first_min {
+                if accumulated >= hedge_floor {
+                    warn!(
+                        pair = %plan.pair_id,
+                        accumulated = %accumulated,
+                        remaining = %remaining,
+                        target = %target,
+                        first_min = %first_min,
+                        "burst: first leg partial; remaining below venue min — hedge filled qty"
+                    );
+                    break 'fill;
+                }
+                if accumulated > Decimal::ZERO {
+                    let bbo = crate::exec::executor::book_for(books, &plan.first.venue, &plan.pair_id)?;
+                    warn!(
+                        pair = %plan.pair_id,
+                        accumulated = %accumulated,
+                        remaining = %remaining,
+                        first_min = %first_min,
+                        "burst: partial fill below hedge min; emergency close first leg"
+                    );
+                    Self::emergency_close(
+                        cfg,
+                        adapters,
+                        &plan.first,
+                        accumulated,
+                        &bbo,
+                        false,
+                    )
+                    .await?;
+                    bail!(
+                        "BURST_PARTIAL_DUST: first leg filled {accumulated} but cannot post remaining {remaining} (< min {first_min})"
+                    );
+                }
+                bail!(
+                    "BURST_QTY_BELOW_MIN: remaining {remaining} < first leg min {first_min}"
+                );
             }
             let bbo = crate::exec::executor::book_for(books, &plan.first.venue, &plan.pair_id)?;
             let px = if plan.first.is_buy {
@@ -732,6 +771,17 @@ impl HedgeExecutor {
                 }
             }
             if accumulated + eps >= target {
+                break 'fill;
+            }
+            let remaining = target - accumulated;
+            if remaining < first_min && accumulated >= hedge_floor {
+                warn!(
+                    pair = %plan.pair_id,
+                    accumulated = %accumulated,
+                    remaining = %remaining,
+                    first_min = %first_min,
+                    "burst: stop rehang; hedge partial first leg"
+                );
                 break 'fill;
             }
         }

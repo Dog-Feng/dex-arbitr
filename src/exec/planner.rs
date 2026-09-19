@@ -108,7 +108,7 @@ fn build(
     })
 }
 
-/// Burst 阶段 2：第一腿 L1 限价 + 第二腿市价。
+/// Burst 阶段 2：费率+点差更高的一侧 L1 maker 限价，另一侧市价对冲（开/平相同）。
 pub fn plan_burst(
     pair: &Pair,
     cfg: &AppConfig,

@@ -85,6 +85,8 @@ pub fn detect_naked_exposures(pairs: &[Pair], accounts: &VenueAccountCache) -> V
 ///
 /// 只有一腿非零时不当成「对冲量 = 0」：第二腿账户快照经常晚几秒，
 /// 这时缩内存会把刚成交的仓抹掉。两腿同号且都非零时对冲量视为 0。
+///
+/// 两腿快照均为 0 但内存仍有仓：视为刷新滞后，**禁止**收成 0（否则会抹掉刚对冲的 Burst 仓）。
 pub fn audit_position_qty(
     pair: &Pair,
     accounts: &VenueAccountCache,
@@ -96,6 +98,9 @@ pub fn audit_position_qty(
     let a = venue_position_qty(accounts, &pair.legs[0]);
     let b = venue_position_qty(accounts, &pair.legs[1]);
     if a.is_zero() ^ b.is_zero() {
+        return None;
+    }
+    if a.is_zero() && b.is_zero() {
         return None;
     }
     // 同向且都非零：对冲量不是 0，是「不能自动对账」。返回 None 让调用方跳过。
@@ -465,6 +470,16 @@ mod tests {
             snap("lighter", None, true),
         ]);
         let p = pair("sodex", "lighter");
+        assert_eq!(audit_position_qty(&p, &accounts, dec!(0.0005)), None);
+    }
+
+    #[test]
+    fn audit_skips_both_legs_zero_while_memory_has_qty() {
+        let accounts = cache(vec![
+            snap("lighter_rh", Some(dec!(0)), true),
+            snap("lighter", Some(dec!(0)), true),
+        ]);
+        let p = pair("lighter_rh", "lighter");
         assert_eq!(audit_position_qty(&p, &accounts, dec!(0.0005)), None);
     }
 

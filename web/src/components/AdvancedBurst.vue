@@ -3,10 +3,10 @@
     <Field label="burst.enabled" hint="阶段 2：L1 限价重挂 + 第二腿市价。开启后不走 μ/STEP 开仓；且只能配置 1 个交易对">
       <n-switch v-model:value="p.burst.enabled" />
     </Field>
-    <Field label="open_repeats" hint="一轮宏观周期内连续开仓次数，之后进入冷却并平到 0">
+    <Field label="open_repeats（小循环）" hint="每轮大循环内连续开仓次数（例如 10）。开满后才平仓；与 total_rounds 无关">
       <n-input-number v-model:value="p.burst.open_repeats" :min="1" :max="1000" />
     </Field>
-    <Field label="total_rounds" hint="大循环总轮次：每轮 = 上述开满 + 平到 0 算 1 次。0 = 不限">
+    <Field label="total_rounds（大循环）" hint="完整「开满小循环 + 平到 0」算 1 次，最多重复几次（例如 3）。0 = 不限">
       <n-input-number v-model:value="p.burst.total_rounds" :min="0" :max="100000" />
     </Field>
     <Field label="pause_ms_min / max" hint="每次开/平 rep 完成后的随机暂停（毫秒）">

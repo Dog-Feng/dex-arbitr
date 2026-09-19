@@ -42,6 +42,8 @@ enum PauseKind {
 pub struct BurstSlot {
     pub phase: BurstPhase,
     pub open_reps_done: u32,
+    /// 本宏观周期锁定的开仓次数目标（与 `total_rounds` 无关；周期开始时快照，避免热改提前平仓）。
+    pub open_repeats_goal: u32,
     /// 已完成的大循环数（每轮 = open_repeats 开满 + 平到 0）。
     pub rounds_completed: u32,
     pub wait_until: Option<Instant>,
@@ -54,6 +56,7 @@ impl Default for BurstSlot {
         Self {
             phase: BurstPhase::Opening,
             open_reps_done: 0,
+            open_repeats_goal: 0,
             rounds_completed: 0,
             wait_until: None,
             peak_capacity_checked: false,
@@ -62,19 +65,28 @@ impl Default for BurstSlot {
     }
 }
 
-fn burst_round_status_suffix(burst: &crate::config::BurstConfig, st: &BurstSlot) -> String {
-    let total = burst.total_rounds;
-    if total == 0 {
-        if st.rounds_completed == 0 {
-            return String::new();
-        }
-        return format!("已完成 {} 轮", st.rounds_completed);
+fn burst_open_repeats_goal(st: &BurstSlot, burst: &crate::config::BurstConfig) -> u32 {
+    if st.open_repeats_goal > 0 {
+        st.open_repeats_goal
+    } else {
+        burst.open_repeats
     }
-    let cur = match st.phase {
-        BurstPhase::Completed => total,
-        _ => (st.rounds_completed + 1).min(total),
-    };
-    format!("轮 {cur}/{total}")
+}
+
+fn burst_status_suffix(burst: &crate::config::BurstConfig, st: &BurstSlot) -> String {
+    let open_goal = burst_open_repeats_goal(st, burst);
+    let mut parts = vec![format!("小循环 {}/{}", st.open_reps_done, open_goal)];
+    let macro_total = burst.total_rounds;
+    if macro_total > 0 {
+        parts.push(format!(
+            "大循环 {}/{}",
+            st.rounds_completed.min(macro_total),
+            macro_total
+        ));
+    } else if st.rounds_completed > 0 {
+        parts.push(format!("大循环已完成 {}", st.rounds_completed));
+    }
+    parts.join(" · ")
 }
 
 impl Controller {
@@ -125,7 +137,16 @@ impl Controller {
                 BurstPhase::RepPause => {
                     st.phase = match st.pause_kind {
                         Some(PauseKind::AfterOpenRep) => {
-                            if st.open_reps_done >= self.cfg.burst.open_repeats {
+                            let goal = burst_open_repeats_goal(&st, &self.cfg.burst);
+                            if st.open_reps_done >= goal {
+                                info!(
+                                    pair = %pair.pair_id,
+                                    open_reps_done = st.open_reps_done,
+                                    open_repeats_goal = goal,
+                                    cfg_open_repeats = self.cfg.burst.open_repeats,
+                                    total_rounds = self.cfg.burst.total_rounds,
+                                    "burst: 小循环开满 → 冷却（与 total_rounds 无关）"
+                                );
                                 BurstPhase::Cooldown
                             } else {
                                 BurstPhase::Opening
@@ -159,6 +180,7 @@ impl Controller {
                     } else {
                         st.phase = BurstPhase::Opening;
                         st.open_reps_done = 0;
+                        st.open_repeats_goal = self.cfg.burst.open_repeats.max(1);
                         st.peak_capacity_checked = false;
                     }
                 }
@@ -213,6 +235,13 @@ impl Controller {
 
         match st.phase {
             BurstPhase::Opening => {
+                if st.open_repeats_goal == 0 {
+                    let mut st = st;
+                    st.open_repeats_goal = self.cfg.burst.open_repeats.max(1);
+                    self.burst_slots.insert(slot.clone(), st);
+                }
+                let st = self.burst_slots.get(&slot).cloned().unwrap_or_default();
+                let open_goal = burst_open_repeats_goal(&st, &self.cfg.burst);
                 if !self.cfg.burst.should_run_another_round(st.rounds_completed) {
                     let mut st = st;
                     st.phase = BurstPhase::Completed;
@@ -236,8 +265,15 @@ impl Controller {
                         }
                     }
                 }
-                if st.open_reps_done >= self.cfg.burst.open_repeats {
+                if st.open_reps_done >= open_goal {
                     let mut st = st;
+                    info!(
+                        pair = %pair.pair_id,
+                        open_reps_done = st.open_reps_done,
+                        open_repeats_goal = open_goal,
+                        total_rounds = self.cfg.burst.total_rounds,
+                        "burst: 小循环开满 → 冷却"
+                    );
                     st.phase = BurstPhase::Cooldown;
                     st.wait_until =
                         Some(Instant::now() + burst_duration(&self.cfg, false));
@@ -246,7 +282,7 @@ impl Controller {
                     return;
                 }
                 if !st.peak_capacity_checked {
-                    let peak = base_qty * Decimal::from(self.cfg.burst.open_repeats);
+                    let peak = base_qty * Decimal::from(open_goal);
                     let mid = mid_from_bbo(&b0, &b1).unwrap_or(Decimal::ZERO);
                     let reserved = self.positions.reserved_margin_by_venue(
                         |v| self.cfg.leverage_for(v),
@@ -514,15 +550,12 @@ impl Controller {
     fn paint_burst_status(&mut self, pair_i: usize, pair: &Pair, slot: &str, status: &str) {
         let st = self.burst_slots.get(slot).cloned().unwrap_or_default();
         let extra = match st.phase {
-            BurstPhase::Opening => {
-                format!("开 {}/{}", st.open_reps_done, self.cfg.burst.open_repeats)
-            }
             BurstPhase::Closing => "平仓中".into(),
             BurstPhase::Stopped => "停止".into(),
             BurstPhase::Completed => "结束".into(),
             _ => String::new(),
         };
-        let round_tag = burst_round_status_suffix(&self.cfg.burst, &st);
+        let round_tag = burst_status_suffix(&self.cfg.burst, &st);
         let ui = match (extra.is_empty(), round_tag.is_empty()) {
             (true, true) => status.to_string(),
             (false, true) => format!("{status} · {extra}"),
@@ -552,9 +585,9 @@ mod round_label_tests {
     use crate::config::BurstConfig;
 
     #[test]
-    fn round_label_shows_progress_when_capped() {
+    fn status_distinguishes_small_and_macro_cycles() {
         let burst = BurstConfig {
-            total_rounds: 100,
+            total_rounds: 3,
             enabled: true,
             open_repeats: 10,
             pause_ms_min: 3000,
@@ -565,11 +598,16 @@ mod round_label_tests {
             hedge_max_attempts: 20,
         };
         let st = BurstSlot {
-            rounds_completed: 2,
+            open_reps_done: 3,
+            open_repeats_goal: 10,
+            rounds_completed: 0,
             phase: BurstPhase::Opening,
             ..BurstSlot::default()
         };
-        assert_eq!(burst_round_status_suffix(&burst, &st), "轮 3/100");
+        assert_eq!(
+            burst_status_suffix(&burst, &st),
+            "小循环 3/10 · 大循环 0/3"
+        );
     }
 }
 
