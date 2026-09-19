@@ -276,7 +276,7 @@ pub fn leg_exchange_qty(accounts: &VenueAccountCache, leg: &VenueMarket) -> Opti
     Some(venue_position_qty(accounts, leg))
 }
 
-/// Burst 平仓 rep 后：任一所仍有仓则列出需市价 reduce-only 平掉的腿。
+/// 内存已平到 0 后：任一所仍有仓则列出需市价 reduce-only 清掉的尾差腿（整腿账户 qty）。
 pub fn exchange_legs_to_flatten(pair: &Pair, accounts: &VenueAccountCache) -> Vec<(VenueMarket, Decimal)> {
     let tol = pair.min_qty();
     let mut out = Vec::new();

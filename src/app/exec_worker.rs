@@ -170,7 +170,7 @@ async fn run_burst_exchange_flatten(
     request_account_refresh();
 }
 
-/// Burst 平仓 rep 结束后：等待结算 → 拉两所实际持仓 → 仍有仓则并发市价 reduce-only。
+/// Burst 小循环平到内存 0 后：等待结算 → 拉两所实际持仓 → 仍有尾差则并发市价 reduce-only。
 pub fn spawn_burst_post_close_exchange_flatten(
     cfg: AppConfig,
     port_adapters: Vec<Arc<dyn ExchangePort>>,

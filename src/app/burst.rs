@@ -525,7 +525,14 @@ impl Controller {
                     "burst rep completed"
                 );
                 if !msg.plan.is_open {
-                    self.burst_flatten_exchange_after_close(&pair);
+                    let held = self
+                        .positions
+                        .get(&slot)
+                        .map(|p| p.qty)
+                        .unwrap_or(Decimal::ZERO);
+                    if held <= Decimal::ZERO {
+                        self.burst_flatten_exchange_after_close(&pair);
+                    }
                 }
             }
             Err(err) => {
@@ -538,7 +545,8 @@ impl Controller {
         }
     }
 
-    /// 挂单平仓 rep 成功后：暂停 3–5s 再拉两所实际持仓，仍有仓则后台市价 reduce-only。
+    /// 小循环全部平完（内存 qty=0）后：暂停 3–5s 再拉所上持仓，仍有尾差则市价 reduce-only。
+    /// 单笔 close rep 后内存仍有余仓时不得 flatten，否则会按所上全仓市价平掉。
     fn burst_flatten_exchange_after_close(&mut self, pair: &Pair) {
         let settle_ms = self.cfg.burst.random_flatten_settle_ms();
         spawn_burst_post_close_exchange_flatten(
