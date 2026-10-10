@@ -43,42 +43,64 @@ go run ./cmd/arbd -config configs/config.yaml   # dry_run: true = paper trading
 
 ---
 
-## Linux 部署（systemd）
+## Linux 部署（root 用户 + systemd）
 
-以下以 Ubuntu/Debian x86_64 为例，部署目录 `/opt/dex-arbitr`，运行用户 `arb`。**服务器必须位于 Lighter 允许交易的地区**（否则下单返回 20558）。
+以 Ubuntu/Debian x86_64 为例。**所有操作都以 root 用户执行**，统一目录：
 
-### 1. 安装 Go（≥ 1.23）
+| 路径 | 用途 |
+|---|---|
+| `/opt/dex-arbitr/app` | 代码（git 仓库） |
+| `/opt/dex-arbitr/bin` | 编译好的程序 |
+| `/opt/dex-arbitr/config.yaml` | 运行配置（仓库之外，避免 `git pull` 冲突） |
+| `/opt/dex-arbitr/arb.env` | 密钥（权限 600） |
+| `/opt/dex-arbitr/state` | 步数状态 |
+
+**服务器必须位于 Lighter 允许交易的地区**（否则下单返回 20558）。
+
+### 0. 切换到 root
 
 ```bash
-sudo apt-get update && sudo apt-get install -y git curl
-curl -fsSL https://go.dev/dl/go1.23.4.linux-amd64.tar.gz | sudo tar -C /usr/local -xz
-echo 'export PATH=/usr/local/go/bin:$PATH' | sudo tee /etc/profile.d/go.sh
+if [ "$(id -u)" -ne 0 ]; then echo "当前用户是 $(whoami)，不是 root，请先执行：sudo -i"; else echo "OK：当前是 root"; fi
+```
+
+如果提示不是 root，执行 `sudo -i` 切换后再继续。之后所有步骤都在 root 下执行（命令里不再写 `sudo`）。
+
+### 1. 安装依赖与 Go（≥ 1.23）
+
+```bash
+apt-get update && apt-get install -y git curl
+curl -fsSL https://go.dev/dl/go1.23.4.linux-amd64.tar.gz | tar -C /usr/local -xz
+echo 'export PATH=/usr/local/go/bin:$PATH' > /etc/profile.d/go.sh
 source /etc/profile.d/go.sh && go version
 ```
 
-（ARM 服务器把 `linux-amd64` 换成 `linux-arm64`。）
+ARM 服务器把 `linux-amd64` 换成 `linux-arm64`。
+
+1G 内存的机器建议先加 2G swap，避免编译时内存不足：
+
+```bash
+fallocate -l 2G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile
+echo '/swapfile none swap sw 0 0' >> /etc/fstab
+```
 
 ### 2. 拉取代码并编译
 
 ```bash
-sudo useradd -r -m -d /opt/dex-arbitr -s /bin/bash arb
-sudo -iu arb                     # 必须带 -i，才会进入 arb 的家目录 /opt/dex-arbitr
-cd ~ && pwd                      # 应输出 /opt/dex-arbitr
-git clone https://github.com/Dog-Feng/dex-arbitr.git ~/app
-ls ~/app/configs/config.yaml     # 能看到文件才继续
-cd ~/app
+mkdir -p /opt/dex-arbitr/bin /opt/dex-arbitr/state
+git clone https://github.com/Dog-Feng/dex-arbitr.git /opt/dex-arbitr/app
+ls /opt/dex-arbitr/app/configs/config.yaml        # 能看到文件才继续
+cd /opt/dex-arbitr/app
 go test ./...
-mkdir -p ~/bin
-go build -o ~/bin/arbd ./cmd/arbd
-go build -o ~/bin/selfcheck ./cmd/selfcheck
+go build -o /opt/dex-arbitr/bin/arbd ./cmd/arbd
+go build -o /opt/dex-arbitr/bin/selfcheck ./cmd/selfcheck
 ```
 
-私有仓库时，clone 使用 `https://<token>@github.com/...` 或配置 SSH Deploy Key；不要把 token 写进仓库文件。
+私有仓库时用 `https://<token>@github.com/...` 克隆或配置 SSH Deploy Key；不要把 token 写进仓库文件。
 
-### 3. 配置密钥（环境变量文件）
+### 3. 配置密钥与运行配置
 
 ```bash
-cat > ~/arb.env <<'ENV'
+cat > /opt/dex-arbitr/arb.env <<'ENV'
 LIGHTER_ACCOUNT_INDEX=123456
 LIGHTER_API_KEY_INDEX=4
 LIGHTER_PRIVATE_KEY=0x...
@@ -86,40 +108,37 @@ RH_ACCOUNT_INDEX=654321
 RH_API_KEY_INDEX=4
 RH_PRIVATE_KEY=0x...
 ENV
-chmod 600 ~/arb.env
+chmod 600 /opt/dex-arbitr/arb.env
+
+cp /opt/dex-arbitr/app/configs/config.yaml /opt/dex-arbitr/config.yaml
+sed -i 's#^state_dir:.*#state_dir: /opt/dex-arbitr/state#' /opt/dex-arbitr/config.yaml
 ```
 
-运行配置：复制一份到仓库之外，避免 `git pull` 冲突（若提示 `No such file`，说明第 2 步 clone 未成功，见下方"常见问题"）：
-
-```bash
-cp ~/app/configs/config.yaml ~/config.yaml
-# 编辑 ~/config.yaml：确认 pairs / step_qty / max_steps；state_dir 改为绝对路径 /opt/dex-arbitr/state
-```
+用 `nano /opt/dex-arbitr/config.yaml` 确认 `pairs` / `step_qty` / `max_steps`。
 
 ### 4. 上线前自检
 
 ```bash
-cd ~/app
-set -a; source ~/arb.env; set +a
-~/bin/selfcheck -config ~/config.yaml                 # 只读检查
-~/bin/selfcheck -config ~/config.yaml -live           # 实盘 0.01 开→平
-~/bin/selfcheck -config ~/config.yaml -live -rescue   # 单腿失败补救
+cd /opt/dex-arbitr/app
+set -a; source /opt/dex-arbitr/arb.env; set +a
+/opt/dex-arbitr/bin/selfcheck -config /opt/dex-arbitr/config.yaml                 # 只读检查
+/opt/dex-arbitr/bin/selfcheck -config /opt/dex-arbitr/config.yaml -live           # 实盘 0.01 开→平
+/opt/dex-arbitr/bin/selfcheck -config /opt/dex-arbitr/config.yaml -live -rescue   # 单腿失败补救
 ```
 
-三项都显示 `RESULT: N passed, 0 failed` 后，把 `~/config.yaml` 中的 `dry_run` 改为 `false`（先用 `true` 模拟盘观察也可以）。
+三项都显示 `RESULT: N passed, 0 failed` 后，把 `/opt/dex-arbitr/config.yaml` 中 `dry_run` 改为 `false`（也可以先保持 `true` 用模拟盘观察）。
 
 ### 5. 注册 systemd 服务
 
 ```bash
-exit   # 回到有 sudo 权限的用户
-sudo tee /etc/systemd/system/arbd.service >/dev/null <<'UNIT'
+cat > /etc/systemd/system/arbd.service <<'UNIT'
 [Unit]
 Description=dex-arbitr spread step arbitrage
 After=network-online.target
 Wants=network-online.target
 
 [Service]
-User=arb
+User=root
 WorkingDirectory=/opt/dex-arbitr
 EnvironmentFile=/opt/dex-arbitr/arb.env
 ExecStart=/opt/dex-arbitr/bin/arbd -config /opt/dex-arbitr/config.yaml
@@ -131,65 +150,76 @@ TimeoutStopSec=30
 [Install]
 WantedBy=multi-user.target
 UNIT
-sudo systemctl daemon-reload
-sudo systemctl enable --now arbd
+systemctl daemon-reload
+systemctl enable --now arbd
 ```
 
 ### 6. 日常运维
 
 ```bash
-sudo systemctl status arbd          # 运行状态
-sudo journalctl -u arbd -f          # 实时日志
-sudo journalctl -u arbd --since "1 hour ago" | grep -E "action|step|rescue|ALERT"
-sudo systemctl stop arbd            # 停止（收到 SIGTERM 会先保存步数状态）
-cat /opt/dex-arbitr/state/*.json    # 当前持有的步
+systemctl status arbd             # 运行状态
+journalctl -u arbd -f             # 实时日志
+journalctl -u arbd --since "1 hour ago" | grep -E "action|step|rescue|ALERT"
+systemctl stop arbd               # 停止（收到 SIGTERM 会先保存步数状态）
+cat /opt/dex-arbitr/state/*.json  # 当前持有的步
 ```
 
-- 均值需要先采样 60 分钟才会开始开仓（日志出现 `mean ready -> RUNNING`）。
-- 启动时会核对两边持仓；若两边不对冲（合计不为 0）会自动进入 `PAUSED`，需人工处理后再重启。
+- 均值需先采样 60 分钟才开始开仓（日志出现 `mean ready -> RUNNING`）。
+- 启动时会核对两边持仓；若两边不对冲（合计不为 0）自动进入 `PAUSED`，人工处理后再重启。
+- 限制日志占用：`/etc/systemd/journald.conf` 中设 `SystemMaxUse=500M`，然后 `systemctl restart systemd-journald`。
 
-## 更新流程
+## 更新流程（root）
 
 ```bash
-sudo -iu arb
-cd ~/app
-git fetch && git log --oneline HEAD..origin/main     # 查看有哪些更新
+[ "$(id -u)" -eq 0 ] || echo "请先执行 sudo -i 切换到 root"
+cd /opt/dex-arbitr/app
+git fetch && git log --oneline HEAD..origin/main      # 查看有哪些更新
 git pull --ff-only
-go test ./...                                        # 测试不过就不要继续
-go build -o ~/bin/arbd.new ./cmd/arbd && go build -o ~/bin/selfcheck ./cmd/selfcheck
-set -a; source ~/arb.env; set +a
-~/bin/selfcheck -config ~/config.yaml                # 只读自检
-diff ~/app/configs/config.yaml ~/config.yaml         # 检查是否有新增配置项需要同步
-mv ~/bin/arbd ~/bin/arbd.prev && mv ~/bin/arbd.new ~/bin/arbd
-exit
-sudo systemctl restart arbd && sudo journalctl -u arbd -f
+go test ./...                                         # 测试不过就不要继续
+go build -o /opt/dex-arbitr/bin/arbd.new ./cmd/arbd
+go build -o /opt/dex-arbitr/bin/selfcheck ./cmd/selfcheck
+set -a; source /opt/dex-arbitr/arb.env; set +a
+/opt/dex-arbitr/bin/selfcheck -config /opt/dex-arbitr/config.yaml      # 只读自检
+diff /opt/dex-arbitr/app/configs/config.yaml /opt/dex-arbitr/config.yaml   # 检查是否有新增配置项需要同步
+mv /opt/dex-arbitr/bin/arbd /opt/dex-arbitr/bin/arbd.prev
+mv /opt/dex-arbitr/bin/arbd.new /opt/dex-arbitr/bin/arbd
+systemctl restart arbd && journalctl -u arbd -f
 ```
 
-- 重启是安全的：步数状态保存在 `state/`，重启后自动加载并与实际持仓核对。
-- 建议在没有补救单进行时更新（日志中无 `rescue order` 输出）。
+- 重启是安全的：步数状态保存在 `/opt/dex-arbitr/state`，重启后自动加载并与实际持仓核对。
+- 建议在没有补救单进行时更新（日志中无 `rescue order`）。
 
 **回滚：**
 
 ```bash
-sudo -iu arb mv /opt/dex-arbitr/bin/arbd.prev /opt/dex-arbitr/bin/arbd
-sudo systemctl restart arbd
+mv /opt/dex-arbitr/bin/arbd.prev /opt/dex-arbitr/bin/arbd
+systemctl restart arbd
 ```
 
-如需同时回滚代码：`cd ~/app && git checkout <上一个提交号>` 后重新编译。
+如需同时回滚代码：`cd /opt/dex-arbitr/app && git checkout <上一个提交号>` 后重新编译。
 
 ## 常见问题
 
 **`cp: cannot stat '/opt/dex-arbitr/app/configs/config.yaml': No such file or directory`**
 
-代码没有克隆到 `/opt/dex-arbitr/app`。按顺序检查：
+代码没有克隆到 `/opt/dex-arbitr/app`：
 
 ```bash
-whoami && echo ~                       # 应为 arb 和 /opt/dex-arbitr
-ls -la ~                               # 看是否有 app 目录
-sudo find / -name config.yaml -path "*dex-arbitr*" 2>/dev/null   # 是否克隆到了别处
+whoami                                 # 必须是 root，否则 sudo -i
+ls -la /opt/dex-arbitr                 # 看是否有 app 目录
+find / -name config.yaml -path "*dex-arbitr*" 2>/dev/null   # 是否克隆到了别处
 ```
 
-- 没有 `app` 目录：以 arb 身份重新执行 `git clone https://github.com/Dog-Feng/dex-arbitr.git ~/app`，注意看有无报错。
-- 克隆到了别的用户目录（例如 `/root/dex-arbitr` 或 `/home/ubuntu/dex-arbitr`）：删掉它，以 arb 身份重新克隆到 `~/app`。
-- `git: command not found`：先 `sudo apt-get install -y git`。
-- `Permission denied`：`sudo chown -R arb:arb /opt/dex-arbitr`。
+- 没有 `app` 目录：重新执行 `git clone https://github.com/Dog-Feng/dex-arbitr.git /opt/dex-arbitr/app`，注意看有无报错。
+- 目录存在但内容不全：`rm -rf /opt/dex-arbitr/app` 后重新克隆。
+- `git: command not found`：`apt-get install -y git`。
+
+**之前按旧文档创建过 `arb` 用户**（可选清理）：
+
+```bash
+systemctl stop arbd 2>/dev/null
+userdel arb 2>/dev/null
+chown -R root:root /opt/dex-arbitr
+```
+
+然后按本文档从第 2 步开始（已有代码可直接 `cd /opt/dex-arbitr/app && git pull`）。
