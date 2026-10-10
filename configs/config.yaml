@@ -1,0 +1,44 @@
+# Cross-DEX perp spread step arbitrage. Secrets come from environment variables.
+dry_run: true            # true = paper trading (no orders). Set false for live.
+state_dir: state
+
+venues:
+  - name: lighter
+    kind: lighter        # Lighter mainnet, chain id 304
+    opts:
+      account_index: ${LIGHTER_ACCOUNT_INDEX}
+      api_key_index: ${LIGHTER_API_KEY_INDEX}
+      private_key: ${LIGHTER_PRIVATE_KEY}
+  - name: rhlighter
+    kind: rhlighter      # RH Lighter mainnet, chain id 466324
+    opts:
+      account_index: ${RH_ACCOUNT_INDEX}
+      api_key_index: ${RH_API_KEY_INDEX}
+      private_key: ${RH_PRIVATE_KEY}
+
+matching:
+  strip_suffixes: [PERP, USDC, USDG, USDT, USD]   # USDC/USDG/USDT treated 1:1
+  separators: "-_/: ."
+
+estimator:
+  kind: sma
+  window: 2h
+  min_warmup: 60m
+  min_coverage: 0.8
+  interval: 1s
+
+strategy:
+  open_bps: 1          # open when deviation from mean >= 1bps
+  close_bps: 1         # close when step gross profit >= 1bps
+  depth_mult: 2        # top-of-book qty >= step_qty * 2 on both legs
+  close_order: best    # best | lifo | fifo
+  interval_min: 7s
+  interval_max: 10s
+  max_book_age: 10s
+
+pairs:
+  - base: SNDK
+    left: lighter
+    right: rhlighter
+    step_qty: 0.01
+    max_steps: 10

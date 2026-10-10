@@ -1,0 +1,66 @@
+// Package estimator provides pluggable spread-mean estimators.
+package estimator
+
+import (
+	"fmt"
+	"sort"
+	"sync"
+	"time"
+)
+
+// Stats describes estimator state for logging / readiness.
+type Stats struct {
+	Kind     string
+	Mean     float64
+	Samples  int
+	Span     time.Duration // time since first sample in window
+	Coverage float64       // samples / expected samples over span
+	Ready    bool
+}
+
+// Estimator estimates the "center" of the spread series.
+type Estimator interface {
+	Update(t time.Time, x float64)
+	Mean() float64
+	Ready() bool
+	Stats() Stats
+}
+
+// Params are generic estimator params.
+type Params struct {
+	Window      time.Duration
+	MinWarmup   time.Duration
+	MinCoverage float64
+	Interval    time.Duration // sampling interval (1s)
+}
+
+// Factory builds an estimator.
+type Factory func(p Params) (Estimator, error)
+
+var (
+	mu  sync.RWMutex
+	reg = map[string]Factory{}
+)
+
+// Register an estimator kind.
+func Register(kind string, f Factory) {
+	mu.Lock()
+	reg[kind] = f
+	mu.Unlock()
+}
+
+// New builds a registered estimator.
+func New(kind string, p Params) (Estimator, error) {
+	mu.RLock()
+	f, ok := reg[kind]
+	mu.RUnlock()
+	if !ok {
+		ks := make([]string, 0)
+		for k := range reg {
+			ks = append(ks, k)
+		}
+		sort.Strings(ks)
+		return nil, fmt.Errorf("unknown estimator %q (have %v)", kind, ks)
+	}
+	return f(p)
+}
