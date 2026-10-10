@@ -62,8 +62,10 @@ source /etc/profile.d/go.sh && go version
 
 ```bash
 sudo useradd -r -m -d /opt/dex-arbitr -s /bin/bash arb
-sudo -iu arb
+sudo -iu arb                     # 必须带 -i，才会进入 arb 的家目录 /opt/dex-arbitr
+cd ~ && pwd                      # 应输出 /opt/dex-arbitr
 git clone https://github.com/Dog-Feng/dex-arbitr.git ~/app
+ls ~/app/configs/config.yaml     # 能看到文件才继续
 cd ~/app
 go test ./...
 mkdir -p ~/bin
@@ -87,7 +89,7 @@ ENV
 chmod 600 ~/arb.env
 ```
 
-运行配置：复制一份到仓库之外，避免 `git pull` 冲突：
+运行配置：复制一份到仓库之外，避免 `git pull` 冲突（若提示 `No such file`，说明第 2 步 clone 未成功，见下方"常见问题"）：
 
 ```bash
 cp ~/app/configs/config.yaml ~/config.yaml
@@ -174,3 +176,20 @@ sudo systemctl restart arbd
 ```
 
 如需同时回滚代码：`cd ~/app && git checkout <上一个提交号>` 后重新编译。
+
+## 常见问题
+
+**`cp: cannot stat '/opt/dex-arbitr/app/configs/config.yaml': No such file or directory`**
+
+代码没有克隆到 `/opt/dex-arbitr/app`。按顺序检查：
+
+```bash
+whoami && echo ~                       # 应为 arb 和 /opt/dex-arbitr
+ls -la ~                               # 看是否有 app 目录
+sudo find / -name config.yaml -path "*dex-arbitr*" 2>/dev/null   # 是否克隆到了别处
+```
+
+- 没有 `app` 目录：以 arb 身份重新执行 `git clone https://github.com/Dog-Feng/dex-arbitr.git ~/app`，注意看有无报错。
+- 克隆到了别的用户目录（例如 `/root/dex-arbitr` 或 `/home/ubuntu/dex-arbitr`）：删掉它，以 arb 身份重新克隆到 `~/app`。
+- `git: command not found`：先 `sudo apt-get install -y git`。
+- `Permission denied`：`sudo chown -R arb:arb /opt/dex-arbitr`。
