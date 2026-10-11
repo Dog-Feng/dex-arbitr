@@ -22,13 +22,17 @@ type Config struct {
 	RescueInterval   time.Duration
 	RescueAlertAfter time.Duration
 	Rescue           RescueParams
+	// PriceTicks widens the IOC limit price of each leg by this many ticks
+	// beyond the decision price (buy: +N ticks, sell: -N ticks). Fills still
+	// match from the best level, so this only adds a worst-case allowance.
+	PriceTicks int
 }
 
 // DefaultConfig values.
 func DefaultConfig() Config {
 	return Config{AckTimeout: 3 * time.Second, QueryRetries: 3, QueryInterval: time.Second,
 		SettleDelay: 700 * time.Millisecond, RescueInterval: 400 * time.Millisecond,
-		RescueAlertAfter: 10 * time.Second, Rescue: DefaultRescue}
+		RescueAlertAfter: 10 * time.Second, Rescue: DefaultRescue, PriceTicks: 3}
 }
 
 // LegSpec is one side of a hedged action.
@@ -159,9 +163,28 @@ func (e *Executor) positions(ctx context.Context, l, r LegSpec) (float64, float6
 // runLeg submits one IOC order and resolves its final state.
 func (e *Executor) runLeg(ctx context.Context, leg LegSpec, qty float64, reduceOnly bool) LegResult {
 	return e.submitAndResolve(ctx, domain.OrderReq{
-		ClientID: e.ids.Next(), Inst: leg.Inst, Side: leg.Side, Qty: qty, Price: leg.Price,
+		ClientID: e.ids.Next(), Inst: leg.Inst, Side: leg.Side, Qty: qty, Price: e.limitPrice(leg),
 		Type: domain.Limit, ReduceOnly: reduceOnly,
 	}, leg.Venue)
+}
+
+// limitPrice returns the IOC limit price for a leg: the decision price moved
+// PriceTicks ticks in the aggressive direction. leg.Price itself is left
+// untouched so fill estimates and expected_bps keep using the decision price.
+func (e *Executor) limitPrice(leg LegSpec) float64 {
+	n := e.cfg.PriceTicks
+	if n <= 0 {
+		return leg.Price
+	}
+	off := float64(n) * leg.Inst.Tick()
+	px := leg.Price + off
+	if leg.Side == domain.Sell {
+		px = leg.Price - off
+		if px <= 0 {
+			return leg.Price
+		}
+	}
+	return domain.Round(px, leg.Inst.PriceDecimals)
 }
 
 func (e *Executor) submitAndResolve(ctx context.Context, req domain.OrderReq, v exchange.Venue) LegResult {
