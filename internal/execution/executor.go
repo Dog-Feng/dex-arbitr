@@ -32,7 +32,7 @@ type Config struct {
 func DefaultConfig() Config {
 	return Config{AckTimeout: 3 * time.Second, QueryRetries: 3, QueryInterval: time.Second,
 		SettleDelay: 700 * time.Millisecond, RescueInterval: 400 * time.Millisecond,
-		RescueAlertAfter: 10 * time.Second, Rescue: DefaultRescue, PriceTicks: 3}
+		RescueAlertAfter: 10 * time.Second, Rescue: DefaultRescue, PriceTicks: 10}
 }
 
 // LegSpec is one side of a hedged action.
