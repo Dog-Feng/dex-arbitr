@@ -37,7 +37,8 @@ type PairConfig struct {
 	IDs         *execution.IDGen
 }
 
-// PairActor owns all mutable state of one pair (single goroutine).
+// PairActor owns the trading state of one pair (single goroutine).
+// A separate goroutine updates the book cache, including during execution.
 type PairActor struct {
 	cfg   PairConfig
 	key   string
@@ -75,10 +76,35 @@ func NewPairActor(cfg PairConfig) (*PairActor, error) {
 func (a *PairActor) book(venue string, _ int) (domain.Book, bool) {
 	a.bookMu.RLock()
 	defer a.bookMu.RUnlock()
+	b := a.bookR
 	if venue == a.cfg.L.Name() {
-		return a.bookL, a.bookL.Valid()
+		b = a.bookL
 	}
-	return a.bookR, a.bookR.Valid()
+	return b, b.Valid() && time.Since(b.Ts) <= a.cfg.MaxBookAge
+}
+
+// collectBooks keeps rescue pricing current while Run waits for execution.
+func (a *PairActor) collectBooks(ctx context.Context, chL, chR <-chan domain.Book) {
+	for chL != nil || chR != nil {
+		select {
+		case <-ctx.Done():
+			return
+		case b, ok := <-chL:
+			if !ok {
+				chL = nil
+			}
+			a.bookMu.Lock()
+			a.bookL = b
+			a.bookMu.Unlock()
+		case b, ok := <-chR:
+			if !ok {
+				chR = nil
+			}
+			a.bookMu.Lock()
+			a.bookR = b
+			a.bookMu.Unlock()
+		}
+	}
 }
 
 func (a *PairActor) persist() {
@@ -124,6 +150,8 @@ func (a *PairActor) reconcile(ctx context.Context) error {
 
 // Run the actor until ctx is done.
 func (a *PairActor) Run(ctx context.Context) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	chL, err := a.cfg.L.SubscribeBook(ctx, a.cfg.Pair.Left)
 	if err != nil {
 		return err
@@ -132,6 +160,15 @@ func (a *PairActor) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	booksDone := make(chan struct{})
+	go func() {
+		defer close(booksDone)
+		a.collectBooks(ctx, chL, chR)
+	}()
+	defer func() {
+		cancel()
+		<-booksDone
+	}()
 	if !a.cfg.DryRun {
 		if err := a.reconcile(ctx); err != nil {
 			a.log.Error("reconcile", "err", err)
@@ -155,14 +192,6 @@ func (a *PairActor) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			a.persist()
 			return nil
-		case b := <-chL:
-			a.bookMu.Lock()
-			a.bookL = b
-			a.bookMu.Unlock()
-		case b := <-chR:
-			a.bookMu.Lock()
-			a.bookR = b
-			a.bookMu.Unlock()
 		case now := <-sample.C:
 			if q, ok := a.quote(now); ok {
 				a.cfg.Est.Update(now, q.Mid)
