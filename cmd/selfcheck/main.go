@@ -145,8 +145,8 @@ loop:
 	okQty, why := pair.ValidQty(*qty, q.RefMid)
 	check(okQty, fmt.Sprintf("qty %.4f valid on both", *qty), "notional %.2f USD %s", *qty*q.RefMid, why)
 	p := strategy.Params{StepQty: *qty, MaxSteps: pc.MaxSteps, OpenBps: cfg.Strategy.OpenBps, CloseBps: cfg.Strategy.CloseBps,
-		DepthMult: cfg.Strategy.DepthMult, CloseOrder: cfg.Strategy.CloseOrder}
-	a := strategy.Decide(p, strategy.State{Mode: strategy.ModeRunning}, q, est.Mean(), true)
+		DepthMult: cfg.Strategy.DepthMult, CloseOrder: cfg.Strategy.CloseOrder, VolK: cfg.Strategy.VolK}
+	a := strategy.Decide(p, strategy.State{Mode: strategy.ModeRunning}, q, est.Mean(), true, 0)
 	check(true, "decide (using short-window mean)", "%s %s", a.Kind, a.Reason)
 	need := *qty * cfg.Strategy.DepthMult
 	fmt.Printf("     depth need %.4f: L bid %.4f ask %.4f | R bid %.4f ask %.4f\n", need, bl.Bids[0].Size, bl.Asks[0].Size, br.Bids[0].Size, br.Asks[0].Size)
@@ -186,7 +186,7 @@ loop:
 	}
 
 	if *live {
-		liveFlow(ctx, L, R, pair, *qty, cfg.Strategy.DepthMult, *rescue)
+		liveFlow(ctx, L, R, pair, *qty, cfg.Strategy.DepthMult, *rescue, engine.ExecutionConfig(cfg))
 	} else {
 		fmt.Println("== 6. live orders: skipped (run with -live and API keys) ==")
 	}
@@ -199,7 +199,7 @@ loop:
 	}
 }
 
-func liveFlow(ctx context.Context, L, R exchange.Venue, pair symbols.Pair, qty, depthMult float64, rescue bool) {
+func liveFlow(ctx context.Context, L, R exchange.Venue, pair symbols.Pair, qty, depthMult float64, rescue bool, execCfg execution.Config) {
 	fmt.Println("== 6. LIVE round trip ==")
 	if !L.CanTrade() || !R.CanTrade() {
 		check(false, "credentials", "both venues need keys (env LIGHTER_* / RH_*)")
@@ -239,12 +239,15 @@ func liveFlow(ctx context.Context, L, R exchange.Venue, pair symbols.Pair, qty, 
 		b, ok := latest[v]
 		return b, ok && b.Valid()
 	}
-	ex := execution.NewExecutor(execution.DefaultConfig(), tr, execution.NewIDGen(), bookFn, nil)
+	ex := execution.NewExecutor(execCfg, tr, execution.NewIDGen(), bookFn, nil, nil)
 	time.Sleep(2 * time.Second) // let WS subscriptions settle
 
 	pl0, e1 := execution.MarketPosition(ctx, L, pair.Left.MarketID)
 	pr0, e2 := execution.MarketPosition(ctx, R, pair.Right.MarketID)
 	check(e1 == nil && e2 == nil, "baseline positions", "L %.4f R %.4f %v %v", pl0, pr0, e1, e2)
+	if e1 != nil || e2 != nil {
+		return
+	}
 
 	leg := func(v exchange.Venue, inst domain.Instrument, side domain.Side) execution.LegSpec {
 		b := latest[v.Name()]

@@ -18,6 +18,7 @@ import (
 	"github.com/Dog-Feng/dex-arbitr/internal/store"
 	"github.com/Dog-Feng/dex-arbitr/internal/strategy"
 	"github.com/Dog-Feng/dex-arbitr/internal/symbols"
+	"github.com/Dog-Feng/dex-arbitr/internal/volatility"
 )
 
 // PairConfig wires one pair actor.
@@ -35,6 +36,10 @@ type PairConfig struct {
 	Tracker     *execution.Tracker // nil in dry run
 	ExecCfg     execution.Config
 	IDs         *execution.IDGen
+	Vol         *volatility.Estimator
+	VolEvery    time.Duration
+	VolMaxAge   time.Duration
+	Samples     *store.SampleSink
 }
 
 // PairActor owns the trading state of one pair (single goroutine).
@@ -52,7 +57,35 @@ type PairActor struct {
 	bookMu sync.RWMutex
 	bookL  domain.Book
 	bookR  domain.Book
+	lat    latencyStat
 }
+
+// latencyStat aggregates per-leg submit-to-result latency for the status report.
+type latencyStat struct {
+	n   int
+	sum time.Duration
+	max time.Duration
+}
+
+func (s *latencyStat) add(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	s.n++
+	s.sum += d
+	if d > s.max {
+		s.max = d
+	}
+}
+
+func (s *latencyStat) avg() time.Duration {
+	if s.n == 0 {
+		return 0
+	}
+	return s.sum / time.Duration(s.n)
+}
+
+func (s *latencyStat) reset() { *s = latencyStat{} }
 
 // NewPairActor builds the actor and loads persisted steps.
 func NewPairActor(cfg PairConfig) (*PairActor, error) {
@@ -68,7 +101,9 @@ func NewPairActor(cfg PairConfig) (*PairActor, error) {
 	a.state = strategy.State{Mode: strategy.ModeWarmup, Steps: st.Steps}
 	a.next = st.NextID
 	if !cfg.DryRun {
-		a.exec = execution.NewExecutor(cfg.ExecCfg, cfg.Tracker, cfg.IDs, a.book, nil)
+		// Live trading stays paused until reconciliation succeeds.
+		a.state.Mode = strategy.ModePaused
+		a.exec = execution.NewExecutor(cfg.ExecCfg, cfg.Tracker, cfg.IDs, a.book, a.volBps, nil)
 	}
 	return a, nil
 }
@@ -123,13 +158,15 @@ func (a *PairActor) jitter() time.Duration {
 
 // reconcile checks persisted steps against live positions.
 func (a *PairActor) reconcile(ctx context.Context) error {
+	// Any failed query or mismatch must block both opens and closes.
+	a.state.Mode = strategy.ModePaused
 	pl, err := execution.MarketPosition(ctx, a.cfg.L, a.cfg.Pair.Left.MarketID)
 	if err != nil {
-		return err
+		return fmt.Errorf("%s positions: %w", a.cfg.L.Name(), err)
 	}
 	pr, err := execution.MarketPosition(ctx, a.cfg.R, a.cfg.Pair.Right.MarketID)
 	if err != nil {
-		return err
+		return fmt.Errorf("%s positions: %w", a.cfg.R.Name(), err)
 	}
 	a.posL, a.posR = pl, pr
 	var expL float64
@@ -139,12 +176,13 @@ func (a *PairActor) reconcile(ctx context.Context) error {
 	eps := math.Pow10(-a.cfg.Pair.SizeDecimals) / 2
 	a.log.Info("positions", "posL", pl, "posR", pr, "expected_posL", expL, "steps", a.state.Counter())
 	if math.Abs(pl+pr) >= eps {
-		a.state.Mode = strategy.ModePaused
 		return fmt.Errorf("positions unhedged (posL %.6f + posR %.6f != 0): paused, fix manually", pl, pr)
 	}
-	if math.Abs(pl-expL) >= eps {
-		a.log.Warn("position differs from recorded steps (manual trades?)", "posL", pl, "expected", expL)
+	if math.Abs(pl-expL) >= eps || math.Abs(pr+expL) >= eps {
+		return fmt.Errorf("positions differ from recorded steps (posL %.6f posR %.6f, expected L %.6f R %.6f): paused, fix manually", pl, pr, expL, -expL)
 	}
+	a.state.Mode = strategy.ModeWarmup
+	a.log.Info("position reconciliation passed")
 	return nil
 }
 
@@ -169,6 +207,9 @@ func (a *PairActor) Run(ctx context.Context) error {
 		cancel()
 		<-booksDone
 	}()
+	if a.cfg.Samples != nil {
+		defer a.cfg.Samples.Close()
+	}
 	if !a.cfg.DryRun {
 		if err := a.reconcile(ctx); err != nil {
 			a.log.Error("reconcile", "err", err)
@@ -177,8 +218,20 @@ func (a *PairActor) Run(ctx context.Context) error {
 	if a.cfg.SampleEvery == 0 {
 		a.cfg.SampleEvery = time.Second
 	}
+	if a.cfg.Vol != nil && a.cfg.VolEvery == 0 {
+		a.cfg.VolEvery = 100 * time.Millisecond
+	}
+	if a.cfg.Vol != nil && a.cfg.VolMaxAge == 0 {
+		a.cfg.VolMaxAge = 50 * time.Millisecond
+	}
 	sample := time.NewTicker(a.cfg.SampleEvery)
 	defer sample.Stop()
+	var volC <-chan time.Time
+	if a.cfg.Vol != nil {
+		vt := time.NewTicker(a.cfg.VolEvery)
+		defer vt.Stop()
+		volC = vt.C
+	}
 	decide := time.NewTicker(200 * time.Millisecond)
 	defer decide.Stop()
 	report := time.NewTicker(time.Minute)
@@ -200,12 +253,25 @@ func (a *PairActor) Run(ctx context.Context) error {
 				a.state.Mode = strategy.ModeRunning
 				a.log.Info("mean ready -> RUNNING", "stats", a.cfg.Est.Stats())
 			}
+		case now := <-volC:
+			if q, ok := a.volQuote(now); ok {
+				a.cfg.Vol.Add(q.Mid)
+				if a.cfg.Samples != nil {
+					a.cfg.Samples.Add(now, q.Mid, q.LS, q.SL)
+				}
+			}
 		case <-report.C:
 			st := a.cfg.Est.Stats()
 			q, _ := a.quote(time.Now())
+			vol := 0.0
+			if a.cfg.Vol != nil {
+				vol = a.cfg.Vol.Vol()
+			}
 			a.log.Info("status", "mode", a.state.Mode, "steps", a.state.Counter(), "mu_bps", round2(st.Mean),
 				"samples", st.Samples, "span", st.Span.Round(time.Second), "coverage", round2(st.Coverage),
-				"LS_bps", round2(q.LS), "SL_bps", round2(q.SL), "mid_bps", round2(q.Mid))
+				"LS_bps", round2(q.LS), "SL_bps", round2(q.SL), "mid_bps", round2(q.Mid),
+				"vol_500ms_bps", round4(vol), "lat_n", a.lat.n, "lat_avg_ms", a.lat.avg().Milliseconds(), "lat_max_ms", a.lat.max.Milliseconds())
+			a.lat.reset()
 		case now := <-decide.C:
 			if now.Before(nextAt) || a.state.Mode == strategy.ModePaused {
 				continue
@@ -214,7 +280,7 @@ func (a *PairActor) Run(ctx context.Context) error {
 			if !ok {
 				continue
 			}
-			act := strategy.Decide(a.cfg.Params, a.state, q, a.cfg.Est.Mean(), a.cfg.Est.Ready())
+			act := strategy.Decide(a.cfg.Params, a.state, q, a.cfg.Est.Mean(), a.cfg.Est.Ready(), a.volBps())
 			if act.Kind == strategy.None {
 				continue
 			}
@@ -234,6 +300,30 @@ func (a *PairActor) quote(now time.Time) (spread.Quote, bool) {
 	return spread.Compute(l, r)
 }
 
+// volQuote returns a spread sample only when both books are fresh and mutually
+// close in time, so short-horizon volatility is not polluted by stale reads.
+func (a *PairActor) volQuote(now time.Time) (spread.Quote, bool) {
+	a.bookMu.RLock()
+	l, r := a.bookL, a.bookR
+	a.bookMu.RUnlock()
+	age := a.cfg.VolMaxAge
+	if now.Sub(l.Ts) > age || now.Sub(r.Ts) > age {
+		return spread.Quote{}, false
+	}
+	if d := l.Ts.Sub(r.Ts); d > age || -d > age {
+		return spread.Quote{}, false
+	}
+	return spread.Compute(l, r)
+}
+
+// volBps is the current short-horizon spread volatility in bps, or 0.
+func (a *PairActor) volBps() float64 {
+	if a.cfg.Vol == nil {
+		return 0
+	}
+	return a.cfg.Vol.Vol()
+}
+
 func (a *PairActor) apply(ctx context.Context, act strategy.Action, q spread.Quote) {
 	a.log.Info("action", "kind", act.Kind, "dir", act.Dir, "qty", act.Qty, "L", fmt.Sprintf("%s@%.4f", act.L.Side, act.L.Price),
 		"R", fmt.Sprintf("%s@%.4f", act.R.Side, act.R.Price), "expected_bps", round2(act.ExpectedBps), "reason", act.Reason)
@@ -246,8 +336,11 @@ func (a *PairActor) apply(ctx context.Context, act strategy.Action, q spread.Quo
 			act.Qty, act.Kind == strategy.Close, a.posL, a.posR)
 		fillL, fillR, pxL, pxR = res.L.Filled, res.R.Filled, res.L.AvgPrice, res.R.AvgPrice
 		a.posL, a.posR = res.PosL, res.PosR
+		a.lat.add(res.L.Latency)
+		a.lat.add(res.R.Latency)
 		a.log.Info("executed", "fillL", fillL, "fillR", fillR, "pxL", pxL, "pxR", pxR, "statusL", res.L.Status, "statusR", res.R.Status,
-			"rescue_orders", res.RescueOrders, "rescue_qty", res.RescueQty, "posL", res.PosL, "posR", res.PosR, "took", res.Duration.Round(time.Millisecond))
+			"rescue_orders", res.RescueOrders, "rescue_qty", res.RescueQty, "posL", res.PosL, "posR", res.PosR, "took", res.Duration.Round(time.Millisecond),
+			"latL_ms", res.L.Latency.Milliseconds(), "latR_ms", res.R.Latency.Milliseconds())
 	}
 	eps := math.Pow10(-a.cfg.Pair.SizeDecimals) / 2
 	switch act.Kind {
@@ -280,3 +373,5 @@ func (a *PairActor) apply(ctx context.Context, act strategy.Action, q spread.Quo
 }
 
 func round2(v float64) float64 { return math.Round(v*100) / 100 }
+
+func round4(v float64) float64 { return math.Round(v*10000) / 10000 }

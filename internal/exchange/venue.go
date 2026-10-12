@@ -31,6 +31,12 @@ type Venue interface {
 	Close() error
 }
 
+// LeverageSetter is implemented by venues that apply account leverage per
+// market (e.g. Lighter's initial-margin fraction).
+type LeverageSetter interface {
+	SetLeverage(ctx context.Context, inst domain.Instrument, leverage int) error
+}
+
 // Factory builds a venue from a generic option map.
 type Factory func(name string, opts map[string]string) (Venue, error)
 

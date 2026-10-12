@@ -1,6 +1,8 @@
 # Cross-DEX perp spread step arbitrage. Secrets come from environment variables.
 dry_run: true            # true = paper trading (no orders). Set false for live.
 state_dir: state
+leverage: 10            # account leverage, applied to every venue (1x..10000x)
+samples_dir: state/samples   # append 100ms spread samples for offline calibration (empty = off)
 
 venues:
   - name: lighter
@@ -27,14 +29,28 @@ estimator:
   min_coverage: 0.8
   interval: 1s
 
+volatility:
+  interval: 100ms       # sampling interval for the spread series
+  horizon: 500ms        # increment horizon whose volatility is estimated
+  half_life: 1m         # EWMA half-life of realized variance
+  max_age: 50ms         # drop samples when either book is older than this
+
 strategy:
   open_bps: 1          # open when deviation from mean >= 1bps
   close_bps: 1         # close when step gross profit >= 1bps
   depth_mult: 2        # top-of-book qty >= step_qty * 2 on both legs
   close_order: best    # best | lifo | fifo
+  vol_k: 1.28          # one-sided sigma buffer added to open_bps
   interval_min: 7s
   interval_max: 10s
   max_book_age: 10s
+
+execution:
+  price_ticks: 30      # fixed IOC allowance; fallback while sigma is not ready
+  dynamic_ticks: true  # scale the allowance by sigma (volatility.horizon)
+  tick_k: 1.28         # one-sided coverage coefficient
+  min_ticks: 1
+  max_ticks: 0         # 0 = no upper clamp
 
 pairs:
   - base: SNDK

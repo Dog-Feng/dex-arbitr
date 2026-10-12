@@ -38,6 +38,15 @@ go run ./cmd/selfcheck -live -rescue      # + forced one-leg failure, verifies r
 go run ./cmd/arbd -config configs/config.yaml   # dry_run: true = paper trading
 ```
 
+普通开平仓 IOC 的让价幅度由配置文件控制，`arbd` 和实盘 `selfcheck` 共用：
+
+```yaml
+execution:
+  price_ticks: 30
+```
+
+买单限价为决策价格加 N 个 tick，卖单为决策价格减 N 个 tick；tick 是各交易所的最小价格单位。设为 `0` 时使用决策价格，省略时默认 `30`，负数配置会报错。修改后重启程序生效；补救单仍使用原有价格阶梯。
+
 > Lighter blocks order submission (`sendTx`, authenticated WS) from restricted jurisdictions (e.g. US IPs, code 20558).
 > Run live trading from a permitted region.
 
@@ -165,7 +174,7 @@ cat /opt/dex-arbitr/state/*.json  # 当前持有的步
 ```
 
 - 均值需先采样 60 分钟才开始开仓（日志出现 `mean ready -> RUNNING`）。
-- 启动时会核对两边持仓；若两边不对冲（合计不为 0）自动进入 `PAUSED`，人工处理后再重启。
+- 实盘启动时先核对两边持仓；只有两边查询成功、相互对冲且分别与本地步骤记录一致，才允许开平仓。查询失败或持仓不一致时保持 `PAUSED`，处理后重启重新核对；均值就绪不会解除暂停。
 - 限制日志占用：`/etc/systemd/journald.conf` 中设 `SystemMaxUse=500M`，然后 `systemctl restart systemd-journald`。
 
 ## 更新流程（root）

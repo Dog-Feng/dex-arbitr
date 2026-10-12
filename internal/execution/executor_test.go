@@ -73,10 +73,44 @@ func testExec(t *testing.T, l, r *fakeVenue) *Executor {
 	cfg := DefaultConfig()
 	cfg.AckTimeout, cfg.QueryInterval, cfg.SettleDelay, cfg.RescueInterval = 50*time.Millisecond, 10*time.Millisecond, time.Millisecond, time.Millisecond
 	bk := domain.Book{Bids: []domain.Level{{Price: 100, Size: 1}}, Asks: []domain.Level{{Price: 100.1, Size: 1}}}
-	return NewExecutor(cfg, tr, NewIDGen(), func(string, int) (domain.Book, bool) { return bk, true }, func(string) {})
+	return NewExecutor(cfg, tr, NewIDGen(), func(string, int) (domain.Book, bool) { return bk, true }, nil, func(string) {})
 }
 
 func full(_ int, r domain.OrderReq) float64 { return r.Qty }
+
+func TestDynamicAllowance(t *testing.T) {
+	leg := LegSpec{Inst: domain.Instrument{PriceDecimals: 2}, Side: domain.Buy, Price: 100}
+	e := NewExecutor(Config{DynamicTicks: true, TickK: 1, TickMin: 1, TickMax: 100, PriceTicks: 30},
+		nil, NewIDGen(), nil, func() float64 { return 10 }, func(string) {})
+	// adverse move = 100 * 1 * 10bps / 1e4 = 0.1 => 10 ticks of 0.01
+	if n := e.allowance(leg, 0.01); n != 10 {
+		t.Fatalf("dynamic allowance=%d, want 10", n)
+	}
+	// volatility not ready falls back to the fixed allowance
+	e.vol = func() float64 { return 0 }
+	if n := e.allowance(leg, 0.01); n != 30 {
+		t.Fatalf("fallback allowance=%d, want 30", n)
+	}
+	// high volatility is capped at TickMax
+	e.vol = func() float64 { return 5000 }
+	if n := e.allowance(leg, 0.01); n != 100 {
+		t.Fatalf("capped allowance=%d, want 100", n)
+	}
+}
+
+func TestDepthTicks(t *testing.T) {
+	inst := domain.Instrument{PriceDecimals: 2} // tick 0.01
+	bk := domain.Book{
+		Asks: []domain.Level{{Price: 100, Size: 0.005}, {Price: 100.2, Size: 1}},
+		Bids: []domain.Level{{Price: 100, Size: 0.005}, {Price: 99.9, Size: 1}},
+	}
+	if n := depthTicks(LegSpec{Inst: inst, Side: domain.Buy, Price: 100}, bk, 0.01); n != 20 {
+		t.Fatalf("buy depth ticks=%d, want 20", n)
+	}
+	if n := depthTicks(LegSpec{Inst: inst, Side: domain.Sell, Price: 100}, bk, 0.01); n != 10 {
+		t.Fatalf("sell depth ticks=%d, want 10", n)
+	}
+}
 
 func TestBothFilled(t *testing.T) {
 	l, r := newFake("L", full), newFake("R", full)

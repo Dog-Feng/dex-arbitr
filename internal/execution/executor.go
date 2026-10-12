@@ -23,16 +23,24 @@ type Config struct {
 	RescueAlertAfter time.Duration
 	Rescue           RescueParams
 	// PriceTicks widens the IOC limit price of each leg by this many ticks
-	// beyond the decision price (buy: +N ticks, sell: -N ticks). Fills still
-	// match from the best level, so this only adds a worst-case allowance.
-	PriceTicks int
+	// beyond the decision price (buy: +N ticks, sell: -N ticks). It is the
+	// fixed allowance, and the fallback while volatility is not ready.
+	// DynamicTicks replaces it with ticks = clamp(ceil(price*TickK*sigmaBps/1e4/tick),
+	// TickMin, TickMax). Fills still match from the best level, so this only
+	// adds a worst-case allowance.
+	PriceTicks   int
+	DynamicTicks bool
+	TickK        float64
+	TickMin      int
+	TickMax      int // 0 = no upper clamp
 }
 
 // DefaultConfig values.
 func DefaultConfig() Config {
 	return Config{AckTimeout: 3 * time.Second, QueryRetries: 3, QueryInterval: time.Second,
 		SettleDelay: 700 * time.Millisecond, RescueInterval: 400 * time.Millisecond,
-		RescueAlertAfter: 10 * time.Second, Rescue: DefaultRescue, PriceTicks: 30}
+		RescueAlertAfter: 10 * time.Second, Rescue: DefaultRescue, PriceTicks: 30,
+		TickK: 1.28, TickMin: 1}
 }
 
 // LegSpec is one side of a hedged action.
@@ -51,6 +59,7 @@ type LegResult struct {
 	AvgPrice  float64
 	Resolved  bool // status came from venue (WS/REST), else inferred from positions
 	SubmitErr error
+	Latency   time.Duration // submit -> terminal state (WS/REST) or give-up
 }
 
 // Result of a two-leg execution.
@@ -65,21 +74,25 @@ type Result struct {
 // BookFn returns the latest book for a venue/market (for rescue pricing).
 type BookFn func(venue string, marketID int) (domain.Book, bool)
 
+// VolFn returns the current short-horizon spread volatility in bps (0 if not ready).
+type VolFn func() float64
+
 // Executor runs hedged two-leg actions.
 type Executor struct {
 	cfg     Config
 	tracker *Tracker
 	ids     *IDGen
 	book    BookFn
+	vol     VolFn
 	alert   func(msg string)
 }
 
 // NewExecutor builds an executor.
-func NewExecutor(cfg Config, t *Tracker, ids *IDGen, book BookFn, alert func(string)) *Executor {
+func NewExecutor(cfg Config, t *Tracker, ids *IDGen, book BookFn, vol VolFn, alert func(string)) *Executor {
 	if alert == nil {
 		alert = func(m string) { slog.Error("ALERT", "msg", m) }
 	}
-	return &Executor{cfg: cfg, tracker: t, ids: ids, book: book, alert: alert}
+	return &Executor{cfg: cfg, tracker: t, ids: ids, book: book, vol: vol, alert: alert}
 }
 
 // MarketPosition returns the signed position on one market.
@@ -163,16 +176,16 @@ func (e *Executor) positions(ctx context.Context, l, r LegSpec) (float64, float6
 // runLeg submits one IOC order and resolves its final state.
 func (e *Executor) runLeg(ctx context.Context, leg LegSpec, qty float64, reduceOnly bool) LegResult {
 	return e.submitAndResolve(ctx, domain.OrderReq{
-		ClientID: e.ids.Next(), Inst: leg.Inst, Side: leg.Side, Qty: qty, Price: e.limitPrice(leg),
+		ClientID: e.ids.Next(), Inst: leg.Inst, Side: leg.Side, Qty: qty, Price: e.limitPrice(leg, qty),
 		Type: domain.Limit, ReduceOnly: reduceOnly,
 	}, leg.Venue)
 }
 
 // limitPrice returns the IOC limit price for a leg: the decision price moved
-// PriceTicks ticks in the aggressive direction. leg.Price itself is left
+// allowance ticks in the aggressive direction. leg.Price itself is left
 // untouched so fill estimates and expected_bps keep using the decision price.
-func (e *Executor) limitPrice(leg LegSpec) float64 {
-	n := e.cfg.PriceTicks
+func (e *Executor) limitPrice(leg LegSpec, qty float64) float64 {
+	n := e.allowance(leg, qty)
 	if n <= 0 {
 		return leg.Price
 	}
@@ -187,8 +200,70 @@ func (e *Executor) limitPrice(leg LegSpec) float64 {
 	return domain.Round(px, leg.Inst.PriceDecimals)
 }
 
+// allowance is the IOC tick allowance for a leg: the fixed PriceTicks, or when
+// DynamicTicks is enabled and volatility is ready, a volatility-scaled value
+// covering TickK one-sided standard deviations of the horizon move.
+func (e *Executor) allowance(leg LegSpec, qty float64) int {
+	if !e.cfg.DynamicTicks || e.vol == nil {
+		return e.cfg.PriceTicks
+	}
+	sigma := e.vol()
+	if sigma <= 0 {
+		return e.cfg.PriceTicks
+	}
+	ticks := int(math.Ceil(leg.Price*(e.cfg.TickK*sigma/1e4)/leg.Inst.Tick() - 1e-9))
+	// Cover the depth the quantity actually consumes (IOC walks past level 1).
+	if e.book != nil && leg.Venue != nil {
+		if b, ok := e.book(leg.Venue.Name(), leg.Inst.MarketID); ok {
+			if d := depthTicks(leg, b, qty); d > ticks {
+				ticks = d
+			}
+		}
+	}
+	if ticks < e.cfg.TickMin {
+		ticks = e.cfg.TickMin
+	}
+	if e.cfg.TickMax > 0 && ticks > e.cfg.TickMax {
+		ticks = e.cfg.TickMax
+	}
+	return ticks
+}
+
+// depthTicks is the number of ticks from the decision price to the level where
+// qty fills (adverse direction), or to the deepest level if depth is short.
+func depthTicks(leg LegSpec, b domain.Book, qty float64) int {
+	levels := b.Asks
+	if leg.Side == domain.Sell {
+		levels = b.Bids
+	}
+	if len(levels) == 0 {
+		return 0
+	}
+	rem := qty
+	for _, lv := range levels {
+		rem -= lv.Size
+		if rem > 0 {
+			continue
+		}
+		return ticksTo(leg, lv.Price)
+	}
+	return ticksTo(leg, levels[len(levels)-1].Price)
+}
+
+func ticksTo(leg LegSpec, price float64) int {
+	d := price - leg.Price
+	if leg.Side == domain.Sell {
+		d = leg.Price - price
+	}
+	if d <= 0 {
+		return 0
+	}
+	return int(math.Ceil(d/leg.Inst.Tick() - 1e-9))
+}
+
 func (e *Executor) submitAndResolve(ctx context.Context, req domain.OrderReq, v exchange.Venue) LegResult {
 	lr := LegResult{ClientID: req.ClientID}
+	start := time.Now()
 	w := e.tracker.Watch(v.Name(), req.ClientID)
 	defer e.tracker.Done(v.Name(), req.ClientID)
 
@@ -196,6 +271,7 @@ func (e *Executor) submitAndResolve(ctx context.Context, req domain.OrderReq, v 
 	lr.SubmitErr = err
 	if errors.Is(err, domain.ErrRejected) || errors.Is(err, domain.ErrNoCredentials) {
 		lr.Status, lr.Resolved = domain.StatusRejected, true
+		lr.Latency = time.Since(start)
 		slog.Warn("order rejected", "venue", v.Name(), "cid", req.ClientID, "err", err)
 		return lr
 	}
@@ -206,7 +282,7 @@ func (e *Executor) submitAndResolve(ctx context.Context, req domain.OrderReq, v 
 		select {
 		case u := <-w:
 			if u.Status.Terminal() {
-				return fill(lr, u)
+				return fill(lr, u, start)
 			}
 			continue
 		case <-timer.C:
@@ -219,23 +295,25 @@ func (e *Executor) submitAndResolve(ctx context.Context, req domain.OrderReq, v 
 	for i := 0; i < e.cfg.QueryRetries && ctx.Err() == nil; i++ {
 		u, qerr := v.QueryOrder(ctx, req.Inst, req.ClientID)
 		if qerr == nil && u.Status.Terminal() {
-			return fill(lr, u)
+			return fill(lr, u, start)
 		}
 		select {
 		case u := <-w:
 			if u.Status.Terminal() {
-				return fill(lr, u)
+				return fill(lr, u, start)
 			}
 		case <-time.After(e.cfg.QueryInterval):
 		}
 	}
 	slog.Warn("order state unresolved; will infer from positions", "venue", v.Name(), "cid", req.ClientID)
 	lr.Status = domain.StatusUnknown
+	lr.Latency = time.Since(start)
 	return lr
 }
 
-func fill(lr LegResult, u domain.OrderUpdate) LegResult {
+func fill(lr LegResult, u domain.OrderUpdate, start time.Time) LegResult {
 	lr.Status, lr.Filled, lr.AvgPrice, lr.Resolved = u.Status, u.FilledQty, u.AvgPrice(), true
+	lr.Latency = time.Since(start)
 	return lr
 }
 

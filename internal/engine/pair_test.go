@@ -16,14 +16,15 @@ import (
 )
 
 type actorTestVenue struct {
-	name   string
-	books  chan domain.Book
-	orders chan domain.OrderUpdate
-	flat   chan struct{}
-	mu     sync.Mutex
-	pos    float64
-	traded bool
-	submit func(context.Context, domain.OrderReq) (float64, error)
+	name      string
+	books     chan domain.Book
+	orders    chan domain.OrderUpdate
+	flat      chan struct{}
+	mu        sync.Mutex
+	pos       float64
+	traded    bool
+	submit    func(context.Context, domain.OrderReq) (float64, error)
+	positions func(context.Context) ([]domain.Position, error)
 }
 
 func newActorTestVenue(name string) *actorTestVenue {
@@ -57,7 +58,10 @@ func (v *actorTestVenue) Submit(ctx context.Context, req domain.OrderReq) (domai
 		FilledQty: qty, FilledQuote: qty * req.Price}
 	return domain.SubmitAck{ClientID: req.ClientID}, nil
 }
-func (v *actorTestVenue) Positions(context.Context) ([]domain.Position, error) {
+func (v *actorTestVenue) Positions(ctx context.Context) ([]domain.Position, error) {
+	if v.positions != nil {
+		return v.positions(ctx)
+	}
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	if v.traded && v.pos == 0 {

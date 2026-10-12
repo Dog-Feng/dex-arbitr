@@ -107,6 +107,43 @@ func (v *Venue) Submit(ctx context.Context, r domain.OrderReq) (domain.SubmitAck
 	return domain.SubmitAck{ClientID: r.ClientID, TxHash: hash}, nil
 }
 
+// SetLeverage applies account leverage to a market by submitting an
+// updateLeverage transaction (leverage N -> initial margin fraction 10000/N bps,
+// cross margin). It is a no-op on venues without trading credentials.
+func (v *Venue) SetLeverage(ctx context.Context, inst domain.Instrument, leverage int) error {
+	if v.tx == nil {
+		return domain.ErrNoCredentials
+	}
+	if leverage < 1 || leverage > 10000 {
+		return fmt.Errorf("%w: leverage %d out of range [1, 10000]", domain.ErrRejected, leverage)
+	}
+	v.sendMu.Lock()
+	defer v.sendMu.Unlock()
+	nonce, err := v.nonce.take()
+	if err != nil {
+		return err
+	}
+	txInfo, err := v.tx.GetUpdateLeverageTransaction(&types.UpdateLeverageTxReq{
+		MarketIndex:           int16(inst.MarketID),
+		InitialMarginFraction: uint16(10000 / leverage),
+		MarginMode:            0, // cross margin
+	}, &types.TransactOpts{Nonce: &nonce})
+	if err != nil {
+		v.nonce.invalidate()
+		return err
+	}
+	body, err := txInfo.GetTxInfo()
+	if err != nil {
+		v.nonce.invalidate()
+		return err
+	}
+	if _, err := v.rest.sendTx(ctx, txInfo.GetTxType(), body); err != nil {
+		v.nonce.invalidate()
+		return err
+	}
+	return nil
+}
+
 // CancelOrder cancels by order index (Lighter accepts client order index here as well).
 func (v *Venue) CancelOrder(ctx context.Context, inst domain.Instrument, clientID int64) error {
 	if v.tx == nil {

@@ -64,6 +64,7 @@ type Params struct {
 	CloseBps   float64 // gross round-trip profit to close
 	DepthMult  float64 // top-of-book qty must be >= StepQty*DepthMult on both legs
 	CloseOrder string  // best | lifo | fifo
+	VolK       float64 // one-sided sigma buffer on top of OpenBps for opening
 }
 
 // State is the pair state the strategy needs.
@@ -95,7 +96,7 @@ func (k Kind) String() string { return [...]string{"NONE", "OPEN", "CLOSE"}[k] }
 // Leg of an action.
 type Leg struct {
 	Side  domain.Side
-	Price float64 // top-of-book IOC price (never crosses deeper than level 1)
+	Price float64 // top-of-book decision price; executor adds the configured IOC allowance
 }
 
 // Action produced by Decide.
@@ -137,8 +138,10 @@ func legs(q spread.Quote, l, r domain.Side) (Leg, Leg) {
 }
 
 // Decide is pure: same inputs => same action. mu is the spread mean in bps
-// (only used for opening; muReady=false blocks opens).
-func Decide(p Params, s State, q spread.Quote, mu float64, muReady bool) Action {
+// (only used for opening; muReady=false blocks opens). vol is the short-horizon
+// spread volatility in bps; openings require the deviation to exceed
+// OpenBps + VolK*vol so the expected 500ms adverse move is pre-reserved.
+func Decide(p Params, s State, q spread.Quote, mu float64, muReady bool, vol float64) Action {
 	if s.Mode == ModePaused {
 		return Action{Reason: "paused"}
 	}
@@ -186,8 +189,9 @@ func Decide(p Params, s State, q spread.Quote, mu float64, muReady bool) Action 
 	cnt := s.Counter()
 	devLS := q.LS - mu // buy L / sell R is rich vs mean
 	devSL := q.SL + mu // buy R / sell L is rich vs mean
+	needDev := p.OpenBps + p.VolK*vol
 	try := func(d Dir, dev float64) (Action, bool) {
-		if dev < p.OpenBps {
+		if dev < needDev {
 			return Action{}, false
 		}
 		if cnt != 0 && Dir(sign(cnt)) != d {
@@ -202,7 +206,7 @@ func Decide(p Params, s State, q spread.Quote, mu float64, muReady bool) Action 
 		}
 		la, ra := legs(q, l, r)
 		return Action{Kind: Open, Dir: d, Qty: p.StepQty, L: la, R: ra, ExpectedBps: dev,
-			Reason: fmt.Sprintf("open %s dev %.2fbps >= %.2f (mu %.2f)", d, dev, p.OpenBps, mu)}, true
+			Reason: fmt.Sprintf("open %s dev %.2fbps >= %.2f+%.2f*vol %.2f (mu %.2f)", d, dev, p.OpenBps, p.VolK, vol, mu)}, true
 	}
 	// prefer the larger deviation
 	first, second := DirLS, DirSL
@@ -219,7 +223,7 @@ func Decide(p Params, s State, q spread.Quote, mu float64, muReady bool) Action 
 	} else if ok2 {
 		return b
 	}
-	return Action{Reason: fmt.Sprintf("no signal: LS dev %.2f, SL dev %.2f (mu %.2f)", devLS, devSL, mu)}
+	return Action{Reason: fmt.Sprintf("no signal: LS dev %.2f, SL dev %.2f (need %.2f, mu %.2f)", devLS, devSL, needDev, mu)}
 }
 
 // EntryBps computes the executed entry spread of a step from fill prices.
