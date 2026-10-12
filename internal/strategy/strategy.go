@@ -38,7 +38,10 @@ type Step struct {
 	ID       int64     `json:"id"`
 	Dir      Dir       `json:"dir"`
 	Qty      float64   `json:"qty"`
-	EntryBps float64   `json:"entry_bps"` // executed (sell - buy)/ref in the step's direction
+	EntryBps float64   `json:"entry_bps"` // entry spread from open fills, fill-time mid
+	OpenL    float64   `json:"open_l,omitempty"`
+	OpenR    float64   `json:"open_r,omitempty"`
+	Realized float64   `json:"realized_bps,omitempty"` // cumulative net realized PnL
 	OpenedAt time.Time `json:"opened_at"`
 }
 
@@ -226,8 +229,10 @@ func Decide(p Params, s State, q spread.Quote, mu float64, muReady bool, vol flo
 	return Action{Reason: fmt.Sprintf("no signal: LS dev %.2f, SL dev %.2f (need %.2f, mu %.2f)", devLS, devSL, needDev, mu)}
 }
 
-// EntryBps computes the executed entry spread of a step from fill prices.
-func EntryBps(d Dir, lPx, rPx, ref float64) float64 {
+// EntryBps computes the executed spread (bps) of a leg pair in direction d,
+// referencing the fill-time mid (lPx+rPx)/2.
+func EntryBps(d Dir, lPx, rPx float64) float64 {
+	ref := (lPx + rPx) / 2
 	if d == DirLS {
 		return (rPx - lPx) / ref * 1e4
 	}

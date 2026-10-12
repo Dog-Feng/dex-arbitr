@@ -169,10 +169,7 @@ func (a *PairActor) reconcile(ctx context.Context) error {
 		return fmt.Errorf("%s positions: %w", a.cfg.R.Name(), err)
 	}
 	a.posL, a.posR = pl, pr
-	var expL float64
-	for _, s := range a.state.Steps {
-		expL += -float64(s.Dir) * s.Qty
-	}
+	expL := a.expectedL()
 	eps := math.Pow10(-a.cfg.Pair.SizeDecimals) / 2
 	a.log.Info("positions", "posL", pl, "posR", pr, "expected_posL", expL, "steps", a.state.Counter())
 	if math.Abs(pl+pr) >= eps {
@@ -348,18 +345,25 @@ func (a *PairActor) apply(ctx context.Context, act strategy.Action, q spread.Quo
 		h := math.Min(fillL, fillR)
 		if h < eps {
 			a.log.Warn("open produced no hedged qty")
-			return
+			break
 		}
 		st := strategy.Step{ID: a.next, Dir: act.Dir, Qty: domain.Round(h, a.cfg.Pair.SizeDecimals),
-			EntryBps: strategy.EntryBps(act.Dir, pxL, pxR, q.RefMid), OpenedAt: time.Now()}
+			EntryBps: strategy.EntryBps(act.Dir, pxL, pxR), OpenL: pxL, OpenR: pxR, OpenedAt: time.Now()}
 		a.next++
 		a.state.Steps = append(a.state.Steps, st)
 		a.log.Info("step opened", "id", st.ID, "entry_bps", round2(st.EntryBps), "counter", a.state.Counter())
 	case strategy.Close:
 		closed := math.Max(fillL, fillR) // the lagging leg is completed by rescue
+		fee := a.roundTripFeeBps()
 		for i := range a.state.Steps {
 			if a.state.Steps[i].ID != act.StepID {
 				continue
+			}
+			if closed >= eps {
+				gross := a.state.Steps[i].EntryBps + strategy.EntryBps(-act.Dir, pxL, pxR)
+				a.state.Steps[i].Realized += gross - fee
+				a.log.Info("step pnl", "id", act.StepID, "gross_bps", round2(gross), "fee_bps", round2(fee),
+					"net_bps", round2(gross-fee), "realized_bps", round2(a.state.Steps[i].Realized))
 			}
 			a.state.Steps[i].Qty = domain.Round(a.state.Steps[i].Qty-closed, a.cfg.Pair.SizeDecimals)
 			if a.state.Steps[i].Qty < eps {
@@ -369,7 +373,38 @@ func (a *PairActor) apply(ctx context.Context, act strategy.Action, q spread.Quo
 			break
 		}
 	}
+	if !a.cfg.DryRun {
+		if err := a.checkHedge(); err != nil {
+			a.state.Mode = strategy.ModePaused
+			a.log.Error("hedge invariant broken; pausing", "err", err)
+		}
+	}
 	a.persist()
+}
+
+// expectedL is the left-leg position implied by the step ledger.
+func (a *PairActor) expectedL() float64 {
+	var exp float64
+	for _, s := range a.state.Steps {
+		exp += -float64(s.Dir) * s.Qty
+	}
+	return exp
+}
+
+// roundTripFeeBps is the total taker fee (bps) of a full open+close round trip.
+func (a *PairActor) roundTripFeeBps() float64 {
+	return 2 * (a.cfg.Pair.Left.TakerFee + a.cfg.Pair.Right.TakerFee) * 1e4
+}
+
+// checkHedge verifies the step ledger still matches venue positions after
+// execution; drift is an invariant violation (e.g. an incomplete rescue).
+func (a *PairActor) checkHedge() error {
+	eps := math.Pow10(-a.cfg.Pair.SizeDecimals) / 2
+	expL := a.expectedL()
+	if math.Abs(a.posL-expL) >= eps || math.Abs(a.posR+expL) >= eps {
+		return fmt.Errorf("posL %.6f posR %.6f vs expected L %.6f R %.6f", a.posL, a.posR, expL, -expL)
+	}
+	return nil
 }
 
 func round2(v float64) float64 { return math.Round(v*100) / 100 }

@@ -1,6 +1,7 @@
 package strategy
 
 import (
+	"math"
 	"testing"
 
 	"github.com/Dog-Feng/dex-arbitr/internal/domain"
@@ -12,6 +13,17 @@ func book(bid, ask, sz float64) domain.Book {
 }
 
 var P = Params{StepQty: 0.01, MaxSteps: 3, OpenBps: 1, CloseBps: 1, DepthMult: 2, CloseOrder: "best"}
+
+func TestEntryBpsFillTimeMid(t *testing.T) {
+	// DirLS buys L / sells R: (100.1-100)/100.05 ≈ 9.995 bps
+	if got := EntryBps(DirLS, 100, 100.1); math.Abs(got-9.995) > 0.01 {
+		t.Fatalf("DirLS entry=%v, want ~9.995", got)
+	}
+	// DirSL sells L / buys R: (100.1-100)/100.05 ≈ 9.995 bps
+	if got := EntryBps(DirSL, 100.1, 100); math.Abs(got-9.995) > 0.01 {
+		t.Fatalf("DirSL entry=%v, want ~9.995", got)
+	}
+}
 
 func TestOpenLS(t *testing.T) {
 	// R rich: R.bid 1001 vs L.ask 1000 => LS ~ +10bps, mu 0
