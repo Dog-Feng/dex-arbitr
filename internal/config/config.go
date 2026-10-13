@@ -90,6 +90,9 @@ type Config struct {
 		MinK       float64 `yaml:"min_k"`
 		MaxK       float64 `yaml:"max_k"`
 	} `yaml:"adaptive"`
+	Monitor struct {
+		Addr string `yaml:"addr"` // HTTP metrics endpoint; empty = disabled
+	} `yaml:"monitor"`
 	Pairs []Pair `yaml:"pairs"`
 }
 

@@ -14,6 +14,7 @@ import (
 	"github.com/Dog-Feng/dex-arbitr/internal/domain"
 	"github.com/Dog-Feng/dex-arbitr/internal/exchange"
 	"github.com/Dog-Feng/dex-arbitr/internal/execution"
+	"github.com/Dog-Feng/dex-arbitr/internal/monitor"
 	"github.com/Dog-Feng/dex-arbitr/internal/spread"
 	"github.com/Dog-Feng/dex-arbitr/internal/spread/estimator"
 	"github.com/Dog-Feng/dex-arbitr/internal/store"
@@ -48,6 +49,7 @@ type PairConfig struct {
 	VolTarget     float64 // daily volume target (USD); 0 = unlimited
 	VolCostBudget float64 // max daily realized loss (USD); 0 = unlimited
 	Adaptive      adaptive.Config
+	Monitor       *monitor.Monitor
 }
 
 // PairActor owns the trading state of one pair (single goroutine).
@@ -330,6 +332,10 @@ func (a *PairActor) Run(ctx context.Context) error {
 				"vol_500ms_bps", round4(vol), "lat_n", a.lat.n, "lat_avg_ms", a.lat.avg().Milliseconds(), "lat_max_ms", a.lat.max.Milliseconds(),
 				"day_volume_usd", round2(a.volAcc.volumeUSD), "day_pnl_usd", round4(a.volAcc.pnlUSD),
 				"tick_k", round4(a.tickK()), "fail_rate", round4(a.failRate()))
+			a.record(monitor.KindStatus, func(e *monitor.Event) {
+				e.Steps = a.state.Counter()
+				e.MuBps, e.SigmaBps, e.TickK, e.FailRate = st.Mean, vol, a.tickK(), a.failRate()
+			})
 			a.lat.reset()
 		case now := <-decide.C:
 			if now.Before(nextAt) || a.state.Mode == strategy.ModePaused {
@@ -386,6 +392,18 @@ func (a *PairActor) volBps() float64 {
 		return 0
 	}
 	return a.cfg.Vol.Vol()
+}
+
+// record publishes a runtime event to the optional monitor.
+func (a *PairActor) record(kind monitor.Kind, fill func(*monitor.Event)) {
+	if a.cfg.Monitor == nil {
+		return
+	}
+	e := monitor.Event{Time: time.Now(), Pair: a.key, Kind: kind}
+	if fill != nil {
+		fill(&e)
+	}
+	a.cfg.Monitor.Record(e)
 }
 
 // legVolBps is the short-horizon leg-price volatility (bps) of a venue, or 0.
@@ -454,6 +472,7 @@ func (a *PairActor) riskMarks() (float64, float64, bool) {
 // emergency market-flattens both legs to zero and pauses the pair.
 func (a *PairActor) emergency(ctx context.Context) {
 	a.log.Error("ALERT: liquidation risk, emergency unwind")
+	a.record(monitor.KindEmergency, nil)
 	res, err := a.exec.EmergencyFlatten(ctx,
 		execution.LegSpec{Venue: a.cfg.L, Inst: a.cfg.Pair.Left},
 		execution.LegSpec{Venue: a.cfg.R, Inst: a.cfg.Pair.Right},
@@ -492,6 +511,15 @@ func (a *PairActor) apply(ctx context.Context, act strategy.Action, q spread.Quo
 		a.log.Info("executed", "fillL", fillL, "fillR", fillR, "pxL", pxL, "pxR", pxR, "statusL", res.L.Status, "statusR", res.R.Status,
 			"rescue_orders", res.RescueOrders, "rescue_qty", res.RescueQty, "posL", res.PosL, "posR", res.PosR, "took", res.Duration.Round(time.Millisecond),
 			"rescue_cost_usd", round4(rescueCost), "latL_ms", res.L.Latency.Milliseconds(), "latR_ms", res.R.Latency.Milliseconds())
+		half := math.Pow10(-a.cfg.Pair.SizeDecimals) / 2
+		a.record(monitor.KindExecuted, func(e *monitor.Event) {
+			e.USD = (res.L.Filled + res.R.Filled + res.RescueQty) * q.RefMid
+			e.OneLeg = (res.L.Filled < half && res.R.Filled >= half) || (res.R.Filled < half && res.L.Filled >= half)
+			e.LatencyMs = float64(res.L.Latency.Milliseconds()+res.R.Latency.Milliseconds()) / 2
+		})
+		if res.RescueOrders > 0 {
+			a.record(monitor.KindRescue, func(e *monitor.Event) { e.Qty = res.RescueQty })
+		}
 	}
 	a.volAcc.volumeUSD += (fillL + fillR + rescueQty) * q.RefMid
 	a.volAcc.pnlUSD -= rescueCost
@@ -512,6 +540,7 @@ func (a *PairActor) apply(ctx context.Context, act strategy.Action, q spread.Quo
 		a.next++
 		a.state.Steps = append(a.state.Steps, st)
 		a.log.Info("step opened", "id", st.ID, "entry_bps", round2(st.EntryBps), "counter", a.state.Counter())
+		a.record(monitor.KindStepOpened, func(e *monitor.Event) { e.Dir = act.Dir.String(); e.Qty = st.Qty })
 	case strategy.Close:
 		closed := math.Max(fillL, fillR) // the lagging leg is completed by rescue
 		fee := a.roundTripFeeBps()
@@ -536,8 +565,13 @@ func (a *PairActor) apply(ctx context.Context, act strategy.Action, q spread.Quo
 			}
 			a.state.Steps[i].Qty = domain.Round(a.state.Steps[i].Qty-closed, a.cfg.Pair.SizeDecimals)
 			if a.state.Steps[i].Qty < eps {
+				realized := a.state.Steps[i].Realized
 				a.state.Steps = append(a.state.Steps[:i], a.state.Steps[i+1:]...)
 				a.log.Info("step closed", "id", act.StepID, "profit_bps", round2(act.ExpectedBps), "counter", a.state.Counter())
+				a.record(monitor.KindStepClosed, func(e *monitor.Event) {
+					e.Dir = act.Dir.String()
+					e.USD = closed * q.RefMid * realized / 1e4
+				})
 			}
 			break
 		}
@@ -546,6 +580,7 @@ func (a *PairActor) apply(ctx context.Context, act strategy.Action, q spread.Quo
 		if err := a.checkHedge(); err != nil {
 			a.state.Mode = strategy.ModePaused
 			a.log.Error("hedge invariant broken; pausing", "err", err)
+			a.record(monitor.KindError, func(e *monitor.Event) { e.Msg = err.Error() })
 		}
 	}
 	a.persist()

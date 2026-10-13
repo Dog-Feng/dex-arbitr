@@ -75,9 +75,12 @@ adaptive:
   min_k: 0.5
   max_k: 10
 
+monitor:
+  addr: ""             # HTTP metrics endpoint, e.g. ":8080"; empty = disabled
+
 pairs:
-  - base: SNDK
+  - base: SPY
     left: lighter
     right: rhlighter
-    step_qty: 0.01
-    max_steps: 10
+    step_qty: 0.02
+    max_steps: 30

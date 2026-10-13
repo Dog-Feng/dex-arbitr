@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"path/filepath"
 	"sync"
 
@@ -12,6 +13,7 @@ import (
 	"github.com/Dog-Feng/dex-arbitr/internal/domain"
 	"github.com/Dog-Feng/dex-arbitr/internal/exchange"
 	"github.com/Dog-Feng/dex-arbitr/internal/execution"
+	"github.com/Dog-Feng/dex-arbitr/internal/monitor"
 	"github.com/Dog-Feng/dex-arbitr/internal/spread/estimator"
 	"github.com/Dog-Feng/dex-arbitr/internal/store"
 	"github.com/Dog-Feng/dex-arbitr/internal/strategy"
@@ -89,6 +91,16 @@ func setLeverage(ctx context.Context, v exchange.Venue, inst domain.Instrument, 
 
 // Run starts every configured pair and blocks until ctx is done.
 func Run(ctx context.Context, c *config.Config) error {
+	mon := monitor.New(func(msg string) { slog.Error("ALERT", "msg", msg) })
+	if c.Monitor.Addr != "" {
+		srv := &http.Server{Addr: c.Monitor.Addr, Handler: mon.Handler()}
+		go func() {
+			if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				slog.Error("monitor server", "err", err)
+			}
+		}()
+		defer func() { _ = srv.Shutdown(context.Background()) }()
+	}
 	venues, err := BuildVenues(c)
 	if err != nil {
 		return err
@@ -175,6 +187,7 @@ func Run(ctx context.Context, c *config.Config) error {
 			Adaptive: adaptive.Config{Init: c.Execution.TickK, Window: c.Adaptive.Window, High: c.Adaptive.FailHigh,
 				Low: c.Adaptive.FailLow, Up: c.Adaptive.UpFactor, Down: c.Adaptive.DownFactor,
 				Min: c.Adaptive.MinK, Max: c.Adaptive.MaxK},
+			Monitor: mon,
 			Params: strategy.Params{StepQty: qty, MaxSteps: pc.MaxSteps, OpenBps: openBps, CloseBps: closeBps,
 				DepthMult: c.Strategy.DepthMult, CloseOrder: c.Strategy.CloseOrder, VolK: c.Strategy.VolK, FeeBps: feeBps,
 				MinInventory: minInv},
