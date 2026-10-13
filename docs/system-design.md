@@ -1,55 +1,62 @@
 # dex-arbitr 系统设计文档（当前实现）
 
-> 本文档描述代码的**实际实现状态**，与 `docs/spread-arb-design.md`（早期设计稿）互补；以本文档为准。
+> 本文档描述代码的实际实现状态，与 `docs/spread-arb-design.md`（早期设计稿）互补；以本文档为准。
 > 分支：`codex/vol-latency-leverage`。
 
 ## 1. 系统定位
 
-跨 DEX 永续合约的**价差均值回归步进套利**系统，Go 实现。同一币种在两个交易所之间存在价差时，围绕历史中枢 μ 做对冲开仓，价差回归后平仓赚取价差，一次只动一步，可阶梯加仓到上限。
+跨 DEX 永续合约的价差均值回归步进套利 + 低成本刷量系统，Go 实现。同一币种在两个交易所之间存在价差时，围绕历史中枢 μ 做对冲开仓，价差回归后平仓赚取价差，一次只动一步，可阶梯加仓到上限；刷量模式则把门槛压到成本线、快速 churn。
 
 当前接入：Lighter 主网（chain 304）与 RH Lighter（chain 466324）。
 
-核心原则：**策略只做决定，执行器只管下单，适配器只管对接交易所，三者只通过接口连接。**
+核心原则：策略只做决定，执行器只管下单，适配器只管对接交易所，三者只通过接口连接；监控/扫描/回放都是只读旁路，绝不下交易指令。
 
 ## 2. 架构风格
 
-- **六边形（端口-适配器）**：核心只依赖 `exchange.Venue`、`estimator.Estimator` 等接口，不 import 具体交易所。
-- **Actor 模型**：每个套利对一个 goroutine，独占自己的步列表、状态、决策节奏，基本无锁（仅盘口缓存用读写锁）。
-- **可插拔纯策略**：`strategy.Strategy` 接口 + 注册表（当前实现 `Arbitrage`），输入（状态 + 盘口 + μ + σ）输出动作，不做 IO，可直接回放回测。
-- **接口 + 注册表**：交易所、均值估计器按名字注册，配置选择。
+- 六边形（端口-适配器）：核心只依赖 `exchange.Venue`、`estimator.Estimator` 等接口，不 import 具体交易所。
+- Actor 模型：每个套利对一个 goroutine，独占步列表、状态、决策节奏，基本无锁（仅盘口缓存用读写锁）。
+- 可插拔纯策略：`strategy.Strategy` 接口 + 注册表（`Arbitrage` / `Volume`），输入（状态 + 盘口 + μ + σ）输出动作，不做 IO，可直接回放回测。
+- 接口 + 注册表：交易所、均值估计器、策略按名字注册，配置选择。
+- 只读旁路模块：monitor / backtest / scan 三个模块只读，不 import 交易引擎，也不被引擎反向依赖（引擎仅单向向 monitor 发事件）。
 
 ## 3. 目录与依赖
 
 ```
-cmd/arbd            # 入口：读配置 → engine.Run
-cmd/selfcheck       # 自检：instruments/匹配/WS/下单/签名（-live 实盘往返）
-cmd/volcal          # 离线校准：签名图 + 500ms 增量分位数
-internal/domain     # 纯类型（零依赖）：Instrument/Book/Position/OrderReq…
-internal/config     # 配置加载、默认值、校验
-internal/exchange   # Venue 端口 + 注册表 + 能力接口（LeverageSetter）
-  lighter/          # Lighter 家族适配器（REST + WS + 签名 + 下单）
-internal/symbols    # 币种前缀匹配、精度对齐、生成 Pair
-internal/spread     # 价差计算（LS/SL/Mid，单位 bps）
-  estimator/        # 均值估计器接口 + SMA
-internal/volatility # 波动率估计器（实现波动率 RV）
-internal/strategy   # 纯函数 Decide + Step/State/Params
-internal/execution  # 双腿 IOC 执行器、订单追踪、补救阶梯
-internal/engine     # PairActor（每对一个 goroutine）+ 组装 + 保证金风控
-internal/store      # 步状态持久化（JSON）+ 样本落盘（JSONL）
+cmd/arbd            交易引擎入口：读配置 -> engine.Run
+cmd/selfcheck       自检：instruments/匹配/WS/下单/签名（-live 实盘往返）
+cmd/backtest        离线回放标定：读样本 -> 参数扫描 -> 净 EV 报告
+cmd/scanner         只读机会扫描：匹配对 -> 净机会排序/告警（无交易密钥）
+cmd/volcal          离线校准：签名图 + 500ms 增量分位数
+internal/domain     纯类型（零依赖）：Instrument/Book/Position/OrderReq
+internal/config     配置加载、默认值、校验
+internal/exchange   Venue 端口 + 注册表 + 能力接口（LeverageSetter）
+  lighter/          Lighter 家族适配器（REST + WS + 签名 + 下单）
+internal/symbols    币种前缀匹配、精度对齐、生成 Pair
+internal/spread     价差计算（LS/SL/Mid，单位 bps）
+  estimator/        均值估计器接口 + SMA
+internal/volatility 波动率估计器（实现波动率 RV，价差/腿价通用）
+internal/strategy   Strategy 接口 + Arbitrage/Volume + Step/State/Params
+internal/execution  双腿 IOC 执行器、订单追踪、补救阶梯、动态让价
+internal/engine     PairActor + 组装 + 保证金风控 + 量记账
+internal/adaptive   AIMD 自适应系数控制器（tick_k）
+internal/store      步状态持久化（JSON）+ 样本落盘（JSONL）
+internal/monitor    运行监控（事件聚合 + 指标 + 告警 + HTTP，只读）
+internal/backtest   离线回放（复用 strategy/spread/volatility，不碰引擎）
+internal/scan       套利检测（净机会 Eval/Watch，只读）
 ```
 
-依赖只能向内：`exchange/store/strategy → domain`；`domain` 不依赖任何内部包；`strategy` 不依赖 `exchange/store`。
+依赖方向：交易核心各包 -> `domain`；`strategy` 不依赖 `exchange/store`；`monitor/backtest/scan` 复用共享统计包，但不 import `engine`，也不被 `engine` 反向依赖（engine 仅单向调用 monitor 的 Record）。
 
 ## 4. 核心概念与数据模型
 
 | 名词 | 含义 |
 |---|---|
 | Venue / Instrument | 交易所 / 某所一个永续合约（含精度、最小量、taker/maker 费率） |
-| Base / Pair | 币种前缀（如 SNDK）/ 一个 Base 在左右两所的套利对，最小运行单元 |
+| Base / Pair | 币种前缀 / 一个 Base 在左右两所的套利对，最小运行单元 |
 | Step | 一次双腿开仓：方向、剩余量、开仓价差、开仓成交价、累计已实现盈亏 |
 | Counter | 有符号步数：负=左多右空（DirLS），正=左空右多（DirSL） |
-| Quote | 盘口价差：`LS/SL` 可成交、`Mid` 中间价（bps） |
-| μ / σ | 价差中枢（2h SMA）/ 短周期波动率（500ms 实现波动率） |
+| Quote | 盘口价差：LS/SL 可成交、Mid 中间价（bps） |
+| μ / σ | 价差中枢（2h SMA）/ 短周期波动率（500ms 实现波动率）；另有腿价 σ（让价用） |
 
 关键结构（当前实现）：
 
@@ -64,9 +71,13 @@ type Step struct {
 	ID, Dir, Qty, EntryBps, OpenL, OpenR, Realized, OpenedAt ...
 }
 
-// strategy.State / Params
-type State struct { Mode Mode; Steps []Step }
-type Params struct { StepQty, MaxSteps, OpenBps, CloseBps, DepthMult, CloseOrder, VolK ... }
+// strategy.Strategy（接口）+ Arbitrage / Volume 实现
+type Strategy interface {
+	Decide(p Params, s State, q spread.Quote, mu float64, muReady bool, vol float64) Action
+}
+
+// strategy.Params
+type Params struct { StepQty, MaxSteps, OpenBps, CloseBps, DepthMult, CloseOrder, VolK, FeeBps, MinInventory ... }
 ```
 
 ## 5. 价差与统计公式
@@ -75,211 +86,247 @@ type Params struct { StepQty, MaxSteps, OpenBps, CloseBps, DepthMult, CloseOrder
 
 ```
 mid   = (L.mid + R.mid) / 2
-Mid   = (R.mid − L.mid) / mid        // 采样进 μ
-LS    = (R.bid1 − L.ask1) / mid      // 买左卖右的可成交价差
-SL    = (L.bid1 − R.ask1) / mid      // 卖左买右的可成交价差
+Mid   = (R.mid - L.mid) / mid        // 采样进 μ
+LS    = (R.bid1 - L.ask1) / mid      // 买左卖右的可成交价差
+SL    = (L.bid1 - R.ask1) / mid      // 卖左买右的可成交价差
 ```
 
-- **μ**：`Mid` 的滑动均值（SMA），窗口 2h、1s 采样、60m 预热、覆盖率 ≥80%，O(1) 更新。
-- **σ**：`Mid` 的实现波动率，100ms 采样、500ms 窗口 `Σ(Δs)²` 滚动和 + EWMA（半衰期 1m），`σ=√(RV)`。
-- **开仓门槛**：`dev ≥ open_bps + fee_bps + vol_k·σ`，其中 `devLS = LS−μ`、`devSL = SL+μ`，`fee_bps` 为该 pair 的往返 taker 费（由两所 `TakerFee` 合成，净成本）。
-- **平仓门槛**：该步往返净利 `EntryBps + 反向可成交价差 − fee_bps ≥ close_bps`。
-- **EntryBps**：开仓成交价差的真实值，分母用成交时 mid `(lPx+rPx)/2`。
+- μ：`Mid` 的滑动均值（SMA），窗口 2h、1s 采样、60m 预热、覆盖率 >=80%，O(1) 更新。
+- σ（价差）：`Mid` 的实现波动率，100ms 采样、500ms 窗口 sum(Δs)^2 滚动和 + EWMA（半衰期 1m），σ=sqrt(RV)。
+- σ（腿价）：`bookL.Mid()`/`bookR.Mid()` 各自估计，用于单腿让价（腿价波动 = 标的 + 价差，比价差 σ 大）。
+- 开仓门槛：`dev >= open_bps + fee_bps + vol_k*σ`，其中 `devLS = LS-μ`、`devSL = SL+μ`，`fee_bps` 为该 pair 的往返 taker 费（由两所 TakerFee 合成，净成本）。
+- 平仓门槛：该步往返净利 `EntryBps + 反向可成交价差 - fee_bps >= close_bps`。
+- EntryBps：开仓成交价差的真实值，分母用成交时 mid `(lPx+rPx)/2`。
 
 ## 6. 状态机
 
 ```
-WARMUP ──(μ 就绪)──> RUNNING ⇄ REDUCE_ONLY
-   │                     │
-   └──(恢复)── PAUSED <──┘  数据过期 / 单腿失败 / 对冲不变量破坏 / 应急平仓
+WARMUP --(μ 就绪)--> RUNNING <-> REDUCE_ONLY
+   |                     |
+   +--(恢复)-- PAUSED <--+  数据过期 / 单腿失败 / 对冲不变量破坏 / 应急平仓
 ```
 
 | 状态 | 开仓 | 平仓 | 采样 |
 |---|---|---|---|
-| WARMUP | ❌ | ✅ | ✅ |
-| RUNNING | ✅ | ✅ | ✅ |
-| REDUCE_ONLY | ❌ | ✅ | ✅ |
-| PAUSED | ❌ | ❌ | ✅ |
+| WARMUP | 否 | 是 | 是 |
+| RUNNING | 是 | 是 | 是 |
+| REDUCE_ONLY | 否 | 是 | 是 |
+| PAUSED | 否 | 否 | 是 |
 
-状态迁移来源：μ 就绪（WARMUP→RUNNING）；保证金超 floor 线（RUNNING→REDUCE_ONLY）；保证金恢复（REDUCE_ONLY→RUNNING）；保证金超 trigger 线触发应急平仓（→PAUSED）；`checkHedge` 不变量破坏（→PAUSED）；启动 reconcile 失败（→PAUSED）。
+状态迁移：μ 就绪（WARMUP->RUNNING）；保证金超 floor（RUNNING->REDUCE_ONLY）；保证金恢复（REDUCE_ONLY->RUNNING）；保证金超 trigger 应急平仓（->PAUSED）；checkHedge 不变量破坏（->PAUSED）；启动 reconcile 失败（->PAUSED）。
 
 ## 7. 运行时完整链路
 
 ### 7.1 启动
 
-1. `config.Load`：读 YAML、`${ENV}` 展开、填默认值、校验。
-2. `engine.Run`：按注册表构建 venues；实盘校验凭证并建 `OrderTracker`（订阅各所订单 WS）。
-3. 对每个 pair：拉永续列表 → 前缀匹配 → 精度对齐（`size_decimals` 取短、`min_qty` 取大）。
-4. 实盘启动时为每个市场提交 `updateLeverage`（杠杆 `leverage`，默认 10x，即初始保证金比例 1000 bps，全仓）。
-5. 每个 pair 起一个 `PairActor` goroutine。
+1. `config.Load`：读 YAML、${ENV} 展开、填默认值、校验。
+2. `engine.Run`：构建 monitor（可选 HTTP）、按注册表构建 venues；实盘校验凭证并建 OrderTracker。
+3. 对每个 pair：拉永续列表 -> 前缀匹配 -> 精度对齐（size_decimals 取短、min_qty 取大）。
+4. 实盘启动时为每个市场提交 updateLeverage（杠杆 leverage，默认 10x，即初始保证金比例 1000 bps，全仓）。
+5. 每个 pair 起一个 PairActor goroutine。
 
 ### 7.2 Actor 内部（单 goroutine 事件循环）
 
-select 五类事件：
-
 | 事件 | 频率 | 动作 |
 |---|---|---|
-| 盘口 WS 推送 | 事件驱动 | `collectBooks` goroutine 更新 bookL/bookR 缓存（latest wins） |
-| sample | 1s | 算 `Mid` 喂 SMA（μ）；μ 就绪则 WARMUP→RUNNING |
-| volC | 100ms | 新鲜度+两腿偏差 ≤50ms 门控后喂波动率（σ）+ 样本落盘 |
-| riskC | 1s | 保证金风控（见 §8） |
-| decide | 200ms | 到 `next_action_at` 且非 PAUSED 时 `Decide` → `apply` |
-| report | 1min | 状态日志（μ/σ/步数/延迟/价差） |
+| 盘口 WS 推送 | 事件驱动 | collectBooks goroutine 更新 bookL/bookR 缓存 |
+| sample | 1s | 算 Mid 喂 SMA（μ）；μ 就绪则 WARMUP->RUNNING |
+| volC | 100ms | 门控后喂价差 σ、腿价 σ（VolL/VolR）+ 样本落盘 |
+| riskC | 1s | 保证金风控 |
+| decide | 200ms | 到点且非 PAUSED 时 Decide -> apply |
+| report | 1min | 状态日志 + 向 monitor 发 status 事件 |
 
 ### 7.3 一次决策（Decide，纯函数）
 
-1. 先平仓：所有满足 `profit ≥ close_bps` 的步按 `close_order`（best/lifo/fifo）排序取最优，检查反向盘口深度后平。
-2. 再开仓：仅 RUNNING 且 μ 就绪；`dev ≥ open_bps + vol_k·σ`、同方向、`|counter| < max_steps`、两腿一档深度 ≥ `step_qty×depth_mult`；两方向取偏离更大者。
+1. 先平仓：满足 `profit >= close_bps + fee_bps` 的步按 close_order 排序取最优；`|counter| > min_inventory` 才平（刷量库存地板）。
+2. 再开仓：仅 RUNNING 且 μ 就绪；`dev >= open_bps + fee_bps + vol_k*σ`、同方向、`|counter| < max_steps`、两腿一档深度 >= `step_qty*depth_mult`。
 3. 都不满足则不动。
 
 ### 7.4 一次执行（Executor）
 
-1. 双腿并发提交 IOC 限价单（价格 = 决策价 ± 动态让价，见下）。
-2. 等 WS 终态 → 超时 REST 查询兜底 → 仍未知从仓位差推断（未知绝不当失败）。
-3. settle 后读两边真实仓位；净敞口 ≠ 目标时进入补救阶梯（reduce-only）。
-4. 记录每腿延迟（submit→终态）和补救成交（量+均价）。
+1. 双腿并发提交 IOC 限价单（价格 = 决策价 ± 动态让价）。
+2. 等 WS 终态 -> 超时 REST 兜底 -> 仍未知从仓位差推断（未知绝不当失败）。
+3. settle 后读真实仓位；净敞口不等于目标时进入补救阶梯（reduce-only）。
+4. 记录每腿延迟和补救成交。
 
-**动态让价（allowance）**：
+动态让价（用腿价 σ）：
 
 ```
-ticks = clamp( ceil( price × tick_k × σ_bps / 1e4 / tick ), min_ticks, max_ticks )
-ticks = max( ticks, 走到 step_qty 实际成交档位所需的 tick 数 )   // 深度感知
+ticks = clamp( ceil( price * tick_k * σ_leg / 1e4 / tick ), min_ticks, max_ticks )
+ticks = max( ticks, 走到 step_qty 实际成交档位所需的 tick 数 )
 ```
 
-σ 未就绪或 `dynamic_ticks=false` 时回退到固定 `price_ticks`。
+- tick_k 由 adaptive AIMD 控制器按实测单腿失败率动态调整（失败率高放宽、低收紧，夹在 [min_k,max_k]）；窗口未满用配置初值。
+- σ_leg 未就绪或 dynamic_ticks=false 时回退固定 price_ticks。
 
-**补救阶梯（rescue）**：严格第一档（3 次）→ 逐 tick 让价（5 tick）→ 保护性市价（mid ±30bps）。`Immediate=true` 时（应急）直接从第一笔就是保护性市价。
+补救阶梯（rescue）：严格第一档（3 次）-> 逐 tick 让价（5 tick）-> 保护性市价（mid ±30bps）。Immediate=true 时（应急）从第一笔就是保护性市价。
 
-### 7.5 平账与持久化
+### 7.5 平账、量记账与持久化
 
-- 开仓：对冲量 `h=min(fillL, fillR)`，`h<半单位` 则放弃；记 `Step`（`EntryBps` 用成交时 mid，`OpenL/OpenR` 存成交价）。
-- 平仓：`closed=max(fillL, fillR)`，零成交腿用补救价；`realized = EntryBps + 反向 EntryBps − 往返费` 累计进 `Step.Realized`；Qty 归零则移除该步。
-- `checkHedge`：每次 apply 后校验 `posL/posR` 与步账本反推一致，漂移即 PAUSED。
-- `persist`：步状态 JSON 原子写（`state_dir/<pair_key>.json`）。
+- 开仓：对冲量 h=min(fillL,fillR)，h<半单位则放弃；记 Step（EntryBps 用成交时 mid，OpenL/OpenR 存成交价）。
+- 平仓：closed=max(fillL,fillR)，零成交腿用补救价；realized = EntryBps + 反向 EntryBps - 往返费 累计进 Step.Realized；Qty 归零则移除。
+- 统一量记账：volume_usd += (fillL + fillR + rescue_qty) * mid（失败开仓的单腿成交+补救也计入）；补救滑点 rescue_cost_usd 从 day_pnl_usd 扣除。
+- 每日预算闸：刷量模式下 daily_volume_target / daily_cost_budget 达限停止开仓，跨天清零。
+- checkHedge：每次 apply 后校验 posL/posR 与步账本一致，漂移即 PAUSED。
+- persist：步状态 JSON 原子写（state_dir/<pair_key>.json）。
 
 ## 8. 保证金风控（risk）
 
-主动监控（不挂单）。每秒评估，每 `position_refresh`（15s）用 REST 刷新两所 `LiquidationPrice`；mark 用 book mid（新鲜才评估）。
+主动监控（不挂单）。每秒评估，每 position_refresh（15s）用 REST 刷新两所 LiquidationPrice；mark 用 book mid（新鲜才评估）。
 
 ```
-多腿剩余 = (mark − liq) / (entry − liq)
-空腿剩余 = (liq − mark) / (liq − entry)
+多腿剩余 = (mark - liq) / (entry - liq)
+空腿剩余 = (liq - mark) / (liq - entry)
 ```
 
-- 任一腿 ≤ `margin_trigger_ratio`（0.1）→ **应急市价平仓**：`EmergencyFlatten` 用 Immediate 市价（保护价 `emergency_market_bps`=100bps）把两腿吃到零，清空步账本，置 PAUSED + 告警。
-- 任一腿 ≤ `margin_floor_ratio`（0.2）→ 置 REDUCE_ONLY（停止加仓、允许减仓）。
-- 两腿都 > `floor + hysteresis`（0.25）→ 恢复 RUNNING。
-- **账户级名义上限**：`max_notional > 0` 时，按 venue 汇总该账户所有市场的 `|qty|×avgEntry` 名义，超限即 REDUCE_ONLY（多交易对共享账户的聚合闸）。
-- `trigger=0` 或 dry_run 时风控禁用。
+- 任一腿 <= margin_trigger_ratio（0.1）-> 应急市价平仓：EmergencyFlatten 用 Immediate 市价（保护价 emergency_market_bps=100bps）把两腿吃到零，清空步账本，置 PAUSED + 告警。
+- 任一腿 <= margin_floor_ratio（0.2）-> 置 REDUCE_ONLY（停止加仓、允许减仓）。
+- 两腿都 > floor + hysteresis（0.25）-> 恢复 RUNNING。
+- 账户级名义上限：max_notional > 0 时按 venue 汇总该账户所有市场的 |qty|*avgEntry 名义，超限即 REDUCE_ONLY。
+- trigger=0 或 dry_run 时风控禁用。
 
-## 9. 配置全景
+## 9. 只读旁路模块
+
+交易核心是唯一会下单的；下面三个模块只读、独立、不互相 import。
+
+### 9.1 monitor（运行监控）
+
+职责：盯系统自己的交易数据（仓位、成交量、成功/失败率、盈亏、延迟、保证金、补救/应急/错误）。
+
+- 引擎在关键点发类型化事件（step_opened/step_closed/executed/rescue/status/emergency/error），monitor.Monitor.Record 聚合指标并告警。
+- 可选 HTTP：monitor.addr 非空时 arbd 内起服务，GET /metrics 返回 JSON；monitor.token 非空时要求 Authorization: Bearer <token> 或 ?token=（常量时间比较，401 拒绝）。
+- 只读、不 import engine。
+
+### 9.2 backtest（回放标定）
+
+- 离线：backtest.Load 读样本（unixNano,midBps,lsBps,slBps），backtest.Replay 复用 strategy.Arbitrage + SMA/波动率在可成交价差上模拟成交，算净 EV。
+- 命令：go run ./cmd/backtest -samples <file> 扫 open_bps * close_bps 网格，输出 trips / net_bps / avg_bps。
+- 只依赖 strategy/spread/volatility，不碰引擎与交易所。
+
+### 9.3 scan（套利检测）
+
+- scan.Eval 是核心纯函数：net = dev - fee_bps - vol_k*σ - open_bps，>0 即机会（与交易策略口径一致）。
+- scan.Watch 订阅两腿盘口（只读 WS），维护 μ/σ，按四层条件（可交易/数据新鲜/统计就绪/净机会>0）发机会。
+- 命令：go run ./cmd/scanner -config <file> 用只读 venue 扫描所有匹配对，去重后打日志；不 import engine。
+
+## 10. 配置全景
 
 ```yaml
-dry_run: true            # true=模拟盘（按决策价成交）；false=实盘
+dry_run: true
 state_dir: state
-leverage: 10             # 账户杠杆，启动时对每个市场发 updateLeverage（1x..10000x）
-samples_dir: state/samples   # 非空则按 pair 落 100ms 样本，供 volcal 校准
+leverage: 10
+samples_dir: state/samples
 
 venues:
   - name: lighter
-    kind: lighter         # 或 rhlighter；opts 传 account_index/api_key_index/private_key/book_depth
+    kind: lighter
     opts: { account_index: ${LIGHTER_ACCOUNT_INDEX}, api_key_index: ${LIGHTER_API_KEY_INDEX}, private_key: ${LIGHTER_PRIVATE_KEY} }
 
 matching:
-  strip_suffixes: [PERP, USDC, USDG, USDT, USD]   # 去掉后取币种前缀
+  strip_suffixes: [PERP, USDC, USDG, USDT, USD]
   separators: "-_/: ."
 
-estimator:
-  kind: sma               # 均值估计器（可替换）
-  window: 2h
-  min_warmup: 60m
-  min_coverage: 0.8
-  interval: 1s
-
-volatility:
-  interval: 100ms
-  horizon: 500ms
-  half_life: 1m
-  max_age: 50ms
+estimator: { kind: sma, window: 2h, min_warmup: 60m, min_coverage: 0.8, interval: 1s }
+volatility: { interval: 100ms, horizon: 500ms, half_life: 1m, max_age: 50ms }
 
 risk:
-  margin_floor_ratio: 0.2     # 剩余保证金 ≤20% 停止加仓
-  margin_trigger_ratio: 0.1   # ≤10% 应急市价平仓
-  margin_hysteresis: 0.05     # 恢复回差
+  margin_floor_ratio: 0.2
+  margin_trigger_ratio: 0.1
+  margin_hysteresis: 0.05
   position_refresh: 15s
   emergency_market_bps: 100
-  max_notional: 0             # 每所账户级总名义上限(USD)，0=不限
+  max_notional: 0
 
 strategy:
-  kind: arbitrage             # 策略实现（注册表：arbitrage | volume...）
-  open_bps: 1              # 开仓毛利门槛（未扣费）
-  close_bps: 1             # 平仓毛利门槛（未扣费）
+  kind: arbitrage
+  open_bps: 1
+  close_bps: 1
   depth_mult: 2
-  close_order: best        # best | lifo | fifo
-  vol_k: 1.28              # 开仓的 σ 缓冲系数
+  close_order: best
+  vol_k: 1.28
   interval_min: 7s
   interval_max: 10s
   max_book_age: 10s
 
+volume:
+  min_inventory: 0
+  daily_volume_target: 0
+  daily_cost_budget: 0
+
 execution:
-  price_ticks: 30          # 固定让价；σ 未就绪或 dynamic_ticks=false 时兜底
+  price_ticks: 30
   dynamic_ticks: true
-  tick_k: 1.28
+  tick_k: 2.5
   min_ticks: 1
-  max_ticks: 0             # 0=不封顶
+  max_ticks: 0
+
+adaptive:
+  window: 0
+  fail_high: 0.10
+  fail_low: 0.02
+  up_factor: 1.3
+  down_factor: 0.95
+  min_k: 0.5
+  max_k: 10
+
+monitor:
+  addr: ":8080"
+  token: ""
 
 pairs:
-  - base: SNDK
-    left: lighter
-    right: rhlighter
-    step_qty: 0.01
-    max_steps: 10
+  - { base: SNDK, left: lighter, right: rhlighter, step_qty: 0.01, max_steps: 10 }
 ```
 
-## 10. 扩展点
+## 11. 扩展点
 
 | 需求 | 做法 |
 |---|---|
-| 接入新交易所 | 实现 `exchange.Venue`（+ 可选 `LeverageSetter`），`init()` 注册 |
-| 替换均值算法 | 实现 `estimator.Estimator` 并注册，改 `estimator.kind` |
-| 替换策略 | 实现 `strategy.Strategy` 并注册，改 `strategy.kind` |
-| 新增风控规则 | 在 `engine` 加规则，参考 `margin.go` 的监控模式，置 Mode / 告警 |
-| 挂单硬保证（未来） | 新增 `Protector` 能力接口，叠加在现有 risk 之上 |
-| 回测 | 回放 `samples_dir` 样本，复用 `strategy.Decide` + 模拟成交 |
+| 接入新交易所 | 实现 exchange.Venue（+ 可选 LeverageSetter），init() 注册 |
+| 替换均值算法 | 实现 estimator.Estimator 并注册，改 estimator.kind |
+| 新策略（刷量/做市） | 实现 strategy.Strategy 并注册，改 strategy.kind |
+| 新增风控规则 | 在 engine 加规则，参考 margin.go 的监控模式 |
+| 挂单硬保证（未来） | 新增 Protector 能力接口，叠加在现有 risk 之上 |
+| 回放标定 | go run ./cmd/backtest -samples <file> |
+| 机会扫描 | go run ./cmd/scanner -config <file> |
+| 监控接入 | monitor.addr/token 配好，前端带 token 读 /metrics |
 
-## 11. 日志与排查
+## 12. 日志与排查
 
-关键日志行（`msg=`）：
+关键日志行（msg=）：
 
 | 消息 | 含义 / 排查 |
 |---|---|
-| `pair actor started` | 启动参数（dry_run/step_qty/max_steps/size_decimals/recorded_steps） |
-| `positions` / `position reconciliation passed` | 启动时本地步账本 vs 交易所仓位核对；失败即 PAUSED，需人工修复后重启 |
-| `mean ready -> RUNNING` | μ 采样满 60m 就绪 |
-| `status` | 每分钟：mode/steps/mu_bps/samples/span/coverage/LS/SL/mid/vol_500ms_bps/lat_* |
-| `action` | 决策：kind/dir/qty/两腿价/expected_bps/reason |
-| `executed` | 成交：fill/px/status/rescue_orders/rescue_qty/pos/took/latL_ms/latR_ms |
-| `step opened` / `step pnl` / `step closed` | 步账本：entry_bps / gross_fee_net_realized_bps + lpx/rpx / profit_bps + counter |
-| `rescue order` / `rescue complete`（WARN） | 补救单与完成 |
-| `hedge invariant broken; pausing`（ERROR） | 平账后本地账本与仓位不一致（补救未完成等），已 PAUSED |
-| `margin floor reached; reduce only`（WARN） | 剩余保证金 ≤ floor，停止加仓 |
-| `ALERT: liquidation risk, emergency unwind` / `emergency unwind done`（ERROR） | 应急市价平仓触发与完成 |
-| `order state unresolved; will infer from positions`（WARN） | 订单终态超时，从仓位差推断 |
-| `ws read error, reconnecting`（WARN） | WS 断线自动重连 |
+| pair actor started | 启动参数 |
+| positions / position reconciliation passed | 启动仓位核对；失败即 PAUSED |
+| mean ready -> RUNNING | μ 采样满 60m 就绪 |
+| status | 每分钟：mode/steps/mu/σ/价差/tick_k/fail_rate/day_volume/day_pnl/latency |
+| action | 决策：kind/dir/qty/两腿价/expected_bps/reason |
+| executed | 成交：fill/px/status/rescue/rescue_cost_usd/pos/took/latency |
+| step opened / step pnl / step closed | 步账本与已实现盈亏 |
+| rescue order / rescue complete（WARN） | 补救单与完成 |
+| hedge invariant broken; pausing（ERROR） | 账本与仓位不一致，已 PAUSED |
+| margin floor reached; reduce only（WARN） | 剩余保证金 <= floor |
+| ALERT: liquidation risk, emergency unwind（ERROR） | 应急平仓触发 |
+| order state unresolved; will infer from positions（WARN） | 订单终态超时，从仓位差推断 |
+| ws read error, reconnecting（WARN） | WS 断线自动重连 |
+| opportunity（scanner） | 检测到净机会 |
+| monitor server（ERROR） | 监控端口监听失败（检查 monitor.addr 格式） |
 
 常见问题：
 
-- **下单返回 20558**：受限地区，换允许交易地区的服务器；只读行情可加 `?readonly=true`。
-- **reconcile 失败 / PAUSED**：本地步账本与交易所仓位不一致，先 `cat state/*.json` 核对、手动平齐后再重启。
-- **hedge invariant broken**：补救未把落后腿补平，查 `rescue order` 与 `executed` 的 posL/posR，修复后重启。
-- **emergency unwind 触发**：某腿保证金触及 trigger 线，系统已市价清仓；确认账户状态后人工解除 PAUSED。
-- **nonce gap / WS 断线**：自动重订阅/重连，无需人工；频繁出现需查网络与限频。
+- 下单返回 20558：受限地区，换允许交易地区的服务器；只读行情加 ?readonly=true。
+- reconcile 失败 / PAUSED：步账本与仓位不一致，cat state/*.json 核对后手动平齐再重启。
+- hedge invariant broken：补救未补平落后腿，查 rescue/executed 的 posL/posR。
+- emergency unwind 触发：某腿保证金触及 trigger，系统已清仓；确认账户后人工解除 PAUSED。
+- monitor server: missing port in address：monitor.addr 少了冒号，写成 ":8080"。
+- 监控 401：monitor.token 非空时必须带 Bearer 或 ?token=。
+- nonce gap / WS 断线：自动重订阅/重连。
 
-## 12. 当前边界（已知简化）
+## 13. 当前边界（已知简化）
 
-- **门槛为毛利**：`open_bps/close_bps` 未扣手续费；手续费仅在 `realized_bps` 记账时扣除（往返 taker）。
-- **应急平仓不计 step 级盈亏**：应急平仓清空步账本，亏损直接体现在账户余额。
-- **mark 用 book mid 近似**：更准可用 WS 的 `market_stats.mark_price`。
-- **liq 为 15s REST 缓存**：单币单仓近似稳定；多仓共担保证金时需提高刷新频率。
-- **步数上限 ≠ 名义仓位上限**：`max_steps` 限步数，部分平仓可能残留碎步占位。
-- **1:1 计价假设**：USDC/USDG 不换算，脱锚会直接表现为价差（不在本次范围）。
+- 门槛为净成本：open_bps/close_bps 已扣 fee_bps；补救滑点计入 day_pnl_usd，但应急平仓亏损未记 step 级盈亏（直接体现账户余额）。
+- mark 用 book mid 近似：更准可用 WS 的 market_stats.mark_price。
+- liq 为 15s REST 缓存：单币单仓近似稳定；多仓共担保证金需提高刷新频率。
+- 步数上限不等于名义仓位上限：max_steps 限步数，部分平仓可能残留碎步。
+- 自适应只管 tick_k：vol_k / min_ticks 也可挂 adaptive.K 模式，暂未做。
+- 1:1 计价假设：USDC/USDG 不换算，脱锚会直接表现为价差（不在本次范围）。
