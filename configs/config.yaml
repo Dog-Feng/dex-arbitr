@@ -3,6 +3,8 @@ dry_run: true            # true = paper trading (no orders). Set false for live.
 state_dir: state
 leverage: 10            # account leverage, applied to every venue (1x..10000x)
 samples_dir: state/samples   # append 100ms spread samples for offline calibration (empty = off)
+step_qty: 0.02          # unified step size for every pair
+max_steps: 30           # unified max steps for every pair
 
 venues:
   - name: lighter
@@ -44,7 +46,7 @@ risk:
   max_notional: 0             # per-venue aggregate notional cap (USD); 0 = unlimited
 
 strategy:
-  kind: arbitrage           # arbitrage | volume (registered strategies)
+  kind: volume           # arbitrage | volume (registered strategies)
   open_bps: 1          # open when deviation from mean >= 1bps
   close_bps: 1         # close when step gross profit >= 1bps
   depth_mult: 2        # top-of-book qty >= step_qty * 2 on both legs
@@ -78,11 +80,12 @@ adaptive:
 
 monitor:
   addr: ":8080"            # HTTP metrics endpoint; empty = disabled
-  token: ""                # bearer token; empty = no auth (use ${ENV} for secrets)
+  token: ${SECRETS}                # bearer token; empty = no auth (use ${ENV} for secrets)
 
 pairs:
   - base: SPY
     left: lighter
     right: rhlighter
-    step_qty: 0.02
-    max_steps: 30
+  - base: SNDK
+    left: lighter
+    right: rhlighter

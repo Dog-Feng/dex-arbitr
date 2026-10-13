@@ -18,18 +18,18 @@ type Venue struct {
 
 // Pair config.
 type Pair struct {
-	Base     string  `yaml:"base"`
-	Left     string  `yaml:"left"`
-	Right    string  `yaml:"right"`
-	StepQty  float64 `yaml:"step_qty"`
-	MaxSteps int     `yaml:"max_steps"`
+	Base  string `yaml:"base"`
+	Left  string `yaml:"left"`
+	Right string `yaml:"right"`
 }
 
 // Config root.
 type Config struct {
-	DryRun   bool   `yaml:"dry_run"`
-	StateDir string `yaml:"state_dir"`
-	Leverage int    `yaml:"leverage"` // account leverage, applied to every venue
+	DryRun   bool    `yaml:"dry_run"`
+	StateDir string  `yaml:"state_dir"`
+	Leverage int     `yaml:"leverage"`  // account leverage, applied to every venue
+	StepQty  float64 `yaml:"step_qty"`  // unified step size for every pair
+	MaxSteps int     `yaml:"max_steps"` // unified max steps for every pair
 	// SamplesDir, when set, appends spread samples (100ms) for offline calibration.
 	SamplesDir string  `yaml:"samples_dir"`
 	Venues     []Venue `yaml:"venues"`
@@ -120,6 +120,12 @@ func (c *Config) defaults() {
 	}
 	if c.Leverage == 0 {
 		c.Leverage = 10
+	}
+	if c.StepQty == 0 {
+		c.StepQty = 0.01
+	}
+	if c.MaxSteps == 0 {
+		c.MaxSteps = 10
 	}
 	x := &c.Execution
 	if x.TickK == 0 {
@@ -278,9 +284,12 @@ func (c *Config) validate() error {
 		if !names[p.Left] || !names[p.Right] {
 			return fmt.Errorf("pair %s references unknown venue", p.Base)
 		}
-		if p.StepQty <= 0 || p.MaxSteps <= 0 {
-			return fmt.Errorf("pair %s: step_qty and max_steps must be > 0", p.Base)
+		if p.Base == "" {
+			return fmt.Errorf("pair entry needs a base")
 		}
+	}
+	if c.StepQty <= 0 || c.MaxSteps <= 0 {
+		return fmt.Errorf("step_qty and max_steps must be > 0")
 	}
 	if c.Strategy.IntervalMax < c.Strategy.IntervalMin {
 		return fmt.Errorf("strategy.interval_max < interval_min")

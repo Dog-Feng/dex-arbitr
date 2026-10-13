@@ -144,7 +144,7 @@ loop:
 	check(st.Samples > 0 && !st.Ready, "SMA sampling (warmup expected)", "samples %d mean %+.2fbps ready=%v (needs 60m)", st.Samples, st.Mean, st.Ready)
 	okQty, why := pair.ValidQty(*qty, q.RefMid)
 	check(okQty, fmt.Sprintf("qty %.4f valid on both", *qty), "notional %.2f USD %s", *qty*q.RefMid, why)
-	p := strategy.Params{StepQty: *qty, MaxSteps: pc.MaxSteps, OpenBps: cfg.Strategy.OpenBps, CloseBps: cfg.Strategy.CloseBps,
+	p := strategy.Params{StepQty: *qty, MaxSteps: cfg.MaxSteps, OpenBps: cfg.Strategy.OpenBps, CloseBps: cfg.Strategy.CloseBps,
 		DepthMult: cfg.Strategy.DepthMult, CloseOrder: cfg.Strategy.CloseOrder, VolK: cfg.Strategy.VolK}
 	strat, err := strategy.New(cfg.Strategy.Kind)
 	if err != nil {

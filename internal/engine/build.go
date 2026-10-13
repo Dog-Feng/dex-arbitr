@@ -141,9 +141,9 @@ func Run(ctx context.Context, c *config.Config) error {
 		if err != nil {
 			return err
 		}
-		qty := pair.AlignQty(pc.StepQty)
-		if ok, why := pair.ValidQty(qty, 0); !ok || qty != domain.Round(pc.StepQty, pair.SizeDecimals) {
-			return fmt.Errorf("pair %s: step_qty %v invalid (%s; aligned decimals %d, min %v)", pc.Base, pc.StepQty, why, pair.SizeDecimals, pair.MinQty)
+		qty := pair.AlignQty(c.StepQty)
+		if ok, why := pair.ValidQty(qty, 0); !ok || qty != domain.Round(c.StepQty, pair.SizeDecimals) {
+			return fmt.Errorf("pair %s: step_qty %v invalid (%s; aligned decimals %d, min %v)", pc.Base, c.StepQty, why, pair.SizeDecimals, pair.MinQty)
 		}
 		if !c.DryRun {
 			if err := setLeverage(ctx, l, pair.Left, c.Leverage); err != nil {
@@ -193,7 +193,7 @@ func Run(ctx context.Context, c *config.Config) error {
 				Low: c.Adaptive.FailLow, Up: c.Adaptive.UpFactor, Down: c.Adaptive.DownFactor,
 				Min: c.Adaptive.MinK, Max: c.Adaptive.MaxK},
 			Monitor: mon,
-			Params: strategy.Params{StepQty: qty, MaxSteps: pc.MaxSteps, OpenBps: openBps, CloseBps: closeBps,
+			Params: strategy.Params{StepQty: qty, MaxSteps: c.MaxSteps, OpenBps: openBps, CloseBps: closeBps,
 				DepthMult: c.Strategy.DepthMult, CloseOrder: c.Strategy.CloseOrder, VolK: c.Strategy.VolK, FeeBps: feeBps,
 				MinInventory: minInv},
 		})
