@@ -82,8 +82,8 @@ func full(_ int, r domain.OrderReq) float64 { return r.Qty }
 func TestDynamicAllowance(t *testing.T) {
 	leg := LegSpec{Venue: newFake("L", full), Inst: domain.Instrument{PriceDecimals: 2}, Side: domain.Buy, Price: 100}
 	e := NewExecutor(Config{DynamicTicks: true, TickK: 1, TickMin: 1, TickMax: 100, PriceTicks: 30},
-		nil, NewIDGen(), nil, func(string) float64 { return 10 }, nil, func(string) {})
-	// adverse move = 100 * 1 * 10bps / 1e4 = 0.1 => 10 ticks of 0.01
+		nil, NewIDGen(), nil, func(string) float64 { return 0.1 }, nil, func(string) {})
+	// adverse move = 1 * 0.1 price units => 10 ticks of 0.01
 	if n := e.allowance(leg, 0.01); n != 10 {
 		t.Fatalf("dynamic allowance=%d, want 10", n)
 	}
@@ -93,9 +93,27 @@ func TestDynamicAllowance(t *testing.T) {
 		t.Fatalf("fallback allowance=%d, want 30", n)
 	}
 	// high volatility is capped at TickMax
-	e.vol = func(string) float64 { return 5000 }
+	e.vol = func(string) float64 { return 50 }
 	if n := e.allowance(leg, 0.01); n != 100 {
 		t.Fatalf("capped allowance=%d, want 100", n)
+	}
+}
+
+func TestDepthScale(t *testing.T) {
+	inst := domain.Instrument{PriceDecimals: 2}
+	bk := domain.Book{
+		Bids: []domain.Level{{Price: 100, Size: 0.1}},
+		Asks: []domain.Level{{Price: 100.1, Size: 0.01}},
+	}
+	e := NewExecutor(Config{DepthMinMult: 5, DepthMaxScale: 4}, nil, NewIDGen(),
+		func(string, int) (domain.Book, bool) { return bk, true }, nil, nil, func(string) {})
+	// buy leg: ask size 0.01, qty 0.005 => multiple 2 (<5) => scale 2.5
+	if s := e.depthScale(LegSpec{Venue: newFake("L", full), Inst: inst, Side: domain.Buy}, 0.005); s != 2.5 {
+		t.Fatalf("buy depthScale=%v, want 2.5", s)
+	}
+	// sell leg: bid size 0.1, qty 0.005 => multiple 20 (>=5) => scale 1
+	if s := e.depthScale(LegSpec{Venue: newFake("L", full), Inst: inst, Side: domain.Sell}, 0.005); s != 1 {
+		t.Fatalf("sell depthScale=%v, want 1", s)
 	}
 }
 

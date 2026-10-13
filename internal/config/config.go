@@ -76,11 +76,13 @@ type Config struct {
 		LossToleranceBps  float64 `yaml:"loss_tolerance_bps"`  // per-trade allowed loss (bps) on open
 	} `yaml:"volume"`
 	Execution struct {
-		PriceTicks   int     `yaml:"price_ticks"`   // fixed allowance; fallback while sigma is not ready
-		DynamicTicks bool    `yaml:"dynamic_ticks"` // scale the allowance by volatility
-		TickK        float64 `yaml:"tick_k"`        // one-sided coverage coefficient
-		TickMin      int     `yaml:"min_ticks"`     // floor for the dynamic allowance
-		TickMax      int     `yaml:"max_ticks"`     // cap for the dynamic allowance; 0 = no cap
+		PriceTicks    int     `yaml:"price_ticks"`     // fixed allowance; fallback while sigma is not ready
+		DynamicTicks  bool    `yaml:"dynamic_ticks"`   // scale the allowance by volatility
+		TickK         float64 `yaml:"tick_k"`          // one-sided coverage coefficient
+		TickMin       int     `yaml:"min_ticks"`       // floor for the dynamic allowance
+		TickMax       int     `yaml:"max_ticks"`       // cap for the dynamic allowance; 0 = no cap
+		DepthMinMult  float64 `yaml:"depth_min_mult"`  // depth multiple below which allowance widens
+		DepthMaxScale float64 `yaml:"depth_max_scale"` // max multiplier on thin books
 	} `yaml:"execution"`
 	Adaptive struct {
 		Window     int     `yaml:"window"`      // outcomes before adjusting; 0 = disabled
@@ -127,6 +129,12 @@ func (c *Config) defaults() {
 	}
 	if x.TickMin == 0 {
 		x.TickMin = 1
+	}
+	if x.DepthMinMult == 0 {
+		x.DepthMinMult = 5
+	}
+	if x.DepthMaxScale == 0 {
+		x.DepthMaxScale = 4
 	}
 	a := &c.Adaptive
 	if a.FailHigh == 0 {
@@ -234,6 +242,12 @@ func (c *Config) validate() error {
 	}
 	if c.Execution.TickMax > 0 && c.Execution.TickMax < c.Execution.TickMin {
 		return fmt.Errorf("execution.max_ticks must be >= min_ticks")
+	}
+	if c.Execution.DepthMinMult <= 0 {
+		return fmt.Errorf("execution.depth_min_mult must be > 0")
+	}
+	if c.Execution.DepthMaxScale < 1 {
+		return fmt.Errorf("execution.depth_max_scale must be >= 1")
 	}
 	if c.Adaptive.Window < 0 {
 		return fmt.Errorf("adaptive.window must be >= 0")

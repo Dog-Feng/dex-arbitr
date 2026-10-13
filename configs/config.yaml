@@ -66,9 +66,11 @@ execution:
   tick_k: 2.5          # one-sided coverage coefficient (leg-price vol); calibrate by replay
   min_ticks: 1
   max_ticks: 0         # 0 = no upper clamp
+  depth_min_mult: 5    # depth multiple below which the allowance widens
+  depth_max_scale: 4   # max multiplier on thin books
 
 adaptive:
-  window: 0            # outcomes before adjusting tick_k; 0 = disabled
+  window: 50            # outcomes before adjusting tick_k; 0 = disabled
   fail_high: 0.10      # widen when the one-leg failure rate exceeds this
   fail_low: 0.02       # tighten when below this
   up_factor: 1.3

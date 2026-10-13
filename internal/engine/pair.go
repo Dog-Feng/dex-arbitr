@@ -151,7 +151,7 @@ func NewPairActor(cfg PairConfig) (*PairActor, error) {
 			a.adaptive = adaptive.NewK(cfg.Adaptive)
 			tickK = a.adaptive.K
 		}
-		a.exec = execution.NewExecutor(cfg.ExecCfg, cfg.Tracker, cfg.IDs, a.book, a.legVolBps, tickK, nil)
+		a.exec = execution.NewExecutor(cfg.ExecCfg, cfg.Tracker, cfg.IDs, a.book, a.legVol, tickK, nil)
 	}
 	return a, nil
 }
@@ -406,8 +406,8 @@ func (a *PairActor) record(kind monitor.Kind, fill func(*monitor.Event)) {
 	a.cfg.Monitor.Record(e)
 }
 
-// legVolBps is the short-horizon leg-price volatility (bps) of a venue, or 0.
-func (a *PairActor) legVolBps(venue string) float64 {
+// legVol is the short-horizon leg-price volatility (price units) of a venue.
+func (a *PairActor) legVol(venue string) float64 {
 	if venue == a.cfg.L.Name() && a.cfg.VolL != nil {
 		return a.cfg.VolL.Vol()
 	}

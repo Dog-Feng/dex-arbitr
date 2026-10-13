@@ -22,17 +22,18 @@ type Config struct {
 	RescueInterval   time.Duration
 	RescueAlertAfter time.Duration
 	Rescue           RescueParams
-	// PriceTicks widens the IOC limit price of each leg by this many ticks
-	// beyond the decision price (buy: +N ticks, sell: -N ticks). It is the
-	// fixed allowance, and the fallback while volatility is not ready.
-	// DynamicTicks replaces it with ticks = clamp(ceil(price*TickK*sigmaBps/1e4/tick),
-	// TickMin, TickMax). Fills still match from the best level, so this only
-	// adds a worst-case allowance.
-	PriceTicks   int
-	DynamicTicks bool
-	TickK        float64
-	TickMin      int
-	TickMax      int // 0 = no upper clamp
+	// PriceTicks is the fixed allowance (fallback while volatility is not
+	// ready). DynamicTicks replaces it with a volatility-scaled allowance:
+	// ticks = ceil(TickK * legVol / tick * depthScale), where legVol is the
+	// leg-price volatility in price units and depthScale >= 1 grows when the
+	// top-of-book is thin relative to the quantity.
+	PriceTicks    int
+	DynamicTicks  bool
+	TickK         float64
+	TickMin       int
+	TickMax       int     // 0 = no upper clamp
+	DepthMinMult  float64 // depth multiple below which the allowance widens
+	DepthMaxScale float64 // max multiplier applied to the allowance
 	// EmergencyMarketBps bounds the protective market price of an emergency
 	// unwind (liquidation-risk flatten), wider than the normal rescue bound.
 	EmergencyMarketBps float64
@@ -43,7 +44,7 @@ func DefaultConfig() Config {
 	return Config{AckTimeout: 3 * time.Second, QueryRetries: 3, QueryInterval: time.Second,
 		SettleDelay: 700 * time.Millisecond, RescueInterval: 400 * time.Millisecond,
 		RescueAlertAfter: 10 * time.Second, Rescue: DefaultRescue, PriceTicks: 30,
-		TickK: 2.5, TickMin: 1, EmergencyMarketBps: 100}
+		TickK: 2.5, TickMin: 1, DepthMinMult: 5, DepthMaxScale: 4, EmergencyMarketBps: 100}
 }
 
 // LegSpec is one side of a hedged action.
@@ -236,7 +237,7 @@ func (e *Executor) allowance(leg LegSpec, qty float64) int {
 	if k <= 0 {
 		k = e.cfg.TickK
 	}
-	ticks := int(math.Ceil(leg.Price*(k*sigma/1e4)/leg.Inst.Tick() - 1e-9))
+	ticks := int(math.Ceil(k*sigma/leg.Inst.Tick()*e.depthScale(leg, qty) - 1e-9))
 	// Cover the depth the quantity actually consumes (IOC walks past level 1).
 	if e.book != nil && leg.Venue != nil {
 		if b, ok := e.book(leg.Venue.Name(), leg.Inst.MarketID); ok {
@@ -252,6 +253,35 @@ func (e *Executor) allowance(leg LegSpec, qty float64) int {
 		ticks = e.cfg.TickMax
 	}
 	return ticks
+}
+
+// depthScale returns a multiplier >= 1 for the volatility allowance: the
+// thinner the top-of-book relative to qty, the larger the multiplier (a thin
+// book is swept by a small move, so the allowance must reach further).
+func (e *Executor) depthScale(leg LegSpec, qty float64) float64 {
+	if e.cfg.DepthMinMult <= 0 || e.cfg.DepthMaxScale <= 1 || qty <= 0 || e.book == nil || leg.Venue == nil {
+		return 1
+	}
+	b, ok := e.book(leg.Venue.Name(), leg.Inst.MarketID)
+	if !ok || len(b.Bids) == 0 || len(b.Asks) == 0 {
+		return 1
+	}
+	top := b.Asks[0].Size
+	if leg.Side == domain.Sell {
+		top = b.Bids[0].Size
+	}
+	if top <= 0 {
+		return 1
+	}
+	m := top / qty
+	if m >= e.cfg.DepthMinMult {
+		return 1
+	}
+	s := e.cfg.DepthMinMult / m
+	if s > e.cfg.DepthMaxScale {
+		s = e.cfg.DepthMaxScale
+	}
+	return s
 }
 
 // depthTicks is the number of ticks from the decision price to the level where
