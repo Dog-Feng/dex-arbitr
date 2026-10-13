@@ -66,6 +66,15 @@ execution:
   min_ticks: 1
   max_ticks: 0         # 0 = no upper clamp
 
+adaptive:
+  window: 0            # outcomes before adjusting tick_k; 0 = disabled
+  fail_high: 0.10      # widen when the one-leg failure rate exceeds this
+  fail_low: 0.02       # tighten when below this
+  up_factor: 1.3
+  down_factor: 0.95
+  min_k: 0.5
+  max_k: 10
+
 pairs:
   - base: SNDK
     left: lighter

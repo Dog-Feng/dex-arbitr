@@ -74,7 +74,7 @@ func testExec(t *testing.T, l, r *fakeVenue) *Executor {
 	cfg := DefaultConfig()
 	cfg.AckTimeout, cfg.QueryInterval, cfg.SettleDelay, cfg.RescueInterval = 50*time.Millisecond, 10*time.Millisecond, time.Millisecond, time.Millisecond
 	bk := domain.Book{Bids: []domain.Level{{Price: 100, Size: 1}}, Asks: []domain.Level{{Price: 100.1, Size: 1}}}
-	return NewExecutor(cfg, tr, NewIDGen(), func(string, int) (domain.Book, bool) { return bk, true }, nil, func(string) {})
+	return NewExecutor(cfg, tr, NewIDGen(), func(string, int) (domain.Book, bool) { return bk, true }, nil, nil, func(string) {})
 }
 
 func full(_ int, r domain.OrderReq) float64 { return r.Qty }
@@ -82,7 +82,7 @@ func full(_ int, r domain.OrderReq) float64 { return r.Qty }
 func TestDynamicAllowance(t *testing.T) {
 	leg := LegSpec{Venue: newFake("L", full), Inst: domain.Instrument{PriceDecimals: 2}, Side: domain.Buy, Price: 100}
 	e := NewExecutor(Config{DynamicTicks: true, TickK: 1, TickMin: 1, TickMax: 100, PriceTicks: 30},
-		nil, NewIDGen(), nil, func(string) float64 { return 10 }, func(string) {})
+		nil, NewIDGen(), nil, func(string) float64 { return 10 }, nil, func(string) {})
 	// adverse move = 100 * 1 * 10bps / 1e4 = 0.1 => 10 ticks of 0.01
 	if n := e.allowance(leg, 0.01); n != 10 {
 		t.Fatalf("dynamic allowance=%d, want 10", n)

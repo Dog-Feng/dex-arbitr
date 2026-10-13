@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Dog-Feng/dex-arbitr/internal/adaptive"
 	"github.com/Dog-Feng/dex-arbitr/internal/domain"
 	"github.com/Dog-Feng/dex-arbitr/internal/exchange"
 	"github.com/Dog-Feng/dex-arbitr/internal/execution"
@@ -46,6 +47,7 @@ type PairConfig struct {
 	Risk          marginConfig
 	VolTarget     float64 // daily volume target (USD); 0 = unlimited
 	VolCostBudget float64 // max daily realized loss (USD); 0 = unlimited
+	Adaptive      adaptive.Config
 }
 
 // PairActor owns the trading state of one pair (single goroutine).
@@ -60,12 +62,13 @@ type PairActor struct {
 	posR  float64
 	exec  *execution.Executor
 
-	bookMu sync.RWMutex
-	bookL  domain.Book
-	bookR  domain.Book
-	lat    latencyStat
-	margin marginMonitor
-	volAcc volumeAcc
+	bookMu   sync.RWMutex
+	bookL    domain.Book
+	bookR    domain.Book
+	lat      latencyStat
+	margin   marginMonitor
+	volAcc   volumeAcc
+	adaptive *adaptive.K
 }
 
 // volumeAcc accumulates daily traded volume and realized PnL for the volume
@@ -141,7 +144,12 @@ func NewPairActor(cfg PairConfig) (*PairActor, error) {
 	if !cfg.DryRun {
 		// Live trading stays paused until reconciliation succeeds.
 		a.state.Mode = strategy.ModePaused
-		a.exec = execution.NewExecutor(cfg.ExecCfg, cfg.Tracker, cfg.IDs, a.book, a.legVolBps, nil)
+		var tickK execution.TickKFn
+		if cfg.Adaptive.Window > 0 {
+			a.adaptive = adaptive.NewK(cfg.Adaptive)
+			tickK = a.adaptive.K
+		}
+		a.exec = execution.NewExecutor(cfg.ExecCfg, cfg.Tracker, cfg.IDs, a.book, a.legVolBps, tickK, nil)
 	}
 	return a, nil
 }
@@ -320,7 +328,8 @@ func (a *PairActor) Run(ctx context.Context) error {
 				"samples", st.Samples, "span", st.Span.Round(time.Second), "coverage", round2(st.Coverage),
 				"LS_bps", round2(q.LS), "SL_bps", round2(q.SL), "mid_bps", round2(q.Mid),
 				"vol_500ms_bps", round4(vol), "lat_n", a.lat.n, "lat_avg_ms", a.lat.avg().Milliseconds(), "lat_max_ms", a.lat.max.Milliseconds(),
-				"day_volume_usd", round2(a.volAcc.volumeUSD), "day_pnl_usd", round4(a.volAcc.pnlUSD))
+				"day_volume_usd", round2(a.volAcc.volumeUSD), "day_pnl_usd", round4(a.volAcc.pnlUSD),
+				"tick_k", round4(a.tickK()), "fail_rate", round4(a.failRate()))
 			a.lat.reset()
 		case now := <-decide.C:
 			if now.Before(nextAt) || a.state.Mode == strategy.ModePaused {
@@ -386,6 +395,22 @@ func (a *PairActor) legVolBps(venue string) float64 {
 	}
 	if venue == a.cfg.R.Name() && a.cfg.VolR != nil {
 		return a.cfg.VolR.Vol()
+	}
+	return 0
+}
+
+// tickK returns the current allowance coefficient (dynamic or configured).
+func (a *PairActor) tickK() float64 {
+	if a.adaptive != nil {
+		return a.adaptive.K()
+	}
+	return a.cfg.ExecCfg.TickK
+}
+
+// failRate returns the observed one-leg failure rate (0 before a full window).
+func (a *PairActor) failRate() float64 {
+	if a.adaptive != nil {
+		return a.adaptive.Rate()
 	}
 	return 0
 }
@@ -471,6 +496,10 @@ func (a *PairActor) apply(ctx context.Context, act strategy.Action, q spread.Quo
 	a.volAcc.volumeUSD += (fillL + fillR + rescueQty) * q.RefMid
 	a.volAcc.pnlUSD -= rescueCost
 	eps := math.Pow10(-a.cfg.Pair.SizeDecimals) / 2
+	if a.adaptive != nil {
+		oneLeg := (fillL < eps && fillR >= eps) || (fillR < eps && fillL >= eps)
+		a.adaptive.Observe(oneLeg)
+	}
 	switch act.Kind {
 	case strategy.Open:
 		h := math.Min(fillL, fillR)

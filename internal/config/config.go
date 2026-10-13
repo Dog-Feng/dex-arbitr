@@ -81,6 +81,15 @@ type Config struct {
 		TickMin      int     `yaml:"min_ticks"`     // floor for the dynamic allowance
 		TickMax      int     `yaml:"max_ticks"`     // cap for the dynamic allowance; 0 = no cap
 	} `yaml:"execution"`
+	Adaptive struct {
+		Window     int     `yaml:"window"`      // outcomes before adjusting; 0 = disabled
+		FailHigh   float64 `yaml:"fail_high"`   // failure rate above which to widen
+		FailLow    float64 `yaml:"fail_low"`    // failure rate below which to tighten
+		UpFactor   float64 `yaml:"up_factor"`   // widen factor (>1)
+		DownFactor float64 `yaml:"down_factor"` // tighten factor (<1)
+		MinK       float64 `yaml:"min_k"`
+		MaxK       float64 `yaml:"max_k"`
+	} `yaml:"adaptive"`
 	Pairs []Pair `yaml:"pairs"`
 }
 
@@ -113,6 +122,25 @@ func (c *Config) defaults() {
 	}
 	if x.TickMin == 0 {
 		x.TickMin = 1
+	}
+	a := &c.Adaptive
+	if a.FailHigh == 0 {
+		a.FailHigh = 0.10
+	}
+	if a.FailLow == 0 {
+		a.FailLow = 0.02
+	}
+	if a.UpFactor == 0 {
+		a.UpFactor = 1.3
+	}
+	if a.DownFactor == 0 {
+		a.DownFactor = 0.95
+	}
+	if a.MinK == 0 {
+		a.MinK = 0.5
+	}
+	if a.MaxK == 0 {
+		a.MaxK = 10
 	}
 	e := &c.Estimator
 	if e.Kind == "" {
@@ -201,6 +229,20 @@ func (c *Config) validate() error {
 	}
 	if c.Execution.TickMax > 0 && c.Execution.TickMax < c.Execution.TickMin {
 		return fmt.Errorf("execution.max_ticks must be >= min_ticks")
+	}
+	if c.Adaptive.Window < 0 {
+		return fmt.Errorf("adaptive.window must be >= 0")
+	}
+	if c.Adaptive.Window > 0 {
+		if c.Adaptive.FailLow < 0 || c.Adaptive.FailLow >= c.Adaptive.FailHigh || c.Adaptive.FailHigh > 1 {
+			return fmt.Errorf("adaptive: require 0 <= fail_low < fail_high <= 1")
+		}
+		if c.Adaptive.UpFactor <= 1 || c.Adaptive.DownFactor <= 0 || c.Adaptive.DownFactor >= 1 {
+			return fmt.Errorf("adaptive: up_factor > 1 and 0 < down_factor < 1")
+		}
+		if c.Adaptive.MinK <= 0 || c.Adaptive.MaxK < c.Adaptive.MinK {
+			return fmt.Errorf("adaptive: require 0 < min_k <= max_k")
+		}
 	}
 	if c.Leverage < 1 {
 		return fmt.Errorf("leverage must be >= 1")

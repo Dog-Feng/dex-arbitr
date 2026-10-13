@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sync"
 
+	"github.com/Dog-Feng/dex-arbitr/internal/adaptive"
 	"github.com/Dog-Feng/dex-arbitr/internal/config"
 	"github.com/Dog-Feng/dex-arbitr/internal/domain"
 	"github.com/Dog-Feng/dex-arbitr/internal/exchange"
@@ -171,6 +172,9 @@ func Run(ctx context.Context, c *config.Config) error {
 				hysteresis: c.Risk.MarginHysteresis, refresh: c.Risk.PositionRefresh, marketBps: c.Risk.EmergencyMarketBps,
 				maxNotional: c.Risk.MaxNotional},
 			VolTarget: volTarget, VolCostBudget: volBudget,
+			Adaptive: adaptive.Config{Init: c.Execution.TickK, Window: c.Adaptive.Window, High: c.Adaptive.FailHigh,
+				Low: c.Adaptive.FailLow, Up: c.Adaptive.UpFactor, Down: c.Adaptive.DownFactor,
+				Min: c.Adaptive.MinK, Max: c.Adaptive.MaxK},
 			Params: strategy.Params{StepQty: qty, MaxSteps: pc.MaxSteps, OpenBps: openBps, CloseBps: closeBps,
 				DepthMult: c.Strategy.DepthMult, CloseOrder: c.Strategy.CloseOrder, VolK: c.Strategy.VolK, FeeBps: feeBps,
 				MinInventory: minInv},

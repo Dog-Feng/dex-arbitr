@@ -244,7 +244,7 @@ func liveFlow(ctx context.Context, L, R exchange.Venue, pair symbols.Pair, qty, 
 		b, ok := latest[v]
 		return b, ok && b.Valid()
 	}
-	ex := execution.NewExecutor(execCfg, tr, execution.NewIDGen(), bookFn, nil, nil)
+	ex := execution.NewExecutor(execCfg, tr, execution.NewIDGen(), bookFn, nil, nil, nil)
 	time.Sleep(2 * time.Second) // let WS subscriptions settle
 
 	pl0, e1 := execution.MarketPosition(ctx, L, pair.Left.MarketID)

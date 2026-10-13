@@ -43,7 +43,7 @@ func DefaultConfig() Config {
 	return Config{AckTimeout: 3 * time.Second, QueryRetries: 3, QueryInterval: time.Second,
 		SettleDelay: 700 * time.Millisecond, RescueInterval: 400 * time.Millisecond,
 		RescueAlertAfter: 10 * time.Second, Rescue: DefaultRescue, PriceTicks: 30,
-		TickK: 1.28, TickMin: 1, EmergencyMarketBps: 100}
+		TickK: 2.5, TickMin: 1, EmergencyMarketBps: 100}
 }
 
 // LegSpec is one side of a hedged action.
@@ -87,6 +87,10 @@ type BookFn func(venue string, marketID int) (domain.Book, bool)
 // cross-venue spread move.
 type VolFn func(venue string) float64
 
+// TickKFn returns the current allowance coverage coefficient (dynamic tuning);
+// nil falls back to Config.TickK.
+type TickKFn func() float64
+
 // Executor runs hedged two-leg actions.
 type Executor struct {
 	cfg     Config
@@ -94,15 +98,16 @@ type Executor struct {
 	ids     *IDGen
 	book    BookFn
 	vol     VolFn
+	tickK   TickKFn
 	alert   func(msg string)
 }
 
 // NewExecutor builds an executor.
-func NewExecutor(cfg Config, t *Tracker, ids *IDGen, book BookFn, vol VolFn, alert func(string)) *Executor {
+func NewExecutor(cfg Config, t *Tracker, ids *IDGen, book BookFn, vol VolFn, tickK TickKFn, alert func(string)) *Executor {
 	if alert == nil {
 		alert = func(m string) { slog.Error("ALERT", "msg", m) }
 	}
-	return &Executor{cfg: cfg, tracker: t, ids: ids, book: book, vol: vol, alert: alert}
+	return &Executor{cfg: cfg, tracker: t, ids: ids, book: book, vol: vol, tickK: tickK, alert: alert}
 }
 
 // MarketPosition returns the signed position on one market.
@@ -224,7 +229,14 @@ func (e *Executor) allowance(leg LegSpec, qty float64) int {
 	if sigma <= 0 {
 		return e.cfg.PriceTicks
 	}
-	ticks := int(math.Ceil(leg.Price*(e.cfg.TickK*sigma/1e4)/leg.Inst.Tick() - 1e-9))
+	k := e.cfg.TickK
+	if e.tickK != nil {
+		k = e.tickK()
+	}
+	if k <= 0 {
+		k = e.cfg.TickK
+	}
+	ticks := int(math.Ceil(leg.Price*(k*sigma/1e4)/leg.Inst.Tick() - 1e-9))
 	// Cover the depth the quantity actually consumes (IOC walks past level 1).
 	if e.book != nil && leg.Venue != nil {
 		if b, ok := e.book(leg.Venue.Name(), leg.Inst.MarketID); ok {
