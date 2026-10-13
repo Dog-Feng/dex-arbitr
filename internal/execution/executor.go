@@ -33,6 +33,9 @@ type Config struct {
 	TickK        float64
 	TickMin      int
 	TickMax      int // 0 = no upper clamp
+	// EmergencyMarketBps bounds the protective market price of an emergency
+	// unwind (liquidation-risk flatten), wider than the normal rescue bound.
+	EmergencyMarketBps float64
 }
 
 // DefaultConfig values.
@@ -40,7 +43,7 @@ func DefaultConfig() Config {
 	return Config{AckTimeout: 3 * time.Second, QueryRetries: 3, QueryInterval: time.Second,
 		SettleDelay: 700 * time.Millisecond, RescueInterval: 400 * time.Millisecond,
 		RescueAlertAfter: 10 * time.Second, Rescue: DefaultRescue, PriceTicks: 30,
-		TickK: 1.28, TickMin: 1}
+		TickK: 1.28, TickMin: 1, EmergencyMarketBps: 100}
 }
 
 // LegSpec is one side of a hedged action.
@@ -141,7 +144,7 @@ func (e *Executor) Execute(ctx context.Context, l, r LegSpec, qty float64, reduc
 	target := beforeL + beforeR
 	res.PosL, res.PosR = pl, pr
 	if eps := halfUnit(l.Inst, r.Inst); math.Abs(pl+pr-target) >= eps {
-		n, q, fl, fr := e.flatten(ctx, l, r, target, pl, pr, &res)
+		n, q, fl, fr := e.flatten(ctx, l, r, target, pl, pr, &res, e.cfg.Rescue)
 		res.RescueOrders, res.RescueQty, res.PosL, res.PosR = n, q, fl, fr
 	}
 	res.Duration = time.Since(start)
@@ -324,7 +327,28 @@ func fill(lr LegResult, u domain.OrderUpdate, start time.Time) LegResult {
 
 // flatten loops reduce-only orders until posL+posR == target.
 // Positions are re-read before every retry.
-func (e *Executor) flatten(ctx context.Context, l, r LegSpec, target, pl, pr float64, res *Result) (int, float64, float64, float64) {
+// EmergencyFlatten reduces both legs to a flat position using immediate market
+// orders (liquidation-risk unwind). It reuses the flatten loop with a wider
+// protective bound and no price relaxation ladder.
+func (e *Executor) EmergencyFlatten(ctx context.Context, l, r LegSpec, target, pl, pr float64) (Result, error) {
+	start := time.Now()
+	res := Result{}
+	pl, pr, err := e.positions(ctx, l, r)
+	if err != nil {
+		return res, err
+	}
+	bps := e.cfg.EmergencyMarketBps
+	if bps <= 0 {
+		bps = 100
+	}
+	rescue := RescueParams{Immediate: true, MarketBps: bps}
+	n, q, fl, fr := e.flatten(ctx, l, r, target, pl, pr, &res, rescue)
+	res.RescueOrders, res.RescueQty, res.PosL, res.PosR = n, q, fl, fr
+	res.Duration = time.Since(start)
+	return res, nil
+}
+
+func (e *Executor) flatten(ctx context.Context, l, r LegSpec, target, pl, pr float64, res *Result, rescue RescueParams) (int, float64, float64, float64) {
 	start := time.Now()
 	alerted := false
 	orders, total := 0, 0.0
@@ -372,7 +396,7 @@ func (e *Executor) flatten(ctx context.Context, l, r LegSpec, target, pl, pr flo
 			attempt--
 			continue
 		}
-		px, typ := RescuePrice(e.cfg.Rescue, attempt, b, side, leg.Inst.PriceDecimals)
+		px, typ := RescuePrice(rescue, attempt, b, side, leg.Inst.PriceDecimals)
 		slog.Warn("rescue order", "attempt", attempt+1, "venue", leg.Venue.Name(), "side", side, "qty", q, "price", px, "type", typ)
 		lr := e.submitAndResolve(ctx, domain.OrderReq{ClientID: e.ids.Next(), Inst: leg.Inst, Side: side, Qty: q,
 			Price: px, Type: typ, ReduceOnly: true}, leg.Venue)

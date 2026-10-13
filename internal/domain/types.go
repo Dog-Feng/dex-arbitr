@@ -135,10 +135,11 @@ type SubmitAck struct {
 
 // Position on a venue market. Qty is signed (+long / -short).
 type Position struct {
-	MarketID int
-	Symbol   string
-	Qty      float64
-	AvgEntry float64
+	MarketID         int
+	Symbol           string
+	Qty              float64
+	AvgEntry         float64
+	LiquidationPrice float64
 }
 
 var (

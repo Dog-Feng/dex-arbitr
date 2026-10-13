@@ -40,6 +40,7 @@ type PairConfig struct {
 	VolEvery    time.Duration
 	VolMaxAge   time.Duration
 	Samples     *store.SampleSink
+	Risk        marginConfig
 }
 
 // PairActor owns the trading state of one pair (single goroutine).
@@ -58,6 +59,7 @@ type PairActor struct {
 	bookL  domain.Book
 	bookR  domain.Book
 	lat    latencyStat
+	margin marginMonitor
 }
 
 // latencyStat aggregates per-leg submit-to-result latency for the status report.
@@ -94,6 +96,7 @@ func NewPairActor(cfg PairConfig) (*PairActor, error) {
 		key += "_paper"
 	}
 	a := &PairActor{cfg: cfg, key: key, log: slog.With("pair", cfg.Pair.Base, "L", cfg.L.Name(), "R", cfg.R.Name())}
+	a.margin = marginMonitor{cfg: cfg.Risk}
 	st, err := cfg.Store.Load(key)
 	if err != nil {
 		return nil, err
@@ -229,6 +232,12 @@ func (a *PairActor) Run(ctx context.Context) error {
 		defer vt.Stop()
 		volC = vt.C
 	}
+	var riskC <-chan time.Time
+	if !a.cfg.DryRun && a.cfg.Risk.trigger > 0 {
+		rt := time.NewTicker(time.Second)
+		defer rt.Stop()
+		riskC = rt.C
+	}
 	decide := time.NewTicker(200 * time.Millisecond)
 	defer decide.Stop()
 	report := time.NewTicker(time.Minute)
@@ -257,6 +266,8 @@ func (a *PairActor) Run(ctx context.Context) error {
 					a.cfg.Samples.Add(now, q.Mid, q.LS, q.SL)
 				}
 			}
+		case now := <-riskC:
+			a.risk(ctx, now)
 		case <-report.C:
 			st := a.cfg.Est.Stats()
 			q, _ := a.quote(time.Now())
@@ -319,6 +330,61 @@ func (a *PairActor) volBps() float64 {
 		return 0
 	}
 	return a.cfg.Vol.Vol()
+}
+
+// risk refreshes liquidation data on its interval, then applies the margin
+// monitor's decision (arm/disarm/trigger) to the actor state.
+func (a *PairActor) risk(ctx context.Context, now time.Time) {
+	if a.cfg.DryRun || a.cfg.Risk.trigger <= 0 {
+		return
+	}
+	if now.Sub(a.margin.lastRefresh) >= a.margin.cfg.refresh {
+		a.margin.refresh(ctx, a.cfg.L, a.cfg.R, a.cfg.Pair.Left.MarketID, a.cfg.Pair.Right.MarketID)
+	}
+	markL, markR, fresh := a.riskMarks()
+	switch a.margin.assess(markL, markR, fresh) {
+	case marginArm:
+		if a.state.Mode == strategy.ModeRunning {
+			a.state.Mode = strategy.ModeReduceOnly
+			a.log.Warn("margin floor reached; reduce only", "markL", round2(markL), "markR", round2(markR))
+		}
+	case marginDisarm:
+		if a.state.Mode == strategy.ModeReduceOnly {
+			a.state.Mode = strategy.ModeRunning
+			a.log.Info("margin recovered; resuming", "markL", round2(markL), "markR", round2(markR))
+		}
+	case marginTrigger:
+		a.emergency(ctx)
+	}
+}
+
+// riskMarks returns fresh book mids for both legs.
+func (a *PairActor) riskMarks() (float64, float64, bool) {
+	lb, lok := a.book(a.cfg.L.Name(), a.cfg.Pair.Left.MarketID)
+	rb, rok := a.book(a.cfg.R.Name(), a.cfg.Pair.Right.MarketID)
+	if !lok || !rok {
+		return 0, 0, false
+	}
+	return lb.Mid(), rb.Mid(), true
+}
+
+// emergency market-flattens both legs to zero and pauses the pair.
+func (a *PairActor) emergency(ctx context.Context) {
+	a.log.Error("ALERT: liquidation risk, emergency unwind")
+	res, err := a.exec.EmergencyFlatten(ctx,
+		execution.LegSpec{Venue: a.cfg.L, Inst: a.cfg.Pair.Left},
+		execution.LegSpec{Venue: a.cfg.R, Inst: a.cfg.Pair.Right},
+		0, a.posL, a.posR)
+	if err != nil {
+		a.log.Error("emergency flatten failed; will retry", "err", err)
+		return
+	}
+	a.posL, a.posR = res.PosL, res.PosR
+	a.state.Steps = nil
+	a.state.Mode = strategy.ModePaused
+	a.log.Error("emergency unwind done", "rescue_orders", res.RescueOrders, "posL", res.PosL, "posR", res.PosR,
+		"took", res.Duration.Round(time.Millisecond))
+	a.persist()
 }
 
 func (a *PairActor) apply(ctx context.Context, act strategy.Action, q spread.Quote) {

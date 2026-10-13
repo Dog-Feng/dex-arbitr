@@ -96,11 +96,12 @@ func (r *restClient) positions(ctx context.Context, account int64) ([]domain.Pos
 	var out struct {
 		Accounts []struct {
 			Positions []struct {
-				MarketID int    `json:"market_id"`
-				Symbol   string `json:"symbol"`
-				Sign     int    `json:"sign"`
-				Position string `json:"position"`
-				AvgEntry string `json:"avg_entry_price"`
+				MarketID         int    `json:"market_id"`
+				Symbol           string `json:"symbol"`
+				Sign             int    `json:"sign"`
+				Position         string `json:"position"`
+				AvgEntry         string `json:"avg_entry_price"`
+				LiquidationPrice string `json:"liquidation_price"`
 			} `json:"positions"`
 		} `json:"accounts"`
 	}
@@ -120,7 +121,8 @@ func (r *restClient) positions(ctx context.Context, account int64) ([]domain.Pos
 		if qty == 0 {
 			continue
 		}
-		ps = append(ps, domain.Position{MarketID: p.MarketID, Symbol: p.Symbol, Qty: qty, AvgEntry: domain.ParseF(p.AvgEntry)})
+		ps = append(ps, domain.Position{MarketID: p.MarketID, Symbol: p.Symbol, Qty: qty,
+			AvgEntry: domain.ParseF(p.AvgEntry), LiquidationPrice: domain.ParseF(p.LiquidationPrice)})
 	}
 	return ps, nil
 }

@@ -50,6 +50,13 @@ type Config struct {
 		HalfLife time.Duration `yaml:"half_life"` // EWMA half-life
 		MaxAge   time.Duration `yaml:"max_age"`   // book freshness gate for sampling
 	} `yaml:"volatility"`
+	Risk struct {
+		MarginFloorRatio   float64       `yaml:"margin_floor_ratio"`   // <= ratio stops opening
+		MarginTriggerRatio float64       `yaml:"margin_trigger_ratio"` // <= ratio triggers emergency unwind
+		MarginHysteresis   float64       `yaml:"margin_hysteresis"`    // recovery band above the floor
+		PositionRefresh    time.Duration `yaml:"position_refresh"`     // liquidation price refresh interval
+		EmergencyMarketBps float64       `yaml:"emergency_market_bps"` // protective bound of the emergency unwind
+	} `yaml:"risk"`
 	Strategy struct {
 		OpenBps     float64       `yaml:"open_bps"`
 		CloseBps    float64       `yaml:"close_bps"`
@@ -129,6 +136,22 @@ func (c *Config) defaults() {
 	if v.MaxAge == 0 {
 		v.MaxAge = 50 * time.Millisecond
 	}
+	r := &c.Risk
+	if r.MarginFloorRatio == 0 {
+		r.MarginFloorRatio = 0.2
+	}
+	if r.MarginTriggerRatio == 0 {
+		r.MarginTriggerRatio = 0.1
+	}
+	if r.MarginHysteresis == 0 {
+		r.MarginHysteresis = 0.05
+	}
+	if r.PositionRefresh == 0 {
+		r.PositionRefresh = 15 * time.Second
+	}
+	if r.EmergencyMarketBps == 0 {
+		r.EmergencyMarketBps = 100
+	}
 	s := &c.Strategy
 	if s.OpenBps == 0 {
 		s.OpenBps = 1
@@ -174,6 +197,15 @@ func (c *Config) validate() error {
 	}
 	if c.Volatility.Interval <= 0 || c.Volatility.Horizon < c.Volatility.Interval || c.Volatility.HalfLife <= 0 || c.Volatility.MaxAge <= 0 {
 		return fmt.Errorf("volatility: interval/half_life/max_age must be > 0 and horizon >= interval")
+	}
+	if c.Risk.MarginTriggerRatio <= 0 || c.Risk.MarginTriggerRatio > c.Risk.MarginFloorRatio || c.Risk.MarginFloorRatio >= 1 {
+		return fmt.Errorf("risk: require 0 < margin_trigger_ratio <= margin_floor_ratio < 1")
+	}
+	if c.Risk.MarginHysteresis < 0 || c.Risk.MarginFloorRatio+c.Risk.MarginHysteresis >= 1 {
+		return fmt.Errorf("risk: margin_hysteresis must keep floor+hysteresis < 1")
+	}
+	if c.Risk.PositionRefresh <= 0 || c.Risk.EmergencyMarketBps <= 0 {
+		return fmt.Errorf("risk: position_refresh and emergency_market_bps must be > 0")
 	}
 	names := map[string]bool{}
 	for _, v := range c.Venues {

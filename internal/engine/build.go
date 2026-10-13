@@ -38,6 +38,7 @@ func ExecutionConfig(c *config.Config) execution.Config {
 	ec.TickK = c.Execution.TickK
 	ec.TickMin = c.Execution.TickMin
 	ec.TickMax = c.Execution.TickMax
+	ec.EmergencyMarketBps = c.Risk.EmergencyMarketBps
 	return ec
 }
 
@@ -152,6 +153,8 @@ func Run(ctx context.Context, c *config.Config) error {
 			ExecCfg: ExecutionConfig(c), SampleEvery: c.Estimator.Interval,
 			IntervalMin: c.Strategy.IntervalMin, IntervalMax: c.Strategy.IntervalMax, MaxBookAge: c.Strategy.MaxBookAge,
 			Vol: vol, VolEvery: c.Volatility.Interval, VolMaxAge: c.Volatility.MaxAge, Samples: samples,
+			Risk: marginConfig{floor: c.Risk.MarginFloorRatio, trigger: c.Risk.MarginTriggerRatio,
+				hysteresis: c.Risk.MarginHysteresis, refresh: c.Risk.PositionRefresh, marketBps: c.Risk.EmergencyMarketBps},
 			Params: strategy.Params{StepQty: qty, MaxSteps: pc.MaxSteps, OpenBps: c.Strategy.OpenBps, CloseBps: c.Strategy.CloseBps,
 				DepthMult: c.Strategy.DepthMult, CloseOrder: c.Strategy.CloseOrder, VolK: c.Strategy.VolK},
 		})
