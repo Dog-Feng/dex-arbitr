@@ -109,7 +109,7 @@ func (c *Config) defaults() {
 	}
 	x := &c.Execution
 	if x.TickK == 0 {
-		x.TickK = 1.28
+		x.TickK = 2.5
 	}
 	if x.TickMin == 0 {
 		x.TickMin = 1

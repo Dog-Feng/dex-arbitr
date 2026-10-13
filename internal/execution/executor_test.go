@@ -80,20 +80,20 @@ func testExec(t *testing.T, l, r *fakeVenue) *Executor {
 func full(_ int, r domain.OrderReq) float64 { return r.Qty }
 
 func TestDynamicAllowance(t *testing.T) {
-	leg := LegSpec{Inst: domain.Instrument{PriceDecimals: 2}, Side: domain.Buy, Price: 100}
+	leg := LegSpec{Venue: newFake("L", full), Inst: domain.Instrument{PriceDecimals: 2}, Side: domain.Buy, Price: 100}
 	e := NewExecutor(Config{DynamicTicks: true, TickK: 1, TickMin: 1, TickMax: 100, PriceTicks: 30},
-		nil, NewIDGen(), nil, func() float64 { return 10 }, func(string) {})
+		nil, NewIDGen(), nil, func(string) float64 { return 10 }, func(string) {})
 	// adverse move = 100 * 1 * 10bps / 1e4 = 0.1 => 10 ticks of 0.01
 	if n := e.allowance(leg, 0.01); n != 10 {
 		t.Fatalf("dynamic allowance=%d, want 10", n)
 	}
 	// volatility not ready falls back to the fixed allowance
-	e.vol = func() float64 { return 0 }
+	e.vol = func(string) float64 { return 0 }
 	if n := e.allowance(leg, 0.01); n != 30 {
 		t.Fatalf("fallback allowance=%d, want 30", n)
 	}
 	// high volatility is capped at TickMax
-	e.vol = func() float64 { return 5000 }
+	e.vol = func(string) float64 { return 5000 }
 	if n := e.allowance(leg, 0.01); n != 100 {
 		t.Fatalf("capped allowance=%d, want 100", n)
 	}

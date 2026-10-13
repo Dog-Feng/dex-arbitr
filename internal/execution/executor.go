@@ -82,8 +82,10 @@ type Result struct {
 // BookFn returns the latest book for a venue/market (for rescue pricing).
 type BookFn func(venue string, marketID int) (domain.Book, bool)
 
-// VolFn returns the current short-horizon spread volatility in bps (0 if not ready).
-type VolFn func() float64
+// VolFn returns the current short-horizon leg-price volatility (bps) of a venue
+// (0 if not ready). The allowance covers the leg's own price move, not the
+// cross-venue spread move.
+type VolFn func(venue string) float64
 
 // Executor runs hedged two-leg actions.
 type Executor struct {
@@ -215,7 +217,10 @@ func (e *Executor) allowance(leg LegSpec, qty float64) int {
 	if !e.cfg.DynamicTicks || e.vol == nil {
 		return e.cfg.PriceTicks
 	}
-	sigma := e.vol()
+	sigma := 0.0
+	if leg.Venue != nil {
+		sigma = e.vol(leg.Venue.Name())
+	}
 	if sigma <= 0 {
 		return e.cfg.PriceTicks
 	}

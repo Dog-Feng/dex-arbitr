@@ -62,7 +62,7 @@ volume:                     # only used when strategy.kind = volume
 execution:
   price_ticks: 30      # fixed IOC allowance; fallback while sigma is not ready
   dynamic_ticks: true  # scale the allowance by sigma (volatility.horizon)
-  tick_k: 1.28         # one-sided coverage coefficient
+  tick_k: 2.5          # one-sided coverage coefficient (leg-price vol); calibrate by replay
   min_ticks: 1
   max_ticks: 0         # 0 = no upper clamp
 

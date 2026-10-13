@@ -33,3 +33,20 @@
 - Use `interface{}` when generics or concrete types work
 - Start goroutines without termination condition
 - Add dependencies without stating why
+
+## Module Design (must follow)
+
+- 简洁性 (simplicity): one package = one responsibility; no dead or speculative
+  code. Prefer the simplest data flow (a function call when a single goroutine
+  owns the state, a channel only for real cross-goroutine signalling).
+- 解耦性 (decoupling): modules talk through small interfaces defined at the
+  call site, not through concrete types. Business strategies implement
+  `strategy.Strategy` and register by name (`arbitrage`, `volume`); shared
+  services (`execution`, `risk`, `monitor`) expose ports, not internals.
+- 可拓展性 (extensibility): a new capability is a new registered implementation
+  (`exchange.Venue`, `estimator.Estimator`, `strategy.Strategy`, or a future
+  `Protector`), never an edit to the core engine. Keep `engine` thin: it wires,
+  it does not implement business logic.
+- Monitor is read-only: it consumes events and never sends trading commands.
+  Business modules are independent in code, but share account-level risk; that
+  is why risk is a cross-cutting aggregator, not a per-module feature.

@@ -141,6 +141,8 @@ func Run(ctx context.Context, c *config.Config) error {
 			return err
 		}
 		vol := volatility.New(volatility.Params{Interval: c.Volatility.Interval, Horizon: c.Volatility.Horizon, HalfLife: c.Volatility.HalfLife})
+		volL := volatility.New(volatility.Params{Interval: c.Volatility.Interval, Horizon: c.Volatility.Horizon, HalfLife: c.Volatility.HalfLife})
+		volR := volatility.New(volatility.Params{Interval: c.Volatility.Interval, Horizon: c.Volatility.Horizon, HalfLife: c.Volatility.HalfLife})
 		strat, err := strategy.New(c.Strategy.Kind)
 		if err != nil {
 			return err
@@ -164,7 +166,7 @@ func Run(ctx context.Context, c *config.Config) error {
 			Pair: pair, L: l, R: r, Strategy: strat, Est: est, DryRun: c.DryRun, Store: st, Tracker: tracker, IDs: ids,
 			ExecCfg: ExecutionConfig(c), SampleEvery: c.Estimator.Interval,
 			IntervalMin: c.Strategy.IntervalMin, IntervalMax: c.Strategy.IntervalMax, MaxBookAge: c.Strategy.MaxBookAge,
-			Vol: vol, VolEvery: c.Volatility.Interval, VolMaxAge: c.Volatility.MaxAge, Samples: samples,
+			Vol: vol, VolL: volL, VolR: volR, VolEvery: c.Volatility.Interval, VolMaxAge: c.Volatility.MaxAge, Samples: samples,
 			Risk: marginConfig{floor: c.Risk.MarginFloorRatio, trigger: c.Risk.MarginTriggerRatio,
 				hysteresis: c.Risk.MarginHysteresis, refresh: c.Risk.PositionRefresh, marketBps: c.Risk.EmergencyMarketBps,
 				maxNotional: c.Risk.MaxNotional},

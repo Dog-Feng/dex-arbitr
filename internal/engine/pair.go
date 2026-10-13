@@ -38,6 +38,8 @@ type PairConfig struct {
 	ExecCfg       execution.Config
 	IDs           *execution.IDGen
 	Vol           *volatility.Estimator
+	VolL          *volatility.Estimator
+	VolR          *volatility.Estimator
 	VolEvery      time.Duration
 	VolMaxAge     time.Duration
 	Samples       *store.SampleSink
@@ -139,7 +141,7 @@ func NewPairActor(cfg PairConfig) (*PairActor, error) {
 	if !cfg.DryRun {
 		// Live trading stays paused until reconciliation succeeds.
 		a.state.Mode = strategy.ModePaused
-		a.exec = execution.NewExecutor(cfg.ExecCfg, cfg.Tracker, cfg.IDs, a.book, a.volBps, nil)
+		a.exec = execution.NewExecutor(cfg.ExecCfg, cfg.Tracker, cfg.IDs, a.book, a.legVolBps, nil)
 	}
 	return a, nil
 }
@@ -295,6 +297,12 @@ func (a *PairActor) Run(ctx context.Context) error {
 		case now := <-volC:
 			if q, ok := a.volQuote(now); ok {
 				a.cfg.Vol.Add(q.Mid)
+				if a.cfg.VolL != nil {
+					a.cfg.VolL.Add(q.L.Mid())
+				}
+				if a.cfg.VolR != nil {
+					a.cfg.VolR.Add(q.R.Mid())
+				}
 				if a.cfg.Samples != nil {
 					a.cfg.Samples.Add(now, q.Mid, q.LS, q.SL)
 				}
@@ -371,6 +379,17 @@ func (a *PairActor) volBps() float64 {
 	return a.cfg.Vol.Vol()
 }
 
+// legVolBps is the short-horizon leg-price volatility (bps) of a venue, or 0.
+func (a *PairActor) legVolBps(venue string) float64 {
+	if venue == a.cfg.L.Name() && a.cfg.VolL != nil {
+		return a.cfg.VolL.Vol()
+	}
+	if venue == a.cfg.R.Name() && a.cfg.VolR != nil {
+		return a.cfg.VolR.Vol()
+	}
+	return 0
+}
+
 // risk refreshes liquidation data on its interval, then applies the margin
 // monitor's decision (arm/disarm/trigger) to the actor state.
 func (a *PairActor) risk(ctx context.Context, now time.Time) {
@@ -432,6 +451,7 @@ func (a *PairActor) apply(ctx context.Context, act strategy.Action, q spread.Quo
 
 	fillL, fillR, pxL, pxR := act.Qty, act.Qty, act.L.Price, act.R.Price
 	rescueLPx, rescueRPx := 0.0, 0.0
+	rescueQty, rescueCost := 0.0, 0.0
 	if !a.cfg.DryRun {
 		res := a.exec.Execute(ctx,
 			execution.LegSpec{Venue: a.cfg.L, Inst: a.cfg.Pair.Left, Side: act.L.Side, Price: act.L.Price},
@@ -439,13 +459,17 @@ func (a *PairActor) apply(ctx context.Context, act strategy.Action, q spread.Quo
 			act.Qty, act.Kind == strategy.Close, a.posL, a.posR)
 		fillL, fillR, pxL, pxR = res.L.Filled, res.R.Filled, res.L.AvgPrice, res.R.AvgPrice
 		rescueLPx, rescueRPx = res.L.RescuePrice, res.R.RescuePrice
+		rescueQty = res.RescueQty
+		rescueCost = rescueCostUSD(res.L, res.R)
 		a.posL, a.posR = res.PosL, res.PosR
 		a.lat.add(res.L.Latency)
 		a.lat.add(res.R.Latency)
 		a.log.Info("executed", "fillL", fillL, "fillR", fillR, "pxL", pxL, "pxR", pxR, "statusL", res.L.Status, "statusR", res.R.Status,
 			"rescue_orders", res.RescueOrders, "rescue_qty", res.RescueQty, "posL", res.PosL, "posR", res.PosR, "took", res.Duration.Round(time.Millisecond),
-			"latL_ms", res.L.Latency.Milliseconds(), "latR_ms", res.R.Latency.Milliseconds())
+			"rescue_cost_usd", round4(rescueCost), "latL_ms", res.L.Latency.Milliseconds(), "latR_ms", res.R.Latency.Milliseconds())
 	}
+	a.volAcc.volumeUSD += (fillL + fillR + rescueQty) * q.RefMid
+	a.volAcc.pnlUSD -= rescueCost
 	eps := math.Pow10(-a.cfg.Pair.SizeDecimals) / 2
 	switch act.Kind {
 	case strategy.Open:
@@ -458,7 +482,6 @@ func (a *PairActor) apply(ctx context.Context, act strategy.Action, q spread.Quo
 			EntryBps: strategy.EntryBps(act.Dir, pxL, pxR), OpenL: pxL, OpenR: pxR, OpenedAt: time.Now()}
 		a.next++
 		a.state.Steps = append(a.state.Steps, st)
-		a.volAcc.volumeUSD += 2 * st.Qty * q.RefMid
 		a.log.Info("step opened", "id", st.ID, "entry_bps", round2(st.EntryBps), "counter", a.state.Counter())
 	case strategy.Close:
 		closed := math.Max(fillL, fillR) // the lagging leg is completed by rescue
@@ -478,7 +501,6 @@ func (a *PairActor) apply(ctx context.Context, act strategy.Action, q spread.Quo
 				gross := a.state.Steps[i].EntryBps + strategy.EntryBps(-act.Dir, lpx, rpx)
 				net := gross - fee
 				a.state.Steps[i].Realized += net
-				a.volAcc.volumeUSD += 2 * closed * q.RefMid
 				a.volAcc.pnlUSD += closed * q.RefMid * net / 1e4
 				a.log.Info("step pnl", "id", act.StepID, "gross_bps", round2(gross), "fee_bps", round2(fee),
 					"net_bps", round2(net), "realized_bps", round2(a.state.Steps[i].Realized), "lpx", lpx, "rpx", rpx)
@@ -523,6 +545,20 @@ func (a *PairActor) checkHedge() error {
 		return fmt.Errorf("posL %.6f posR %.6f vs expected L %.6f R %.6f", a.posL, a.posR, expL, -expL)
 	}
 	return nil
+}
+
+// rescueCostUSD estimates the slippage of rescue orders that flattened a
+// directly-filled leg (e.g. a one-leg open failure); legs with no direct fill
+// are skipped because their rescue price is already folded into realized PnL.
+func rescueCostUSD(l, r execution.LegResult) float64 {
+	cost := 0.0
+	if l.RescueFilled > 0 && l.AvgPrice > 0 {
+		cost += l.RescueFilled * math.Abs(l.AvgPrice-l.RescuePrice)
+	}
+	if r.RescueFilled > 0 && r.AvgPrice > 0 {
+		cost += r.RescueFilled * math.Abs(r.AvgPrice-r.RescuePrice)
+	}
+	return cost
 }
 
 func round2(v float64) float64 { return math.Round(v*100) / 100 }
