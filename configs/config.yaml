@@ -85,9 +85,9 @@ pairs:
     left: lighter
     right: rhlighter
     step_qty: 0.02
-    max_steps: 30
-  - base: SNDK
+    max_steps: 15
+  - base: QQQ
     left: lighter
     right: rhlighter
-    step_qty: 0.01
-    max_steps: 10
+    step_qty: 0.02
+    max_steps: 15
