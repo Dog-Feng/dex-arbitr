@@ -270,6 +270,7 @@ volume:
   min_inventory: 0
   daily_volume_target: 0
   daily_cost_budget: 0
+  loss_tolerance_bps: 0
 
 execution:
   price_ticks: 30

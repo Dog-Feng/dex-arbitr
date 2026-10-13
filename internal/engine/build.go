@@ -169,7 +169,7 @@ func Run(ctx context.Context, c *config.Config) error {
 		openBps, closeBps, minInv := c.Strategy.OpenBps, c.Strategy.CloseBps, 0
 		volTarget, volBudget := 0.0, 0.0
 		if c.Strategy.Kind == "volume" {
-			openBps, closeBps = 0, 0
+			openBps, closeBps = -c.Volume.LossToleranceBps, 0
 			minInv = c.Volume.MinInventory
 			volTarget, volBudget = c.Volume.DailyVolumeTarget, c.Volume.DailyCostBudget
 		}

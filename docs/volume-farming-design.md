@@ -99,6 +99,7 @@ volume:
   churn_interval: 2s      # 时间兜底的固定节奏
   daily_volume_target: 1000000   # USD
   daily_cost_budget: 100         # bps
+  loss_tolerance_bps: 0.5  # 每笔允许的亏损(bps)，配合 daily_cost_budget 封顶
   close_at_breakeven: true
 
 maker:

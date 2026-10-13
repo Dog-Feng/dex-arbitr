@@ -58,6 +58,7 @@ volume:                     # only used when strategy.kind = volume
   min_inventory: 0          # floor steps held while churning
   daily_volume_target: 0    # USD; 0 = unlimited
   daily_cost_budget: 0      # USD max daily loss; 0 = unlimited
+  loss_tolerance_bps: 0     # per-trade allowed loss (bps) on open; 0 = break-even
 
 execution:
   price_ticks: 30      # fixed IOC allowance; fallback while sigma is not ready
