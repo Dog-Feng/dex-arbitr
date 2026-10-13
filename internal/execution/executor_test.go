@@ -2,6 +2,7 @@ package execution
 
 import (
 	"context"
+	"math"
 	"sync"
 	"testing"
 	"time"
@@ -178,8 +179,24 @@ func TestCloseCompletesLaggingLeg(t *testing.T) {
 	if res.PosL != 0 || res.PosR != 0 || res.RescueOrders != 1 {
 		t.Fatalf("%+v", res)
 	}
+	if res.R.RescueFilled != 0.01 || math.Abs(res.R.RescuePrice-100.1) > 1e-9 {
+		t.Fatalf("rescue fill not recorded: %+v", res.R)
+	}
 	if o := r.orders[1]; o.Side != domain.Buy || !o.ReduceOnly {
 		t.Fatalf("%+v", o)
+	}
+}
+
+func TestMergeRescue(t *testing.T) {
+	var lr LegResult
+	mergeRescue(&lr, 0.01, 100)
+	mergeRescue(&lr, 0.01, 102)
+	if lr.RescueFilled != 0.02 || math.Abs(lr.RescuePrice-101) > 1e-9 {
+		t.Fatalf("%+v", lr)
+	}
+	mergeRescue(&lr, 0, 50) // zero fill must be ignored
+	if lr.RescueFilled != 0.02 || math.Abs(lr.RescuePrice-101) > 1e-9 {
+		t.Fatalf("%+v", lr)
 	}
 }
 

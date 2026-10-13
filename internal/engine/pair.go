@@ -326,12 +326,14 @@ func (a *PairActor) apply(ctx context.Context, act strategy.Action, q spread.Quo
 		"R", fmt.Sprintf("%s@%.4f", act.R.Side, act.R.Price), "expected_bps", round2(act.ExpectedBps), "reason", act.Reason)
 
 	fillL, fillR, pxL, pxR := act.Qty, act.Qty, act.L.Price, act.R.Price
+	rescueLPx, rescueRPx := 0.0, 0.0
 	if !a.cfg.DryRun {
 		res := a.exec.Execute(ctx,
 			execution.LegSpec{Venue: a.cfg.L, Inst: a.cfg.Pair.Left, Side: act.L.Side, Price: act.L.Price},
 			execution.LegSpec{Venue: a.cfg.R, Inst: a.cfg.Pair.Right, Side: act.R.Side, Price: act.R.Price},
 			act.Qty, act.Kind == strategy.Close, a.posL, a.posR)
 		fillL, fillR, pxL, pxR = res.L.Filled, res.R.Filled, res.L.AvgPrice, res.R.AvgPrice
+		rescueLPx, rescueRPx = res.L.RescuePrice, res.R.RescuePrice
 		a.posL, a.posR = res.PosL, res.PosR
 		a.lat.add(res.L.Latency)
 		a.lat.add(res.R.Latency)
@@ -360,10 +362,17 @@ func (a *PairActor) apply(ctx context.Context, act strategy.Action, q spread.Quo
 				continue
 			}
 			if closed >= eps {
-				gross := a.state.Steps[i].EntryBps + strategy.EntryBps(-act.Dir, pxL, pxR)
+				lpx, rpx := pxL, pxR
+				if fillL <= eps && rescueLPx > 0 {
+					lpx = rescueLPx
+				}
+				if fillR <= eps && rescueRPx > 0 {
+					rpx = rescueRPx
+				}
+				gross := a.state.Steps[i].EntryBps + strategy.EntryBps(-act.Dir, lpx, rpx)
 				a.state.Steps[i].Realized += gross - fee
 				a.log.Info("step pnl", "id", act.StepID, "gross_bps", round2(gross), "fee_bps", round2(fee),
-					"net_bps", round2(gross-fee), "realized_bps", round2(a.state.Steps[i].Realized))
+					"net_bps", round2(gross-fee), "realized_bps", round2(a.state.Steps[i].Realized), "lpx", lpx, "rpx", rpx)
 			}
 			a.state.Steps[i].Qty = domain.Round(a.state.Steps[i].Qty-closed, a.cfg.Pair.SizeDecimals)
 			if a.state.Steps[i].Qty < eps {

@@ -60,6 +60,11 @@ type LegResult struct {
 	Resolved  bool // status came from venue (WS/REST), else inferred from positions
 	SubmitErr error
 	Latency   time.Duration // submit -> terminal state (WS/REST) or give-up
+	// RescueFilled/RescuePrice are the quantity and volume-weighted price this
+	// leg completed via rescue orders (opposite side for opens, same side for
+	// closes). They let callers reconstruct the effective close price.
+	RescueFilled float64
+	RescuePrice  float64
 }
 
 // Result of a two-leg execution.
@@ -136,7 +141,7 @@ func (e *Executor) Execute(ctx context.Context, l, r LegSpec, qty float64, reduc
 	target := beforeL + beforeR
 	res.PosL, res.PosR = pl, pr
 	if eps := halfUnit(l.Inst, r.Inst); math.Abs(pl+pr-target) >= eps {
-		n, q, fl, fr := e.flatten(ctx, l, r, target, pl, pr)
+		n, q, fl, fr := e.flatten(ctx, l, r, target, pl, pr, &res)
 		res.RescueOrders, res.RescueQty, res.PosL, res.PosR = n, q, fl, fr
 	}
 	res.Duration = time.Since(start)
@@ -319,7 +324,7 @@ func fill(lr LegResult, u domain.OrderUpdate, start time.Time) LegResult {
 
 // flatten loops reduce-only orders until posL+posR == target.
 // Positions are re-read before every retry.
-func (e *Executor) flatten(ctx context.Context, l, r LegSpec, target, pl, pr float64) (int, float64, float64, float64) {
+func (e *Executor) flatten(ctx context.Context, l, r LegSpec, target, pl, pr float64, res *Result) (int, float64, float64, float64) {
 	start := time.Now()
 	alerted := false
 	orders, total := 0, 0.0
@@ -373,7 +378,28 @@ func (e *Executor) flatten(ctx context.Context, l, r LegSpec, target, pl, pr flo
 			Price: px, Type: typ, ReduceOnly: true}, leg.Venue)
 		orders++
 		total += lr.Filled
+		if lr.Filled > 0 {
+			if leg.Venue.Name() == l.Venue.Name() {
+				mergeRescue(&res.L, lr.Filled, lr.AvgPrice)
+			} else {
+				mergeRescue(&res.R, lr.Filled, lr.AvgPrice)
+			}
+		}
 		time.Sleep(e.cfg.RescueInterval)
 	}
 	return orders, total, pl, pr
+}
+
+// mergeRescue folds a rescue fill into the leg's volume-weighted rescue price.
+func mergeRescue(lr *LegResult, qty, px float64) {
+	if qty <= 0 || px <= 0 {
+		return
+	}
+	if lr.RescueFilled <= 0 {
+		lr.RescueFilled, lr.RescuePrice = qty, px
+		return
+	}
+	total := lr.RescueFilled + qty
+	lr.RescuePrice = (lr.RescuePrice*lr.RescueFilled + px*qty) / total
+	lr.RescueFilled = total
 }
