@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/Dog-Feng/dex-arbitr/internal/adaptive"
@@ -93,7 +94,11 @@ func setLeverage(ctx context.Context, v exchange.Venue, inst domain.Instrument, 
 func Run(ctx context.Context, c *config.Config) error {
 	mon := monitor.New(func(msg string) { slog.Error("ALERT", "msg", msg) })
 	if c.Monitor.Addr != "" {
-		srv := &http.Server{Addr: c.Monitor.Addr, Handler: mon.Handler(c.Monitor.Token)}
+		addr := c.Monitor.Addr
+		if !strings.Contains(addr, ":") {
+			addr = ":" + addr // bare port, e.g. "8080"
+		}
+		srv := &http.Server{Addr: addr, Handler: mon.Handler(c.Monitor.Token)}
 		go func() {
 			if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 				slog.Error("monitor server", "err", err)
