@@ -146,8 +146,13 @@ loop:
 	check(okQty, fmt.Sprintf("qty %.4f valid on both", *qty), "notional %.2f USD %s", *qty*q.RefMid, why)
 	p := strategy.Params{StepQty: *qty, MaxSteps: pc.MaxSteps, OpenBps: cfg.Strategy.OpenBps, CloseBps: cfg.Strategy.CloseBps,
 		DepthMult: cfg.Strategy.DepthMult, CloseOrder: cfg.Strategy.CloseOrder, VolK: cfg.Strategy.VolK}
-	a := strategy.Decide(p, strategy.State{Mode: strategy.ModeRunning}, q, est.Mean(), true, 0)
-	check(true, "decide (using short-window mean)", "%s %s", a.Kind, a.Reason)
+	strat, err := strategy.New(cfg.Strategy.Kind)
+	if err != nil {
+		check(false, "strategy", "%v", err)
+	} else {
+		a := strat.Decide(p, strategy.State{Mode: strategy.ModeRunning}, q, est.Mean(), true, 0)
+		check(true, "decide (using short-window mean)", "%s %s", a.Kind, a.Reason)
+	}
 	need := *qty * cfg.Strategy.DepthMult
 	fmt.Printf("     depth need %.4f: L bid %.4f ask %.4f | R bid %.4f ask %.4f\n", need, bl.Bids[0].Size, bl.Asks[0].Size, br.Bids[0].Size, br.Asks[0].Size)
 

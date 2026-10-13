@@ -41,8 +41,10 @@ risk:
   margin_hysteresis: 0.05     # recovery band above the floor
   position_refresh: 15s       # liquidation price refresh interval
   emergency_market_bps: 100   # protective bound of the emergency market unwind
+  max_notional: 0             # per-venue aggregate notional cap (USD); 0 = unlimited
 
 strategy:
+  kind: arbitrage           # arbitrage | volume (registered strategies)
   open_bps: 1          # open when deviation from mean >= 1bps
   close_bps: 1         # close when step gross profit >= 1bps
   depth_mult: 2        # top-of-book qty >= step_qty * 2 on both legs

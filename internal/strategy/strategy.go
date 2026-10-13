@@ -4,6 +4,7 @@ package strategy
 import (
 	"fmt"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/Dog-Feng/dex-arbitr/internal/domain"
@@ -68,7 +69,16 @@ type Params struct {
 	DepthMult  float64 // top-of-book qty must be >= StepQty*DepthMult on both legs
 	CloseOrder string  // best | lifo | fifo
 	VolK       float64 // one-sided sigma buffer on top of OpenBps for opening
+	FeeBps     float64 // round-trip taker fees (per pair), subtracted from thresholds
 }
+
+// Strategy decides an action from the pair state and market view.
+type Strategy interface {
+	Decide(p Params, s State, q spread.Quote, mu float64, muReady bool, vol float64) Action
+}
+
+// Arbitrage is the mean-reversion step strategy.
+type Arbitrage struct{}
 
 // State is the pair state the strategy needs.
 type State struct {
@@ -144,7 +154,7 @@ func legs(q spread.Quote, l, r domain.Side) (Leg, Leg) {
 // (only used for opening; muReady=false blocks opens). vol is the short-horizon
 // spread volatility in bps; openings require the deviation to exceed
 // OpenBps + VolK*vol so the expected 500ms adverse move is pre-reserved.
-func Decide(p Params, s State, q spread.Quote, mu float64, muReady bool, vol float64) Action {
+func (Arbitrage) Decide(p Params, s State, q spread.Quote, mu float64, muReady bool, vol float64) Action {
 	if s.Mode == ModePaused {
 		return Action{Reason: "paused"}
 	}
@@ -158,7 +168,7 @@ func Decide(p Params, s State, q spread.Quote, mu float64, muReady bool, vol flo
 	}
 	var cs []cand
 	for i, st := range s.Steps {
-		if pf := profit(st, q); pf >= p.CloseBps {
+		if pf := profit(st, q); pf >= p.CloseBps+p.FeeBps {
 			cs = append(cs, cand{st, pf, i})
 		}
 	}
@@ -179,7 +189,7 @@ func Decide(p Params, s State, q spread.Quote, mu float64, muReady bool, vol flo
 		}
 		la, ra := legs(q, l, r)
 		return Action{Kind: Close, Dir: c.st.Dir, StepID: c.st.ID, Qty: c.st.Qty, L: la, R: ra, ExpectedBps: c.pf,
-			Reason: fmt.Sprintf("close step %d profit %.2fbps >= %.2f", c.st.ID, c.pf, p.CloseBps)}
+			Reason: fmt.Sprintf("close step %d profit %.2fbps >= %.2f+%.2f (net)", c.st.ID, c.pf, p.CloseBps, p.FeeBps)}
 	}
 
 	// 2) open
@@ -192,7 +202,7 @@ func Decide(p Params, s State, q spread.Quote, mu float64, muReady bool, vol flo
 	cnt := s.Counter()
 	devLS := q.LS - mu // buy L / sell R is rich vs mean
 	devSL := q.SL + mu // buy R / sell L is rich vs mean
-	needDev := p.OpenBps + p.VolK*vol
+	needDev := p.OpenBps + p.FeeBps + p.VolK*vol
 	try := func(d Dir, dev float64) (Action, bool) {
 		if dev < needDev {
 			return Action{}, false
@@ -209,7 +219,7 @@ func Decide(p Params, s State, q spread.Quote, mu float64, muReady bool, vol flo
 		}
 		la, ra := legs(q, l, r)
 		return Action{Kind: Open, Dir: d, Qty: p.StepQty, L: la, R: ra, ExpectedBps: dev,
-			Reason: fmt.Sprintf("open %s dev %.2fbps >= %.2f+%.2f*vol %.2f (mu %.2f)", d, dev, p.OpenBps, p.VolK, vol, mu)}, true
+			Reason: fmt.Sprintf("open %s dev %.2fbps >= %.2f fee %.2f +%.2f*vol %.2f (mu %.2f)", d, dev, p.OpenBps, p.FeeBps, p.VolK, vol, mu)}, true
 	}
 	// prefer the larger deviation
 	first, second := DirLS, DirSL
@@ -251,4 +261,34 @@ func abs(x int) int {
 		return -x
 	}
 	return x
+}
+
+// Factory builds a strategy.
+type Factory func() Strategy
+
+var (
+	stratMu    sync.RWMutex
+	strategies = map[string]Factory{}
+)
+
+// Register a strategy kind.
+func Register(name string, f Factory) {
+	stratMu.Lock()
+	strategies[name] = f
+	stratMu.Unlock()
+}
+
+// New builds a registered strategy.
+func New(name string) (Strategy, error) {
+	stratMu.RLock()
+	f, ok := strategies[name]
+	stratMu.RUnlock()
+	if !ok {
+		return nil, fmt.Errorf("unknown strategy %q", name)
+	}
+	return f(), nil
+}
+
+func init() {
+	Register("arbitrage", func() Strategy { return Arbitrage{} })
 }

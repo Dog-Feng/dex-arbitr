@@ -26,6 +26,7 @@ type PairConfig struct {
 	Pair        symbols.Pair
 	L, R        exchange.Venue
 	Params      strategy.Params
+	Strategy    strategy.Strategy
 	Est         estimator.Estimator
 	IntervalMin time.Duration
 	IntervalMax time.Duration
@@ -91,6 +92,9 @@ func (s *latencyStat) reset() { *s = latencyStat{} }
 
 // NewPairActor builds the actor and loads persisted steps.
 func NewPairActor(cfg PairConfig) (*PairActor, error) {
+	if cfg.Strategy == nil {
+		cfg.Strategy = strategy.Arbitrage{}
+	}
 	key := fmt.Sprintf("%s_%s_%s", cfg.Pair.Base, cfg.L.Name(), cfg.R.Name())
 	if cfg.DryRun {
 		key += "_paper"
@@ -288,7 +292,7 @@ func (a *PairActor) Run(ctx context.Context) error {
 			if !ok {
 				continue
 			}
-			act := strategy.Decide(a.cfg.Params, a.state, q, a.cfg.Est.Mean(), a.cfg.Est.Ready(), a.volBps())
+			act := a.cfg.Strategy.Decide(a.cfg.Params, a.state, q, a.cfg.Est.Mean(), a.cfg.Est.Ready(), a.volBps())
 			if act.Kind == strategy.None {
 				continue
 			}
@@ -468,7 +472,7 @@ func (a *PairActor) expectedL() float64 {
 
 // roundTripFeeBps is the total taker fee (bps) of a full open+close round trip.
 func (a *PairActor) roundTripFeeBps() float64 {
-	return 2 * (a.cfg.Pair.Left.TakerFee + a.cfg.Pair.Right.TakerFee) * 1e4
+	return a.cfg.Params.FeeBps
 }
 
 // checkHedge verifies the step ledger still matches venue positions after

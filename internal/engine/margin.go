@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"math"
 	"time"
 
 	"github.com/Dog-Feng/dex-arbitr/internal/domain"
@@ -10,11 +11,12 @@ import (
 
 // marginConfig configures the liquidation-risk monitor.
 type marginConfig struct {
-	floor      float64
-	trigger    float64
-	hysteresis float64
-	refresh    time.Duration
-	marketBps  float64
+	floor       float64
+	trigger     float64
+	hysteresis  float64
+	refresh     time.Duration
+	marketBps   float64
+	maxNotional float64
 }
 
 // marginAction is the decision the monitor asks the actor to apply.
@@ -39,24 +41,20 @@ type marginMonitor struct {
 	liqL, liqR     float64
 	entryL, entryR float64
 	qtyL, qtyR     float64
+	aggL, aggR     float64
 }
 
 // refresh polls both venues for liquidation prices; failures keep the old cache.
 func (m *marginMonitor) refresh(ctx context.Context, l, r exchange.Venue, leftID, rightID int) {
 	m.lastRefresh = time.Now()
-	pl, okL, errL := venuePosition(ctx, l, leftID)
-	pr, okR, errR := venuePosition(ctx, r, rightID)
+	pl, aggL, errL := venuePositions(ctx, l, leftID)
+	pr, aggR, errR := venuePositions(ctx, r, rightID)
 	if errL != nil || errR != nil {
 		return
 	}
-	if !okL {
-		pl = domain.Position{}
-	}
-	if !okR {
-		pr = domain.Position{}
-	}
 	m.liqL, m.entryL, m.qtyL = pl.LiquidationPrice, pl.AvgEntry, pl.Qty
 	m.liqR, m.entryR, m.qtyR = pr.LiquidationPrice, pr.AvgEntry, pr.Qty
+	m.aggL, m.aggR = aggL, aggR
 	m.have = true
 }
 
@@ -65,6 +63,10 @@ func (m *marginMonitor) refresh(ctx context.Context, l, r exchange.Venue, leftID
 func (m *marginMonitor) assess(markL, markR float64, fresh bool) marginAction {
 	if !fresh || !m.have {
 		return marginNone
+	}
+	if m.cfg.maxNotional > 0 && (m.aggL > m.cfg.maxNotional || m.aggR > m.cfg.maxNotional) {
+		m.armed = true
+		return marginArm
 	}
 	minR := 1.0
 	considered := false
@@ -126,15 +128,20 @@ func remainingMargin(qty, entry, liq, mark float64) (float64, bool) {
 	return (liq - mark) / (liq - entry), true
 }
 
-func venuePosition(ctx context.Context, v exchange.Venue, marketID int) (domain.Position, bool, error) {
+// venuePositions returns the pair's position on marketID and the venue's total
+// notional aggregated across all markets (the account-level exposure).
+func venuePositions(ctx context.Context, v exchange.Venue, marketID int) (domain.Position, float64, error) {
 	ps, err := v.Positions(ctx)
 	if err != nil {
-		return domain.Position{}, false, err
+		return domain.Position{}, 0, err
 	}
+	var pos domain.Position
+	var agg float64
 	for _, p := range ps {
+		agg += math.Abs(p.Qty) * p.AvgEntry
 		if p.MarketID == marketID {
-			return p, true, nil
+			pos = p
 		}
 	}
-	return domain.Position{}, false, nil
+	return pos, agg, nil
 }

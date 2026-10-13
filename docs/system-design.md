@@ -15,7 +15,7 @@
 
 - **六边形（端口-适配器）**：核心只依赖 `exchange.Venue`、`estimator.Estimator` 等接口，不 import 具体交易所。
 - **Actor 模型**：每个套利对一个 goroutine，独占自己的步列表、状态、决策节奏，基本无锁（仅盘口缓存用读写锁）。
-- **纯函数策略**：`strategy.Decide` 输入（状态 + 盘口 + μ + σ）输出动作，不做 IO，可直接回放回测。
+- **可插拔纯策略**：`strategy.Strategy` 接口 + 注册表（当前实现 `Arbitrage`），输入（状态 + 盘口 + μ + σ）输出动作，不做 IO，可直接回放回测。
 - **接口 + 注册表**：交易所、均值估计器按名字注册，配置选择。
 
 ## 3. 目录与依赖
@@ -82,8 +82,8 @@ SL    = (L.bid1 − R.ask1) / mid      // 卖左买右的可成交价差
 
 - **μ**：`Mid` 的滑动均值（SMA），窗口 2h、1s 采样、60m 预热、覆盖率 ≥80%，O(1) 更新。
 - **σ**：`Mid` 的实现波动率，100ms 采样、500ms 窗口 `Σ(Δs)²` 滚动和 + EWMA（半衰期 1m），`σ=√(RV)`。
-- **开仓门槛**：`dev ≥ open_bps + vol_k·σ`，其中 `devLS = LS−μ`、`devSL = SL+μ`。
-- **平仓门槛**：该步往返毛利 `EntryBps + 反向可成交价差 ≥ close_bps`。
+- **开仓门槛**：`dev ≥ open_bps + fee_bps + vol_k·σ`，其中 `devLS = LS−μ`、`devSL = SL+μ`，`fee_bps` 为该 pair 的往返 taker 费（由两所 `TakerFee` 合成，净成本）。
+- **平仓门槛**：该步往返净利 `EntryBps + 反向可成交价差 − fee_bps ≥ close_bps`。
 - **EntryBps**：开仓成交价差的真实值，分母用成交时 mid `(lPx+rPx)/2`。
 
 ## 6. 状态机
@@ -169,6 +169,7 @@ ticks = max( ticks, 走到 step_qty 实际成交档位所需的 tick 数 )   // 
 - 任一腿 ≤ `margin_trigger_ratio`（0.1）→ **应急市价平仓**：`EmergencyFlatten` 用 Immediate 市价（保护价 `emergency_market_bps`=100bps）把两腿吃到零，清空步账本，置 PAUSED + 告警。
 - 任一腿 ≤ `margin_floor_ratio`（0.2）→ 置 REDUCE_ONLY（停止加仓、允许减仓）。
 - 两腿都 > `floor + hysteresis`（0.25）→ 恢复 RUNNING。
+- **账户级名义上限**：`max_notional > 0` 时，按 venue 汇总该账户所有市场的 `|qty|×avgEntry` 名义，超限即 REDUCE_ONLY（多交易对共享账户的聚合闸）。
 - `trigger=0` 或 dry_run 时风控禁用。
 
 ## 9. 配置全景
@@ -207,8 +208,10 @@ risk:
   margin_hysteresis: 0.05     # 恢复回差
   position_refresh: 15s
   emergency_market_bps: 100
+  max_notional: 0             # 每所账户级总名义上限(USD)，0=不限
 
 strategy:
+  kind: arbitrage             # 策略实现（注册表：arbitrage | volume...）
   open_bps: 1              # 开仓毛利门槛（未扣费）
   close_bps: 1             # 平仓毛利门槛（未扣费）
   depth_mult: 2
@@ -239,7 +242,7 @@ pairs:
 |---|---|
 | 接入新交易所 | 实现 `exchange.Venue`（+ 可选 `LeverageSetter`），`init()` 注册 |
 | 替换均值算法 | 实现 `estimator.Estimator` 并注册，改 `estimator.kind` |
-| 替换策略 | 替换纯函数 `strategy.Decide`（或将其接口化） |
+| 替换策略 | 实现 `strategy.Strategy` 并注册，改 `strategy.kind` |
 | 新增风控规则 | 在 `engine` 加规则，参考 `margin.go` 的监控模式，置 Mode / 告警 |
 | 挂单硬保证（未来） | 新增 `Protector` 能力接口，叠加在现有 risk 之上 |
 | 回测 | 回放 `samples_dir` 样本，复用 `strategy.Decide` + 模拟成交 |

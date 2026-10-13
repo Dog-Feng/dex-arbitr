@@ -53,3 +53,13 @@ func TestMarginMonitorAssess(t *testing.T) {
 		t.Fatalf("stale case got %v", got)
 	}
 }
+
+func TestMarginMonitorNotionalCap(t *testing.T) {
+	m := marginMonitor{cfg: marginConfig{floor: 0.2, trigger: 0.1, hysteresis: 0.05, maxNotional: 1000}, have: true}
+	m.qtyL, m.entryL, m.liqL = 1, 100, 90
+	m.qtyR, m.entryR, m.liqR = -1, 100, 110
+	m.aggL, m.aggR = 500, 1200 // margin healthy but R account notional over cap
+	if got := m.assess(99, 104, true); got != marginArm {
+		t.Fatalf("notional cap should arm, got %v", got)
+	}
+}

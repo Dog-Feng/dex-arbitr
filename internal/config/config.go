@@ -56,8 +56,10 @@ type Config struct {
 		MarginHysteresis   float64       `yaml:"margin_hysteresis"`    // recovery band above the floor
 		PositionRefresh    time.Duration `yaml:"position_refresh"`     // liquidation price refresh interval
 		EmergencyMarketBps float64       `yaml:"emergency_market_bps"` // protective bound of the emergency unwind
+		MaxNotional        float64       `yaml:"max_notional"`         // per-venue aggregate notional cap (USD); 0 = unlimited
 	} `yaml:"risk"`
 	Strategy struct {
+		Kind        string        `yaml:"kind"` // arbitrage | volume (registered strategies)
 		OpenBps     float64       `yaml:"open_bps"`
 		CloseBps    float64       `yaml:"close_bps"`
 		DepthMult   float64       `yaml:"depth_mult"`
@@ -153,6 +155,9 @@ func (c *Config) defaults() {
 		r.EmergencyMarketBps = 100
 	}
 	s := &c.Strategy
+	if s.Kind == "" {
+		s.Kind = "arbitrage"
+	}
 	if s.OpenBps == 0 {
 		s.OpenBps = 1
 	}
@@ -206,6 +211,9 @@ func (c *Config) validate() error {
 	}
 	if c.Risk.PositionRefresh <= 0 || c.Risk.EmergencyMarketBps <= 0 {
 		return fmt.Errorf("risk: position_refresh and emergency_market_bps must be > 0")
+	}
+	if c.Risk.MaxNotional < 0 {
+		return fmt.Errorf("risk: max_notional must be >= 0")
 	}
 	names := map[string]bool{}
 	for _, v := range c.Venues {
