@@ -146,6 +146,13 @@ func Run(ctx context.Context, c *config.Config) error {
 			return err
 		}
 		feeBps := 2 * (pair.Left.TakerFee + pair.Right.TakerFee) * 1e4
+		openBps, closeBps, minInv := c.Strategy.OpenBps, c.Strategy.CloseBps, 0
+		volTarget, volBudget := 0.0, 0.0
+		if c.Strategy.Kind == "volume" {
+			openBps, closeBps = 0, 0
+			minInv = c.Volume.MinInventory
+			volTarget, volBudget = c.Volume.DailyVolumeTarget, c.Volume.DailyCostBudget
+		}
 		var samples *store.SampleSink
 		if c.SamplesDir != "" {
 			samples, err = store.NewSampleSink(filepath.Join(c.SamplesDir, fmt.Sprintf("%s_%s_%s.jsonl", pair.Base, l.Name(), r.Name())))
@@ -161,8 +168,10 @@ func Run(ctx context.Context, c *config.Config) error {
 			Risk: marginConfig{floor: c.Risk.MarginFloorRatio, trigger: c.Risk.MarginTriggerRatio,
 				hysteresis: c.Risk.MarginHysteresis, refresh: c.Risk.PositionRefresh, marketBps: c.Risk.EmergencyMarketBps,
 				maxNotional: c.Risk.MaxNotional},
-			Params: strategy.Params{StepQty: qty, MaxSteps: pc.MaxSteps, OpenBps: c.Strategy.OpenBps, CloseBps: c.Strategy.CloseBps,
-				DepthMult: c.Strategy.DepthMult, CloseOrder: c.Strategy.CloseOrder, VolK: c.Strategy.VolK, FeeBps: feeBps},
+			VolTarget: volTarget, VolCostBudget: volBudget,
+			Params: strategy.Params{StepQty: qty, MaxSteps: pc.MaxSteps, OpenBps: openBps, CloseBps: closeBps,
+				DepthMult: c.Strategy.DepthMult, CloseOrder: c.Strategy.CloseOrder, VolK: c.Strategy.VolK, FeeBps: feeBps,
+				MinInventory: minInv},
 		})
 		if err != nil {
 			return err

@@ -69,6 +69,11 @@ type Config struct {
 		IntervalMax time.Duration `yaml:"interval_max"`
 		MaxBookAge  time.Duration `yaml:"max_book_age"`
 	} `yaml:"strategy"`
+	Volume struct {
+		MinInventory      int     `yaml:"min_inventory"`       // floor steps held while churning
+		DailyVolumeTarget float64 `yaml:"daily_volume_target"` // USD; 0 = unlimited
+		DailyCostBudget   float64 `yaml:"daily_cost_budget"`   // USD max daily loss; 0 = unlimited
+	} `yaml:"volume"`
 	Execution struct {
 		PriceTicks   int     `yaml:"price_ticks"`   // fixed allowance; fallback while sigma is not ready
 		DynamicTicks bool    `yaml:"dynamic_ticks"` // scale the allowance by volatility
@@ -240,6 +245,12 @@ func (c *Config) validate() error {
 	}
 	if c.Strategy.VolK <= 0 {
 		return fmt.Errorf("strategy.vol_k must be > 0")
+	}
+	if c.Volume.MinInventory < 0 {
+		return fmt.Errorf("volume.min_inventory must be >= 0")
+	}
+	if c.Volume.DailyVolumeTarget < 0 || c.Volume.DailyCostBudget < 0 {
+		return fmt.Errorf("volume.daily_volume_target / daily_cost_budget must be >= 0")
 	}
 	return nil
 }

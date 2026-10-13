@@ -102,3 +102,22 @@ func TestFeeBpsRaisesThreshold(t *testing.T) {
 		t.Fatalf("dev 10 < 1+9.5 should block: %+v", a)
 	}
 }
+
+func TestMinInventoryFloor(t *testing.T) {
+	q, _ := spread.Compute(book(1001, 1001.1, 1), book(1000.4, 1000.5, 1)) // SL ~ +5bps, profitable close
+	steps := []Step{{ID: 1, Dir: DirLS, Qty: 0.01, EntryBps: -3}, {ID: 2, Dir: DirLS, Qty: 0.01, EntryBps: 2}}
+	p := Params{StepQty: 0.01, MaxSteps: 5, OpenBps: 1, CloseBps: 1, DepthMult: 2, CloseOrder: "best", MinInventory: 2}
+	if a := (Arbitrage{}).Decide(p, State{Mode: ModeReduceOnly, Steps: steps}, q, 0, false, 0); a.Kind != None {
+		t.Fatalf("floor should block close: %+v", a)
+	}
+	steps = append(steps, Step{ID: 3, Dir: DirLS, Qty: 0.01, EntryBps: 5})
+	if a := (Arbitrage{}).Decide(p, State{Mode: ModeReduceOnly, Steps: steps}, q, 0, false, 0); a.Kind != Close {
+		t.Fatalf("above floor should close: %+v", a)
+	}
+}
+
+func TestVolumeStrategyRegistered(t *testing.T) {
+	if v, err := New("volume"); err != nil || v == nil {
+		t.Fatalf("volume strategy: %v", err)
+	}
+}

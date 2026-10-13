@@ -23,25 +23,27 @@ import (
 
 // PairConfig wires one pair actor.
 type PairConfig struct {
-	Pair        symbols.Pair
-	L, R        exchange.Venue
-	Params      strategy.Params
-	Strategy    strategy.Strategy
-	Est         estimator.Estimator
-	IntervalMin time.Duration
-	IntervalMax time.Duration
-	MaxBookAge  time.Duration
-	SampleEvery time.Duration
-	DryRun      bool // paper trading: fills assumed at decision prices
-	Store       *store.Store
-	Tracker     *execution.Tracker // nil in dry run
-	ExecCfg     execution.Config
-	IDs         *execution.IDGen
-	Vol         *volatility.Estimator
-	VolEvery    time.Duration
-	VolMaxAge   time.Duration
-	Samples     *store.SampleSink
-	Risk        marginConfig
+	Pair          symbols.Pair
+	L, R          exchange.Venue
+	Params        strategy.Params
+	Strategy      strategy.Strategy
+	Est           estimator.Estimator
+	IntervalMin   time.Duration
+	IntervalMax   time.Duration
+	MaxBookAge    time.Duration
+	SampleEvery   time.Duration
+	DryRun        bool // paper trading: fills assumed at decision prices
+	Store         *store.Store
+	Tracker       *execution.Tracker // nil in dry run
+	ExecCfg       execution.Config
+	IDs           *execution.IDGen
+	Vol           *volatility.Estimator
+	VolEvery      time.Duration
+	VolMaxAge     time.Duration
+	Samples       *store.SampleSink
+	Risk          marginConfig
+	VolTarget     float64 // daily volume target (USD); 0 = unlimited
+	VolCostBudget float64 // max daily realized loss (USD); 0 = unlimited
 }
 
 // PairActor owns the trading state of one pair (single goroutine).
@@ -61,6 +63,33 @@ type PairActor struct {
 	bookR  domain.Book
 	lat    latencyStat
 	margin marginMonitor
+	volAcc volumeAcc
+}
+
+// volumeAcc accumulates daily traded volume and realized PnL for the volume
+// budget gate; owned by the actor goroutine, no locking.
+type volumeAcc struct {
+	day       string
+	volumeUSD float64
+	pnlUSD    float64
+}
+
+func (a *PairActor) resetVolumeIfNewDay(now time.Time) {
+	today := now.UTC().Format("2006-01-02")
+	if a.volAcc.day != today {
+		a.volAcc = volumeAcc{day: today}
+	}
+}
+
+// canOpenVolume reports whether the daily volume/cost budget allows another open.
+func (a *PairActor) canOpenVolume() bool {
+	if a.cfg.VolTarget > 0 && a.volAcc.volumeUSD >= a.cfg.VolTarget {
+		return false
+	}
+	if a.cfg.VolCostBudget > 0 && a.volAcc.pnlUSD <= -a.cfg.VolCostBudget {
+		return false
+	}
+	return true
 }
 
 // latencyStat aggregates per-leg submit-to-result latency for the status report.
@@ -282,7 +311,8 @@ func (a *PairActor) Run(ctx context.Context) error {
 			a.log.Info("status", "mode", a.state.Mode, "steps", a.state.Counter(), "mu_bps", round2(st.Mean),
 				"samples", st.Samples, "span", st.Span.Round(time.Second), "coverage", round2(st.Coverage),
 				"LS_bps", round2(q.LS), "SL_bps", round2(q.SL), "mid_bps", round2(q.Mid),
-				"vol_500ms_bps", round4(vol), "lat_n", a.lat.n, "lat_avg_ms", a.lat.avg().Milliseconds(), "lat_max_ms", a.lat.max.Milliseconds())
+				"vol_500ms_bps", round4(vol), "lat_n", a.lat.n, "lat_avg_ms", a.lat.avg().Milliseconds(), "lat_max_ms", a.lat.max.Milliseconds(),
+				"day_volume_usd", round2(a.volAcc.volumeUSD), "day_pnl_usd", round4(a.volAcc.pnlUSD))
 			a.lat.reset()
 		case now := <-decide.C:
 			if now.Before(nextAt) || a.state.Mode == strategy.ModePaused {
@@ -294,6 +324,11 @@ func (a *PairActor) Run(ctx context.Context) error {
 			}
 			act := a.cfg.Strategy.Decide(a.cfg.Params, a.state, q, a.cfg.Est.Mean(), a.cfg.Est.Ready(), a.volBps())
 			if act.Kind == strategy.None {
+				continue
+			}
+			a.resetVolumeIfNewDay(now)
+			if act.Kind == strategy.Open && !a.canOpenVolume() {
+				a.log.Warn("volume budget reached; skipping open", "day_volume_usd", a.volAcc.volumeUSD, "day_pnl_usd", a.volAcc.pnlUSD)
 				continue
 			}
 			a.apply(ctx, act, q)
@@ -423,6 +458,7 @@ func (a *PairActor) apply(ctx context.Context, act strategy.Action, q spread.Quo
 			EntryBps: strategy.EntryBps(act.Dir, pxL, pxR), OpenL: pxL, OpenR: pxR, OpenedAt: time.Now()}
 		a.next++
 		a.state.Steps = append(a.state.Steps, st)
+		a.volAcc.volumeUSD += 2 * st.Qty * q.RefMid
 		a.log.Info("step opened", "id", st.ID, "entry_bps", round2(st.EntryBps), "counter", a.state.Counter())
 	case strategy.Close:
 		closed := math.Max(fillL, fillR) // the lagging leg is completed by rescue
@@ -440,9 +476,12 @@ func (a *PairActor) apply(ctx context.Context, act strategy.Action, q spread.Quo
 					rpx = rescueRPx
 				}
 				gross := a.state.Steps[i].EntryBps + strategy.EntryBps(-act.Dir, lpx, rpx)
-				a.state.Steps[i].Realized += gross - fee
+				net := gross - fee
+				a.state.Steps[i].Realized += net
+				a.volAcc.volumeUSD += 2 * closed * q.RefMid
+				a.volAcc.pnlUSD += closed * q.RefMid * net / 1e4
 				a.log.Info("step pnl", "id", act.StepID, "gross_bps", round2(gross), "fee_bps", round2(fee),
-					"net_bps", round2(gross-fee), "realized_bps", round2(a.state.Steps[i].Realized), "lpx", lpx, "rpx", rpx)
+					"net_bps", round2(net), "realized_bps", round2(a.state.Steps[i].Realized), "lpx", lpx, "rpx", rpx)
 			}
 			a.state.Steps[i].Qty = domain.Round(a.state.Steps[i].Qty-closed, a.cfg.Pair.SizeDecimals)
 			if a.state.Steps[i].Qty < eps {

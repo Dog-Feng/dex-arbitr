@@ -62,14 +62,15 @@ func (m Mode) String() string {
 
 // Params of the strategy.
 type Params struct {
-	StepQty    float64
-	MaxSteps   int
-	OpenBps    float64 // deviation from mean to open
-	CloseBps   float64 // gross round-trip profit to close
-	DepthMult  float64 // top-of-book qty must be >= StepQty*DepthMult on both legs
-	CloseOrder string  // best | lifo | fifo
-	VolK       float64 // one-sided sigma buffer on top of OpenBps for opening
-	FeeBps     float64 // round-trip taker fees (per pair), subtracted from thresholds
+	StepQty      float64
+	MaxSteps     int
+	OpenBps      float64 // deviation from mean to open
+	CloseBps     float64 // gross round-trip profit to close
+	DepthMult    float64 // top-of-book qty must be >= StepQty*DepthMult on both legs
+	CloseOrder   string  // best | lifo | fifo
+	VolK         float64 // one-sided sigma buffer on top of OpenBps for opening
+	FeeBps       float64 // round-trip taker fees (per pair), subtracted from thresholds
+	MinInventory int     // minimum steps to hold (volume churn floor); 0 = none
 }
 
 // Strategy decides an action from the pair state and market view.
@@ -79,6 +80,10 @@ type Strategy interface {
 
 // Arbitrage is the mean-reversion step strategy.
 type Arbitrage struct{}
+
+// Volume is the minimal-cost churn strategy: the same mean-reversion mechanics,
+// driven by Params to open at cost and close at break-even above a floor.
+type Volume struct{ Arbitrage }
 
 // State is the pair state the strategy needs.
 type State struct {
@@ -159,37 +164,40 @@ func (Arbitrage) Decide(p Params, s State, q spread.Quote, mu float64, muReady b
 		return Action{Reason: "paused"}
 	}
 	need := p.StepQty * p.DepthMult
+	cnt := s.Counter()
 
-	// 1) close first (allowed in every non-paused mode)
-	type cand struct {
-		st Step
-		pf float64
-		ix int
-	}
-	var cs []cand
-	for i, st := range s.Steps {
-		if pf := profit(st, q); pf >= p.CloseBps+p.FeeBps {
-			cs = append(cs, cand{st, pf, i})
+	// 1) close first, but never below the inventory floor
+	if abs(cnt) > p.MinInventory {
+		type cand struct {
+			st Step
+			pf float64
+			ix int
 		}
-	}
-	if len(cs) > 0 {
-		switch p.CloseOrder {
-		case "lifo":
-			sort.Slice(cs, func(i, j int) bool { return cs[i].ix > cs[j].ix })
-		case "fifo":
-			sort.Slice(cs, func(i, j int) bool { return cs[i].ix < cs[j].ix })
-		default: // best
-			sort.SliceStable(cs, func(i, j int) bool { return cs[i].pf > cs[j].pf })
+		var cs []cand
+		for i, st := range s.Steps {
+			if pf := profit(st, q); pf >= p.CloseBps+p.FeeBps {
+				cs = append(cs, cand{st, pf, i})
+			}
 		}
-		c := cs[0]
-		ol, or := c.st.Dir.LegSides()
-		l, r := ol.Opposite(), or.Opposite()
-		if !depthOK(q, l, r, c.st.Qty*p.DepthMult) {
-			return Action{Reason: fmt.Sprintf("close step %d profitable (%.2fbps) but top-of-book depth < %.4f", c.st.ID, c.pf, c.st.Qty*p.DepthMult)}
+		if len(cs) > 0 {
+			switch p.CloseOrder {
+			case "lifo":
+				sort.Slice(cs, func(i, j int) bool { return cs[i].ix > cs[j].ix })
+			case "fifo":
+				sort.Slice(cs, func(i, j int) bool { return cs[i].ix < cs[j].ix })
+			default: // best
+				sort.SliceStable(cs, func(i, j int) bool { return cs[i].pf > cs[j].pf })
+			}
+			c := cs[0]
+			ol, or := c.st.Dir.LegSides()
+			l, r := ol.Opposite(), or.Opposite()
+			if !depthOK(q, l, r, c.st.Qty*p.DepthMult) {
+				return Action{Reason: fmt.Sprintf("close step %d profitable (%.2fbps) but top-of-book depth < %.4f", c.st.ID, c.pf, c.st.Qty*p.DepthMult)}
+			}
+			la, ra := legs(q, l, r)
+			return Action{Kind: Close, Dir: c.st.Dir, StepID: c.st.ID, Qty: c.st.Qty, L: la, R: ra, ExpectedBps: c.pf,
+				Reason: fmt.Sprintf("close step %d profit %.2fbps >= %.2f+%.2f (net)", c.st.ID, c.pf, p.CloseBps, p.FeeBps)}
 		}
-		la, ra := legs(q, l, r)
-		return Action{Kind: Close, Dir: c.st.Dir, StepID: c.st.ID, Qty: c.st.Qty, L: la, R: ra, ExpectedBps: c.pf,
-			Reason: fmt.Sprintf("close step %d profit %.2fbps >= %.2f+%.2f (net)", c.st.ID, c.pf, p.CloseBps, p.FeeBps)}
 	}
 
 	// 2) open
@@ -199,7 +207,6 @@ func (Arbitrage) Decide(p Params, s State, q spread.Quote, mu float64, muReady b
 	if !muReady {
 		return Action{Reason: "mean not ready"}
 	}
-	cnt := s.Counter()
 	devLS := q.LS - mu // buy L / sell R is rich vs mean
 	devSL := q.SL + mu // buy R / sell L is rich vs mean
 	needDev := p.OpenBps + p.FeeBps + p.VolK*vol
@@ -291,4 +298,5 @@ func New(name string) (Strategy, error) {
 
 func init() {
 	Register("arbitrage", func() Strategy { return Arbitrage{} })
+	Register("volume", func() Strategy { return Volume{} })
 }
