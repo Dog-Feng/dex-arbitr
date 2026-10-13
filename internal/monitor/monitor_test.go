@@ -1,6 +1,10 @@
 package monitor
 
-import "testing"
+import (
+	"net/http"
+	"net/http/httptest"
+	"testing"
+)
 
 func TestMonitorAggregates(t *testing.T) {
 	m := New(nil)
@@ -34,5 +38,32 @@ func TestMonitorAlerts(t *testing.T) {
 	}
 	if g := m.Metrics(); g.Emergencies != 1 || g.Errors != 1 {
 		t.Fatalf("%+v", g)
+	}
+}
+
+func TestHandlerAuth(t *testing.T) {
+	m := New(nil)
+	h := m.Handler("secret")
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("no token => %d, want 401", rr.Code)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("bearer token => %d, want 200", rr.Code)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/metrics?token=secret", nil)
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("query token => %d, want 200", rr.Code)
 	}
 }

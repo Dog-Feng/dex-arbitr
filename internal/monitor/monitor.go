@@ -4,9 +4,11 @@
 package monitor
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -180,10 +182,27 @@ func (m *Monitor) Metrics() Metrics {
 	}
 }
 
-// Handler serves the metrics snapshot as JSON.
-func (m *Monitor) Handler() http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+// Handler serves the metrics snapshot as JSON. When token is non-empty, every
+// request must carry it as an Authorization Bearer header or a ?token= query.
+func (m *Monitor) Handler(token string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if token != "" && !authorized(r, token) {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="monitor"`)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(m.Metrics())
 	})
+}
+
+// authorized reports whether r carries the expected token (constant-time).
+func authorized(r *http.Request, token string) bool {
+	if t := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "); t != "" && subtle.ConstantTimeCompare([]byte(t), []byte(token)) == 1 {
+		return true
+	}
+	if t := r.URL.Query().Get("token"); t != "" && subtle.ConstantTimeCompare([]byte(t), []byte(token)) == 1 {
+		return true
+	}
+	return false
 }

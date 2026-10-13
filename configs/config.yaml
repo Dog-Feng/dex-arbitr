@@ -76,7 +76,8 @@ adaptive:
   max_k: 10
 
 monitor:
-  addr: ""             # HTTP metrics endpoint, e.g. ":8080"; empty = disabled
+  addr: "8080"             # HTTP metrics endpoint, e.g. ":8080"; empty = disabled
+  token: ""                # bearer token; empty = no auth (use ${ENV} for secrets)
 
 pairs:
   - base: SPY

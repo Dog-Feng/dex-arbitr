@@ -93,7 +93,7 @@ func setLeverage(ctx context.Context, v exchange.Venue, inst domain.Instrument, 
 func Run(ctx context.Context, c *config.Config) error {
 	mon := monitor.New(func(msg string) { slog.Error("ALERT", "msg", msg) })
 	if c.Monitor.Addr != "" {
-		srv := &http.Server{Addr: c.Monitor.Addr, Handler: mon.Handler()}
+		srv := &http.Server{Addr: c.Monitor.Addr, Handler: mon.Handler(c.Monitor.Token)}
 		go func() {
 			if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 				slog.Error("monitor server", "err", err)

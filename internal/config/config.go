@@ -91,7 +91,8 @@ type Config struct {
 		MaxK       float64 `yaml:"max_k"`
 	} `yaml:"adaptive"`
 	Monitor struct {
-		Addr string `yaml:"addr"` // HTTP metrics endpoint; empty = disabled
+		Addr  string `yaml:"addr"`  // HTTP metrics endpoint; empty = disabled
+		Token string `yaml:"token"` // bearer token; empty = no auth
 	} `yaml:"monitor"`
 	Pairs []Pair `yaml:"pairs"`
 }
