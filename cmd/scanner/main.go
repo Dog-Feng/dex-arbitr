@@ -14,7 +14,6 @@ import (
 
 	"github.com/Dog-Feng/dex-arbitr/internal/config"
 	"github.com/Dog-Feng/dex-arbitr/internal/domain"
-	"github.com/Dog-Feng/dex-arbitr/internal/engine"
 	"github.com/Dog-Feng/dex-arbitr/internal/exchange"
 	_ "github.com/Dog-Feng/dex-arbitr/internal/exchange/lighter"
 	"github.com/Dog-Feng/dex-arbitr/internal/scan"
@@ -48,7 +47,14 @@ func main() {
 		}
 	}()
 
-	pairs := matchAll(ctx, engine.Matcher(c), venues)
+	m := symbols.DefaultMatcher()
+	if len(c.Matching.StripSuffixes) > 0 {
+		m.Suffixes = c.Matching.StripSuffixes
+	}
+	if c.Matching.Separators != "" {
+		m.Separators = c.Matching.Separators
+	}
+	pairs := matchAll(ctx, m, venues)
 	slog.Info("scanner started", "pairs", len(pairs))
 
 	var wg sync.WaitGroup
