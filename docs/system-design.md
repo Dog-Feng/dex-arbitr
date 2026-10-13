@@ -170,6 +170,24 @@ ticks = max( ticks, 走到 step_qty 实际成交档位所需的 tick 数 )
 - checkHedge：每次 apply 后校验 posL/posR 与步账本一致，漂移即 PAUSED。
 - persist：步状态 JSON 原子写（state_dir/<pair_key>.json）。
 
+### 7.6 一次完整往返（启动 -> 订阅 -> 下单时机 -> 平仓时机）
+
+1. 启动与订阅：构建 venue -> 对 pair 的左右市场 `SubscribeBook`（WS 推 `subscribed/order_book` 快照 + `update/order_book` 增量，50ms 批量）；本地维护 bookL/bookR，nonce 连续性校验、gap 自动重订阅。
+2. 采样与价差：1s sample 算第一档 `Mid` 喂 SMA（2h 窗口、60m 预热、覆盖率 80% 才 Ready）；100ms vol 门控后喂价差 σ 与腿价 σ，并落样本。
+3. 下单时机：decide 循环 200ms 检查，到 next_action_at（7-10s 抖动）且 RUNNING；`dev >= open_bps + fee_bps + vol_k*σ`、同方向、未满 max_steps、两腿一档深度够 -> 双腿并发 IOC 开仓。
+4. 持仓：开仓后记 Step（EntryBps、OpenL/OpenR），持有对冲仓位，步数 ±1。
+5. 平仓时机：decide 循环里平仓优先；`profit = EntryBps + 反向可成交价差 - fee_bps >= close_bps` 且 `|counter| > min_inventory` -> 平仓。
+6. 平账：双腿成交后 realized 累计、移除步、checkHedge 校验、持久化。
+
+注：μ/σ 都用第一档；"10 档价差曲线"未实现，深档风险由让价的深度感知（depthTicks）近似覆盖；如需多档 σ，需另加每档估计器。
+
+### 7.7 手续费处理
+
+- 已纳入成本：`fee_bps = 2 * (L.taker + R.taker)`（bps），由两所 `Instrument.TakerFee` 在 build 阶段自动合成。
+- 用途：开仓门槛 `dev >= open_bps + fee_bps + vol_k*σ`；平仓 `profit >= close_bps + fee_bps`；已实现盈亏 `gross - fee_bps`。
+- 后续接有手续费的 DEX：`TakerFee` 从该所合约元数据读取，自动抬高门槛，无需改代码（即"手续费作为损耗点、提高阈值"）。
+- 注意：当前只算 taker 费（执行是 taker IOC）；未来 maker 模式需把 maker 费/返佣加入成本模型。
+
 ## 8. 保证金风控（risk）
 
 主动监控（不挂单）。每秒评估，每 position_refresh（15s）用 REST 刷新两所 LiquidationPrice；mark 用 book mid（新鲜才评估）。
@@ -329,4 +347,5 @@ pairs:
 - liq 为 15s REST 缓存：单币单仓近似稳定；多仓共担保证金需提高刷新频率。
 - 步数上限不等于名义仓位上限：max_steps 限步数，部分平仓可能残留碎步。
 - 自适应只管 tick_k：vol_k / min_ticks 也可挂 adaptive.K 模式，暂未做。
+- 无 10 档价差曲线：μ/σ 用第一档，深档风险由让价深度感知近似。
 - 1:1 计价假设：USDC/USDG 不换算，脱锚会直接表现为价差（不在本次范围）。
