@@ -3,8 +3,6 @@ dry_run: true            # true = paper trading (no orders). Set false for live.
 state_dir: state
 leverage: 10            # account leverage, applied to every venue (1x..10000x)
 samples_dir: state/samples   # append 100ms spread samples for offline calibration (empty = off)
-step_qty: 0.02          # unified step size for every pair
-max_steps: 30           # unified max steps for every pair
 
 venues:
   - name: lighter
@@ -86,6 +84,10 @@ pairs:
   - base: SPY
     left: lighter
     right: rhlighter
+    step_qty: 0.02
+    max_steps: 30
   - base: SNDK
     left: lighter
     right: rhlighter
+    step_qty: 0.01
+    max_steps: 10
