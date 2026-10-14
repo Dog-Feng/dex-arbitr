@@ -79,6 +79,9 @@ func Watch(ctx context.Context, base string, l, r exchange.Venue, li, ri domain.
 			}
 			mu.Update(now, q.Mid)
 			vol.Add(q.Mid)
+			if !mu.Ready() {
+				continue
+			}
 			if ls, sl := Eval(q, mu.Mean(), vol.Vol(), cfg.FeeBps, cfg.OpenBps, cfg.VolK); ls > 0 {
 				on(Opportunity{Base: base, Dir: strategy.DirLS, NetBps: ls})
 			} else if sl > 0 {

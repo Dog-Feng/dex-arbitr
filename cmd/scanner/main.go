@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"sort"
 	"sync"
 	"syscall"
 	"time"
@@ -97,7 +98,13 @@ func matchAll(ctx context.Context, m symbols.Matcher, venues map[string]exchange
 		inst  []domain.Instrument
 	}
 	var vs []ven
-	for name, v := range venues {
+	names := make([]string, 0, len(venues))
+	for name := range venues {
+		names = append(names, name)
+	}
+	sort.Strings(names) // deterministic left/right: lighter before rhlighter
+	for _, name := range names {
+		v := venues[name]
 		inst, err := v.Instruments(ctx)
 		if err != nil {
 			slog.Warn("instruments", "venue", name, "err", err)
