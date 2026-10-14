@@ -66,7 +66,7 @@ auto:                       # only used when strategy.pair_selection = auto
   max_steps: 3              # steps allowed per active pair
   notional_per_leg: 200     # USD notional cap per leg
   depth_use_ratio: 0.25     # max fraction of top-of-book depth used for sizing
-  min_churn_score: 1        # pairs below this score are never selected
+  min_churn_score: 0        # pairs below this score are never selected (0 = ordering only)
   promote_margin: 0.05      # relative score lead required to displace an active pair
   dwell: 1m                 # sustained lead/lag before promoting/demoting
   max_fail_rate: 0.3        # one-leg failure rate above which a pair is disabled

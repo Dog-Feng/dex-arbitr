@@ -261,9 +261,6 @@ func (c *Config) defaults() {
 	if au.DepthUseRatio == 0 {
 		au.DepthUseRatio = 0.25
 	}
-	if au.MinChurnScore == 0 {
-		au.MinChurnScore = 1
-	}
 	if au.PromoteMargin == 0 {
 		au.PromoteMargin = 0.05
 	}
