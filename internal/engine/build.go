@@ -137,6 +137,7 @@ func Run(ctx context.Context, c *config.Config) error {
 		matcher: Matcher(c),
 		ids:     execution.NewIDGen(),
 	}
+	slog.Info("engine starting", "pair_selection", c.Strategy.PairSelection, "strategy", c.Strategy.Kind, "dry_run", c.DryRun)
 	if c.Strategy.PairSelection == "auto" {
 		return rt.runAuto(ctx)
 	}

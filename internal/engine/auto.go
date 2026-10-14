@@ -224,6 +224,7 @@ func (rt *runtime) matchAll(ctx context.Context) ([]*candidate, error) {
 	}
 	sort.Strings(names)
 	for _, name := range names {
+		slog.Info("auto: fetching instruments", "venue", name)
 		inst, err := rt.venues[name].Instruments(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("%s instruments: %w", name, err)
@@ -284,11 +285,13 @@ func (rt *runtime) runAuto(ctx context.Context) error {
 	if len(cands) == 0 {
 		return fmt.Errorf("auto pair selection: no matched pairs")
 	}
+	slog.Info("auto pair selection", "candidates", len(cands), "top_y", rt.cfg.Auto.TopY)
 	collectCtx, cancelCollect := context.WithCancel(ctx)
 	defer cancelCollect()
 	for _, c := range cands {
 		go c.collect(collectCtx, rt.cfg.Estimator.Interval, rt.cfg.Volatility.Interval, rt.cfg.Volatility.MaxAge)
 	}
+	slog.Info("auto collectors started", "warmup", rt.cfg.Estimator.MinWarmup)
 	active := map[string]*activeRun{}
 	promoteSince := map[string]time.Time{}
 	demoteSince := map[string]time.Time{}
@@ -301,12 +304,24 @@ func (rt *runtime) runAuto(ctx context.Context) error {
 	}()
 	tick := time.NewTicker(2 * time.Second)
 	defer tick.Stop()
+	status := time.NewTicker(30 * time.Second)
+	defer status.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		case <-tick.C:
 			rt.selectPairs(ctx, cands, active, promoteSince, demoteSince, &wg)
+		case <-status.C:
+			ready, warm := 0, 0
+			for _, c := range cands {
+				if _, ok := c.Mean(); ok {
+					ready++
+				} else {
+					warm++
+				}
+			}
+			slog.Info("picker status", "candidates", len(cands), "ready", ready, "warming", warm, "active", len(active))
 		}
 	}
 }
