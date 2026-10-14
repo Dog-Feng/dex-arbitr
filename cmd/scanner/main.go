@@ -5,12 +5,16 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
+	"math"
 	"os"
 	"os/signal"
 	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -20,13 +24,19 @@ import (
 	"github.com/Dog-Feng/dex-arbitr/internal/exchange"
 	_ "github.com/Dog-Feng/dex-arbitr/internal/exchange/lighter"
 	"github.com/Dog-Feng/dex-arbitr/internal/scan"
+	"github.com/Dog-Feng/dex-arbitr/internal/spread/estimator"
 	"github.com/Dog-Feng/dex-arbitr/internal/symbols"
+	"github.com/Dog-Feng/dex-arbitr/internal/volatility"
 )
 
 func main() {
 	path := flag.String("config", "configs/config.yaml", "config file")
 	refresh := flag.Duration("refresh", 2*time.Second, "panel refresh interval")
 	flag.Parse()
+	if err := validateFlags(*path, *refresh, flag.Args()); err != nil {
+		slog.Error("flags", "err", err)
+		os.Exit(2)
+	}
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, nil)))
 
 	c, err := config.Load(*path)
@@ -36,22 +46,44 @@ func main() {
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+	if err := run(ctx, c, *refresh, os.Stdout, isTTY()); err != nil {
+		slog.Error("scanner", "err", err)
+		os.Exit(1)
+	}
+}
+
+func validateFlags(path string, refresh time.Duration, args []string) error {
+	if strings.TrimSpace(path) == "" {
+		return fmt.Errorf("config path must not be empty")
+	}
+	if refresh <= 0 {
+		return fmt.Errorf("refresh must be positive")
+	}
+	if len(args) != 0 {
+		return fmt.Errorf("unexpected arguments: %v", args)
+	}
+	return nil
+}
+
+func run(ctx context.Context, c *config.Config, refresh time.Duration, output io.Writer, tty bool) (err error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
 	venues := map[string]exchange.Venue{}
+	defer func() {
+		for name, v := range venues {
+			if closeErr := v.Close(); closeErr != nil {
+				err = errors.Join(err, fmt.Errorf("close %s: %w", name, closeErr))
+			}
+		}
+	}()
 	for _, vc := range c.Venues {
 		v, err := exchange.New(vc.Kind, vc.Name, map[string]string{}) // read-only: no credentials
 		if err != nil {
-			slog.Error("venue", "name", vc.Name, "err", err)
-			os.Exit(1)
+			return fmt.Errorf("venue %s: %w", vc.Name, err)
 		}
 		venues[vc.Name] = v
 	}
-	defer func() {
-		for _, v := range venues {
-			_ = v.Close()
-		}
-	}()
-
 	m := symbols.DefaultMatcher()
 	if len(c.Matching.StripSuffixes) > 0 {
 		m.Suffixes = c.Matching.StripSuffixes
@@ -60,18 +92,27 @@ func main() {
 		m.Separators = c.Matching.Separators
 	}
 	pairs := matchAll(ctx, m, venues)
+	if len(pairs) == 0 {
+		return fmt.Errorf("no matched pairs")
+	}
 	board := newBoard(pairs)
-	tty := isTTY()
+	errs := make(chan error, len(pairs)+1)
+	renderDone := make(chan struct{})
 
 	go func() {
-		t := time.NewTicker(*refresh)
+		defer close(renderDone)
+		t := time.NewTicker(refresh)
 		defer t.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				render(board, tty)
+				if err := render(output, board, tty, time.Now()); err != nil {
+					errs <- fmt.Errorf("render: %w", err)
+					cancel()
+					return
+				}
 			}
 		}
 	}()
@@ -82,12 +123,26 @@ func main() {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_ = scan.Watch(ctx, p.base, p.l, p.r, p.li, p.ri, scan.Config{
-				OpenBps: c.Strategy.OpenBps, VolK: c.Strategy.VolK, FeeBps: p.fee, MaxBookAge: c.Strategy.MaxBookAge},
-				func(s scan.Score) { board.set(s) })
+			if err := scan.Watch(ctx, p.base, p.l, p.r, p.li, p.ri, scan.Config{
+				OpenBps: c.Strategy.OpenBps, VolK: c.Strategy.VolK, FeeBps: p.fee,
+				MaxBookAge: c.Strategy.MaxBookAge, MaxVolBookAge: c.Volatility.MaxAge,
+				Estimator: estimator.Params{Window: c.Estimator.Window, MinWarmup: c.Estimator.MinWarmup,
+					MinCoverage: c.Estimator.MinCoverage, Interval: c.Estimator.Interval},
+				Volatility: volatility.Params{Interval: c.Volatility.Interval, Horizon: c.Volatility.Horizon,
+					HalfLife: c.Volatility.HalfLife}}, func(s scan.Score) { board.set(s) }); err != nil {
+				slog.Warn("scan stopped", "pair", p.base, "err", err)
+				errs <- fmt.Errorf("scan %s: %w", p.base, err)
+			}
 		}()
 	}
 	wg.Wait()
+	cancel()
+	<-renderDone
+	close(errs)
+	for scanErr := range errs {
+		err = errors.Join(err, scanErr)
+	}
+	return err
 }
 
 type board struct {
@@ -109,7 +164,7 @@ func (b *board) set(s scan.Score) {
 	b.mu.Unlock()
 }
 
-func (b *board) sorted() []scan.Score {
+func (b *board) sorted(now time.Time) []scan.Score {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	out := make([]scan.Score, 0, len(b.m))
@@ -117,7 +172,11 @@ func (b *board) sorted() []scan.Score {
 		out = append(out, s)
 	}
 	sort.Slice(out, func(i, j int) bool {
-		if out[i].NetBps != out[j].NetBps {
+		validI, validJ := scoreStatus(out[i], now) == "", scoreStatus(out[j], now) == ""
+		if validI != validJ {
+			return validI
+		}
+		if validI && out[i].NetBps != out[j].NetBps {
 			return out[i].NetBps > out[j].NetBps
 		}
 		return out[i].Base < out[j].Base
@@ -125,23 +184,52 @@ func (b *board) sorted() []scan.Score {
 	return out
 }
 
-func render(b *board, tty bool) {
-	rows := b.sorted()
-	if tty {
-		fmt.Print("\033[2J\033[H") // clear screen, home cursor
+// Watch evaluates once per second. A missed evaluation expires its display
+// even when the last callback reported a profitable opportunity.
+const scoreMaxAge = 2 * time.Second
+
+func scoreStatus(s scan.Score, now time.Time) string {
+	if s.Ts.IsZero() {
+		return "warming"
 	}
-	fmt.Printf("== pair scan  %d pairs  %s ==\n", len(rows), time.Now().Format("15:04:05"))
-	fmt.Printf("%-4s %-12s %-18s %s\n", "#", "PAIR", "DIR", "NET_BPS")
+	if s.Ts.After(now) || now.Sub(s.Ts) > scoreMaxAge {
+		return "stale"
+	}
+	if math.IsNaN(s.NetBps) || math.IsInf(s.NetBps, 0) {
+		return "invalid"
+	}
+	if !s.MuReady || !s.VolReady {
+		return "unavailable"
+	}
+	return ""
+}
+
+func render(output io.Writer, b *board, tty bool, now time.Time) error {
+	rows := b.sorted(now)
+	if tty {
+		if _, err := fmt.Fprint(output, "\033[2J\033[H"); err != nil { // clear screen, home cursor
+			return err
+		}
+	}
+	if _, err := fmt.Fprintf(output, "== pair scan  %d pairs  %s ==\n", len(rows), now.Format("15:04:05")); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(output, "%-4s %-12s %-18s %s\n", "#", "PAIR", "DIR", "NET_BPS"); err != nil {
+		return err
+	}
 	for i, s := range rows {
-		dir, net := "—", "warming"
-		if s.MuReady {
+		dir, net := "—", scoreStatus(s, now)
+		if net == "" {
 			if s.NetBps > 0 {
 				dir = s.Dir.String()
 			}
 			net = fmt.Sprintf("%+.2f", s.NetBps)
 		}
-		fmt.Printf("%-4d %-12s %-18s %s\n", i+1, s.Base, dir, net)
+		if _, err := fmt.Fprintf(output, "%-4d %-12s %-18s %s\n", i+1, s.Base, dir, net); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
 func isTTY() bool {

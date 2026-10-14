@@ -10,13 +10,29 @@ import (
 
 // Stats describes estimator state for logging / readiness.
 type Stats struct {
-	Kind     string
-	Mean     float64
-	Samples  int
-	Span     time.Duration // time since first sample in window
-	Coverage float64       // samples / expected samples over span
-	Ready    bool
+	Kind       string
+	Mean       float64
+	Samples    int
+	Span       time.Duration // time since first sample in window
+	Coverage   float64       // samples / expected samples over span
+	Ready      bool
+	LastSample time.Time // latest accepted sample; zero for estimators without timestamps
 }
+
+// StatsAt reads an estimator against the evaluation clock. Implementations that
+// have no time-aware snapshot retain their existing Stats contract.
+func StatsAt(e Estimator, now time.Time) Stats {
+	if timed, ok := e.(interface{ StatsAt(time.Time) Stats }); ok {
+		return timed.StatsAt(now)
+	}
+	return e.Stats()
+}
+
+// ReadyAt reports whether the current window is fresh and warmed up.
+func ReadyAt(e Estimator, now time.Time) bool { return StatsAt(e, now).Ready }
+
+// MeanAt returns the current time window's mean.
+func MeanAt(e Estimator, now time.Time) float64 { return StatsAt(e, now).Mean }
 
 // Estimator estimates the "center" of the spread series.
 type Estimator interface {

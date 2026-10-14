@@ -7,6 +7,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
@@ -17,6 +18,7 @@ import (
 type Kind string
 
 const (
+	KindPnL          Kind = "pnl"
 	KindStepOpened   Kind = "step_opened"
 	KindStepClosed   Kind = "step_closed"
 	KindExecuted     Kind = "executed"
@@ -94,30 +96,31 @@ type Metrics struct {
 
 // PairMetrics is the per-pair slice of the snapshot.
 type PairMetrics struct {
-	Base        string  `json:"base"`
-	Active      bool    `json:"active"`
-	Mode        string  `json:"mode"`
-	Opens       uint64  `json:"opens"`
-	Closes      uint64  `json:"closes"`
-	Executions  uint64  `json:"executions"`
-	OneLegFails uint64  `json:"one_leg_fails"`
-	Rescues     uint64  `json:"rescues"`
-	Errors      uint64  `json:"errors"`
-	OpenSteps   int     `json:"open_steps"`
-	VolumeUSD   float64 `json:"volume_usd"`
-	RealizedUSD float64 `json:"realized_usd"`
-	MuBps       float64 `json:"mu_bps"`
-	SigmaBps    float64 `json:"sigma_bps"`
-	TickK       float64 `json:"tick_k"`
-	FailRate    float64 `json:"fail_rate"`
-	Score       float64 `json:"score"`
-	DepthQ      float64 `json:"depth_q"`
-	TickQ       float64 `json:"tick_q"`
-	Stability   float64 `json:"stability"`
-	Reverts     float64 `json:"reverts_per_min"`
-	Coverage    float64 `json:"coverage"`
-	Samples     int     `json:"samples"`
-	Ready       bool    `json:"ready"`
+	Base            string  `json:"base"`
+	Active          bool    `json:"active"`
+	Mode            string  `json:"mode"`
+	Opens           uint64  `json:"opens"`
+	Closes          uint64  `json:"closes"`
+	Executions      uint64  `json:"executions"`
+	OneLegFails     uint64  `json:"one_leg_fails"`
+	Rescues         uint64  `json:"rescues"`
+	Errors          uint64  `json:"errors"`
+	OpenSteps       int     `json:"open_steps"`
+	VolumeUSD       float64 `json:"volume_usd"`
+	RealizedUSD     float64 `json:"realized_usd"`
+	MuBps           float64 `json:"mu_bps"`
+	SigmaBps        float64 `json:"sigma_bps"`
+	TickK           float64 `json:"tick_k"`
+	FailRate        float64 `json:"fail_rate"`
+	RollingFailRate float64 `json:"rolling_fail_rate"` // latest actor window; fail_rate is lifetime
+	Score           float64 `json:"score"`
+	DepthQ          float64 `json:"depth_q"`
+	TickQ           float64 `json:"tick_q"`
+	Stability       float64 `json:"stability"`
+	Reverts         float64 `json:"reverts_per_min"`
+	Coverage        float64 `json:"coverage"`
+	Samples         int     `json:"samples"`
+	Ready           bool    `json:"ready"`
 }
 
 // Monitor consumes events, aggregates metrics and fires alerts.
@@ -176,22 +179,23 @@ func (m *Monitor) RollingFailRate(pair string) float64 {
 // Record applies one event.
 func (m *Monitor) Record(e Event) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	alertMsg := ""
 	switch e.Kind {
 	case KindStepOpened:
 		m.opens++
-		m.openSteps++
 		a := m.acc(e.Pair)
 		a.opens++
 		a.openSteps++
+	case KindPnL:
+		m.realizedUSD += e.USD
+		m.acc(e.Pair).realizedUSD += e.USD
 	case KindStepClosed:
 		m.closes++
-		m.openSteps--
-		m.realizedUSD += e.USD
 		a := m.acc(e.Pair)
 		a.closes++
-		a.openSteps--
-		a.realizedUSD += e.USD
+		if a.openSteps > 0 {
+			a.openSteps--
+		}
 	case KindExecuted:
 		m.executions++
 		m.volumeUSD += e.USD
@@ -216,16 +220,19 @@ func (m *Monitor) Record(e Event) {
 		m.acc(e.Pair).rescues++
 	case KindEmergency:
 		m.emergencies++
-		m.alertf("emergency unwind on %s", e.Pair)
+		alertMsg = fmt.Sprintf("emergency unwind on %s", e.Pair)
 	case KindError:
 		m.errors++
 		m.acc(e.Pair).errors++
-		m.alertf("error on %s: %s", e.Pair, e.Msg)
+		alertMsg = fmt.Sprintf("error on %s: %s", e.Pair, e.Msg)
 	case KindStatus:
-		m.openSteps = e.Steps
 		m.muBps, m.sigmaBps, m.tickK, m.failRate = e.MuBps, e.SigmaBps, e.TickK, e.FailRate
 		a := m.acc(e.Pair)
 		a.openSteps = e.Steps
+		if a.openSteps < 0 {
+			a.openSteps = -a.openSteps
+		}
+		a.mode = e.Mode
 		a.muBps, a.sigmaBps, a.tickK, a.failRate = e.MuBps, e.SigmaBps, e.TickK, e.FailRate
 	case KindPairPromoted:
 		a := m.acc(e.Pair)
@@ -241,18 +248,21 @@ func (m *Monitor) Record(e Event) {
 		a := m.acc(e.Pair)
 		a.samples, a.coverage, a.ready = e.Samples, e.Coverage, e.Ready
 	}
-}
-
-func (m *Monitor) alertf(format string, args ...any) {
-	if m.alert == nil {
-		return
+	m.openSteps = 0
+	for _, a := range m.pairs {
+		m.openSteps += a.openSteps
 	}
-	msg := fmt.Sprintf(format, args...)
-	m.alerts = append(m.alerts, msg)
-	if len(m.alerts) > 64 {
-		m.alerts = m.alerts[len(m.alerts)-64:]
+	if alertMsg != "" {
+		m.alerts = append(m.alerts, alertMsg)
+		if len(m.alerts) > 64 {
+			m.alerts = m.alerts[len(m.alerts)-64:]
+		}
 	}
-	m.alert(msg)
+	alert := m.alert
+	m.mu.Unlock()
+	if alert != nil && alertMsg != "" {
+		alert(alertMsg)
+	}
 }
 
 // Metrics returns a snapshot.
@@ -280,7 +290,8 @@ func (m *Monitor) Metrics() Metrics {
 			OpenSteps: a.openSteps, VolumeUSD: a.volumeUSD, RealizedUSD: a.realizedUSD,
 			MuBps: a.muBps, SigmaBps: a.sigmaBps, TickK: a.tickK, FailRate: pfail,
 			Score: a.score, DepthQ: a.depthQ, TickQ: a.tickQ, Stability: a.stability, Reverts: a.reverts,
-			Coverage: a.coverage, Samples: a.samples, Ready: a.ready,
+			RollingFailRate: a.failRate,
+			Coverage:        a.coverage, Samples: a.samples, Ready: a.ready,
 		}
 	}
 	return Metrics{
@@ -317,17 +328,26 @@ func (m *Monitor) Handler(token string) http.Handler {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(m.Metrics())
+		if err := json.NewEncoder(w).Encode(m.Metrics()); err != nil {
+			slog.Error("write monitor metrics", "err", err)
+		}
 	})
 }
 
 // authorized reports whether r carries the expected token (constant-time).
 func authorized(r *http.Request, token string) bool {
-	if t := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "); t != "" && subtle.ConstantTimeCompare([]byte(t), []byte(token)) == 1 {
-		return true
+	if hs := r.Header.Values("Authorization"); len(hs) > 0 {
+		if len(hs) != 1 {
+			return false
+		}
+		scheme, value, ok := strings.Cut(hs[0], " ")
+		if !ok || !strings.EqualFold(scheme, "Bearer") || value == "" || strings.ContainsAny(value, " \t\r\n") {
+			return false
+		}
+		return subtle.ConstantTimeCompare([]byte(value), []byte(token)) == 1
 	}
-	if t := r.URL.Query().Get("token"); t != "" && subtle.ConstantTimeCompare([]byte(t), []byte(token)) == 1 {
-		return true
+	if ts := r.URL.Query()["token"]; len(ts) == 1 {
+		return subtle.ConstantTimeCompare([]byte(ts[0]), []byte(token)) == 1
 	}
 	return false
 }

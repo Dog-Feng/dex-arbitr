@@ -4,8 +4,11 @@
 package lighter
 
 import (
+	"bytes"
 	"context"
+	"encoding/hex"
 	"fmt"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -13,7 +16,6 @@ import (
 	"time"
 
 	lclient "github.com/elliottech/lighter-go/client"
-	lhttp "github.com/elliottech/lighter-go/client/http"
 
 	"github.com/Dog-Feng/dex-arbitr/internal/domain"
 	"github.com/Dog-Feng/dex-arbitr/internal/exchange"
@@ -59,7 +61,7 @@ type Venue struct {
 	rest   *restClient
 	ws     *wsClient
 	nonce  nonceMgr
-	sendMu sync.Mutex // serialize sign+send to keep nonces ordered
+	sendMu chan struct{} // serialize sign+send while allowing cancelled waiters to leave
 
 	authMu     sync.Mutex
 	authToken  string
@@ -72,7 +74,8 @@ type Venue struct {
 	orderSubs  []chan domain.OrderUpdate
 	orderMu    sync.Mutex
 
-	closed atomic.Bool
+	closed    atomic.Bool
+	closeDone chan struct{}
 }
 
 // New builds the venue from a preset kind plus option overrides.
@@ -97,7 +100,11 @@ func New(name, kind string, opts map[string]string) (*Venue, error) {
 		cfg.ChainID = uint32(n)
 	}
 	if v := opts["book_depth"]; v != "" {
-		cfg.BookDepth, _ = strconv.Atoi(v)
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return nil, fmt.Errorf("book_depth: %w", err)
+		}
+		cfg.BookDepth = n
 	}
 	cfg.PrivateKey = strings.TrimSpace(opts["private_key"])
 	if cfg.PrivateKey != "" {
@@ -116,24 +123,39 @@ func New(name, kind string, opts map[string]string) (*Venue, error) {
 
 // NewWithConfig builds a venue from an explicit config.
 func NewWithConfig(cfg Config) (*Venue, error) {
-	v := &Venue{cfg: cfg, books: map[int]*bookState{}}
+	if cfg.BookDepth <= 0 {
+		return nil, fmt.Errorf("book_depth must be positive")
+	}
+	host, err := url.Parse(cfg.Host)
+	if err != nil || host.Host == "" || (host.Scheme != "http" && host.Scheme != "https") || host.RawQuery != "" || host.Fragment != "" || host.User != nil {
+		return nil, fmt.Errorf("invalid REST host")
+	}
+	wsURL, err := url.Parse(cfg.WSURL)
+	if err != nil || wsURL.Host == "" || (wsURL.Scheme != "ws" && wsURL.Scheme != "wss") || wsURL.User != nil || wsURL.Fragment != "" {
+		return nil, fmt.Errorf("invalid websocket URL")
+	}
+	cfg.Host = strings.TrimRight(cfg.Host, "/")
+	v := &Venue{cfg: cfg, books: map[int]*bookState{}, sendMu: make(chan struct{}, 1), closeDone: make(chan struct{})}
 	v.rest = &restClient{host: cfg.Host}
 	if cfg.PrivateKey != "" {
-		tx, err := lclient.NewTxClient(lhttp.NewClient(cfg.Host), cfg.PrivateKey, cfg.AccountIndex, cfg.APIKeyIndex, cfg.ChainID)
+		// Nonces and key checks use our contextual REST client. Supplying no SDK
+		// HTTP client also prevents an accidental implicit nonce fetch.
+		tx, err := lclient.NewTxClient(nil, cfg.PrivateKey, cfg.AccountIndex, cfg.APIKeyIndex, cfg.ChainID)
 		if err != nil {
 			return nil, fmt.Errorf("%s: signer: %w", cfg.Name, err)
 		}
 		v.tx = tx
 	}
-	wsURL := cfg.WSURL
 	if v.tx == nil {
 		// Read-only sessions use the readonly endpoint (also works from restricted regions).
-		wsURL += "?readonly=true"
+		q := wsURL.Query()
+		q.Set("readonly", "true")
+		wsURL.RawQuery = q.Encode()
 	}
-	v.ws = newWSClient(cfg.Name, wsURL, v.onWSMessage)
+	v.ws = newWSClient(cfg.Name, wsURL.String(), v.onWSMessage)
 	v.ws.onReset = v.resetBooks
-	v.nonce.fetch = func() (int64, error) {
-		return v.rest.nextNonce(context.Background(), cfg.AccountIndex, cfg.APIKeyIndex)
+	v.nonce.fetch = func(ctx context.Context) (int64, error) {
+		return v.rest.nextNonce(ctx, cfg.AccountIndex, cfg.APIKeyIndex)
 	}
 	return v, nil
 }
@@ -143,17 +165,44 @@ func (v *Venue) CanTrade() bool { return v.tx != nil }
 
 // Close stops websocket loops.
 func (v *Venue) Close() error {
-	v.closed.Store(true)
+	if !v.closed.CompareAndSwap(false, true) {
+		<-v.closeDone
+		return nil
+	}
+	defer close(v.closeDone)
 	v.ws.close()
+	v.booksMu.Lock()
+	for _, bs := range v.books {
+		for _, ch := range bs.subs {
+			close(ch)
+		}
+		bs.subs = nil
+	}
+	v.booksMu.Unlock()
+	v.orderMu.Lock()
+	for _, ch := range v.orderSubs {
+		close(ch)
+	}
+	v.orderSubs = nil
+	v.orderMu.Unlock()
 	return nil
 }
 
 // CheckKey verifies the configured API key matches the one registered on chain.
-func (v *Venue) CheckKey() error {
+func (v *Venue) CheckKey(ctx context.Context) error {
 	if v.tx == nil {
 		return domain.ErrNoCredentials
 	}
-	return v.tx.Check()
+	key, err := v.rest.apiKey(ctx, v.cfg.AccountIndex, v.cfg.APIKeyIndex)
+	if err != nil {
+		return fmt.Errorf("check configured API key: %w", err)
+	}
+	registered, err := hex.DecodeString(strings.TrimPrefix(key, "0x"))
+	public := v.tx.GetKeyManager().PubKeyBytes()
+	if err != nil || !bytes.Equal(registered, public[:]) {
+		return fmt.Errorf("configured API key does not match this venue")
+	}
+	return nil
 }
 
 // auth returns a cached auth token (valid up to 8h; we use 2h and refresh at <10min).
@@ -186,16 +235,42 @@ func (v *Venue) Instruments(ctx context.Context) ([]domain.Instrument, error) {
 		if o.MarketType != "perp" || o.Status != "active" {
 			continue
 		}
+		if o.MarketID == nil || o.SizeDecimals == nil || o.PriceDecimals == nil {
+			return nil, fmt.Errorf("market metadata missing id or precision")
+		}
+		marketID, sizeDecimals, priceDecimals := *o.MarketID, *o.SizeDecimals, *o.PriceDecimals
+		if _, err := marketIndex(domain.Instrument{MarketID: marketID}); err != nil {
+			return nil, err
+		}
+		if sizeDecimals < 0 || sizeDecimals > 18 || priceDecimals < 0 || priceDecimals > 18 {
+			return nil, fmt.Errorf("market %d: invalid precision", marketID)
+		}
+		minBase, err := finiteDecimal(o.MinBase)
+		if err != nil || minBase < 0 {
+			return nil, fmt.Errorf("market %d: invalid min base", marketID)
+		}
+		minQuote, err := finiteDecimal(o.MinQuote)
+		if err != nil || minQuote < 0 {
+			return nil, fmt.Errorf("market %d: invalid min quote", marketID)
+		}
+		taker, err := finiteDecimal(o.TakerFee)
+		if err != nil {
+			return nil, fmt.Errorf("market %d: invalid taker fee", marketID)
+		}
+		maker, err := finiteDecimal(o.MakerFee)
+		if err != nil {
+			return nil, fmt.Errorf("market %d: invalid maker fee", marketID)
+		}
 		out = append(out, domain.Instrument{
 			Venue:         v.cfg.Name,
 			Symbol:        o.Symbol,
-			MarketID:      o.MarketID,
-			SizeDecimals:  o.SizeDecimals,
-			PriceDecimals: o.PriceDecimals,
-			MinBase:       domain.ParseF(o.MinBase),
-			MinQuote:      domain.ParseF(o.MinQuote),
-			TakerFee:      domain.ParseF(o.TakerFee) / 100,
-			MakerFee:      domain.ParseF(o.MakerFee) / 100,
+			MarketID:      marketID,
+			SizeDecimals:  sizeDecimals,
+			PriceDecimals: priceDecimals,
+			MinBase:       minBase,
+			MinQuote:      minQuote,
+			TakerFee:      taker / 100,
+			MakerFee:      maker / 100,
 		})
 	}
 	return out, nil

@@ -1,0 +1,525 @@
+package engine
+
+import (
+	"context"
+	"fmt"
+	"math"
+	"time"
+
+	"github.com/Dog-Feng/dex-arbitr/internal/domain"
+	"github.com/Dog-Feng/dex-arbitr/internal/execution"
+	"github.com/Dog-Feng/dex-arbitr/internal/monitor"
+	"github.com/Dog-Feng/dex-arbitr/internal/spread"
+	"github.com/Dog-Feng/dex-arbitr/internal/strategy"
+)
+
+// pendingExecution retains the complete executor result, including outstanding
+// IOC identities and rescue batches. Recovery never resubmits an original IOC.
+type pendingExecution struct {
+	action           strategy.Action
+	quote            spread.Quote
+	beforeL, beforeR float64
+	result           execution.Result
+	unwind           bool
+	lastAttempt      time.Time
+}
+
+func (a *PairActor) syncPositionState() {
+	a.flatPositions.Store(math.Abs(a.posL) < math.Pow10(-a.cfg.Pair.Left.SizeDecimals)/2 &&
+		math.Abs(a.posR) < math.Pow10(-a.cfg.Pair.Right.SizeDecimals)/2)
+}
+
+func (a *PairActor) executionContext(parent context.Context) (context.Context, func()) {
+	ctx, cancel := context.WithCancel(parent)
+	a.busy.Store(true)
+	a.execMu.Lock()
+	a.execCancel = cancel
+	a.execMu.Unlock()
+	return ctx, func() {
+		a.execMu.Lock()
+		a.execCancel = nil
+		a.execMu.Unlock()
+		cancel()
+		a.busy.Store(false)
+	}
+}
+
+// watchRisk owns its margin monitor independently of the trading loop. It can
+// interrupt a long ordinary rescue; settlement is then recovered before unwind.
+func (a *PairActor) watchRisk(ctx context.Context) {
+	m := a.margin
+	t := time.NewTicker(time.Second)
+	defer t.Stop()
+	for {
+		now := time.Now()
+		if now.Sub(m.lastRefresh) >= m.cfg.refresh {
+			m.refresh(ctx, a.cfg.L, a.cfg.R, a.cfg.Pair.Left.MarketID, a.cfg.Pair.Right.MarketID)
+		}
+		ml, mr, fresh := a.riskMarks()
+		// A stale peer must block admission without hiding a liquidation
+		// trigger on the leg whose price is still known.
+		action := m.assessAt(time.Now(), ml, mr, ml > 0 || mr > 0)
+		a.riskBlocked.Store(!fresh || m.armed || action == marginArm || action == marginTrigger)
+		if action == marginTrigger && a.emergencyRequested.CompareAndSwap(false, true) {
+			a.execMu.Lock()
+			if a.execCancel != nil {
+				a.execCancel()
+			}
+			a.execMu.Unlock()
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
+}
+
+func (a *PairActor) checkpointBeforeSend() bool {
+	a.checkpoint = true
+	a.settled.Store(false)
+	return a.persist() == nil
+}
+
+func (a *PairActor) failSettlement(p *pendingExecution) {
+	a.pending = p
+	a.checkpoint = true
+	a.settled.Store(false)
+	if p.result.PositionsKnown {
+		a.posL, a.posR = p.result.PosL, p.result.PosR
+		a.syncPositionState()
+	}
+	a.state.Mode = strategy.ModePaused
+	a.record(monitor.KindError, func(e *monitor.Event) { e.Msg = fmt.Sprintf("execution unresolved: %v", p.result.Err) })
+	if err := a.persist(); err != nil {
+		a.log.Error("persist unresolved execution", "err", err)
+	}
+}
+
+func (a *PairActor) resolvePending(ctx context.Context) {
+	p := a.pending
+	interval := a.cfg.ExecCfg.QueryInterval
+	if interval <= 0 {
+		interval = time.Second
+	}
+	if time.Since(p.lastAttempt) < interval {
+		return
+	}
+	p.lastAttempt = time.Now()
+	l, r := a.legSpecs(p.action)
+	if p.unwind {
+		l.Side, r.Side = 0, 0
+	}
+	if a.emergencyRequested.Load() || a.draining.Load() {
+		p.result = a.exec.EscalateOutstanding(p.result)
+	}
+	execCtx, finish := a.executionContext(ctx)
+	res := a.exec.ResolveOutstanding(execCtx, l, r, p.result, p.action.Qty, p.beforeL, p.beforeR)
+	finish()
+	p.result = res
+	if res.Err != nil || !res.PositionsKnown || !res.SettlementKnown {
+		if res.PositionsKnown {
+			a.posL, a.posR = res.PosL, res.PosR
+			a.syncPositionState()
+		}
+		return
+	}
+	if p.unwind {
+		if err := a.finishUnwind(res); err != nil {
+			a.log.Error("unwind accounting", "err", err)
+			return
+		}
+	} else if err := a.accountExecution(p.action, p.quote, p.beforeL, p.beforeR, res); err != nil {
+		a.state.Mode = strategy.ModePaused
+		a.record(monitor.KindError, func(e *monitor.Event) { e.Msg = err.Error() })
+		return
+	}
+	a.pending = nil
+	a.checkpoint = false
+	if !a.draining.Load() && !a.emergencyRequested.Load() && !a.legacyPrices {
+		a.state.Mode = strategy.ModeWarmup
+	}
+	if err := a.persist(); err != nil {
+		a.log.Error("persist recovered execution", "err", err)
+		return
+	}
+	a.settled.Store(true)
+	if p.unwind {
+		if a.draining.Load() {
+			a.drainConfirmed.Store(true)
+		}
+		a.emergencyRequested.Store(false)
+	}
+}
+
+func (a *PairActor) legSpecs(act strategy.Action) (execution.LegSpec, execution.LegSpec) {
+	return execution.LegSpec{Venue: a.cfg.L, Inst: a.cfg.Pair.Left, Side: act.L.Side, Price: act.L.Price},
+		execution.LegSpec{Venue: a.cfg.R, Inst: a.cfg.Pair.Right, Side: act.R.Side, Price: act.R.Price}
+}
+
+func (a *PairActor) apply(ctx context.Context, act strategy.Action, q spread.Quote) {
+	if a.draining.Load() || a.emergencyRequested.Load() || (act.Kind == strategy.Open && a.riskBlocked.Load()) {
+		return
+	}
+	beforeL, beforeR := a.posL, a.posR
+	a.resetVolumeIfNewDay(time.Now())
+	var res execution.Result
+	if a.cfg.DryRun {
+		a.busy.Store(true)
+		defer a.busy.Store(false)
+		res = execution.Result{L: execution.LegResult{Filled: act.Qty, AvgPrice: act.L.Price, Resolved: true},
+			R:    execution.LegResult{Filled: act.Qty, AvgPrice: act.R.Price, Resolved: true},
+			PosL: beforeL + float64(act.L.Side)*act.Qty, PosR: beforeR + float64(act.R.Side)*act.Qty,
+			PositionsKnown: true, SettlementKnown: true}
+	} else {
+		if !a.checkpointBeforeSend() {
+			return
+		}
+		execCtx, finish := a.executionContext(ctx)
+		// A drain/risk request may arrive between the decision and registering
+		// the execution cancel function. Recheck before sending either IOC.
+		if a.draining.Load() || a.emergencyRequested.Load() || (act.Kind == strategy.Open && a.riskBlocked.Load()) {
+			finish()
+			a.checkpoint = false
+			if err := a.persist(); err != nil {
+				a.log.Error("persist canceled decision", "err", err)
+				return
+			}
+			a.settled.Store(true)
+			return
+		}
+		l, r := a.legSpecs(act)
+		res = a.exec.Execute(execCtx, l, r, act.Qty, act.Kind == strategy.Close, beforeL, beforeR)
+		finish()
+	}
+	if res.Err != nil || !res.PositionsKnown || !res.SettlementKnown {
+		a.failSettlement(&pendingExecution{action: act, quote: q, beforeL: beforeL, beforeR: beforeR, result: res})
+		return
+	}
+	if err := a.accountExecution(act, q, beforeL, beforeR, res); err != nil {
+		a.failSettlement(&pendingExecution{action: act, quote: q, beforeL: beforeL, beforeR: beforeR, result: res})
+		a.record(monitor.KindError, func(e *monitor.Event) { e.Msg = err.Error() })
+		return
+	}
+	a.checkpoint = false
+	if err := a.persist(); err != nil {
+		a.log.Error("persist execution", "err", err)
+		return
+	}
+	a.settled.Store(true)
+}
+
+func finitePositive(x float64) bool { return x > 0 && !math.IsNaN(x) && !math.IsInf(x, 0) }
+
+func legNotional(lr execution.LegResult) (float64, error) {
+	sum := 0.0
+	for _, fill := range []struct{ qty, px float64 }{{lr.Filled, lr.AvgPrice}, {lr.RescueFilled, lr.RescuePrice}} {
+		if math.IsNaN(fill.qty) || math.IsInf(fill.qty, 0) || fill.qty < 0 {
+			return 0, fmt.Errorf("invalid fill quantity")
+		}
+		if fill.qty == 0 {
+			continue
+		}
+		if !finitePositive(fill.px) {
+			return 0, fmt.Errorf("missing or invalid price for confirmed fill")
+		}
+		sum += fill.qty * fill.px
+	}
+	return sum, nil
+}
+
+func closePrice(lr execution.LegResult, qty float64) (float64, error) {
+	n, err := legNotional(lr)
+	if err != nil {
+		return 0, err
+	}
+	total := lr.Filled + lr.RescueFilled
+	if total <= 0 || math.Abs(total-qty) > math.Max(1e-9, qty*1e-8) {
+		return 0, fmt.Errorf("closing fills %.8f do not match position reduction %.8f", total, qty)
+	}
+	return n / total, nil
+}
+
+// accountExecution derives ledger quantity from confirmed final positions,
+// not min/max of the original IOC fills. Fees include every direct/rescue fill.
+func (a *PairActor) accountExecution(act strategy.Action, q spread.Quote, beforeL, beforeR float64, res execution.Result) error {
+	if res.Err != nil || !res.PositionsKnown || !res.SettlementKnown {
+		return execution.ErrUnresolved
+	}
+	nl, err := legNotional(res.L)
+	if err != nil {
+		return err
+	}
+	nr, err := legNotional(res.R)
+	if err != nil {
+		return err
+	}
+	feeL, feeR := a.cfg.Pair.Left.TakerFee, a.cfg.Pair.Right.TakerFee
+	fees := nl*feeL + nr*feeR
+	deltaPnL := -fees
+	uncertain := res.L.PriceEstimated || res.R.PriceEstimated || res.L.RescuePriceEstimated || res.R.RescuePriceEstimated
+	eps := math.Pow10(-a.cfg.Pair.SizeDecimals) / 2
+	steps := append([]strategy.Step(nil), a.state.Steps...)
+	var opened *strategy.Step
+	var removed *strategy.Step
+	switch act.Kind {
+	case strategy.Open:
+		dl, dr := res.PosL-beforeL, res.PosR-beforeR
+		h := float64(act.L.Side) * dl
+		if h < -eps || math.Abs(float64(act.R.Side)*dr-h) >= eps {
+			return fmt.Errorf("final opening positions are not an equal hedge")
+		}
+		for _, leg := range []struct {
+			result execution.LegResult
+			side   domain.Side
+		}{{res.L, act.L.Side}, {res.R, act.R.Side}} {
+			if leg.result.RescueFilled > 0 {
+				if !finitePositive(leg.result.AvgPrice) {
+					return fmt.Errorf("cannot price an opening rollback")
+				}
+				deltaPnL += float64(leg.side) * leg.result.RescueFilled * (leg.result.RescuePrice - leg.result.AvgPrice)
+			}
+		}
+		if h >= eps {
+			if !finitePositive(res.L.AvgPrice) || !finitePositive(res.R.AvgPrice) {
+				return fmt.Errorf("opening prices unknown")
+			}
+			st := strategy.Step{ID: a.next, Dir: act.Dir, Qty: domain.Round(h, a.cfg.Pair.SizeDecimals), OriginalQty: h,
+				OpenL: res.L.AvgPrice, OpenR: res.R.AvgPrice, EntryBps: strategy.EntryBps(act.Dir, res.L.AvgPrice, res.R.AvgPrice),
+				EntryFeesUSD:   h * (res.L.AvgPrice*feeL + res.R.AvgPrice*feeR),
+				PriceEstimated: res.L.PriceEstimated || res.R.PriceEstimated, OpenedAt: time.Now()}
+			steps = append(steps, st)
+			opened = &st
+		}
+	case strategy.Close:
+		cl, cr := math.Abs(beforeL)-math.Abs(res.PosL), math.Abs(beforeR)-math.Abs(res.PosR)
+		if cl < -eps || math.Abs(cl-cr) >= eps {
+			return fmt.Errorf("final closing positions are not an equal reduction")
+		}
+		if cl >= eps {
+			lpx, err := closePrice(res.L, cl)
+			if err != nil {
+				return err
+			}
+			rpx, err := closePrice(res.R, cr)
+			if err != nil {
+				return err
+			}
+			found := false
+			for i := range steps {
+				if steps[i].ID != act.StepID {
+					continue
+				}
+				found = true
+				st := &steps[i]
+				uncertain = uncertain || st.PriceEstimated
+				if cl > st.Qty+eps {
+					return fmt.Errorf("close exceeds selected step")
+				}
+				gross := strategy.GrossProfitUSD(*st, lpx, rpx, cl)
+				if math.IsNaN(gross) || math.IsInf(gross, 0) {
+					return fmt.Errorf("step %d lacks a trustworthy entry basis", st.ID)
+				}
+				entryFees := st.EntryFeesUSD * cl / st.Qty
+				partNet := gross - fees - entryFees
+				st.EntryFeesUSD -= entryFees
+				st.RealizedUSD += partNet
+				if st.OriginalQty <= 0 {
+					st.OriginalQty = st.Qty
+				}
+				st.Realized = st.RealizedUSD / (st.OriginalQty * (st.OpenL + st.OpenR) / 2) * 1e4
+				st.PriceEstimated = st.PriceEstimated || res.L.PriceEstimated || res.R.PriceEstimated || res.L.RescuePriceEstimated || res.R.RescuePriceEstimated
+				st.Qty = domain.Round(st.Qty-cl, a.cfg.Pair.SizeDecimals)
+				deltaPnL += gross
+				if st.Qty < eps {
+					copyStep := *st
+					removed = &copyStep
+					steps = append(steps[:i], steps[i+1:]...)
+				}
+				break
+			}
+			if !found {
+				return fmt.Errorf("selected step %d not found", act.StepID)
+			}
+		}
+	default:
+		return fmt.Errorf("unsupported action %v", act.Kind)
+	}
+	expected := 0.0
+	for _, st := range steps {
+		expected += -float64(st.Dir) * st.Qty
+	}
+	if math.Abs(res.PosL-expected) >= math.Pow10(-a.cfg.Pair.Left.SizeDecimals)/2 ||
+		math.Abs(res.PosR+expected) >= math.Pow10(-a.cfg.Pair.Right.SizeDecimals)/2 {
+		return fmt.Errorf("confirmed positions %.8f/%.8f do not match updated ledger %.8f", res.PosL, res.PosR, expected)
+	}
+	a.state.Steps = steps
+	a.posL, a.posR = res.PosL, res.PosR
+	a.syncCounter()
+	a.syncPositionState()
+	if opened != nil {
+		a.next++
+		a.record(monitor.KindStepOpened, func(e *monitor.Event) { e.Dir = act.Dir.String(); e.Qty = opened.Qty })
+	}
+	if removed != nil {
+		a.record(monitor.KindStepClosed, func(e *monitor.Event) { e.Dir = act.Dir.String(); e.Qty = clampedQty(act.Qty) })
+	}
+	// Budgets use the UTC day on which settlement is confirmed, including
+	// executions recovered after midnight.
+	a.resetVolumeIfNewDay(time.Now())
+	a.volAcc.volumeUSD += nl + nr
+	a.volAcc.pnlUSD += deltaPnL
+	oneLeg := math.Abs(res.L.Filled-res.R.Filled) >= eps || res.RescueOrders > 0
+	a.observeFailure(oneLeg)
+	a.lat.add(res.L.Latency)
+	a.lat.add(res.R.Latency)
+	a.record(monitor.KindExecuted, func(e *monitor.Event) {
+		e.USD = nl + nr
+		e.OneLeg = oneLeg
+		e.LatencyMs = float64(res.L.Latency+res.R.Latency) / float64(2*time.Millisecond)
+	})
+	a.record(monitor.KindPnL, func(e *monitor.Event) { e.USD = deltaPnL })
+	if res.RescueOrders > 0 {
+		a.record(monitor.KindRescue, func(e *monitor.Event) { e.Qty = res.RescueQty })
+	}
+	if uncertain {
+		a.volAcc.pnlUncertain = true
+		a.log.Warn("PnL includes protective-price estimates", "pair", a.key)
+	}
+	return nil
+}
+
+func clampedQty(q float64) float64 {
+	if q < 0 {
+		return 0
+	}
+	return q
+}
+
+func (a *PairActor) drain(ctx context.Context) {
+	if a.Flat() {
+		a.drainConfirmed.Store(true)
+		a.state.Mode = strategy.ModePaused
+		return
+	}
+	a.unwind(ctx, false)
+}
+
+func (a *PairActor) emergency(ctx context.Context) { a.unwind(ctx, true) }
+
+func (a *PairActor) unwind(ctx context.Context, emergency bool) {
+	if a.pending != nil || !a.reconciled {
+		return
+	}
+	a.state.Mode = strategy.ModePaused
+	a.resetVolumeIfNewDay(time.Now())
+	beforeL, beforeR := a.posL, a.posR
+	var res execution.Result
+	if a.cfg.DryRun {
+		q, ok := a.quote(time.Now())
+		if !ok {
+			return
+		}
+		lp, rp := q.L.Bids[0].Price, q.R.Asks[0].Price
+		if beforeL < 0 {
+			lp, rp = q.L.Asks[0].Price, q.R.Bids[0].Price
+		}
+		res = execution.Result{L: execution.LegResult{RescueFilled: math.Abs(beforeL), RescuePrice: lp},
+			R: execution.LegResult{RescueFilled: math.Abs(beforeR), RescuePrice: rp}, PositionsKnown: true, SettlementKnown: true}
+		a.busy.Store(true)
+		defer a.busy.Store(false)
+	} else {
+		if !a.checkpointBeforeSend() {
+			return
+		}
+		execCtx, finish := a.executionContext(ctx)
+		l, r := a.legSpecs(strategy.Action{})
+		var err error
+		res, err = a.exec.EmergencyFlatten(execCtx, l, r, 0, beforeL, beforeR)
+		if res.Err == nil {
+			res.Err = err
+		}
+		finish()
+	}
+	if emergency {
+		a.record(monitor.KindEmergency, nil)
+	}
+	if res.Err != nil || !res.PositionsKnown || !res.SettlementKnown {
+		a.failSettlement(&pendingExecution{beforeL: beforeL, beforeR: beforeR, result: res, unwind: true})
+		return
+	}
+	if err := a.finishUnwind(res); err != nil {
+		a.failSettlement(&pendingExecution{beforeL: beforeL, beforeR: beforeR, result: res, unwind: true})
+		a.record(monitor.KindError, func(e *monitor.Event) { e.Msg = err.Error() })
+		return
+	}
+	a.checkpoint = false
+	if err := a.persist(); err != nil {
+		a.log.Error("persist unwind", "err", err)
+		return
+	}
+	a.settled.Store(true)
+	if a.draining.Load() {
+		a.drainConfirmed.Store(true)
+	}
+	a.emergencyRequested.Store(false)
+}
+
+func (a *PairActor) finishUnwind(res execution.Result) error {
+	if res.Err != nil || !res.PositionsKnown || !res.SettlementKnown || math.Abs(res.PosL) >= math.Pow10(-a.cfg.Pair.Left.SizeDecimals)/2 ||
+		math.Abs(res.PosR) >= math.Pow10(-a.cfg.Pair.Right.SizeDecimals)/2 {
+		return fmt.Errorf("unwind has not confirmed both legs flat")
+	}
+	nl, err := legNotional(res.L)
+	if err != nil {
+		return err
+	}
+	nr, err := legNotional(res.R)
+	if err != nil {
+		return err
+	}
+	fees := nl*a.cfg.Pair.Left.TakerFee + nr*a.cfg.Pair.Right.TakerFee
+	delta := -fees
+	uncertain := res.L.PriceEstimated || res.R.PriceEstimated || res.L.RescuePriceEstimated || res.R.RescuePriceEstimated
+	qty := math.Abs(a.expectedL())
+	if qty > 0 {
+		lp, err := closePrice(res.L, qty)
+		if err != nil {
+			return err
+		}
+		rp, err := closePrice(res.R, qty)
+		if err != nil {
+			return err
+		}
+		for _, st := range a.state.Steps {
+			uncertain = uncertain || st.PriceEstimated
+			gross := strategy.GrossProfitUSD(st, lp, rp, st.Qty)
+			if math.IsNaN(gross) || math.IsInf(gross, 0) {
+				uncertain = true
+				a.record(monitor.KindError, func(e *monitor.Event) {
+					e.Msg = fmt.Sprintf("legacy step %d exited without a known PnL basis; no profit claimed", st.ID)
+				})
+				continue
+			}
+			delta += gross
+		}
+	}
+	closed := len(a.state.Steps)
+	a.state.Steps = nil
+	a.posL, a.posR = res.PosL, res.PosR
+	a.syncCounter()
+	a.syncPositionState()
+	a.state.Mode = strategy.ModePaused
+	a.resetVolumeIfNewDay(time.Now())
+	a.volAcc.volumeUSD += nl + nr
+	a.volAcc.pnlUSD += delta
+	if uncertain {
+		a.volAcc.pnlUncertain = true
+	}
+	for i := 0; i < closed; i++ {
+		a.record(monitor.KindStepClosed, nil)
+	}
+	a.record(monitor.KindExecuted, func(e *monitor.Event) { e.USD = nl + nr })
+	a.record(monitor.KindPnL, func(e *monitor.Event) { e.USD = delta })
+	return nil
+}

@@ -3,6 +3,8 @@ package execution
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -28,21 +30,32 @@ func (g *IDGen) Next() int64 { return g.n.Add(1) }
 type Tracker struct {
 	mu      sync.Mutex
 	waiters map[string]chan domain.OrderUpdate
-	last    map[string]domain.OrderUpdate
+	stopped map[string]bool
+	cancel  context.CancelFunc
+	wg      sync.WaitGroup
+	closed  bool
 }
 
 // NewTracker subscribes to order updates of each trading venue.
 func NewTracker(ctx context.Context, venues ...exchange.Venue) (*Tracker, error) {
-	t := &Tracker{waiters: map[string]chan domain.OrderUpdate{}, last: map[string]domain.OrderUpdate{}}
+	ctx, cancel := context.WithCancel(ctx)
+	t := &Tracker{waiters: map[string]chan domain.OrderUpdate{}, stopped: map[string]bool{}, cancel: cancel}
 	for _, v := range venues {
 		ch, err := v.SubscribeOrders(ctx)
 		if err != nil {
-			return nil, err
+			t.Close()
+			return nil, fmt.Errorf("subscribe orders on %s: %w", v.Name(), err)
 		}
+		t.wg.Add(1)
 		go func() {
+			defer t.wg.Done()
+			defer t.stopVenue(v.Name())
 			for {
 				select {
-				case u := <-ch:
+				case u, ok := <-ch:
+					if !ok {
+						return
+					}
 					t.dispatch(u)
 				case <-ctx.Done():
 					return
@@ -58,10 +71,18 @@ func key(venue string, cid int64) string { return venue + "#" + itoa(cid) }
 func (t *Tracker) dispatch(u domain.OrderUpdate) {
 	k := key(u.Venue, u.ClientID)
 	t.mu.Lock()
-	t.last[k] = u
+	defer t.mu.Unlock()
 	w := t.waiters[k]
-	t.mu.Unlock()
 	if w != nil {
+		// The latest cumulative update is enough. Preserve a terminal report
+		// against a later nonterminal report and never drop it behind a full queue.
+		select {
+		case previous := <-w:
+			if previous.Status.Terminal() && !u.Status.Terminal() || previous.FilledQty > u.FilledQty {
+				u = previous
+			}
+		default:
+		}
 		select {
 		case w <- u:
 		default:
@@ -71,9 +92,13 @@ func (t *Tracker) dispatch(u domain.OrderUpdate) {
 
 // Watch registers interest BEFORE submitting.
 func (t *Tracker) Watch(venue string, cid int64) <-chan domain.OrderUpdate {
-	ch := make(chan domain.OrderUpdate, 16)
+	ch := make(chan domain.OrderUpdate, 1)
 	t.mu.Lock()
-	t.waiters[key(venue, cid)] = ch
+	if t.closed || t.stopped[venue] {
+		close(ch)
+	} else {
+		t.waiters[key(venue, cid)] = ch
+	}
 	t.mu.Unlock()
 	return ch
 }
@@ -82,8 +107,28 @@ func (t *Tracker) Watch(venue string, cid int64) <-chan domain.OrderUpdate {
 func (t *Tracker) Done(venue string, cid int64) {
 	t.mu.Lock()
 	delete(t.waiters, key(venue, cid))
-	delete(t.last, key(venue, cid))
 	t.mu.Unlock()
+}
+
+func (t *Tracker) stopVenue(venue string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.stopped[venue] = true
+	for k, ch := range t.waiters {
+		if strings.HasPrefix(k, venue+"#") {
+			close(ch)
+			delete(t.waiters, k)
+		}
+	}
+}
+
+// Close stops subscriptions and waits for all order-stream readers to exit.
+func (t *Tracker) Close() {
+	t.mu.Lock()
+	t.closed = true
+	t.mu.Unlock()
+	t.cancel()
+	t.wg.Wait()
 }
 
 func itoa(v int64) string {

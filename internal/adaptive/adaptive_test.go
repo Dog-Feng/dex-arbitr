@@ -36,3 +36,20 @@ func TestKClamps(t *testing.T) {
 		t.Fatalf("clamped K=%v, want 2", k.K())
 	}
 }
+
+func TestRateIncludesWarmupAndAdjustsEachRollingOutcome(t *testing.T) {
+	k := NewK(Config{Init: 1, Window: 3, High: 0.5, Low: 0.1, Up: 2, Down: 0.5, Min: 0.1, Max: 10})
+	k.Observe(true)
+	if k.Rate() != 1 || k.K() != 1 {
+		t.Fatalf("warmup rate=%v coefficient=%v", k.Rate(), k.K())
+	}
+	k.Observe(true)
+	k.Observe(false)
+	if k.K() != 2 {
+		t.Fatalf("first full window K=%v", k.K())
+	}
+	k.Observe(true)
+	if k.K() != 4 {
+		t.Fatalf("sliding window must adjust on each new outcome: %v", k.K())
+	}
+}

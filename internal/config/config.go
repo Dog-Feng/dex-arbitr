@@ -2,9 +2,16 @@
 package config
 
 import (
+	"bytes"
 	"fmt"
+	"io"
+	"math"
 	"os"
+	"reflect"
+	"strings"
 	"time"
+
+	"github.com/Dog-Feng/dex-arbitr/internal/symbols"
 
 	"gopkg.in/yaml.v3"
 )
@@ -125,11 +132,20 @@ func Load(path string) (*Config, error) {
 	}
 	var c Config
 	// Seed before decoding so an explicit 0 remains distinct from an omitted value.
+	c.defaults()
 	c.Execution.PriceTicks = 30
-	if err := yaml.Unmarshal([]byte(os.ExpandEnv(string(raw))), &c); err != nil {
+	d := yaml.NewDecoder(bytes.NewBufferString(os.ExpandEnv(string(raw))))
+	d.KnownFields(true)
+	if err := d.Decode(&c); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
-	c.defaults()
+	var extra yaml.Node
+	if err := d.Decode(&extra); err != io.EOF {
+		if err != nil {
+			return nil, fmt.Errorf("parse %s: %w", path, err)
+		}
+		return nil, fmt.Errorf("parse %s: multiple YAML documents", path)
+	}
 	return &c, c.validate()
 }
 
@@ -273,6 +289,36 @@ func (c *Config) defaults() {
 }
 
 func (c *Config) validate() error {
+	if err := finiteFields(reflect.ValueOf(*c), ""); err != nil {
+		return err
+	}
+	for _, d := range []struct {
+		name  string
+		value time.Duration
+	}{
+		{"estimator.window", c.Estimator.Window}, {"estimator.min_warmup", c.Estimator.MinWarmup},
+		{"estimator.interval", c.Estimator.Interval}, {"strategy.interval_min", c.Strategy.IntervalMin},
+		{"strategy.interval_max", c.Strategy.IntervalMax}, {"strategy.max_book_age", c.Strategy.MaxBookAge},
+		{"auto.dwell", c.Auto.Dwell},
+	} {
+		if d.value <= 0 {
+			return fmt.Errorf("%s must be > 0", d.name)
+		}
+	}
+	if c.Estimator.MinWarmup > c.Estimator.Window || c.Estimator.Interval > c.Estimator.Window {
+		return fmt.Errorf("estimator min_warmup and interval must not exceed window")
+	}
+	if c.Estimator.MinCoverage <= 0 || c.Estimator.MinCoverage > 1 {
+		return fmt.Errorf("estimator.min_coverage must be in (0, 1]")
+	}
+	if c.Strategy.DepthMult <= 0 {
+		return fmt.Errorf("strategy.depth_mult must be > 0")
+	}
+	for _, suffix := range c.Matching.StripSuffixes {
+		if strings.TrimSpace(suffix) == "" {
+			return fmt.Errorf("matching.strip_suffixes must not contain an empty suffix")
+		}
+	}
 	if c.Execution.PriceTicks < 0 {
 		return fmt.Errorf("execution.price_ticks must be >= 0")
 	}
@@ -325,17 +371,55 @@ func (c *Config) validate() error {
 	}
 	names := map[string]bool{}
 	for _, v := range c.Venues {
-		if v.Name == "" || v.Kind == "" {
+		if strings.TrimSpace(v.Name) == "" || strings.TrimSpace(v.Kind) == "" {
 			return fmt.Errorf("venue needs name and kind")
+		}
+		if names[v.Name] {
+			return fmt.Errorf("duplicate venue %q", v.Name)
 		}
 		names[v.Name] = true
 	}
+	pairs := map[string]bool{}
+	markets := map[string]bool{}
+	matcher := symbols.DefaultMatcher()
+	if len(c.Matching.StripSuffixes) > 0 {
+		matcher.Suffixes = c.Matching.StripSuffixes
+	}
+	if c.Matching.Separators != "" {
+		matcher.Separators = c.Matching.Separators
+	}
 	for _, p := range c.Pairs {
+		if strings.TrimSpace(p.Base) == "" {
+			return fmt.Errorf("pair base must not be empty")
+		}
+		if p.Left == p.Right {
+			return fmt.Errorf("pair %s: left and right must be different venues", p.Base)
+		}
 		if !names[p.Left] || !names[p.Right] {
 			return fmt.Errorf("pair %s references unknown venue", p.Base)
 		}
 		if p.StepQty <= 0 || p.MaxSteps <= 0 {
 			return fmt.Errorf("pair %s: step_qty and max_steps must be > 0", p.Base)
+		}
+		l, r := p.Left, p.Right
+		if l > r {
+			l, r = r, l
+		}
+		base := matcher.Normalize(p.Base)
+		if base == "" {
+			return fmt.Errorf("pair %s normalizes to an empty base", p.Base)
+		}
+		key := base + "\x00" + l + "\x00" + r
+		if pairs[key] {
+			return fmt.Errorf("duplicate pair %s on %s/%s", p.Base, l, r)
+		}
+		pairs[key] = true
+		for _, venue := range []string{p.Left, p.Right} {
+			market := venue + "\x00" + base
+			if markets[market] {
+				return fmt.Errorf("pairs share market %s on venue %s", base, venue)
+			}
+			markets[market] = true
 		}
 	}
 	if c.Strategy.IntervalMax < c.Strategy.IntervalMin {
@@ -390,6 +474,32 @@ func (c *Config) validate() error {
 		}
 		if c.Auto.MaxTotalNotional < 0 {
 			return fmt.Errorf("auto.max_total_notional must be >= 0")
+		}
+	}
+	return nil
+}
+
+func finiteFields(v reflect.Value, path string) error {
+	switch v.Kind() {
+	case reflect.Float64:
+		if math.IsNaN(v.Float()) || math.IsInf(v.Float(), 0) {
+			return fmt.Errorf("%s must be finite", path)
+		}
+	case reflect.Struct:
+		for i := 0; i < v.NumField(); i++ {
+			name := strings.Split(v.Type().Field(i).Tag.Get("yaml"), ",")[0]
+			if path != "" {
+				name = path + "." + name
+			}
+			if err := finiteFields(v.Field(i), name); err != nil {
+				return err
+			}
+		}
+	case reflect.Slice:
+		for i := 0; i < v.Len(); i++ {
+			if err := finiteFields(v.Index(i), fmt.Sprintf("%s[%d]", path, i)); err != nil {
+				return err
+			}
 		}
 	}
 	return nil

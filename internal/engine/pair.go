@@ -3,6 +3,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -77,22 +78,41 @@ type PairActor struct {
 	posR  float64
 	exec  *execution.Executor
 
-	bookMu   sync.RWMutex
-	bookL    domain.Book
-	bookR    domain.Book
-	lat      latencyStat
-	margin   marginMonitor
-	volAcc   volumeAcc
-	adaptive *adaptive.K
-	cnt      atomic.Int64 // signed step counter, readable by the picker
+	bookMu             sync.RWMutex
+	bookL              domain.Book
+	bookR              domain.Book
+	lat                latencyStat
+	margin             marginMonitor
+	volAcc             volumeAcc
+	adaptive           *adaptive.K
+	cnt                atomic.Int64 // signed step counter, readable by the picker
+	busy               atomic.Bool
+	flatPositions      atomic.Bool
+	settled            atomic.Bool
+	draining           atomic.Bool
+	drainConfirmed     atomic.Bool
+	emergencyRequested atomic.Bool
+	riskBlocked        atomic.Bool
+	failBits           atomic.Uint64
+	execMu             sync.Mutex
+	execCancel         context.CancelFunc
+	drainWake          chan struct{}
+	reconciled         bool
+	legacyPrices       bool
+	checkpoint         bool
+	pending            *pendingExecution
+	fatalErr           error
+	failures           []bool
+	failureIndex       int
 }
 
 // volumeAcc accumulates daily traded volume and realized PnL for the volume
 // budget gate; owned by the actor goroutine, no locking.
 type volumeAcc struct {
-	day       string
-	volumeUSD float64
-	pnlUSD    float64
+	day          string
+	volumeUSD    float64
+	pnlUSD       float64
+	pnlUncertain bool
 }
 
 func (a *PairActor) resetVolumeIfNewDay(now time.Time) {
@@ -107,7 +127,7 @@ func (a *PairActor) canOpenVolume() bool {
 	if a.cfg.VolTarget > 0 && a.volAcc.volumeUSD >= a.cfg.VolTarget {
 		return false
 	}
-	if a.cfg.VolCostBudget > 0 && a.volAcc.pnlUSD <= -a.cfg.VolCostBudget {
+	if a.cfg.VolCostBudget > 0 && (a.volAcc.pnlUncertain || a.volAcc.pnlUSD <= -a.cfg.VolCostBudget) {
 		return false
 	}
 	return true
@@ -146,7 +166,7 @@ func NewPairActor(cfg PairConfig) (*PairActor, error) {
 		cfg.Strategy = strategy.Arbitrage{}
 	}
 	key := pairKey(cfg.Pair.Base, cfg.L.Name(), cfg.R.Name(), cfg.DryRun)
-	a := &PairActor{cfg: cfg, key: key, log: slog.With("pair", cfg.Pair.Base, "L", cfg.L.Name(), "R", cfg.R.Name())}
+	a := &PairActor{cfg: cfg, key: key, log: slog.With("pair", cfg.Pair.Base, "L", cfg.L.Name(), "R", cfg.R.Name()), drainWake: make(chan struct{}, 1)}
 	a.margin = marginMonitor{cfg: cfg.Risk}
 	st, err := cfg.Store.Load(key)
 	if err != nil {
@@ -154,6 +174,30 @@ func NewPairActor(cfg PairConfig) (*PairActor, error) {
 	}
 	a.state = strategy.State{Mode: strategy.ModeWarmup, Steps: st.Steps}
 	a.next = st.NextID
+	a.volAcc = volumeAcc{day: st.Day, volumeUSD: st.VolumeUSD, pnlUSD: st.PnLUSD, pnlUncertain: st.PnLUncertain}
+	a.checkpoint = st.Unresolved
+	if st.Unresolved {
+		a.state.Mode = strategy.ModePaused
+	}
+	for i := range a.state.Steps {
+		step := &a.state.Steps[i]
+		if step.OriginalQty <= 0 {
+			// Older ledgers did not record original quantity or entry fees.
+			// Preserve the known price basis but never present their costs as exact.
+			step.PriceEstimated = true
+			a.volAcc.pnlUncertain = true
+			a.log.Warn("legacy step has unknown historical fee/partial-fill accounting", "step", step.ID)
+		}
+		if step.OpenL <= 0 || step.OpenR <= 0 {
+			a.legacyPrices = true
+			a.state.Mode = strategy.ModePaused
+		}
+	}
+	a.settled.Store(!st.Unresolved && cfg.DryRun)
+	a.posL, a.posR = a.expectedL(), -a.expectedL()
+	a.flatPositions.Store(cfg.DryRun && len(st.Steps) == 0)
+	a.reconciled = cfg.DryRun
+	a.riskBlocked.Store(!cfg.DryRun && cfg.Risk.trigger > 0)
 	a.cnt.Store(int64(a.state.Counter()))
 	if !cfg.DryRun {
 		// Live trading stays paused until reconciliation succeeds.
@@ -172,7 +216,29 @@ func NewPairActor(cfg PairConfig) (*PairActor, error) {
 func (a *PairActor) syncCounter() { a.cnt.Store(int64(a.state.Counter())) }
 
 // Flat reports whether no steps are open, without racing the actor goroutine.
-func (a *PairActor) Flat() bool { return a.cnt.Load() == 0 }
+func (a *PairActor) Flat() bool {
+	return !a.busy.Load() && a.settled.Load() && a.flatPositions.Load() && a.cnt.Load() == 0
+}
+
+// Busy includes execution and reconciliation, so an empty ledger is not an idle account.
+func (a *PairActor) Busy() bool { return a.busy.Load() }
+func (a *PairActor) Drain() {
+	if a.draining.CompareAndSwap(false, true) {
+		// Move an in-flight ordinary rescue back to the actor so it can be
+		// recovered with the wider unwind protection before retiring.
+		a.execMu.Lock()
+		if a.execCancel != nil {
+			a.execCancel()
+		}
+		a.execMu.Unlock()
+	}
+	select {
+	case a.drainWake <- struct{}{}:
+	default:
+	}
+}
+func (a *PairActor) Drained() bool     { return a.draining.Load() && a.drainConfirmed.Load() && a.Flat() }
+func (a *PairActor) FailRate() float64 { return math.Float64frombits(a.failBits.Load()) }
 
 // mean returns the spread mean and readiness from the view or the actor's own
 // estimator.
@@ -180,7 +246,8 @@ func (a *PairActor) mean() (float64, bool) {
 	if a.cfg.View != nil {
 		return a.cfg.View.Mean()
 	}
-	return a.cfg.Est.Mean(), a.cfg.Est.Ready()
+	st := estimator.StatsAt(a.cfg.Est, time.Now())
+	return st.Mean, st.Ready
 }
 
 func (a *PairActor) meanReady() bool { _, ok := a.mean(); return ok }
@@ -190,13 +257,18 @@ func (a *PairActor) statsSnapshot() estimator.Stats {
 	if a.cfg.View != nil {
 		return a.cfg.View.Stats()
 	}
-	return a.cfg.Est.Stats()
+	return estimator.StatsAt(a.cfg.Est, time.Now())
 }
 
-func (a *PairActor) book(venue string, _ int) (domain.Book, bool) {
+func (a *PairActor) book(venue string, marketID int) (domain.Book, bool) {
+	if (venue != a.cfg.L.Name() || marketID != a.cfg.Pair.Left.MarketID) &&
+		(venue != a.cfg.R.Name() || marketID != a.cfg.Pair.Right.MarketID) {
+		return domain.Book{}, false
+	}
 	if a.cfg.View != nil {
 		b, ok := a.cfg.View.Book(venue)
-		return b, ok && time.Since(b.Ts) <= a.cfg.MaxBookAge
+		age := time.Since(b.Ts)
+		return b, ok && b.Valid() && b.Venue == venue && b.MarketID == marketID && age >= 0 && age <= a.cfg.MaxBookAge
 	}
 	a.bookMu.RLock()
 	defer a.bookMu.RUnlock()
@@ -204,7 +276,8 @@ func (a *PairActor) book(venue string, _ int) (domain.Book, bool) {
 	if venue == a.cfg.L.Name() {
 		b = a.bookL
 	}
-	return b, b.Valid() && time.Since(b.Ts) <= a.cfg.MaxBookAge
+	age := time.Since(b.Ts)
+	return b, b.Valid() && b.Venue == venue && b.MarketID == marketID && age >= 0 && age <= a.cfg.MaxBookAge
 }
 
 // collectBooks keeps rescue pricing current while Run waits for execution.
@@ -231,10 +304,16 @@ func (a *PairActor) collectBooks(ctx context.Context, chL, chR <-chan domain.Boo
 	}
 }
 
-func (a *PairActor) persist() {
-	if err := a.cfg.Store.Save(a.key, store.PairState{NextID: a.next, Steps: a.state.Steps}); err != nil {
-		a.log.Error("persist failed", "err", err)
+func (a *PairActor) persist() error {
+	err := a.cfg.Store.Save(a.key, store.PairState{NextID: a.next, Steps: a.state.Steps, Day: a.volAcc.day, VolumeUSD: a.volAcc.volumeUSD, PnLUSD: a.volAcc.pnlUSD, PnLUncertain: a.volAcc.pnlUncertain, Unresolved: a.checkpoint})
+	if err != nil {
+		a.state.Mode = strategy.ModePaused
+		a.settled.Store(false)
+		a.fatalErr = fmt.Errorf("persist %s: %w", a.key, err)
+		a.record(monitor.KindError, func(e *monitor.Event) { e.Msg = a.fatalErr.Error() })
+		return a.fatalErr
 	}
+	return nil
 }
 
 func (a *PairActor) jitter() time.Duration {
@@ -249,6 +328,8 @@ func (a *PairActor) jitter() time.Duration {
 func (a *PairActor) reconcile(ctx context.Context) error {
 	// Any failed query or mismatch must block both opens and closes.
 	a.state.Mode = strategy.ModePaused
+	a.busy.Store(true)
+	defer a.busy.Store(false)
 	pl, err := execution.MarketPosition(ctx, a.cfg.L, a.cfg.Pair.Left.MarketID)
 	if err != nil {
 		return fmt.Errorf("%s positions: %w", a.cfg.L.Name(), err)
@@ -259,13 +340,28 @@ func (a *PairActor) reconcile(ctx context.Context) error {
 	}
 	a.posL, a.posR = pl, pr
 	expL := a.expectedL()
-	eps := math.Pow10(-a.cfg.Pair.SizeDecimals) / 2
+	epsL := math.Pow10(-a.cfg.Pair.Left.SizeDecimals) / 2
+	epsR := math.Pow10(-a.cfg.Pair.Right.SizeDecimals) / 2
+	eps := math.Min(epsL, epsR)
 	a.log.Info("positions", "posL", pl, "posR", pr, "expected_posL", expL, "steps", a.state.Counter())
 	if math.Abs(pl+pr) >= eps {
 		return fmt.Errorf("positions unhedged (posL %.6f + posR %.6f != 0): paused, fix manually", pl, pr)
 	}
-	if math.Abs(pl-expL) >= eps || math.Abs(pr+expL) >= eps {
+	if math.Abs(pl-expL) >= epsL || math.Abs(pr+expL) >= epsR {
 		return fmt.Errorf("positions differ from recorded steps (posL %.6f posR %.6f, expected L %.6f R %.6f): paused, fix manually", pl, pr, expL, -expL)
+	}
+	a.reconciled = true
+	a.syncPositionState()
+	if a.checkpoint {
+		a.settled.Store(false)
+		return fmt.Errorf("previous execution is unresolved; verify outstanding orders before resuming")
+	}
+	a.settled.Store(true)
+	for _, st := range a.state.Steps {
+		if st.OpenL <= 0 || st.OpenR <= 0 {
+			a.legacyPrices = true
+			return fmt.Errorf("step %d lacks entry prices; normal trading paused, drain remains available", st.ID)
+		}
 	}
 	a.state.Mode = strategy.ModeWarmup
 	a.log.Info("position reconciliation passed")
@@ -273,9 +369,10 @@ func (a *PairActor) reconcile(ctx context.Context) error {
 }
 
 // Run the actor until ctx is done.
-func (a *PairActor) Run(ctx context.Context) error {
+func (a *PairActor) Run(ctx context.Context) (retErr error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	defer func() { retErr = errors.Join(retErr, a.persist()) }()
 	if a.cfg.View == nil {
 		chL, err := a.cfg.L.SubscribeBook(ctx, a.cfg.Pair.Left)
 		if err != nil {
@@ -285,104 +382,120 @@ func (a *PairActor) Run(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		booksDone := make(chan struct{})
-		go func() {
-			defer close(booksDone)
-			a.collectBooks(ctx, chL, chR)
-		}()
-		defer func() {
-			cancel()
-			<-booksDone
-		}()
+		done := make(chan struct{})
+		go func() { defer close(done); a.collectBooks(ctx, chL, chR) }()
+		defer func() { cancel(); <-done }()
 	}
 	if a.cfg.Samples != nil {
-		defer a.cfg.Samples.Close()
+		defer func() { retErr = errors.Join(retErr, a.cfg.Samples.Close()) }()
 	}
 	if !a.cfg.DryRun {
 		if err := a.reconcile(ctx); err != nil {
 			a.log.Error("reconcile", "err", err)
+			a.record(monitor.KindError, func(e *monitor.Event) { e.Msg = err.Error() })
 		}
 	}
-	if a.cfg.SampleEvery == 0 {
+	if a.cfg.SampleEvery <= 0 {
 		a.cfg.SampleEvery = time.Second
 	}
-	if a.cfg.Vol != nil && a.cfg.VolEvery == 0 {
+	if a.cfg.VolEvery <= 0 {
 		a.cfg.VolEvery = 100 * time.Millisecond
 	}
-	if a.cfg.Vol != nil && a.cfg.VolMaxAge == 0 {
+	if a.cfg.VolMaxAge <= 0 {
 		a.cfg.VolMaxAge = 50 * time.Millisecond
 	}
-	var sample <-chan time.Time
+	var sample, volC <-chan time.Time
 	if a.cfg.View == nil {
-		st := time.NewTicker(a.cfg.SampleEvery)
-		defer st.Stop()
-		sample = st.C
+		t := time.NewTicker(a.cfg.SampleEvery)
+		defer t.Stop()
+		sample = t.C
+		if a.cfg.Vol != nil {
+			v := time.NewTicker(a.cfg.VolEvery)
+			defer v.Stop()
+			volC = v.C
+		}
 	}
-	var volC <-chan time.Time
-	if a.cfg.View == nil && a.cfg.Vol != nil {
-		vt := time.NewTicker(a.cfg.VolEvery)
-		defer vt.Stop()
-		volC = vt.C
-	}
-	var riskC <-chan time.Time
 	if !a.cfg.DryRun && a.cfg.Risk.trigger > 0 {
-		rt := time.NewTicker(time.Second)
-		defer rt.Stop()
-		riskC = rt.C
+		done := make(chan struct{})
+		go func() { defer close(done); a.watchRisk(ctx) }()
+		defer func() { cancel(); <-done }()
 	}
 	decide := time.NewTicker(200 * time.Millisecond)
 	defer decide.Stop()
 	report := time.NewTicker(time.Minute)
 	defer report.Stop()
 	nextAt := time.Now().Add(a.jitter())
-	a.log.Info("pair actor started", "dry_run", a.cfg.DryRun, "step_qty", a.cfg.Params.StepQty, "max_steps", a.cfg.Params.MaxSteps,
-		"size_decimals", a.cfg.Pair.SizeDecimals, "recorded_steps", len(a.state.Steps))
-
 	for {
+		if a.fatalErr != nil {
+			return a.fatalErr
+		}
 		select {
 		case <-ctx.Done():
-			a.persist()
 			return nil
-		case now := <-sample:
+		case <-a.drainWake:
+			// Drain is an actor-owned transition; it cannot be overwritten by risk recovery.
+			if a.reconciled && !a.checkpoint {
+				a.state.Mode = strategy.ModeReduceOnly
+			}
+		case <-sample:
+			now := time.Now()
 			if q, ok := a.quote(now); ok {
 				a.cfg.Est.Update(now, q.Mid)
 			}
-		case now := <-volC:
+		case <-volC:
+			now := time.Now()
 			if q, ok := a.volQuote(now); ok {
-				a.cfg.Vol.Add(q.Mid)
+				a.cfg.Vol.AddAt(now, q.Mid)
 				if a.cfg.VolL != nil {
-					a.cfg.VolL.Add(q.L.Mid())
+					a.cfg.VolL.AddAt(now, q.L.Mid())
 				}
 				if a.cfg.VolR != nil {
-					a.cfg.VolR.Add(q.R.Mid())
+					a.cfg.VolR.AddAt(now, q.R.Mid())
 				}
 				if a.cfg.Samples != nil {
-					a.cfg.Samples.Add(now, q.Mid, q.LS, q.SL)
+					if err := a.cfg.Samples.AddQuote(now, q); err != nil {
+						return fmt.Errorf("sample %s: %w", a.key, err)
+					}
 				}
 			}
-		case now := <-riskC:
-			a.risk(ctx, now)
 		case <-report.C:
 			st := a.statsSnapshot()
-			q, _ := a.quote(time.Now())
-			vol := a.volBps()
-			a.log.Info("status", "mode", a.state.Mode, "steps", a.state.Counter(), "mu_bps", round2(st.Mean),
-				"samples", st.Samples, "span", st.Span.Round(time.Second), "coverage", round2(st.Coverage),
-				"LS_bps", round2(q.LS), "SL_bps", round2(q.SL), "mid_bps", round2(q.Mid),
-				"vol_500ms_bps", round4(vol), "lat_n", a.lat.n, "lat_avg_ms", a.lat.avg().Milliseconds(), "lat_max_ms", a.lat.max.Milliseconds(),
-				"day_volume_usd", round2(a.volAcc.volumeUSD), "day_pnl_usd", round4(a.volAcc.pnlUSD),
-				"tick_k", round4(a.tickK()), "fail_rate", round4(a.failRate()))
 			a.record(monitor.KindStatus, func(e *monitor.Event) {
-				e.Steps = a.state.Counter()
-				e.MuBps, e.SigmaBps, e.TickK, e.FailRate = st.Mean, vol, a.tickK(), a.failRate()
+				e.Steps = absCounter(a.state.Counter())
+				e.Mode = a.state.Mode.String()
+				e.MuBps, e.SigmaBps, e.TickK, e.FailRate = st.Mean, a.volBps(), a.tickK(), a.FailRate()
 			})
+			a.log.Info("status", "mode", a.state.Mode, "steps", a.state.Counter(), "day_volume_usd", a.volAcc.volumeUSD, "day_pnl_usd", a.volAcc.pnlUSD, "fail_rate", a.FailRate())
 			a.lat.reset()
-		case now := <-decide.C:
-			if a.state.Mode == strategy.ModeWarmup && a.meanReady() {
-				a.state.Mode = strategy.ModeRunning
-				a.log.Info("mean ready -> RUNNING", "stats", a.statsSnapshot())
+		case <-decide.C:
+			now := time.Now()
+			if a.pending != nil {
+				a.resolvePending(ctx)
+				continue
 			}
-			if now.Before(nextAt) || a.state.Mode == strategy.ModePaused {
+			if a.emergencyRequested.Load() && a.reconciled && !a.checkpoint {
+				a.emergency(ctx)
+				nextAt = now.Add(a.jitter())
+				continue
+			}
+			if a.draining.Load() {
+				if a.reconciled && !a.checkpoint {
+					a.drain(ctx)
+				}
+				continue
+			}
+			if a.state.Mode == strategy.ModePaused {
+				continue
+			}
+			if a.riskBlocked.Load() {
+				a.state.Mode = strategy.ModeReduceOnly
+			} else if a.state.Mode == strategy.ModeReduceOnly && a.meanReady() {
+				a.state.Mode = strategy.ModeRunning
+			}
+			if a.state.Mode == strategy.ModeWarmup && a.meanReady() && !a.riskBlocked.Load() {
+				a.state.Mode = strategy.ModeRunning
+			}
+			if now.Before(nextAt) {
 				continue
 			}
 			q, ok := a.quote(now)
@@ -395,14 +508,20 @@ func (a *PairActor) Run(ctx context.Context) error {
 				continue
 			}
 			a.resetVolumeIfNewDay(now)
-			if act.Kind == strategy.Open && !a.canOpenVolume() {
-				a.log.Warn("volume budget reached; skipping open", "day_volume_usd", a.volAcc.volumeUSD, "day_pnl_usd", a.volAcc.pnlUSD)
+			if act.Kind == strategy.Open && (!a.canOpenVolume() || a.riskBlocked.Load()) {
 				continue
 			}
 			a.apply(ctx, act, q)
 			nextAt = time.Now().Add(a.jitter())
 		}
 	}
+}
+
+func absCounter(n int) int {
+	if n < 0 {
+		return -n
+	}
+	return n
 }
 
 func (a *PairActor) quote(now time.Time) (spread.Quote, bool) {
@@ -413,6 +532,10 @@ func (a *PairActor) quote(now time.Time) (spread.Quote, bool) {
 	l, r := a.bookL, a.bookR
 	a.bookMu.RUnlock()
 	if now.Sub(l.Ts) > a.cfg.MaxBookAge || now.Sub(r.Ts) > a.cfg.MaxBookAge {
+		return spread.Quote{}, false
+	}
+	if l.Ts.After(now) || r.Ts.After(now) || l.Venue != a.cfg.L.Name() || r.Venue != a.cfg.R.Name() ||
+		l.MarketID != a.cfg.Pair.Left.MarketID || r.MarketID != a.cfg.Pair.Right.MarketID {
 		return spread.Quote{}, false
 	}
 	return spread.Compute(l, r)
@@ -426,6 +549,10 @@ func (a *PairActor) volQuote(now time.Time) (spread.Quote, bool) {
 	a.bookMu.RUnlock()
 	age := a.cfg.VolMaxAge
 	if now.Sub(l.Ts) > age || now.Sub(r.Ts) > age {
+		return spread.Quote{}, false
+	}
+	if l.Ts.After(now) || r.Ts.After(now) || l.Venue != a.cfg.L.Name() || r.Venue != a.cfg.R.Name() ||
+		l.MarketID != a.cfg.Pair.Left.MarketID || r.MarketID != a.cfg.Pair.Right.MarketID {
 		return spread.Quote{}, false
 	}
 	if d := l.Ts.Sub(r.Ts); d > age || -d > age {
@@ -442,7 +569,7 @@ func (a *PairActor) volBps() float64 {
 	if a.cfg.Vol == nil {
 		return 0
 	}
-	return a.cfg.Vol.Vol()
+	return a.cfg.Vol.VolAt(time.Now())
 }
 
 // record publishes a runtime event to the optional monitor.
@@ -450,7 +577,7 @@ func (a *PairActor) record(kind monitor.Kind, fill func(*monitor.Event)) {
 	if a.cfg.Monitor == nil {
 		return
 	}
-	e := monitor.Event{Time: time.Now(), Pair: a.key, Kind: kind}
+	e := monitor.Event{Time: time.Now(), Pair: a.key, Kind: kind, Mode: a.state.Mode.String()}
 	if fill != nil {
 		fill(&e)
 	}
@@ -463,10 +590,10 @@ func (a *PairActor) legVol(venue string) float64 {
 		return a.cfg.View.LegVol(venue)
 	}
 	if venue == a.cfg.L.Name() && a.cfg.VolL != nil {
-		return a.cfg.VolL.Vol()
+		return a.cfg.VolL.VolAt(time.Now())
 	}
 	if venue == a.cfg.R.Name() && a.cfg.VolR != nil {
-		return a.cfg.VolR.Vol()
+		return a.cfg.VolR.VolAt(time.Now())
 	}
 	return 0
 }
@@ -479,37 +606,26 @@ func (a *PairActor) tickK() float64 {
 	return a.cfg.ExecCfg.TickK
 }
 
-// failRate returns the observed one-leg failure rate (0 before a full window).
-func (a *PairActor) failRate() float64 {
+func (a *PairActor) observeFailure(failed bool) {
+	window := a.cfg.Adaptive.Window
+	if window <= 0 {
+		window = 50
+	}
+	if len(a.failures) < window {
+		a.failures = append(a.failures, failed)
+	} else {
+		a.failures[a.failureIndex] = failed
+		a.failureIndex = (a.failureIndex + 1) % window
+	}
+	n := 0
+	for _, f := range a.failures {
+		if f {
+			n++
+		}
+	}
+	a.failBits.Store(math.Float64bits(float64(n) / float64(len(a.failures))))
 	if a.adaptive != nil {
-		return a.adaptive.Rate()
-	}
-	return 0
-}
-
-// risk refreshes liquidation data on its interval, then applies the margin
-// monitor's decision (arm/disarm/trigger) to the actor state.
-func (a *PairActor) risk(ctx context.Context, now time.Time) {
-	if a.cfg.DryRun || a.cfg.Risk.trigger <= 0 {
-		return
-	}
-	if now.Sub(a.margin.lastRefresh) >= a.margin.cfg.refresh {
-		a.margin.refresh(ctx, a.cfg.L, a.cfg.R, a.cfg.Pair.Left.MarketID, a.cfg.Pair.Right.MarketID)
-	}
-	markL, markR, fresh := a.riskMarks()
-	switch a.margin.assess(markL, markR, fresh) {
-	case marginArm:
-		if a.state.Mode == strategy.ModeRunning {
-			a.state.Mode = strategy.ModeReduceOnly
-			a.log.Warn("margin floor reached; reduce only", "markL", round2(markL), "markR", round2(markR))
-		}
-	case marginDisarm:
-		if a.state.Mode == strategy.ModeReduceOnly {
-			a.state.Mode = strategy.ModeRunning
-			a.log.Info("margin recovered; resuming", "markL", round2(markL), "markR", round2(markR))
-		}
-	case marginTrigger:
-		a.emergency(ctx)
+		a.adaptive.Observe(failed)
 	}
 }
 
@@ -517,131 +633,17 @@ func (a *PairActor) risk(ctx context.Context, now time.Time) {
 func (a *PairActor) riskMarks() (float64, float64, bool) {
 	lb, lok := a.book(a.cfg.L.Name(), a.cfg.Pair.Left.MarketID)
 	rb, rok := a.book(a.cfg.R.Name(), a.cfg.Pair.Right.MarketID)
-	if !lok || !rok {
-		return 0, 0, false
+	var ml, mr float64
+	if lok {
+		ml = lb.Mid()
 	}
-	return lb.Mid(), rb.Mid(), true
+	if rok {
+		mr = rb.Mid()
+	}
+	return ml, mr, lok && rok
 }
 
-// emergency market-flattens both legs to zero and pauses the pair.
-func (a *PairActor) emergency(ctx context.Context) {
-	a.log.Error("ALERT: liquidation risk, emergency unwind")
-	a.record(monitor.KindEmergency, nil)
-	res, err := a.exec.EmergencyFlatten(ctx,
-		execution.LegSpec{Venue: a.cfg.L, Inst: a.cfg.Pair.Left},
-		execution.LegSpec{Venue: a.cfg.R, Inst: a.cfg.Pair.Right},
-		0, a.posL, a.posR)
-	if err != nil {
-		a.log.Error("emergency flatten failed; will retry", "err", err)
-		return
-	}
-	a.posL, a.posR = res.PosL, res.PosR
-	a.state.Steps = nil
-	a.syncCounter()
-	a.state.Mode = strategy.ModePaused
-	a.log.Error("emergency unwind done", "rescue_orders", res.RescueOrders, "posL", res.PosL, "posR", res.PosR,
-		"took", res.Duration.Round(time.Millisecond))
-	a.persist()
-}
-
-func (a *PairActor) apply(ctx context.Context, act strategy.Action, q spread.Quote) {
-	a.log.Info("action", "kind", act.Kind, "dir", act.Dir, "qty", act.Qty, "L", fmt.Sprintf("%s@%.4f", act.L.Side, act.L.Price),
-		"R", fmt.Sprintf("%s@%.4f", act.R.Side, act.R.Price), "expected_bps", round2(act.ExpectedBps), "reason", act.Reason)
-
-	fillL, fillR, pxL, pxR := act.Qty, act.Qty, act.L.Price, act.R.Price
-	rescueLPx, rescueRPx := 0.0, 0.0
-	rescueQty, rescueCost := 0.0, 0.0
-	if !a.cfg.DryRun {
-		res := a.exec.Execute(ctx,
-			execution.LegSpec{Venue: a.cfg.L, Inst: a.cfg.Pair.Left, Side: act.L.Side, Price: act.L.Price},
-			execution.LegSpec{Venue: a.cfg.R, Inst: a.cfg.Pair.Right, Side: act.R.Side, Price: act.R.Price},
-			act.Qty, act.Kind == strategy.Close, a.posL, a.posR)
-		fillL, fillR, pxL, pxR = res.L.Filled, res.R.Filled, res.L.AvgPrice, res.R.AvgPrice
-		rescueLPx, rescueRPx = res.L.RescuePrice, res.R.RescuePrice
-		rescueQty = res.RescueQty
-		rescueCost = rescueCostUSD(res.L, res.R)
-		a.posL, a.posR = res.PosL, res.PosR
-		a.lat.add(res.L.Latency)
-		a.lat.add(res.R.Latency)
-		a.log.Info("executed", "fillL", fillL, "fillR", fillR, "pxL", pxL, "pxR", pxR, "statusL", res.L.Status, "statusR", res.R.Status,
-			"rescue_orders", res.RescueOrders, "rescue_qty", res.RescueQty, "posL", res.PosL, "posR", res.PosR, "took", res.Duration.Round(time.Millisecond),
-			"rescue_cost_usd", round4(rescueCost), "latL_ms", res.L.Latency.Milliseconds(), "latR_ms", res.R.Latency.Milliseconds())
-		half := math.Pow10(-a.cfg.Pair.SizeDecimals) / 2
-		a.record(monitor.KindExecuted, func(e *monitor.Event) {
-			e.USD = (res.L.Filled + res.R.Filled + res.RescueQty) * q.RefMid
-			e.OneLeg = (res.L.Filled < half && res.R.Filled >= half) || (res.R.Filled < half && res.L.Filled >= half)
-			e.LatencyMs = float64(res.L.Latency.Milliseconds()+res.R.Latency.Milliseconds()) / 2
-		})
-		if res.RescueOrders > 0 {
-			a.record(monitor.KindRescue, func(e *monitor.Event) { e.Qty = res.RescueQty })
-		}
-	}
-	a.volAcc.volumeUSD += (fillL + fillR + rescueQty) * q.RefMid
-	a.volAcc.pnlUSD -= rescueCost
-	eps := math.Pow10(-a.cfg.Pair.SizeDecimals) / 2
-	if a.adaptive != nil {
-		oneLeg := (fillL < eps && fillR >= eps) || (fillR < eps && fillL >= eps)
-		a.adaptive.Observe(oneLeg)
-	}
-	switch act.Kind {
-	case strategy.Open:
-		h := math.Min(fillL, fillR)
-		if h < eps {
-			a.log.Warn("open produced no hedged qty")
-			break
-		}
-		st := strategy.Step{ID: a.next, Dir: act.Dir, Qty: domain.Round(h, a.cfg.Pair.SizeDecimals),
-			EntryBps: strategy.EntryBps(act.Dir, pxL, pxR), OpenL: pxL, OpenR: pxR, OpenedAt: time.Now()}
-		a.next++
-		a.state.Steps = append(a.state.Steps, st)
-		a.syncCounter()
-		a.log.Info("step opened", "id", st.ID, "entry_bps", round2(st.EntryBps), "counter", a.state.Counter())
-		a.record(monitor.KindStepOpened, func(e *monitor.Event) { e.Dir = act.Dir.String(); e.Qty = st.Qty })
-	case strategy.Close:
-		closed := math.Max(fillL, fillR) // the lagging leg is completed by rescue
-		fee := a.roundTripFeeBps()
-		for i := range a.state.Steps {
-			if a.state.Steps[i].ID != act.StepID {
-				continue
-			}
-			if closed >= eps {
-				lpx, rpx := pxL, pxR
-				if fillL <= eps && rescueLPx > 0 {
-					lpx = rescueLPx
-				}
-				if fillR <= eps && rescueRPx > 0 {
-					rpx = rescueRPx
-				}
-				gross := a.state.Steps[i].EntryBps + strategy.EntryBps(-act.Dir, lpx, rpx)
-				net := gross - fee
-				a.state.Steps[i].Realized += net
-				a.volAcc.pnlUSD += closed * q.RefMid * net / 1e4
-				a.log.Info("step pnl", "id", act.StepID, "gross_bps", round2(gross), "fee_bps", round2(fee),
-					"net_bps", round2(net), "realized_bps", round2(a.state.Steps[i].Realized), "lpx", lpx, "rpx", rpx)
-			}
-			a.state.Steps[i].Qty = domain.Round(a.state.Steps[i].Qty-closed, a.cfg.Pair.SizeDecimals)
-			if a.state.Steps[i].Qty < eps {
-				realized := a.state.Steps[i].Realized
-				a.state.Steps = append(a.state.Steps[:i], a.state.Steps[i+1:]...)
-				a.syncCounter()
-				a.log.Info("step closed", "id", act.StepID, "profit_bps", round2(act.ExpectedBps), "counter", a.state.Counter())
-				a.record(monitor.KindStepClosed, func(e *monitor.Event) {
-					e.Dir = act.Dir.String()
-					e.USD = closed * q.RefMid * realized / 1e4
-				})
-			}
-			break
-		}
-	}
-	if !a.cfg.DryRun {
-		if err := a.checkHedge(); err != nil {
-			a.state.Mode = strategy.ModePaused
-			a.log.Error("hedge invariant broken; pausing", "err", err)
-			a.record(monitor.KindError, func(e *monitor.Event) { e.Msg = err.Error() })
-		}
-	}
-	a.persist()
-}
+// Trading settlement and dollar accounting live in settlement.go.
 
 // expectedL is the left-leg position implied by the step ledger.
 func (a *PairActor) expectedL() float64 {
@@ -651,37 +653,3 @@ func (a *PairActor) expectedL() float64 {
 	}
 	return exp
 }
-
-// roundTripFeeBps is the total taker fee (bps) of a full open+close round trip.
-func (a *PairActor) roundTripFeeBps() float64 {
-	return a.cfg.Params.FeeBps
-}
-
-// checkHedge verifies the step ledger still matches venue positions after
-// execution; drift is an invariant violation (e.g. an incomplete rescue).
-func (a *PairActor) checkHedge() error {
-	eps := math.Pow10(-a.cfg.Pair.SizeDecimals) / 2
-	expL := a.expectedL()
-	if math.Abs(a.posL-expL) >= eps || math.Abs(a.posR+expL) >= eps {
-		return fmt.Errorf("posL %.6f posR %.6f vs expected L %.6f R %.6f", a.posL, a.posR, expL, -expL)
-	}
-	return nil
-}
-
-// rescueCostUSD estimates the slippage of rescue orders that flattened a
-// directly-filled leg (e.g. a one-leg open failure); legs with no direct fill
-// are skipped because their rescue price is already folded into realized PnL.
-func rescueCostUSD(l, r execution.LegResult) float64 {
-	cost := 0.0
-	if l.RescueFilled > 0 && l.AvgPrice > 0 {
-		cost += l.RescueFilled * math.Abs(l.AvgPrice-l.RescuePrice)
-	}
-	if r.RescueFilled > 0 && r.AvgPrice > 0 {
-		cost += r.RescueFilled * math.Abs(r.AvgPrice-r.RescuePrice)
-	}
-	return cost
-}
-
-func round2(v float64) float64 { return math.Round(v*100) / 100 }
-
-func round4(v float64) float64 { return math.Round(v*10000) / 10000 }

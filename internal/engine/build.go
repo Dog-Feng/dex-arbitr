@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/Dog-Feng/dex-arbitr/internal/config"
 	"github.com/Dog-Feng/dex-arbitr/internal/domain"
@@ -49,6 +51,23 @@ func BuildVenues(c *config.Config) (map[string]exchange.Venue, error) {
 	for _, vc := range c.Venues {
 		v, err := exchange.New(vc.Kind, vc.Name, vc.Opts)
 		if err != nil {
+			for _, previous := range out {
+				if closeErr := previous.Close(); closeErr != nil {
+					err = errors.Join(err, closeErr)
+				}
+			}
+			return nil, err
+		}
+		if _, exists := out[vc.Name]; exists {
+			err = fmt.Errorf("duplicate venue name %q", vc.Name)
+			if closeErr := v.Close(); closeErr != nil {
+				err = errors.Join(err, closeErr)
+			}
+			for _, previous := range out {
+				if closeErr := previous.Close(); closeErr != nil {
+					err = errors.Join(err, closeErr)
+				}
+			}
 			return nil, err
 		}
 		out[vc.Name] = v
@@ -120,34 +139,67 @@ func (rt *runtime) applyLeverage(ctx context.Context, v exchange.Venue, inst dom
 }
 
 // Run performs shared setup, then runs the configured pair-selection mode.
-func Run(ctx context.Context, c *config.Config) error {
+func Run(ctx context.Context, c *config.Config) (runErr error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	mon := monitor.New(func(msg string) { slog.Error("ALERT", "msg", msg) })
 	if c.Monitor.Addr != "" {
 		addr := c.Monitor.Addr
 		if !strings.Contains(addr, ":") {
 			addr = ":" + addr // bare port, e.g. "8080"
 		}
-		srv := &http.Server{Addr: addr, Handler: mon.Handler(c.Monitor.Token)}
+		listener, err := net.Listen("tcp", addr)
+		if err != nil {
+			return fmt.Errorf("monitor listen: %w", err)
+		}
+		srv := &http.Server{Addr: addr, Handler: mon.Handler(c.Monitor.Token), ReadHeaderTimeout: 5 * time.Second}
+		serverErr := make(chan error, 1)
+		serverDone := make(chan struct{})
 		go func() {
-			if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-				slog.Error("monitor server", "err", err)
+			defer close(serverDone)
+			if err := srv.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				serverErr <- fmt.Errorf("monitor server: %w", err)
+				cancel()
 			}
 		}()
-		defer func() { _ = srv.Shutdown(context.Background()) }()
+		defer func() {
+			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer shutdownCancel()
+			if err := srv.Shutdown(shutdownCtx); err != nil {
+				runErr = errors.Join(runErr, fmt.Errorf("monitor shutdown: %w", err))
+				if closeErr := srv.Close(); closeErr != nil {
+					runErr = errors.Join(runErr, closeErr)
+				}
+			}
+			<-serverDone
+			select {
+			case err := <-serverErr:
+				runErr = errors.Join(runErr, err)
+			default:
+			}
+		}()
 	}
 	venues, err := BuildVenues(c)
 	if err != nil {
 		return err
 	}
 	defer func() {
+		cancel()
 		for _, v := range venues {
-			_ = v.Close()
+			if err := v.Close(); err != nil {
+				runErr = errors.Join(runErr, fmt.Errorf("close %s: %w", v.Name(), err))
+			}
 		}
 	}()
 	st, err := store.New(c.StateDir)
 	if err != nil {
 		return err
 	}
+	defer func() {
+		if err := st.Close(); err != nil {
+			runErr = errors.Join(runErr, fmt.Errorf("close state store: %w", err))
+		}
+	}()
 	var tracker *execution.Tracker
 	if !c.DryRun {
 		var trading []exchange.Venue

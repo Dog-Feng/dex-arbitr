@@ -5,7 +5,98 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
+
+func loadTestConfig(t *testing.T, data string) (*Config, error) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return Load(path)
+}
+
+func TestLoadStrictValidation(t *testing.T) {
+	for _, tc := range []struct {
+		name, data, want string
+	}{
+		{"unknown root field", "dry_rnu: true\n", "dry_rnu"},
+		{"unknown nested field", "strategy:\n  max_books_age: 1s\n", "max_books_age"},
+		{"duplicate YAML key", "dry_run: true\ndry_run: false\n", "already defined"},
+		{"second YAML document", "dry_run: true\n---\ndry_run: false\n", "multiple YAML documents"},
+		{"nan threshold", "strategy:\n  open_bps: .nan\n", "strategy.open_bps must be finite"},
+		{"infinite budget", "volume:\n  daily_cost_budget: .inf\n", "volume.daily_cost_budget must be finite"},
+		{"nonfinite inactive option", "auto:\n  notional_per_leg: -.inf\n", "auto.notional_per_leg must be finite"},
+		{"zero estimator interval", "estimator:\n  interval: 0s\n", "estimator.interval must be > 0"},
+		{"negative estimator window", "estimator:\n  window: -1s\n", "estimator.window must be > 0"},
+		{"zero warmup", "estimator:\n  min_warmup: 0s\n", "estimator.min_warmup must be > 0"},
+		{"warmup beyond window", "estimator:\n  window: 1m\n  min_warmup: 2m\n", "must not exceed window"},
+		{"interval beyond window", "estimator:\n  window: 1m\n  min_warmup: 1m\n  interval: 2m\n", "must not exceed window"},
+		{"coverage above one", "estimator:\n  min_coverage: 1.1\n", "min_coverage"},
+		{"zero action interval", "strategy:\n  interval_min: 0s\n", "strategy.interval_min must be > 0"},
+		{"negative book age", "strategy:\n  max_book_age: -1s\n", "strategy.max_book_age must be > 0"},
+		{"reversed action interval", "strategy:\n  interval_min: 11s\n  interval_max: 10s\n", "interval_max < interval_min"},
+		{"zero auto dwell", "auto:\n  dwell: 0s\n", "auto.dwell must be > 0"},
+		{"zero volatility cadence", "volatility:\n  interval: 0s\n", "volatility"},
+		{"horizon below cadence", "volatility:\n  horizon: 10ms\n", "horizon >= interval"},
+		{"negative margin refresh", "risk:\n  position_refresh: -1s\n", "position_refresh"},
+		{"zero emergency limit", "risk:\n  emergency_market_bps: 0\n", "emergency_market_bps"},
+		{"empty matching suffix", "matching:\n  strip_suffixes: [USD, '']\n", "empty suffix"},
+		{"blank matching suffix", "matching:\n  strip_suffixes: [' ']\n", "empty suffix"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := loadTestConfig(t, tc.data); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Load error=%v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestLoadVenueAndPairIdentity(t *testing.T) {
+	venues := "venues:\n  - {name: L, kind: lighter}\n  - {name: R, kind: extended}\n  - {name: C, kind: lighter}\n"
+	for _, tc := range []struct {
+		name, data, want string
+	}{
+		{"duplicate venue", "venues:\n  - {name: L, kind: lighter}\n  - {name: L, kind: extended}\n", "duplicate venue"},
+		{"blank venue", "venues:\n  - {name: ' ', kind: lighter}\n", "name and kind"},
+		{"same venue on both legs", venues + "pairs:\n  - {base: BTC, left: L, right: L, step_qty: 1, max_steps: 1}\n", "different venues"},
+		{"unknown venue", venues + "pairs:\n  - {base: BTC, left: L, right: Missing, step_qty: 1, max_steps: 1}\n", "unknown venue"},
+		{"empty base", venues + "pairs:\n  - {base: '', left: L, right: R, step_qty: 1, max_steps: 1}\n", "base must not be empty"},
+		{"base normalizes empty", venues + "pairs:\n  - {base: '-', left: L, right: R, step_qty: 1, max_steps: 1}\n", "empty base"},
+		{"duplicate reversed normalized pair", venues + "pairs:\n  - {base: BTC-USD, left: L, right: R, step_qty: 1, max_steps: 1}\n  - {base: BTC, left: R, right: L, step_qty: 1, max_steps: 1}\n", "duplicate pair"},
+		{"shared market between combinations", venues + "pairs:\n  - {base: BTC, left: L, right: R, step_qty: 1, max_steps: 1}\n  - {base: BTCUSD, left: L, right: C, step_qty: 1, max_steps: 1}\n", "share market"},
+		{"nonfinite pair size", venues + "pairs:\n  - {base: BTC, left: L, right: R, step_qty: .nan, max_steps: 1}\n", "pairs[0].step_qty must be finite"},
+		{"zero pair size", venues + "pairs:\n  - {base: BTC, left: L, right: R, step_qty: 0, max_steps: 1}\n", "step_qty and max_steps"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := loadTestConfig(t, tc.data); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Load error=%v, want %q", err, tc.want)
+			}
+		})
+	}
+	if _, err := loadTestConfig(t, venues+"pairs:\n  - {base: BTC, left: L, right: R, step_qty: 1, max_steps: 1}\n  - {base: ETH, left: L, right: C, step_qty: 1, max_steps: 1}\n"); err != nil {
+		t.Fatalf("disjoint markets should be accepted: %v", err)
+	}
+}
+
+func TestLoadDefaultsAndExplicitZero(t *testing.T) {
+	c, err := loadTestConfig(t, "dry_run: true\nstrategy:\n  open_bps: 0\n  close_bps: 0\nexecution:\n  price_ticks: 0\n  min_ticks: 0\nrisk:\n  margin_hysteresis: 0\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Strategy.OpenBps != 0 || c.Strategy.CloseBps != 0 || c.Execution.PriceTicks != 0 || c.Execution.TickMin != 0 || c.Risk.MarginHysteresis != 0 {
+		t.Fatalf("explicit zeros replaced by defaults: %+v", c)
+	}
+	if c.Estimator.Interval != time.Second || c.Volatility.Interval != 100*time.Millisecond || c.Strategy.IntervalMin != 7*time.Second {
+		t.Fatalf("omitted values lost defaults: %+v", c)
+	}
+	t.Setenv("DEX_TEST_MONITOR_TOKEN", "expanded-token")
+	c, err = loadTestConfig(t, "monitor:\n  token: ${DEX_TEST_MONITOR_TOKEN}\n")
+	if err != nil || c.Monitor.Token != "expanded-token" {
+		t.Fatalf("environment expansion: %+v, %v", c, err)
+	}
+}
 
 func TestLoadExecutionPriceTicks(t *testing.T) {
 	for _, tc := range []struct {

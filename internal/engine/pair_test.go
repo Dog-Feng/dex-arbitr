@@ -239,7 +239,7 @@ func TestPairActorUpdatesBooksDuringExecutionAndRescue(t *testing.T) {
 
 func TestPairActorRescueBookFreshness(t *testing.T) {
 	l, r := newActorTestVenue("L"), newActorTestVenue("R")
-	a := &PairActor{cfg: PairConfig{L: l, R: r, MaxBookAge: time.Second}}
+	a := &PairActor{cfg: PairConfig{L: l, R: r, MaxBookAge: time.Second, Pair: symbols.NewPair("TEST", domain.Instrument{MarketID: 1}, domain.Instrument{MarketID: 1})}}
 	for _, name := range []string{"L", "R"} {
 		t.Run(name, func(t *testing.T) {
 			for _, tc := range []struct {
@@ -266,7 +266,7 @@ func TestPairActorBookCollectorStops(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			l, r := newActorTestVenue("L"), newActorTestVenue("R")
-			a := &PairActor{cfg: PairConfig{L: l, R: r, MaxBookAge: time.Second}}
+			a := &PairActor{cfg: PairConfig{L: l, R: r, MaxBookAge: time.Second, Pair: symbols.NewPair("TEST", domain.Instrument{MarketID: 1}, domain.Instrument{MarketID: 1})}}
 			done := make(chan struct{})
 			go func() {
 				defer close(done)

@@ -29,8 +29,8 @@ func (m Matcher) Normalize(sym string) string {
 		s = strings.TrimRight(s, m.Separators)
 		changed := false
 		for _, suf := range m.Suffixes {
-			suf = strings.ToUpper(suf)
-			if len(s) > len(suf) && strings.HasSuffix(s, suf) {
+			suf = strings.ToUpper(strings.TrimSpace(suf))
+			if suf != "" && len(s) > len(suf) && strings.HasSuffix(s, suf) {
 				s = s[:len(s)-len(suf)]
 				changed = true
 				break
@@ -57,14 +57,38 @@ func (p Pair) AlignQty(q float64) float64 { return domain.Floor(q, p.SizeDecimal
 
 // ValidQty reports whether q is tradable on both venues at the given price.
 func (p Pair) ValidQty(q, price float64) (bool, string) {
-	if p.AlignQty(q) != domain.Round(q, p.SizeDecimals) {
+	if math.IsNaN(q) || math.IsInf(q, 0) || q <= 0 {
+		return false, "qty must be finite and positive"
+	}
+	if math.IsNaN(price) || math.IsInf(price, 0) || price < 0 {
+		return false, "price must be finite and nonnegative"
+	}
+	scale := math.Pow10(p.SizeDecimals)
+	if p.SizeDecimals < 0 || math.IsInf(scale, 0) || scale == 0 ||
+		math.IsNaN(p.MinQty) || math.IsInf(p.MinQty, 0) || p.MinQty < 0 ||
+		math.IsNaN(p.MinQuote) || math.IsInf(p.MinQuote, 0) || p.MinQuote < 0 {
+		return false, "invalid aligned trading limits"
+	}
+	scaled := q * scale
+	units := math.Round(scaled)
+	// Allow only floating-point representation error, not part of a size step.
+	ulp := math.Nextafter(scaled, math.Inf(1)) - scaled
+	if math.IsInf(scaled, 0) || units <= 0 || math.Abs(scaled-units) > 2*ulp {
 		return false, "qty has more decimals than aligned precision"
 	}
-	if q+1e-12 < p.MinQty {
+	qtyULP := math.Nextafter(q, math.Inf(1)) - q
+	if q < p.MinQty && p.MinQty-q > 2*qtyULP {
 		return false, "qty below min base"
 	}
-	if price > 0 && q*price+1e-9 < p.MinQuote {
-		return false, "notional below min quote"
+	if price > 0 && math.IsInf(q*price, 0) {
+		return false, "notional must be finite"
+	}
+	if price > 0 {
+		notional := q * price
+		notionalULP := math.Nextafter(notional, math.Inf(1)) - notional
+		if notional < p.MinQuote && p.MinQuote-notional > 2*notionalULP {
+			return false, "notional below min quote"
+		}
 	}
 	return true, ""
 }
@@ -105,6 +129,12 @@ func NewPair(base string, l, r domain.Instrument) Pair {
 	}
 	minQ := math.Max(l.MinBase, r.MinBase)
 	p := math.Pow10(dec)
-	minQ = math.Ceil(minQ*p-1e-9) / p
+	units := minQ * p
+	nearest := math.Round(units)
+	ulp := math.Nextafter(units, math.Inf(1)) - units
+	if math.Abs(units-nearest) <= 2*ulp {
+		units = nearest
+	}
+	minQ = math.Ceil(units) / p
 	return Pair{Base: base, Left: l, Right: r, SizeDecimals: dec, MinQty: minQ, MinQuote: math.Max(l.MinQuote, r.MinQuote)}
 }

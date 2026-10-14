@@ -57,28 +57,57 @@ type LegSpec struct {
 
 // LegResult is the resolved outcome of a leg.
 type LegResult struct {
-	ClientID  int64
-	Status    domain.OrderStatus
-	Filled    float64 // unsigned
-	AvgPrice  float64
-	Resolved  bool // status came from venue (WS/REST), else inferred from positions
-	SubmitErr error
-	Latency   time.Duration // submit -> terminal state (WS/REST) or give-up
+	ClientID       int64
+	Status         domain.OrderStatus
+	Filled         float64 // unsigned
+	AvgPrice       float64
+	Resolved       bool // terminal venue outcome or definitively never submitted
+	SubmitErr      error
+	Latency        time.Duration // submit -> terminal state (WS/REST) or give-up
+	PriceEstimated bool          // AvgPrice is a protective/decision price estimate
 	// RescueFilled/RescuePrice are the quantity and volume-weighted price this
 	// leg completed via rescue orders (opposite side for opens, same side for
 	// closes). They let callers reconstruct the effective close price.
-	RescueFilled float64
-	RescuePrice  float64
+	RescueFilled         float64
+	RescuePrice          float64
+	RescuePriceEstimated bool
+	request              domain.OrderReq
 }
 
 // Result of a two-leg execution.
 type Result struct {
-	L, R         LegResult
-	PosL, PosR   float64 // final positions on the pair markets
-	RescueOrders int
-	RescueQty    float64
-	Duration     time.Duration
+	L, R            LegResult
+	PosL, PosR      float64 // final positions on the pair markets
+	RescueOrders    int
+	RescueQty       float64
+	Duration        time.Duration
+	PositionsKnown  bool  // positions were successfully read after the last order
+	SettlementKnown bool  // all submitted quantities have a terminal or fully-filled outcome
+	Err             error // cancellation, unavailable positions, or an unresolved order
+	pending         *pendingRescue
+	targetL         float64
+	targetR         float64
+	targetsKnown    bool
+	rescue          RescueParams
+	emergency       bool
 }
+
+// pendingRescue retains a submitted batch until its terminal outcomes and
+// position changes agree. Copies of Result must be recovered sequentially.
+type pendingRescue struct {
+	reqs             [2]domain.OrderReq
+	results          [2]LegResult
+	beforeL, beforeR float64
+	accountedQty     [2]float64
+	accountedQuote   [2]float64
+}
+
+// ErrUnresolved means a submitted order may still change the account position.
+var ErrUnresolved = errors.New("order outcome unresolved")
+
+// ErrIncomplete means orders have settled, but a rescue target has not yet
+// been reached. Retain Result and retry recovery without releasing the actor.
+var ErrIncomplete = errors.New("rescue targets not reached")
 
 // BookFn returns the latest book for a venue/market (for rescue pricing).
 type BookFn func(venue string, marketID int) (domain.Book, bool)
@@ -119,55 +148,240 @@ func MarketPosition(ctx context.Context, v exchange.Venue, marketID int) (float6
 	}
 	for _, p := range ps {
 		if p.MarketID == marketID {
+			if math.IsNaN(p.Qty) || math.IsInf(p.Qty, 0) {
+				return 0, fmt.Errorf("invalid position quantity on %s market %d", v.Name(), marketID)
+			}
 			return p.Qty, nil
 		}
 	}
 	return 0, nil
 }
 
-// Execute submits both legs concurrently (IOC), resolves each leg
-// (WS -> REST fallback -> positions), then flattens any net exposure.
-// before = positions (L, R) on the pair markets prior to the action; the
-// invariant enforced is posL+posR == before.L+before.R after completion.
-func (e *Executor) Execute(ctx context.Context, l, r LegSpec, qty float64, reduceOnly bool, beforeL, beforeR float64) Result {
+// Execute submits both IOC legs on an existing hedge, resolves their outcomes,
+// and reduces unequal fills to a hedge representable on both markets.
+func (e *Executor) Execute(ctx context.Context, l, r LegSpec, qty float64, reduceOnly bool, beforeL, beforeR float64) (res Result) {
 	start := time.Now()
-	res := Result{}
+	defer func() { res.Duration = time.Since(start) }()
+	res.PosL, res.PosR = beforeL, beforeR
+	res.rescue = e.cfg.Rescue
+	if err := ctx.Err(); err != nil {
+		res.Err = err
+		return res
+	}
+	if math.IsNaN(beforeL) || math.IsInf(beforeL, 0) || math.IsNaN(beforeR) || math.IsInf(beforeR, 0) || (l.Side != domain.Buy && l.Side != domain.Sell) || l.Side != -r.Side {
+		res.Err = fmt.Errorf("invalid pre-execution position or hedge sides")
+		return res
+	}
+	if math.Abs(beforeL+beforeR) >= halfUnit(l.Inst, r.Inst) {
+		res.Err = fmt.Errorf("cannot execute on unhedged positions %.8f/%.8f", beforeL, beforeR)
+		return res
+	}
+	if qty <= 0 || math.IsNaN(qty) || math.IsInf(qty, 0) || l.Price <= 0 || r.Price <= 0 || math.IsNaN(l.Price) || math.IsNaN(r.Price) || math.IsInf(l.Price, 0) || math.IsInf(r.Price, 0) {
+		res.Err = fmt.Errorf("invalid execution quantity or decision price")
+		return res
+	}
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() { defer wg.Done(); res.L = e.runLeg(ctx, l, qty, reduceOnly) }()
 	go func() { defer wg.Done(); res.R = e.runLeg(ctx, r, qty, reduceOnly) }()
 	wg.Wait()
 
-	// Positions are the source of truth for exposure.
-	time.Sleep(e.cfg.SettleDelay)
-	pl, pr, err := e.positions(ctx, l, r)
-	for err != nil && ctx.Err() == nil {
-		slog.Warn("positions read failed, retrying", "err", err)
-		time.Sleep(e.cfg.QueryInterval)
-		pl, pr, err = e.positions(ctx, l, r)
+	pl, pr, known, err := e.confirmPositions(ctx, l, r, beforeL, beforeR, &res.L, &res.R, qty, qty, l.Side, r.Side)
+	if known {
+		res.PosL, res.PosR, res.PositionsKnown = pl, pr, true
 	}
-	inferLeg(&res.L, pl-beforeL, l.Price)
-	inferLeg(&res.R, pr-beforeR, r.Price)
-
-	target := beforeL + beforeR
-	res.PosL, res.PosR = pl, pr
-	if eps := halfUnit(l.Inst, r.Inst); math.Abs(pl+pr-target) >= eps {
-		n, q, fl, fr := e.flatten(ctx, l, r, target, pl, pr, &res, e.cfg.Rescue)
-		res.RescueOrders, res.RescueQty, res.PosL, res.PosR = n, q, fl, fr
+	if err != nil {
+		res.Err = err
+		return res
 	}
-	res.Duration = time.Since(start)
+	res.SettlementKnown = true
+	// Keep only a hedge representable on both markets. Reducing both legs is
+	// necessary when a fine-precision partial fill leaves dust on the coarse leg.
+	tl, tr := hedgeTargets(pl, pr, l.Inst, r.Inst)
+	res.targetL, res.targetR, res.targetsKnown = tl, tr, true
+	res.Err = e.flatten(ctx, l, r, tl, tr, &res, e.cfg.Rescue)
 	return res
 }
 
-func inferLeg(lr *LegResult, delta, px float64) {
+// ResolveOutstanding continues a canceled execution with a live parent
+// context. It queries existing orders before confirming positions and resumes
+// reduce-only rescue only after every outstanding quantity is settled. Callers
+// must retain Result, the original legs, quantity and pre-execution positions,
+// and keep the actor paused while Err is non-nil.
+func (e *Executor) ResolveOutstanding(ctx context.Context, l, r LegSpec, res Result, qty, beforeL, beforeR float64) Result {
+	start := time.Now()
+	previousDuration := res.Duration
+	res.Err = nil
+	if err := ctx.Err(); err != nil {
+		res.Err = err
+		return res
+	}
+	// Work on a private batch copy so an older Result remains a valid snapshot.
+	if res.pending != nil {
+		batch := *res.pending
+		res.pending = &batch
+		res.Err = e.resolveRescue(ctx, l, r, &res, true)
+	} else if res.emergency {
+		pl, pr, err := e.positions(ctx, l, r)
+		res.PositionsKnown, res.SettlementKnown = err == nil, err == nil
+		if err == nil {
+			res.PosL, res.PosR = pl, pr
+		}
+		res.Err = err
+	} else if !res.SettlementKnown {
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); res.L = e.resolveExisting(ctx, l, qty, res.L) }()
+		go func() { defer wg.Done(); res.R = e.resolveExisting(ctx, r, qty, res.R) }()
+		wg.Wait()
+		pl, pr, known, err := e.confirmPositions(ctx, l, r, beforeL, beforeR, &res.L, &res.R, qty, qty, l.Side, r.Side)
+		res.PositionsKnown = known
+		if known {
+			res.PosL, res.PosR = pl, pr
+		}
+		res.Err = err
+		res.SettlementKnown = err == nil
+	}
+	if res.Err == nil {
+		if !res.targetsKnown {
+			res.targetL, res.targetR = hedgeTargets(res.PosL, res.PosR, l.Inst, r.Inst)
+			res.targetsKnown = true
+		}
+		res.Err = e.flatten(ctx, l, r, res.targetL, res.targetR, &res, res.rescue)
+	}
+	res.Duration = previousDuration + time.Since(start)
+	return res
+}
+
+// EscalateOutstanding widens only future rescue orders to the emergency price
+// bound. Outstanding IOC batches must still settle first, and the original
+// hedge targets and accounting remain intact for the caller's normal action.
+func (e *Executor) EscalateOutstanding(res Result) Result {
+	bps := e.cfg.EmergencyMarketBps
+	if bps <= 0 {
+		bps = 100
+	}
+	res.rescue = RescueParams{Immediate: true, MarketBps: bps}
+	return res
+}
+
+func inferLeg(lr *LegResult, delta, px, qty float64) {
 	if lr.Resolved {
 		return
 	}
 	lr.Filled = math.Abs(delta)
 	if lr.Filled > 0 {
+		// For an IOC with no execution quote, use its original price bound:
+		// buy costs are bounded above and sell proceeds below. A top-of-book
+		// decision estimate could invent profit inside the allowed slippage.
+		if lr.request.Price > 0 && !math.IsNaN(lr.request.Price) && !math.IsInf(lr.request.Price, 0) {
+			px = lr.request.Price
+		}
 		lr.AvgPrice = px // estimate; exact price unknown
-		lr.Status = domain.StatusFilled
+		lr.PriceEstimated = true
+		lr.Status = domain.StatusUnknown
+		if math.Abs(delta-qty) < 1e-9 {
+			lr.Status = domain.StatusFilled
+		}
 	}
+}
+
+func hedgeTargets(pl, pr float64, a, b domain.Instrument) (float64, float64) {
+	if pl*pr >= 0 {
+		return 0, 0
+	}
+	d := a.SizeDecimals
+	if b.SizeDecimals < d {
+		d = b.SizeDecimals
+	}
+	q := domain.Floor(math.Min(math.Abs(pl), math.Abs(pr)), d)
+	if pl < 0 {
+		q = -q
+	}
+	return q, -q
+}
+
+func pause(ctx context.Context, d time.Duration) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+// confirmPositions never interprets a failed read as a zero position. Known
+// fills must be reflected in the snapshot; an unknown order is safe to infer
+// only when its entire requested quantity has already changed the position.
+func (e *Executor) confirmPositions(ctx context.Context, l, r LegSpec, beforeL, beforeR float64, fl, fr *LegResult, qtyL, qtyR float64, sideL, sideR domain.Side) (float64, float64, bool, error) {
+	if err := pause(ctx, e.cfg.SettleDelay); err != nil {
+		return 0, 0, false, err
+	}
+	var lastErr error
+	var lastL, lastR float64
+	known := false
+	for i := 0; i <= e.cfg.QueryRetries; i++ {
+		pl, pr, err := e.positions(ctx, l, r)
+		if err == nil {
+			lastL, lastR, known = pl, pr, true
+			dl, dr := pl-beforeL, pr-beforeR
+			if sideL != 0 {
+				dl *= float64(sideL)
+			}
+			if sideR != 0 {
+				dr *= float64(sideR)
+			}
+			errL, errR := verifyDelta(fl, dl, qtyL, l.Inst), verifyDelta(fr, dr, qtyR, r.Inst)
+			if errL == nil || errors.Is(errL, ErrUnresolved) {
+				inferLeg(fl, dl, l.Price, qtyL)
+			}
+			if errR == nil || errors.Is(errR, ErrUnresolved) {
+				inferLeg(fr, dr, r.Price, qtyR)
+			}
+			err = errors.Join(errL, errR)
+			if err == nil {
+				return pl, pr, true, nil
+			}
+		}
+		lastErr = err
+		if i < e.cfg.QueryRetries {
+			if err := pause(ctx, e.cfg.QueryInterval); err != nil {
+				return lastL, lastR, known, errors.Join(lastErr, err)
+			}
+		}
+	}
+	return lastL, lastR, known, fmt.Errorf("confirm positions: %w", lastErr)
+}
+
+func verifyDelta(lr *LegResult, delta, qty float64, inst domain.Instrument) error {
+	eps := math.Pow10(-inst.SizeDecimals) / 2
+	if math.IsNaN(delta) || math.IsInf(delta, 0) || math.IsNaN(lr.Filled) || math.IsInf(lr.Filled, 0) || lr.Filled < 0 {
+		return fmt.Errorf("invalid position or filled quantity")
+	}
+	if delta < -eps || delta-qty >= eps {
+		return fmt.Errorf("unexpected position change %.8f for quantity %.8f", delta, qty)
+	}
+	if lr.Resolved {
+		if lr.Filled-qty >= eps || lr.Status == domain.StatusRejected && lr.Filled >= eps || lr.Status == domain.StatusFilled && math.Abs(lr.Filled-qty) >= eps {
+			return fmt.Errorf("invalid terminal fill %.8f for status %s and quantity %.8f", lr.Filled, lr.Status, qty)
+		}
+		if math.Abs(delta-lr.Filled) >= eps {
+			return fmt.Errorf("position change %.8f does not reflect confirmed fill %.8f", delta, lr.Filled)
+		}
+		return nil
+	}
+	if lr.Filled-delta >= eps {
+		return fmt.Errorf("position change %.8f is behind observed fill %.8f", delta, lr.Filled)
+	}
+	if math.Abs(delta-qty) >= eps {
+		return fmt.Errorf("%w: confirmed %.8f of requested %.8f", ErrUnresolved, delta, qty)
+	}
+	return nil
 }
 
 func halfUnit(a, b domain.Instrument) float64 {
@@ -316,9 +530,20 @@ func ticksTo(leg LegSpec, price float64) int {
 	return int(math.Ceil(d/leg.Inst.Tick() - 1e-9))
 }
 
-func (e *Executor) submitAndResolve(ctx context.Context, req domain.OrderReq, v exchange.Venue) LegResult {
-	lr := LegResult{ClientID: req.ClientID}
+func (e *Executor) submitAndResolve(ctx context.Context, req domain.OrderReq, v exchange.Venue) (lr LegResult) {
+	lr = LegResult{ClientID: req.ClientID, request: req}
 	start := time.Now()
+	defer func() { lr.Latency = time.Since(start) }()
+	if err := ctx.Err(); err != nil {
+		lr.SubmitErr = err
+		lr.Status, lr.Resolved = domain.StatusCanceled, true // no submission attempted
+		return lr
+	}
+	if req.Price <= 0 || math.IsNaN(req.Price) || math.IsInf(req.Price, 0) {
+		lr.SubmitErr = fmt.Errorf("%w: invalid order price", domain.ErrRejected)
+		lr.Status, lr.Resolved = domain.StatusRejected, true
+		return lr
+	}
 	w := e.tracker.Watch(v.Name(), req.ClientID)
 	defer e.tracker.Done(v.Name(), req.ClientID)
 
@@ -330,14 +555,68 @@ func (e *Executor) submitAndResolve(ctx context.Context, req domain.OrderReq, v 
 		slog.Warn("order rejected", "venue", v.Name(), "cid", req.ClientID, "err", err)
 		return lr
 	}
+	return e.awaitOrder(ctx, req, v, lr, w, start)
+}
+
+// resolveExisting never resubmits an order whose submission was uncertain.
+func (e *Executor) resolveExisting(ctx context.Context, leg LegSpec, qty float64, lr LegResult) LegResult {
+	if lr.Resolved {
+		return lr
+	}
+	if lr.ClientID == 0 {
+		lr.Status, lr.Resolved = domain.StatusCanceled, true // Execute stopped before submission
+		return lr
+	}
+	req := lr.request
+	if req.ClientID == 0 {
+		req = domain.OrderReq{ClientID: lr.ClientID, Inst: leg.Inst, Side: leg.Side, Qty: qty, Price: e.limitPrice(leg, qty)}
+	}
+	return e.queryExisting(ctx, req, leg.Venue, lr)
+}
+
+func (e *Executor) queryExisting(ctx context.Context, req domain.OrderReq, v exchange.Venue, lr LegResult) LegResult {
+	if lr.Resolved || ctx.Err() != nil {
+		return lr
+	}
+	start := time.Now()
+	w := e.tracker.Watch(v.Name(), req.ClientID)
+	defer e.tracker.Done(v.Name(), req.ClientID)
+	for i := 0; i < max(1, e.cfg.QueryRetries); i++ {
+		u, err := v.QueryOrder(ctx, req.Inst, req.ClientID)
+		if err == nil && u.Status.Terminal() {
+			return fill(lr, u, start, req.Price)
+		}
+		timer := time.NewTimer(e.cfg.QueryInterval)
+		select {
+		case u, ok := <-w:
+			timer.Stop()
+			if !ok {
+				w = nil
+			} else if u.Status.Terminal() {
+				return fill(lr, u, start, req.Price)
+			}
+		case <-ctx.Done():
+			timer.Stop()
+			return lr
+		case <-timer.C:
+		}
+	}
+	return lr
+}
+
+func (e *Executor) awaitOrder(ctx context.Context, req domain.OrderReq, v exchange.Venue, lr LegResult, w <-chan domain.OrderUpdate, start time.Time) LegResult {
 	// phase 2: WS terminal state
 	timer := time.NewTimer(e.cfg.AckTimeout)
 	defer timer.Stop()
 	for {
 		select {
-		case u := <-w:
+		case u, ok := <-w:
+			if !ok {
+				w = nil
+				break
+			}
 			if u.Status.Terminal() {
-				return fill(lr, u, start)
+				return fill(lr, u, start, req.Price)
 			}
 			continue
 		case <-timer.C:
@@ -350,13 +629,19 @@ func (e *Executor) submitAndResolve(ctx context.Context, req domain.OrderReq, v 
 	for i := 0; i < e.cfg.QueryRetries && ctx.Err() == nil; i++ {
 		u, qerr := v.QueryOrder(ctx, req.Inst, req.ClientID)
 		if qerr == nil && u.Status.Terminal() {
-			return fill(lr, u, start)
+			return fill(lr, u, start, req.Price)
 		}
 		select {
-		case u := <-w:
-			if u.Status.Terminal() {
-				return fill(lr, u, start)
+		case u, ok := <-w:
+			if !ok {
+				w = nil
+				continue
 			}
+			if u.Status.Terminal() {
+				return fill(lr, u, start, req.Price)
+			}
+		case <-ctx.Done():
+			return lr
 		case <-time.After(e.cfg.QueryInterval):
 		}
 	}
@@ -366,99 +651,197 @@ func (e *Executor) submitAndResolve(ctx context.Context, req domain.OrderReq, v 
 	return lr
 }
 
-func fill(lr LegResult, u domain.OrderUpdate, start time.Time) LegResult {
+func fill(lr LegResult, u domain.OrderUpdate, start time.Time, estimate float64) LegResult {
 	lr.Status, lr.Filled, lr.AvgPrice, lr.Resolved = u.Status, u.FilledQty, u.AvgPrice(), true
+	lr.PriceEstimated = false
+	if lr.Filled > 0 && (lr.AvgPrice <= 0 || math.IsNaN(lr.AvgPrice) || math.IsInf(lr.AvgPrice, 0)) {
+		lr.AvgPrice, lr.PriceEstimated = estimate, true
+	}
 	lr.Latency = time.Since(start)
 	return lr
 }
 
-// flatten loops reduce-only orders until posL+posR == target.
-// Positions are re-read before every retry.
-// EmergencyFlatten reduces both legs to a flat position using immediate market
-// orders (liquidation-risk unwind). It reuses the flatten loop with a wider
-// protective bound and no price relaxation ladder.
-func (e *Executor) EmergencyFlatten(ctx context.Context, l, r LegSpec, target, pl, pr float64) (Result, error) {
+// EmergencyFlatten reduces both market positions to zero and reports an error
+// unless every submitted order and both final positions have been confirmed.
+func (e *Executor) EmergencyFlatten(ctx context.Context, l, r LegSpec, target, pl, pr float64) (res Result, err error) {
 	start := time.Now()
-	res := Result{}
-	pl, pr, err := e.positions(ctx, l, r)
-	if err != nil {
-		return res, err
+	defer func() { res.Duration = time.Since(start); res.Err = err }()
+	res.PosL, res.PosR = pl, pr
+	if target != 0 {
+		return res, fmt.Errorf("emergency target must be zero")
 	}
+	res.targetL, res.targetR, res.targetsKnown, res.emergency = 0, 0, true, true
 	bps := e.cfg.EmergencyMarketBps
 	if bps <= 0 {
 		bps = 100
 	}
-	rescue := RescueParams{Immediate: true, MarketBps: bps}
-	n, q, fl, fr := e.flatten(ctx, l, r, target, pl, pr, &res, rescue)
-	res.RescueOrders, res.RescueQty, res.PosL, res.PosR = n, q, fl, fr
-	res.Duration = time.Since(start)
-	return res, nil
+	res.rescue = RescueParams{Immediate: true, MarketBps: bps}
+	if err = ctx.Err(); err != nil {
+		return res, err
+	}
+	pl, pr, err = e.positions(ctx, l, r)
+	if err != nil {
+		return res, fmt.Errorf("emergency positions: %w", err)
+	}
+	res.PosL, res.PosR, res.PositionsKnown, res.SettlementKnown = pl, pr, true, true
+	err = e.flatten(ctx, l, r, 0, 0, &res, res.rescue)
+	return res, err
 }
 
-func (e *Executor) flatten(ctx context.Context, l, r LegSpec, target, pl, pr float64, res *Result, rescue RescueParams) (int, float64, float64, float64) {
+// flatten reduces each leg to its own target. Urgent orders can reduce the leg
+// with an available book independently. Another batch is never submitted until
+// all previous outcomes and their resulting position snapshot are confirmed.
+func (e *Executor) flatten(ctx context.Context, l, r LegSpec, targetL, targetR float64, res *Result, rescue RescueParams) error {
 	start := time.Now()
 	alerted := false
-	orders, total := 0, 0.0
-	eps := halfUnit(l.Inst, r.Inst)
-	for attempt := 0; ctx.Err() == nil; attempt++ {
-		if attempt > 0 {
-			time.Sleep(e.cfg.SettleDelay)
-			var err error
-			if pl, pr, err = e.positions(ctx, l, r); err != nil {
-				slog.Warn("rescue: positions read failed", "err", err)
-				time.Sleep(e.cfg.RescueInterval)
-				attempt--
-				continue
-			}
+	epsL := math.Pow10(-l.Inst.SizeDecimals) / 2
+	epsR := math.Pow10(-r.Inst.SizeDecimals) / 2
+	for attempt := 0; ; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
 		}
-		resid := pl + pr - target
-		if math.Abs(resid) < eps {
-			slog.Info("rescue complete", "orders", orders, "qty", total, "took", time.Since(start))
-			return orders, total, pl, pr
+		dl, dr := res.PosL-targetL, res.PosR-targetR
+		if math.Abs(dl) < epsL && math.Abs(dr) < epsR {
+			return nil
 		}
 		if !alerted && time.Since(start) > e.cfg.RescueAlertAfter {
 			alerted = true
-			e.alert(fmt.Sprintf("rescue running >%s: residual %.6f (posL %.6f posR %.6f)", e.cfg.RescueAlertAfter, resid, pl, pr))
+			e.alert(fmt.Sprintf("rescue running >%s: positions %.8f/%.8f, targets %.8f/%.8f", e.cfg.RescueAlertAfter, res.PosL, res.PosR, targetL, targetR))
 		}
-		side := domain.Sell
-		if resid < 0 {
-			side = domain.Buy
+		legs := [2]LegSpec{l, r}
+		deltas := [2]float64{dl, dr}
+		positions := [2]float64{res.PosL, res.PosR}
+		var reqs [2]domain.OrderReq
+		var results [2]LegResult
+		ready := true
+		for i, leg := range legs {
+			results[i].Resolved = true // no order on this leg is already settled
+			if math.Abs(deltas[i]) < math.Pow10(-leg.Inst.SizeDecimals)/2 {
+				continue
+			}
+			if deltas[i]*positions[i] <= 0 {
+				return fmt.Errorf("rescue target cannot be reached reduce-only on %s", leg.Venue.Name())
+			}
+			q := domain.Floor(math.Abs(deltas[i]), leg.Inst.SizeDecimals)
+			if q <= 0 {
+				return fmt.Errorf("rescue quantity below native precision on %s", leg.Venue.Name())
+			}
+			if e.book == nil {
+				return fmt.Errorf("rescue has no book source")
+			}
+			b, ok := e.book(leg.Venue.Name(), leg.Inst.MarketID)
+			if !ok || !b.Valid() {
+				if rescue.Immediate {
+					// A missing peer book must not block reducing a leg whose
+					// protective price is available during an urgent unwind.
+					continue
+				}
+				ready = false
+				break
+			}
+			side := domain.Sell
+			if deltas[i] < 0 {
+				side = domain.Buy
+			}
+			px, typ := RescuePrice(rescue, attempt, b, side, leg.Inst.PriceDecimals)
+			if px <= 0 || math.IsNaN(px) || math.IsInf(px, 0) {
+				return fmt.Errorf("invalid rescue price on %s", leg.Venue.Name())
+			}
+			reqs[i] = domain.OrderReq{ClientID: e.ids.Next(), Inst: leg.Inst, Side: side, Qty: q, Price: px, Type: typ, ReduceOnly: true}
 		}
-		// reduce-only on the venue holding a position opposite to the side we need
-		leg, pos := l, pl
-		if (side == domain.Sell && pr > pl) || (side == domain.Buy && pr < pl) {
-			leg, pos = r, pr
-		}
-		q := math.Min(math.Abs(resid), math.Abs(pos))
-		q = domain.Floor(q, leg.Inst.SizeDecimals)
-		if q <= 0 {
-			e.alert(fmt.Sprintf("rescue cannot size order: residual %.6f, pos %.6f on %s", resid, pos, leg.Venue.Name()))
-			time.Sleep(e.cfg.RescueInterval * 5)
-			continue
-		}
-		b, ok := e.book(leg.Venue.Name(), leg.Inst.MarketID)
-		if !ok || !b.Valid() {
-			slog.Warn("rescue: no valid book, waiting", "venue", leg.Venue.Name())
-			time.Sleep(e.cfg.RescueInterval)
+		if !ready || reqs[0].Qty == 0 && reqs[1].Qty == 0 {
+			if rescue.Immediate {
+				return fmt.Errorf("%w: no protective book available for remaining positions %.8f/%.8f", ErrIncomplete, res.PosL, res.PosR)
+			}
+			if err := pause(ctx, e.cfg.RescueInterval); err != nil {
+				return err
+			}
 			attempt--
 			continue
 		}
-		px, typ := RescuePrice(rescue, attempt, b, side, leg.Inst.PriceDecimals)
-		slog.Warn("rescue order", "attempt", attempt+1, "venue", leg.Venue.Name(), "side", side, "qty", q, "price", px, "type", typ)
-		lr := e.submitAndResolve(ctx, domain.OrderReq{ClientID: e.ids.Next(), Inst: leg.Inst, Side: side, Qty: q,
-			Price: px, Type: typ, ReduceOnly: true}, leg.Venue)
-		orders++
-		total += lr.Filled
-		if lr.Filled > 0 {
-			if leg.Venue.Name() == l.Venue.Name() {
-				mergeRescue(&res.L, lr.Filled, lr.AvgPrice)
-			} else {
-				mergeRescue(&res.R, lr.Filled, lr.AvgPrice)
+		beforeL, beforeR := res.PosL, res.PosR
+		res.PositionsKnown, res.SettlementKnown = false, false
+		var wg sync.WaitGroup
+		for i := range reqs {
+			if reqs[i].Qty == 0 {
+				continue
 			}
+			res.RescueOrders++
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				results[i] = e.submitAndResolve(ctx, reqs[i], legs[i].Venue)
+			}(i)
 		}
-		time.Sleep(e.cfg.RescueInterval)
+		wg.Wait()
+		res.pending = &pendingRescue{reqs: reqs, results: results, beforeL: beforeL, beforeR: beforeR}
+		if err := e.resolveRescue(ctx, l, r, res, false); err != nil {
+			return err
+		}
+		if rescue.Immediate {
+			if math.Abs(res.PosL-targetL) < epsL && math.Abs(res.PosR-targetR) < epsR {
+				return nil
+			}
+			return fmt.Errorf("%w: positions %.8f/%.8f, targets %.8f/%.8f", ErrIncomplete, res.PosL, res.PosR, targetL, targetR)
+		}
+		if err := pause(ctx, e.cfg.RescueInterval); err != nil {
+			return err
+		}
 	}
-	return orders, total, pl, pr
+}
+
+func (e *Executor) resolveRescue(ctx context.Context, l, r LegSpec, res *Result, query bool) error {
+	p := res.pending
+	legs := [2]LegSpec{l, r}
+	if query {
+		var wg sync.WaitGroup
+		for i, req := range p.reqs {
+			if req.Qty == 0 || p.results[i].Resolved {
+				continue
+			}
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				p.results[i] = e.queryExisting(ctx, p.reqs[i], legs[i].Venue, p.results[i])
+			}(i)
+		}
+		wg.Wait()
+	}
+	// Protective prices are explicit estimates for position-inferred fills.
+	pricedL, pricedR := l, r
+	pricedL.Price, pricedR.Price = p.reqs[0].Price, p.reqs[1].Price
+	pl, pr, known, err := e.confirmPositions(ctx, pricedL, pricedR, p.beforeL, p.beforeR, &p.results[0], &p.results[1], p.reqs[0].Qty, p.reqs[1].Qty, p.reqs[0].Side, p.reqs[1].Side)
+	res.PositionsKnown = known
+	if known {
+		res.PosL, res.PosR = pl, pr
+	}
+	for i, lr := range p.results {
+		if lr.Filled <= 0 || lr.AvgPrice <= 0 || math.IsNaN(lr.Filled) || math.IsInf(lr.Filled, 0) || math.IsNaN(lr.AvgPrice) || math.IsInf(lr.AvgPrice, 0) || lr.Filled-p.reqs[i].Qty >= math.Pow10(-legs[i].Inst.SizeDecimals)/2 {
+			continue
+		}
+		legResult := &res.L
+		if i == 1 {
+			legResult = &res.R
+		}
+		// Replace this batch's cumulative contribution as additional fills or
+		// an exact quote arrive; recovery must not count a fill twice.
+		quote := lr.Filled * lr.AvgPrice
+		res.RescueQty += lr.Filled - p.accountedQty[i]
+		if p.accountedQty[i] == 0 {
+			mergeRescue(legResult, lr.Filled, lr.AvgPrice)
+		} else {
+			totalQty := legResult.RescueFilled + lr.Filled - p.accountedQty[i]
+			totalQuote := legResult.RescueFilled*legResult.RescuePrice + quote - p.accountedQuote[i]
+			legResult.RescueFilled, legResult.RescuePrice = totalQty, totalQuote/totalQty
+		}
+		legResult.RescuePriceEstimated = legResult.RescuePriceEstimated || lr.PriceEstimated
+		p.accountedQty[i], p.accountedQuote[i] = lr.Filled, quote
+	}
+	res.SettlementKnown = err == nil
+	if err == nil {
+		res.pending = nil
+	}
+	return err
 }
 
 // mergeRescue folds a rescue fill into the leg's volume-weighted rescue price.

@@ -1,6 +1,8 @@
 package symbols
 
 import (
+	"math"
+	"strings"
 	"testing"
 
 	"github.com/Dog-Feng/dex-arbitr/internal/domain"
@@ -16,6 +18,102 @@ func TestNormalize(t *testing.T) {
 		if got := m.Normalize(in); got != want {
 			t.Errorf("Normalize(%q)=%q want %q", in, got, want)
 		}
+	}
+}
+
+func TestValidQtyRejectsUntradableInputs(t *testing.T) {
+	p := Pair{SizeDecimals: 3, MinQty: 0.01, MinQuote: 10}
+	for _, tc := range []struct {
+		name       string
+		qty, price float64
+		want       bool
+	}{
+		{name: "aligned", qty: 0.01, price: 1590, want: true},
+		{name: "extra low fraction", qty: 0.0101, price: 1590},
+		{name: "extra high fraction", qty: 0.0105, price: 1590},
+		{name: "extra fraction just below next step", qty: 0.010999, price: 1590},
+		{name: "zero", price: 1590},
+		{name: "negative", qty: -0.01, price: 1590},
+		{name: "nan", qty: math.NaN(), price: 1590},
+		{name: "infinite qty", qty: math.Inf(1), price: 1590},
+		{name: "below min base", qty: 0.009, price: 1590},
+		{name: "below min quote", qty: 0.01, price: 500},
+		{name: "unknown price skips notional", qty: 0.01, want: true},
+		{name: "negative price", qty: 0.01, price: -1},
+		{name: "nan price", qty: 0.01, price: math.NaN()},
+		{name: "infinite price", qty: 0.01, price: math.Inf(1)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, reason := p.ValidQty(tc.qty, tc.price)
+			if got != tc.want || (!got && reason == "") {
+				t.Fatalf("ValidQty(%v,%v)=(%v,%q), want valid=%v", tc.qty, tc.price, got, reason, tc.want)
+			}
+		})
+	}
+}
+
+func TestValidQtyAllowsRepresentationErrorOnly(t *testing.T) {
+	a, b := 0.1, 0.2
+	for _, tc := range []struct {
+		name string
+		p    Pair
+		qty  float64
+		want bool
+	}{
+		{name: "arithmetic rounding", p: Pair{SizeDecimals: 1}, qty: a + b, want: true},
+		{name: "fractional first step", p: Pair{SizeDecimals: 3}, qty: 0.0001},
+		{name: "below tiny minimum", p: Pair{SizeDecimals: 12, MinQty: 2e-12}, qty: 1e-12},
+		{name: "tiny exact quantity", p: Pair{SizeDecimals: 12, MinQty: 1e-12}, qty: 1e-12, want: true},
+		{name: "negative precision", p: Pair{SizeDecimals: -1}, qty: 10},
+		{name: "overflow precision", p: Pair{SizeDecimals: 309}, qty: 1},
+		{name: "invalid minimum", p: Pair{SizeDecimals: 1, MinQty: math.NaN()}, qty: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if ok, reason := tc.p.ValidQty(tc.qty, 0); ok != tc.want {
+				t.Fatalf("valid=%v (%s), want %v", ok, reason, tc.want)
+			}
+		})
+	}
+}
+
+func TestNormalizeIgnoresEmptySuffixes(t *testing.T) {
+	for _, suffixes := range [][]string{{""}, {"", " ", "PERP", "USDC"}} {
+		t.Run(strings.Join(suffixes, ","), func(t *testing.T) {
+			m := Matcher{Suffixes: suffixes, Separators: "-"}
+			if got := m.Normalize("BTC"); got != "BTC" {
+				t.Fatalf("Normalize(BTC)=%q", got)
+			}
+			if len(suffixes) > 1 && m.Normalize("BTC-USDC-PERP") != "BTC" {
+				t.Fatal("empty suffix prevents nonempty suffix matching")
+			}
+		})
+	}
+}
+
+func TestPairRoundsMinimumUp(t *testing.T) {
+	p := NewPair("TEST", domain.Instrument{SizeDecimals: 4, MinBase: 0.0101}, domain.Instrument{SizeDecimals: 3, MinBase: 0.0102})
+	if p.MinQty != 0.011 {
+		t.Fatalf("MinQty=%v, want 0.011", p.MinQty)
+	}
+	if ok, _ := p.ValidQty(0.010, 0); ok {
+		t.Fatal("quantity below the rounded minimum accepted")
+	}
+}
+
+func TestPairMinimumDoesNotRoundDownFractionOfStep(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		minBase, want float64
+	}{
+		{name: "small extra fraction", minBase: 0.0100000000001, want: 0.011},
+		{name: "exact step", minBase: 0.01, want: 0.01},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := NewPair("TEST", domain.Instrument{SizeDecimals: 3, MinBase: tc.minBase}, domain.Instrument{SizeDecimals: 3})
+			if p.MinQty != tc.want {
+				t.Fatalf("minimum=%v want%v", p.MinQty, tc.want)
+			}
+		})
 	}
 }
 

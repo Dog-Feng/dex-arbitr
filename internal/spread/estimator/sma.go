@@ -1,6 +1,7 @@
 package estimator
 
 import (
+	"math"
 	"time"
 )
 
@@ -17,6 +18,7 @@ type SMA struct {
 	n      int
 	first  int64 // first bucket observed (for span)
 	lastBk int64
+	last   time.Time
 }
 
 type slot struct {
@@ -40,16 +42,22 @@ func NewSMA(p Params) *SMA {
 	if size < 1 {
 		size = 1
 	}
-	return &SMA{p: p, slots: make([]slot, size), first: -1}
+	return &SMA{p: p, slots: make([]slot, size)}
 }
 
 func (s *SMA) bucket(t time.Time) int64 { return t.UnixNano() / int64(s.p.Interval) }
 
 // Update adds a sample; at most one sample per bucket (last write wins).
 func (s *SMA) Update(t time.Time, x float64) {
+	if t.IsZero() || math.IsNaN(x) || math.IsInf(x, 0) || (!s.last.IsZero() && t.Before(s.last)) {
+		return
+	}
 	bk := s.bucket(t)
 	s.evict(bk)
 	i := int(bk % int64(len(s.slots)))
+	if i < 0 {
+		i += len(s.slots)
+	}
 	sl := &s.slots[i]
 	if sl.ok && sl.bucket == bk {
 		s.sum += x - sl.val
@@ -63,10 +71,11 @@ func (s *SMA) Update(t time.Time, x float64) {
 		s.sum += x
 		s.n++
 	}
-	if s.first < 0 || s.first <= bk-int64(len(s.slots)) {
+	if s.n == 1 || s.first <= bk-int64(len(s.slots)) {
 		s.first = s.oldest(bk)
 	}
 	s.lastBk = bk
+	s.last = t
 }
 
 // evict drops slots older than the window relative to bucket bk.
@@ -75,7 +84,17 @@ func (s *SMA) evict(bk int64) {
 	if s.n == 0 {
 		return
 	}
-	for i := range s.slots {
+	// Only buckets crossed since the last update can have become stale. A
+	// long gap costs one window scan; ordinary updates visit a single slot.
+	count := bk - s.lastBk
+	if count > int64(len(s.slots)) {
+		count = int64(len(s.slots))
+	}
+	for offset := int64(1); offset <= count; offset++ {
+		i := int((s.lastBk + offset) % int64(len(s.slots)))
+		if i < 0 {
+			i += len(s.slots)
+		}
 		sl := &s.slots[i]
 		if sl.ok && sl.bucket <= lim {
 			s.sum -= sl.val
@@ -86,13 +105,22 @@ func (s *SMA) evict(bk int64) {
 }
 
 func (s *SMA) oldest(bk int64) int64 {
-	min := bk
-	for _, sl := range s.slots {
-		if sl.ok && sl.bucket < min {
-			min = sl.bucket
-		}
+	first := s.first
+	lim := bk - int64(len(s.slots)) + 1
+	if first < lim {
+		first = lim
 	}
-	return min
+	for first <= bk {
+		i := int(first % int64(len(s.slots)))
+		if i < 0 {
+			i += len(s.slots)
+		}
+		if sl := s.slots[i]; sl.ok && sl.bucket == first {
+			return first
+		}
+		first++
+	}
+	return bk
 }
 
 // Mean of samples in window.
@@ -108,7 +136,7 @@ func (s *SMA) Ready() bool { return s.Stats().Ready }
 
 // Stats snapshot.
 func (s *SMA) Stats() Stats {
-	st := Stats{Kind: "sma", Mean: s.Mean(), Samples: s.n}
+	st := Stats{Kind: "sma", Mean: s.Mean(), Samples: s.n, LastSample: s.last}
 	if s.n == 0 {
 		return st
 	}
@@ -118,3 +146,38 @@ func (s *SMA) Stats() Stats {
 	st.Ready = st.Span >= s.p.MinWarmup && st.Coverage >= s.p.MinCoverage
 	return st
 }
+
+// StatsAt returns a pure snapshot relative to now, including missing sampling
+// buckets. It never evicts or mutates state, so callers may use a read lock.
+func (s *SMA) StatsAt(now time.Time) Stats {
+	st := Stats{Kind: "sma", LastSample: s.last}
+	if s.last.IsZero() || now.Before(s.last) {
+		return st
+	}
+	bk := s.bucket(now)
+	lim := bk - int64(len(s.slots))
+	first := bk
+	var sum float64
+	for _, sl := range s.slots {
+		if !sl.ok || sl.bucket <= lim || sl.bucket > bk {
+			continue
+		}
+		st.Samples++
+		sum += sl.val
+		if sl.bucket < first {
+			first = sl.bucket
+		}
+	}
+	if st.Samples == 0 {
+		return st
+	}
+	st.Mean = sum / float64(st.Samples)
+	spanBk := bk - first + 1
+	st.Span = time.Duration(spanBk) * s.p.Interval
+	st.Coverage = float64(st.Samples) / float64(spanBk)
+	st.Ready = now.Sub(s.last) <= 2*s.p.Interval && st.Span >= s.p.MinWarmup && st.Coverage >= s.p.MinCoverage
+	return st
+}
+
+func (s *SMA) ReadyAt(now time.Time) bool   { return s.StatsAt(now).Ready }
+func (s *SMA) MeanAt(now time.Time) float64 { return s.StatsAt(now).Mean }

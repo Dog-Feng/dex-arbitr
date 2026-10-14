@@ -1,0 +1,107 @@
+package main
+
+import (
+	"bytes"
+	"errors"
+	"math"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/Dog-Feng/dex-arbitr/internal/scan"
+	"github.com/Dog-Feng/dex-arbitr/internal/strategy"
+)
+
+func TestBoardRequiresFreshMeanAndVolatility(t *testing.T) {
+	now := time.Unix(1_600_000_000, 0)
+	valid := scan.Score{Base: "fresh", Ts: now, Dir: strategy.DirLS, NetBps: 1, MuReady: true, VolReady: true}
+	for _, tc := range []struct {
+		name   string
+		score  scan.Score
+		status string
+	}{
+		{"missing mean", scan.Score{Ts: now, NetBps: 100, VolReady: true}, "unavailable"},
+		{"missing volatility", scan.Score{Ts: now, NetBps: 100, MuReady: true}, "unavailable"},
+		{"invalidated callback", scan.Score{Ts: now}, "unavailable"},
+		{"expired", scan.Score{Ts: now.Add(-3 * time.Second), NetBps: 100, MuReady: true, VolReady: true}, "stale"},
+		{"future", scan.Score{Ts: now.Add(time.Second), NetBps: 100, MuReady: true, VolReady: true}, "stale"},
+		{"nonfinite", scan.Score{Ts: now, NetBps: math.NaN(), MuReady: true, VolReady: true}, "invalid"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := newBoard([]pairSpec{{base: "broken"}, {base: "fresh"}})
+			b.set(valid)
+			broken := valid
+			broken.Base, broken.NetBps = "broken", 100
+			b.set(broken) // an old profitable callback must be replaced
+			tc.score.Base = "broken"
+			b.set(tc.score)
+			if got := b.sorted(now)[0].Base; got != "fresh" {
+				t.Fatalf("ranked %s ahead of fresh opportunity", got)
+			}
+			var out bytes.Buffer
+			if err := render(&out, b, false, now); err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(out.String(), tc.status) || strings.Contains(out.String(), "+100.00") {
+				t.Fatalf("invalid score retained a numeric opportunity: %s", out.String())
+			}
+		})
+	}
+}
+
+func TestBoardExpiresLastCallback(t *testing.T) {
+	now := time.Unix(1_600_000_000, 0)
+	b := newBoard([]pairSpec{{base: "pair"}})
+	b.set(scan.Score{Base: "pair", Ts: now, Dir: strategy.DirLS, NetBps: 3, MuReady: true, VolReady: true})
+	for _, tc := range []struct {
+		name string
+		at   time.Time
+		want string
+	}{
+		{"live", now.Add(time.Second), "+3.00"},
+		{"no more callbacks", now.Add(3 * time.Second), "stale"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var out bytes.Buffer
+			if err := render(&out, b, false, tc.at); err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(out.String(), tc.want) {
+				t.Fatalf("display=%s, want %s", out.String(), tc.want)
+			}
+		})
+	}
+}
+
+func TestValidateFlags(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		path    string
+		refresh time.Duration
+		args    []string
+		wantErr bool
+	}{
+		{"valid", "config.yaml", time.Second, nil, false},
+		{"zero refresh", "config.yaml", 0, nil, true},
+		{"negative refresh", "config.yaml", -time.Second, nil, true},
+		{"empty config", " ", time.Second, nil, true},
+		{"extra argument", "config.yaml", time.Second, []string{"extra"}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := validateFlags(tc.path, tc.refresh, tc.args); (err != nil) != tc.wantErr {
+				t.Fatalf("error=%v, want error=%v", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+type failingWriter struct{ err error }
+
+func (w failingWriter) Write([]byte) (int, error) { return 0, w.err }
+
+func TestRenderReturnsOutputError(t *testing.T) {
+	want := errors.New("output closed")
+	if err := render(failingWriter{want}, newBoard(nil), false, time.Now()); !errors.Is(err, want) {
+		t.Fatalf("error=%v, want %v", err, want)
+	}
+}

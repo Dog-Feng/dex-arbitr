@@ -3,6 +3,7 @@ package strategy
 
 import (
 	"fmt"
+	"math"
 	"sort"
 	"sync"
 	"time"
@@ -36,14 +37,18 @@ func (d Dir) LegSides() (domain.Side, domain.Side) {
 
 // Step is one open hedged unit.
 type Step struct {
-	ID       int64     `json:"id"`
-	Dir      Dir       `json:"dir"`
-	Qty      float64   `json:"qty"`
-	EntryBps float64   `json:"entry_bps"` // entry spread from open fills, fill-time mid
-	OpenL    float64   `json:"open_l,omitempty"`
-	OpenR    float64   `json:"open_r,omitempty"`
-	Realized float64   `json:"realized_bps,omitempty"` // cumulative net realized PnL
-	OpenedAt time.Time `json:"opened_at"`
+	ID             int64     `json:"id"`
+	Dir            Dir       `json:"dir"`
+	Qty            float64   `json:"qty"`
+	EntryBps       float64   `json:"entry_bps"` // entry spread from open fills, fill-time mid
+	OpenL          float64   `json:"open_l,omitempty"`
+	OpenR          float64   `json:"open_r,omitempty"`
+	Realized       float64   `json:"realized_bps,omitempty"` // cumulative net realized PnL
+	RealizedUSD    float64   `json:"realized_usd,omitempty"`
+	EntryFeesUSD   float64   `json:"entry_fees_usd,omitempty"`
+	OriginalQty    float64   `json:"original_qty,omitempty"`
+	PriceEstimated bool      `json:"price_estimated,omitempty"`
+	OpenedAt       time.Time `json:"opened_at"`
 }
 
 // Mode of a pair.
@@ -70,7 +75,9 @@ type Params struct {
 	CloseOrder   string  // best | lifo | fifo
 	VolK         float64 // one-sided sigma buffer on top of OpenBps for opening
 	FeeBps       float64 // round-trip taker fees (per pair), subtracted from thresholds
-	MinInventory int     // minimum steps to hold (volume churn floor); 0 = none
+	TakerFeeL    float64 // per-fill fee rates; close fees use actual entry and exit notionals
+	TakerFeeR    float64
+	MinInventory int // minimum steps to hold (volume churn floor); 0 = none
 }
 
 // Strategy decides an action from the pair state and market view.
@@ -128,11 +135,80 @@ type Action struct {
 	Reason      string
 }
 
-func profit(st Step, q spread.Quote) float64 {
-	if st.Dir == DirLS { // close: sell L @bid, buy R @ask
-		return st.EntryBps + q.SL
+// GrossProfitUSD computes price cash flows for the specified closed quantity.
+// Missing entry prices cannot be reconstructed exactly from EntryBps.
+func GrossProfitUSD(st Step, closeL, closeR, qty float64) float64 {
+	if !validPrice(st.OpenL) || !validPrice(st.OpenR) || !validPrice(closeL) || !validPrice(closeR) || qty < 0 || math.IsNaN(qty) || math.IsInf(qty, 0) || (st.Dir != DirLS && st.Dir != DirSL) {
+		return math.NaN()
 	}
-	return st.EntryBps + q.LS // close: buy L @ask, sell R @bid
+	return -float64(st.Dir) * qty * ((closeL - st.OpenL) + (st.OpenR - closeR))
+}
+
+// ProfitBps normalizes both cash-flow terms by the fixed entry notional.
+func ProfitBps(st Step, closeL, closeR float64) float64 {
+	return GrossProfitUSD(st, closeL, closeR, 1) / ((st.OpenL + st.OpenR) / 2) * 1e4
+}
+
+// RoundTripFeeUSD estimates all four taker fees at their actual fill prices.
+func RoundTripFeeUSD(st Step, closeL, closeR, qty, feeL, feeR float64) float64 {
+	if math.IsNaN(GrossProfitUSD(st, closeL, closeR, qty)) || feeL < 0 || feeR < 0 || math.IsNaN(feeL) || math.IsNaN(feeR) || math.IsInf(feeL, 0) || math.IsInf(feeR, 0) {
+		return math.NaN()
+	}
+	return qty * ((st.OpenL+closeL)*feeL + (st.OpenR+closeR)*feeR)
+}
+
+func validPrice(x float64) bool { return x > 0 && !math.IsNaN(x) && !math.IsInf(x, 0) }
+
+func closePrices(st Step, q spread.Quote) (float64, float64) {
+	if len(q.L.Bids) == 0 || len(q.L.Asks) == 0 || len(q.R.Bids) == 0 || len(q.R.Asks) == 0 {
+		return math.NaN(), math.NaN()
+	}
+	if st.Dir == DirLS {
+		return q.L.Bids[0].Price, q.R.Asks[0].Price
+	}
+	return q.L.Asks[0].Price, q.R.Bids[0].Price
+}
+
+// QuoteProfitBps uses the executable reverse sides of the current books.
+func QuoteProfitBps(st Step, q spread.Quote) float64 {
+	l, r := closePrices(st, q)
+	return ProfitBps(st, l, r)
+}
+
+func profit(st Step, q spread.Quote) float64 { return QuoteProfitBps(st, q) }
+
+func closeFeeBps(p Params, st Step, q spread.Quote) float64 {
+	if st.OriginalQty > 0 {
+		if !validPrice(st.Qty) || !finite(st.EntryFeesUSD) || st.EntryFeesUSD < 0 {
+			return math.NaN()
+		}
+		l, r := closePrices(st, q)
+		feeL, feeR := p.TakerFeeL, p.TakerFeeR
+		if feeL == 0 && feeR == 0 {
+			feeL, feeR = p.FeeBps/40000, p.FeeBps/40000
+		}
+		// Entry fees are retained for the remaining quantity, so a restart or
+		// fee-tier change must not reprice them using today's fee rates.
+		return (st.EntryFeesUSD/st.Qty + l*feeL + r*feeR) / ((st.OpenL + st.OpenR) / 2) * 1e4
+	}
+	if p.TakerFeeL == 0 && p.TakerFeeR == 0 {
+		return p.FeeBps
+	}
+	l, r := closePrices(st, q)
+	return RoundTripFeeUSD(st, l, r, 1, p.TakerFeeL, p.TakerFeeR) / ((st.OpenL + st.OpenR) / 2) * 1e4
+}
+
+func openFeeBps(p Params, q spread.Quote, d Dir) float64 {
+	if p.TakerFeeL == 0 && p.TakerFeeR == 0 {
+		return p.FeeBps
+	}
+	l, r := d.LegSides()
+	la, ra := legs(q, l, r)
+	st := Step{Dir: d, OpenL: la.Price, OpenR: ra.Price}
+	lpx, rpx := closePrices(st, q)
+	// Future closing prices are unknown: reserve four fees at today's
+	// executable prices, using the same quote reference as the opening signal.
+	return RoundTripFeeUSD(st, lpx, rpx, 1, p.TakerFeeL, p.TakerFeeR) / q.RefMid * 1e4
 }
 
 func depthOK(q spread.Quote, l, r domain.Side, need float64) bool {
@@ -163,6 +239,12 @@ func (Arbitrage) Decide(p Params, s State, q spread.Quote, mu float64, muReady b
 	if s.Mode == ModePaused {
 		return Action{Reason: "paused"}
 	}
+	if _, ok := spread.Compute(q.L, q.R); !ok || !validPrice(q.RefMid) || !finite(q.LS) || !finite(q.SL) || !finite(q.Mid) {
+		return Action{Reason: "invalid quote"}
+	}
+	if s.Mode < ModeWarmup || s.Mode > ModePaused || !validPrice(p.StepQty) || p.MaxSteps <= 0 || !validPrice(p.DepthMult) || !finite(p.OpenBps) || !finite(p.CloseBps) || !finite(p.VolK) || p.VolK < 0 || !finite(p.FeeBps) || p.FeeBps < 0 || !finite(p.TakerFeeL) || p.TakerFeeL < 0 || !finite(p.TakerFeeR) || p.TakerFeeR < 0 || p.MinInventory < 0 {
+		return Action{Reason: "invalid strategy parameters"}
+	}
 	need := p.StepQty * p.DepthMult
 	cnt := s.Counter()
 
@@ -175,7 +257,7 @@ func (Arbitrage) Decide(p Params, s State, q spread.Quote, mu float64, muReady b
 		}
 		var cs []cand
 		for i, st := range s.Steps {
-			if pf := profit(st, q); pf >= p.CloseBps+p.FeeBps {
+			if pf := profit(st, q); pf >= p.CloseBps+closeFeeBps(p, st, q) {
 				cs = append(cs, cand{st, pf, i})
 			}
 		}
@@ -196,7 +278,7 @@ func (Arbitrage) Decide(p Params, s State, q spread.Quote, mu float64, muReady b
 			}
 			la, ra := legs(q, l, r)
 			return Action{Kind: Close, Dir: c.st.Dir, StepID: c.st.ID, Qty: c.st.Qty, L: la, R: ra, ExpectedBps: c.pf,
-				Reason: fmt.Sprintf("close step %d profit %.2fbps >= %.2f+%.2f (net)", c.st.ID, c.pf, p.CloseBps, p.FeeBps)}
+				Reason: fmt.Sprintf("close step %d profit %.2fbps >= %.2f+%.2f (net)", c.st.ID, c.pf, p.CloseBps, closeFeeBps(p, c.st, q))}
 		}
 	}
 
@@ -209,8 +291,15 @@ func (Arbitrage) Decide(p Params, s State, q spread.Quote, mu float64, muReady b
 	}
 	devLS := q.LS - mu // buy L / sell R is rich vs mean
 	devSL := q.SL + mu // buy R / sell L is rich vs mean
-	needDev := p.OpenBps + p.FeeBps + p.VolK*vol
+	if math.IsNaN(mu) || math.IsInf(mu, 0) || math.IsNaN(vol) || math.IsInf(vol, 0) || vol < 0 {
+		return Action{Reason: "invalid statistics"}
+	}
 	try := func(d Dir, dev float64) (Action, bool) {
+		feeBps := openFeeBps(p, q, d)
+		needDev := p.OpenBps + feeBps + p.VolK*vol
+		if math.IsNaN(dev) || math.IsInf(dev, 0) || math.IsNaN(needDev) || math.IsInf(needDev, 0) {
+			return Action{Reason: "invalid threshold"}, true
+		}
 		if dev < needDev {
 			return Action{}, false
 		}
@@ -226,7 +315,7 @@ func (Arbitrage) Decide(p Params, s State, q spread.Quote, mu float64, muReady b
 		}
 		la, ra := legs(q, l, r)
 		return Action{Kind: Open, Dir: d, Qty: p.StepQty, L: la, R: ra, ExpectedBps: dev,
-			Reason: fmt.Sprintf("open %s dev %.2fbps >= %.2f fee %.2f +%.2f*vol %.2f (mu %.2f)", d, dev, p.OpenBps, p.FeeBps, p.VolK, vol, mu)}, true
+			Reason: fmt.Sprintf("open %s dev %.2fbps >= %.2f fee %.2f +%.2f*vol %.2f (mu %.2f)", d, dev, p.OpenBps, feeBps, p.VolK, vol, mu)}, true
 	}
 	// prefer the larger deviation
 	first, second := DirLS, DirSL
@@ -243,12 +332,15 @@ func (Arbitrage) Decide(p Params, s State, q spread.Quote, mu float64, muReady b
 	} else if ok2 {
 		return b
 	}
-	return Action{Reason: fmt.Sprintf("no signal: LS dev %.2f, SL dev %.2f (need %.2f, mu %.2f)", devLS, devSL, needDev, mu)}
+	return Action{Reason: fmt.Sprintf("no signal: LS dev %.2f, SL dev %.2f (mu %.2f)", devLS, devSL, mu)}
 }
 
 // EntryBps computes the executed spread (bps) of a leg pair in direction d,
 // referencing the fill-time mid (lPx+rPx)/2.
 func EntryBps(d Dir, lPx, rPx float64) float64 {
+	if !validPrice(lPx) || !validPrice(rPx) || (d != DirLS && d != DirSL) {
+		return math.NaN()
+	}
 	ref := (lPx + rPx) / 2
 	if d == DirLS {
 		return (rPx - lPx) / ref * 1e4
@@ -269,6 +361,8 @@ func abs(x int) int {
 	}
 	return x
 }
+
+func finite(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0) }
 
 // Factory builds a strategy.
 type Factory func() Strategy

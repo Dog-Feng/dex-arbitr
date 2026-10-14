@@ -41,7 +41,7 @@ func NewK(cfg Config) *K {
 func (k *K) K() float64 { return k.val }
 
 // Observe records one outcome; failed=true means the allowance was too tight
-// (one leg missed). The coefficient adjusts once the window is full.
+// (one leg missed). After warmup, each outcome adjusts using the rolling window.
 func (k *K) Observe(failed bool) {
 	if len(k.hist) < k.cfg.Window {
 		k.hist = append(k.hist, failed)
@@ -61,7 +61,7 @@ func (k *K) Observe(failed bool) {
 	}
 }
 
-// Rate returns the observed failure rate (0 before the window is full).
+// Rate returns the failure rate of collected outcomes, including warmup.
 func (k *K) Rate() float64 {
 	if len(k.hist) == 0 {
 		return 0

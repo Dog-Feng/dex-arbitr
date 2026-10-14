@@ -3,6 +3,14 @@
 Cross-DEX perpetual spread step arbitrage (design: `docs/spread-arb-design.md`).
 Currently integrated venues: **Lighter mainnet** (`kind: lighter`, chain 304) and **RH Lighter mainnet** (`kind: rhlighter`, chain 466324).
 
+本轮 F01–F26 修复、回归测试及恢复边界见 [交易安全与生命周期修复说明](docs/trading-safety-fixes.md)。代码检查只运行测试和编译，不自动启动项目或服务；下文运行命令由操作者明确选择执行。
+
+升级时请保留完整 `state_dir` 与配置，并注意：
+
+- 同一状态目录只允许一个写入进程；停止信号保存状态，不承诺自动平仓。
+- 尽量在订单和补救均已确认后升级。未决 checkpoint 即使步骤为空，重启仍保持 `PAUSED`，需核实交易所订单和两边仓位后再处理恢复。
+- 旧状态缺少入场价格会暂停普通交易；历史费用或成交价格不确定时，volume 策略启用每日亏损预算会阻止新开仓，减仓与应急退出仍受确认条件保护。
+
 ## Layout
 
 ```
@@ -45,7 +53,7 @@ execution:
   price_ticks: 30
 ```
 
-买单限价为决策价格加 N 个 tick，卖单为决策价格减 N 个 tick；tick 是各交易所的最小价格单位。设为 `0` 时使用决策价格，省略时默认 `30`，负数配置会报错。修改后重启程序生效；补救单仍使用原有价格阶梯。
+固定模式下，买单限价为决策价格加 N 个 tick，卖单为决策价格减 N 个 tick；tick 是各交易所的最小价格单位。设为 `0` 时使用决策价格，省略时默认 `30`，负数配置会报错。启用 `dynamic_ticks` 且波动已就绪时，改用波动、盘口深度及 min/max ticks 计算范围；未就绪时回退到 `price_ticks`。普通补救使用 IOC 价格阶梯；应急退出和 drain 使用 reduce-only 保护市价单，并确认每腿分别归零。修改配置在操作者重启后生效。
 
 > Lighter blocks order submission (`sendTx`, authenticated WS) from restricted jurisdictions (e.g. US IPs, code 20558).
 > Run live trading from a permitted region.
@@ -195,8 +203,8 @@ mv /opt/dex-arbitr/bin/arbd.new /opt/dex-arbitr/bin/arbd
 systemctl restart arbd && journalctl -u arbd -f
 ```
 
-- 重启是安全的：步数状态保存在 `/opt/dex-arbitr/state`，重启后自动加载并与实际持仓核对。
-- 建议在没有补救单进行时更新（日志中无 `rescue order`）。
+- 已结算步骤与每日预算保存在 `/opt/dex-arbitr/state`，重启后加载并核对两边实际仓位。`Unresolved=true` 的状态不会自动恢复下单，需先核实交易所订单终态及持仓；详见 [恢复边界](docs/trading-safety-fixes.md#重启升级和持仓恢复边界)。
+- 建议确认全部订单和补救已结算后更新；仅日志暂时没有 `rescue order` 不足以证明不存在未决订单。
 
 **回滚：**
 

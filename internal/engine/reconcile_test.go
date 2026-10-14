@@ -204,7 +204,7 @@ func TestPairActorReconcileMatchesRecordedSteps(t *testing.T) {
 			defer cancel()
 			l, r := newActorTestVenue("L"), newActorTestVenue("R")
 			l.pos, r.pos = -float64(dir)*0.01, float64(dir)*0.01
-			a := newReconcileTestActor(t, ctx, l, r, []strategy.Step{{ID: 1, Dir: dir, Qty: 0.01}}, actorTestEstimator{}, execution.DefaultConfig())
+			a := newReconcileTestActor(t, ctx, l, r, []strategy.Step{{ID: 1, Dir: dir, Qty: 0.01, OpenL: 100, OpenR: 100.2}}, actorTestEstimator{}, execution.DefaultConfig())
 			if err := a.reconcile(ctx); err != nil {
 				t.Fatal(err)
 			}

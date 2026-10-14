@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"path/filepath"
@@ -90,18 +91,42 @@ func (rt *runtime) buildActor(pair symbols.Pair, qty float64, maxSteps int, l, r
 		Monitor: rt.mon,
 		Params: strategy.Params{StepQty: qty, MaxSteps: maxSteps, OpenBps: openBps, CloseBps: closeBps,
 			DepthMult: c.Strategy.DepthMult, CloseOrder: c.Strategy.CloseOrder, VolK: c.Strategy.VolK, FeeBps: feeBps,
-			MinInventory: minInv},
+			MinInventory: minInv, TakerFeeL: pair.Left.TakerFee, TakerFeeR: pair.Right.TakerFee},
 	})
 }
 
 // runManual trades exactly the configured pairs, each warming its own stats.
-func (rt *runtime) runManual(ctx context.Context) error {
-	var wg sync.WaitGroup
+func (rt *runtime) runManual(ctx context.Context) (runErr error) {
+	var actors []*PairActor
+	markets := map[string]string{}
+	started := false
+	defer func() {
+		if !started {
+			for _, a := range actors {
+				if a.cfg.Samples != nil {
+					if err := a.cfg.Samples.Close(); err != nil {
+						runErr = errors.Join(runErr, fmt.Errorf("close unused samples for %s: %w", a.key, err))
+					}
+				}
+			}
+		}
+	}()
+	// Resolve and build every actor before starting any of them. A later setup
+	// failure must not leave earlier actors trading after this function returns.
 	for _, pc := range rt.cfg.Pairs {
 		l, r := rt.venues[pc.Left], rt.venues[pc.Right]
+		if l == nil || r == nil {
+			return fmt.Errorf("pair %s references unavailable venue", pc.Base)
+		}
 		pair, err := ResolvePair(ctx, rt.matcher, pc.Base, l, r)
 		if err != nil {
 			return err
+		}
+		for _, key := range []string{marketKey(l.Name(), pair.Left.MarketID), marketKey(r.Name(), pair.Right.MarketID)} {
+			if previous, ok := markets[key]; ok {
+				return fmt.Errorf("pairs %s and %s share market %s", previous, pair.Base, key)
+			}
+			markets[key] = pair.Base
 		}
 		qty := pair.AlignQty(pc.StepQty)
 		if ok, why := pair.ValidQty(qty, 0); !ok || qty != domain.Round(pc.StepQty, pair.SizeDecimals) {
@@ -124,18 +149,42 @@ func (rt *runtime) runManual(ctx context.Context) error {
 		}
 		a, err := rt.buildActor(pair, qty, pc.MaxSteps, l, r, est, vol, volL, volR, samples)
 		if err != nil {
+			if samples != nil {
+				if closeErr := samples.Close(); closeErr != nil {
+					err = errors.Join(err, closeErr)
+				}
+			}
 			return err
 		}
+		actors = append(actors, a)
 		slog.Info("pair resolved", "base", pair.Base, "left", fmt.Sprintf("%s#%d", l.Name(), pair.Left.MarketID),
 			"right", fmt.Sprintf("%s#%d", r.Name(), pair.Right.MarketID), "size_decimals", pair.SizeDecimals, "min_qty", pair.MinQty)
+	}
+	if len(actors) == 0 {
+		return fmt.Errorf("manual pair selection: no pairs configured")
+	}
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	results := make(chan error, len(actors))
+	var wg sync.WaitGroup
+	started = true
+	for _, a := range actors {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := a.Run(ctx); err != nil {
-				slog.Error("pair actor stopped", "pair", pair.Base, "err", err)
+			if err := a.Run(runCtx); err != nil {
+				results <- fmt.Errorf("pair %s stopped: %w", a.key, err)
+				return
 			}
+			results <- nil
 		}()
 	}
+	for range actors {
+		if err := <-results; err != nil {
+			runErr = errors.Join(runErr, err)
+			cancel()
+		}
+	}
 	wg.Wait()
-	return nil
+	return runErr
 }

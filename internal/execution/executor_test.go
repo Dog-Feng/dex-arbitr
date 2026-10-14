@@ -71,6 +71,7 @@ func testExec(t *testing.T, l, r *fakeVenue) *Executor {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(tr.Close)
 	cfg := DefaultConfig()
 	cfg.AckTimeout, cfg.QueryInterval, cfg.SettleDelay, cfg.RescueInterval = 50*time.Millisecond, 10*time.Millisecond, time.Millisecond, time.Millisecond
 	bk := domain.Book{Bids: []domain.Level{{Price: 100, Size: 1}}, Asks: []domain.Level{{Price: 100.1, Size: 1}}}
