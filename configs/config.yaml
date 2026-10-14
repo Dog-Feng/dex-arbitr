@@ -46,8 +46,8 @@ risk:
 strategy:
   kind: volume           # arbitrage | volume (registered strategies)
   pair_selection: manual # manual | auto (auto = picker-driven top-Y from shared stats)
-  open_bps: 1          # open when deviation from mean >= 1bps
-  close_bps: 1         # close when step gross profit >= 1bps
+  open_bps: 0          # arbitrage: extra edge above fees/volatility; volume always uses 0
+  close_bps: 0         # arbitrage: extra net return target; volume always uses 0
   depth_mult: 2        # top-of-book qty >= step_qty * 2 on both legs
   close_order: best    # best | lifo | fifo
   vol_k: 1.28          # one-sided sigma buffer added to open_bps
@@ -59,7 +59,7 @@ volume:                     # only used when strategy.kind = volume
   min_inventory: 0          # floor steps held while churning
   daily_volume_target: 0    # USD; 0 = unlimited
   daily_cost_budget: 0      # USD max daily loss; 0 = unlimited
-  loss_tolerance_bps: 0     # per-trade allowed loss (bps) on open; 0 = break-even
+  loss_tolerance_bps: 0     # legacy compatibility field; volume requires 0
 
 auto:                       # only used when strategy.pair_selection = auto
   top_y: 5                  # number of active pairs

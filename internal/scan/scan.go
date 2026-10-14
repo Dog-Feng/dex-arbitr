@@ -4,13 +4,14 @@ package scan
 import (
 	"context"
 	"fmt"
+	"time"
+
 	"github.com/Dog-Feng/dex-arbitr/internal/domain"
 	"github.com/Dog-Feng/dex-arbitr/internal/exchange"
 	"github.com/Dog-Feng/dex-arbitr/internal/spread"
 	"github.com/Dog-Feng/dex-arbitr/internal/spread/estimator"
 	"github.com/Dog-Feng/dex-arbitr/internal/strategy"
 	"github.com/Dog-Feng/dex-arbitr/internal/volatility"
-	"time"
 )
 
 type Score struct {
@@ -21,17 +22,20 @@ type Score struct {
 	NetBps      float64
 	MuReady     bool
 	VolReady    bool
+	VolOptional bool // no volatility filter is required when vol_k is explicitly 0
 }
 
 func Eval(q spread.Quote, mu, sigma, feeBps, openBps, volK float64) (ls, sl float64) {
-	need := openBps + feeBps + volK*sigma
-	return q.LS - mu - need, q.SL + mu - need
+	return strategy.OpeningMargins(strategy.Params{OpenBps: openBps, FeeBps: feeBps, VolK: volK}, q, mu, sigma)
 }
 
 type Config struct {
+	StrategyKind          string
 	OpenBps, VolK, FeeBps float64
+	TakerFeeL, TakerFeeR  float64
 	MaxBookAge            time.Duration
 	MaxVolBookAge         time.Duration
+	EstimatorKind         string
 	Estimator             estimator.Params
 	Volatility            volatility.Params
 }
@@ -43,6 +47,15 @@ func Watch(ctx context.Context, base string, l, r exchange.Venue, li, ri domain.
 	defer cancel()
 	clear := func(at time.Time) { on(Score{Base: base, Left: l.Name(), Right: r.Name(), Ts: at}) }
 	defer func() { clear(time.Now()) }()
+	if cfg.StrategyKind == "" {
+		cfg.StrategyKind = "arbitrage"
+	}
+	strat, err := strategy.New(cfg.StrategyKind)
+	if err != nil {
+		return err
+	}
+	p := strategy.Parameters(strat, strategy.Params{OpenBps: cfg.OpenBps, VolK: cfg.VolK, FeeBps: cfg.FeeBps,
+		TakerFeeL: cfg.TakerFeeL, TakerFeeR: cfg.TakerFeeR})
 	chL, err := l.SubscribeBook(ctx, li)
 	if err != nil {
 		return fmt.Errorf("%s subscribe: %w", l.Name(), err)
@@ -80,11 +93,18 @@ func Watch(ctx context.Context, base string, l, r exchange.Venue, li, ri domain.
 	if vp.HalfLife <= 0 {
 		vp.HalfLife = time.Minute
 	}
-	mu := estimator.NewSMA(ep)
+	if cfg.EstimatorKind == "" {
+		cfg.EstimatorKind = "sma"
+	}
+	mu, err := estimator.New(cfg.EstimatorKind, ep)
+	if err != nil {
+		return err
+	}
 	vol := volatility.New(vp)
 	var bl, br domain.Book
 	quote := func(now time.Time, age time.Duration) (spread.Quote, bool) {
-		if now.Sub(bl.Ts) > age || now.Sub(br.Ts) > age || bl.Ts.After(now) || br.Ts.After(now) {
+		if bl.Venue != l.Name() || br.Venue != r.Name() || bl.MarketID != li.MarketID || br.MarketID != ri.MarketID ||
+			bl.Ts.IsZero() || br.Ts.IsZero() || now.Sub(bl.Ts) > age || now.Sub(br.Ts) > age || bl.Ts.After(now) || br.Ts.After(now) {
 			return spread.Quote{}, false
 		}
 		return spread.Compute(bl, br)
@@ -103,14 +123,14 @@ func Watch(ctx context.Context, base string, l, r exchange.Venue, li, ri domain.
 			if !ok {
 				return fmt.Errorf("%s book subscription closed", l.Name())
 			}
-			if b.Ts.After(bl.Ts) {
+			if !b.Valid() || !b.Ts.Before(bl.Ts) {
 				bl = b
 			}
 		case b, ok := <-chR:
 			if !ok {
 				return fmt.Errorf("%s book subscription closed", r.Name())
 			}
-			if b.Ts.After(br.Ts) {
+			if !b.Valid() || !b.Ts.Before(br.Ts) {
 				br = b
 			}
 		case <-fast.C:
@@ -133,13 +153,13 @@ func Watch(ctx context.Context, base string, l, r exchange.Venue, li, ri domain.
 				clear(now)
 				continue
 			}
-			st := mu.StatsAt(now)
-			s := Score{Base: base, Left: l.Name(), Right: r.Name(), Ts: now, MuReady: st.Ready, VolReady: vol.ReadyAt(now)}
-			if !s.MuReady || !s.VolReady {
+			st := estimator.StatsAt(mu, now)
+			s := Score{Base: base, Left: l.Name(), Right: r.Name(), Ts: now, MuReady: st.Ready, VolReady: vol.ReadyAt(now), VolOptional: p.VolK == 0}
+			if !s.MuReady || (!s.VolReady && !s.VolOptional) {
 				on(s)
 				continue
 			}
-			ls, sl := Eval(q, st.Mean, vol.VolAt(now), cfg.FeeBps, cfg.OpenBps, cfg.VolK)
+			ls, sl := strategy.OpeningMargins(p, q, st.Mean, vol.VolAt(now))
 			if ls >= sl {
 				s.Dir, s.NetBps = strategy.DirLS, ls
 			} else {

@@ -2,6 +2,8 @@
 
 > 目标：以最小净成本产生最大成交额，用于赚积分/空投。本文档描述两种刷量形态（taker churn 与对冲做市），以及它们共享的地基。积分回报率暂不量化。
 
+> 本文包含早期方案与未实现的草案。当前实现以 [策略与选币完整链路](strategy-selection-flow.md) 为准：volume 也需 2 小时滚动窗口、1 小时预热，额外开平阈值固定为零，手续费与配置的过滤条件仍生效；未实现定时无条件交易或 maker 路径。
+
 ## 1. 前提与地基
 
 - Lighter 中心化：所有对以 Lighter 为一腿，Lighter 侧始终 taker（免手续费、滑点低、深度足），spoke 侧费率 >0 且各所不同。
@@ -30,7 +32,7 @@ maker 形态下该成本可为负（赚 spread + maker 返佣）。做单笔是�
 
 ```
 open  条件：dev ≥ fee_bps + vol_k·σ        # 覆盖住成本即可，不要求正 edge
-close 条件：profit ≥ 0                       # 不亏就平，快速 churn
+close 条件：毛利 ≥ 已存入场费 + 预计退出费    # 额外 close_bps=0
 ```
 
 配套：
@@ -117,7 +119,7 @@ volume:
   churn_interval: 2s      # 时间兜底的固定节奏
   daily_volume_target: 1000000   # USD
   daily_cost_budget: 100         # bps
-  loss_tolerance_bps: 0.5  # 每笔允许的亏损(bps)，配合 daily_cost_budget 封顶
+  loss_tolerance_bps: 0    # 当前 volume 必须为 0，不能通过此项降低开仓门槛
   close_at_breakeven: true
 
 maker:

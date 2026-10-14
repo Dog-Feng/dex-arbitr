@@ -78,7 +78,7 @@ func run(ctx context.Context, c *config.Config, refresh time.Duration, output io
 		}
 	}()
 	for _, vc := range c.Venues {
-		v, err := exchange.New(vc.Kind, vc.Name, map[string]string{}) // read-only: no credentials
+		v, err := exchange.New(vc.Kind, vc.Name, readOnlyOptions(vc.Opts))
 		if err != nil {
 			return fmt.Errorf("venue %s: %w", vc.Name, err)
 		}
@@ -91,7 +91,10 @@ func run(ctx context.Context, c *config.Config, refresh time.Duration, output io
 	if c.Matching.Separators != "" {
 		m.Separators = c.Matching.Separators
 	}
-	pairs := matchAll(ctx, m, venues)
+	pairs, err := matchAll(ctx, m, venues)
+	if err != nil {
+		return err
+	}
 	if len(pairs) == 0 {
 		return fmt.Errorf("no matched pairs")
 	}
@@ -124,8 +127,10 @@ func run(ctx context.Context, c *config.Config, refresh time.Duration, output io
 		go func() {
 			defer wg.Done()
 			if err := scan.Watch(ctx, p.base, p.l, p.r, p.li, p.ri, scan.Config{
-				OpenBps: c.Strategy.OpenBps, VolK: c.Strategy.VolK, FeeBps: p.fee,
+				StrategyKind: c.Strategy.Kind, OpenBps: c.Strategy.OpenBps, VolK: c.Strategy.VolK, FeeBps: p.fee,
+				TakerFeeL: p.li.TakerFee, TakerFeeR: p.ri.TakerFee,
 				MaxBookAge: c.Strategy.MaxBookAge, MaxVolBookAge: c.Volatility.MaxAge,
+				EstimatorKind: c.Estimator.Kind,
 				Estimator: estimator.Params{Window: c.Estimator.Window, MinWarmup: c.Estimator.MinWarmup,
 					MinCoverage: c.Estimator.MinCoverage, Interval: c.Estimator.Interval},
 				Volatility: volatility.Params{Interval: c.Volatility.Interval, Horizon: c.Volatility.Horizon,
@@ -153,16 +158,22 @@ type board struct {
 func newBoard(pairs []pairSpec) *board {
 	b := &board{m: map[string]scan.Score{}}
 	for _, p := range pairs {
-		b.m[p.base] = scan.Score{Base: p.base}
+		s := scan.Score{Base: p.base}
+		if p.l != nil && p.r != nil {
+			s.Left, s.Right = p.l.Name(), p.r.Name()
+		}
+		b.m[scoreKey(s)] = s
 	}
 	return b
 }
 
 func (b *board) set(s scan.Score) {
 	b.mu.Lock()
-	b.m[s.Base] = s
+	b.m[scoreKey(s)] = s
 	b.mu.Unlock()
 }
+
+func scoreKey(s scan.Score) string { return s.Base + "\x00" + s.Left + "\x00" + s.Right }
 
 func (b *board) sorted(now time.Time) []scan.Score {
 	b.mu.Lock()
@@ -179,7 +190,7 @@ func (b *board) sorted(now time.Time) []scan.Score {
 		if validI && out[i].NetBps != out[j].NetBps {
 			return out[i].NetBps > out[j].NetBps
 		}
-		return out[i].Base < out[j].Base
+		return scoreKey(out[i]) < scoreKey(out[j])
 	})
 	return out
 }
@@ -198,7 +209,7 @@ func scoreStatus(s scan.Score, now time.Time) string {
 	if math.IsNaN(s.NetBps) || math.IsInf(s.NetBps, 0) {
 		return "invalid"
 	}
-	if !s.MuReady || !s.VolReady {
+	if !s.MuReady || (!s.VolReady && !s.VolOptional) {
 		return "unavailable"
 	}
 	return ""
@@ -214,7 +225,7 @@ func render(output io.Writer, b *board, tty bool, now time.Time) error {
 	if _, err := fmt.Fprintf(output, "== pair scan  %d pairs  %s ==\n", len(rows), now.Format("15:04:05")); err != nil {
 		return err
 	}
-	if _, err := fmt.Fprintf(output, "%-4s %-12s %-18s %s\n", "#", "PAIR", "DIR", "NET_BPS"); err != nil {
+	if _, err := fmt.Fprintf(output, "%-4s %-12s %-24s %-18s %s\n", "#", "PAIR", "VENUES", "DIR", "NET_BPS"); err != nil {
 		return err
 	}
 	for i, s := range rows {
@@ -225,7 +236,7 @@ func render(output io.Writer, b *board, tty bool, now time.Time) error {
 			}
 			net = fmt.Sprintf("%+.2f", s.NetBps)
 		}
-		if _, err := fmt.Fprintf(output, "%-4d %-12s %-18s %s\n", i+1, s.Base, dir, net); err != nil {
+		if _, err := fmt.Fprintf(output, "%-4d %-12s %-24s %-18s %s\n", i+1, s.Base, s.Left+"/"+s.Right, dir, net); err != nil {
 			return err
 		}
 	}
@@ -244,34 +255,29 @@ type pairSpec struct {
 	fee    float64
 }
 
-func matchAll(ctx context.Context, m symbols.Matcher, venues map[string]exchange.Venue) []pairSpec {
-	type ven struct {
-		name  string
-		venue exchange.Venue
-		inst  []domain.Instrument
-	}
-	var vs []ven
-	names := make([]string, 0, len(venues))
-	for name := range venues {
-		names = append(names, name)
-	}
-	sort.Strings(names) // deterministic left/right: lighter before rhlighter
-	for _, name := range names {
-		inst, err := venues[name].Instruments(ctx)
-		if err != nil {
-			slog.Warn("instruments", "venue", name, "err", err)
+// Preserve the configured market-data source while keeping the scanner read-only.
+func readOnlyOptions(opts map[string]string) map[string]string {
+	copy := make(map[string]string, len(opts))
+	for key, value := range opts {
+		switch key {
+		case "private_key", "account_index", "api_key_index":
 			continue
 		}
-		vs = append(vs, ven{name: name, venue: venues[name], inst: inst})
+		copy[key] = value
 	}
-	var out []pairSpec
-	for i := 0; i < len(vs); i++ {
-		for j := i + 1; j < len(vs); j++ {
-			for _, p := range symbols.Match(m, vs[i].inst, vs[j].inst) {
-				out = append(out, pairSpec{base: p.Base, l: vs[i].venue, r: vs[j].venue,
-					li: p.Left, ri: p.Right, fee: 2 * (p.Left.TakerFee + p.Right.TakerFee) * 1e4})
-			}
-		}
+	return copy
+}
+
+func matchAll(ctx context.Context, m symbols.Matcher, venues map[string]exchange.Venue) ([]pairSpec, error) {
+	matches, err := scan.MatchAll(ctx, m, venues)
+	if err != nil {
+		return nil, err
 	}
-	return out
+	out := make([]pairSpec, 0, len(matches))
+	for _, match := range matches {
+		p := match.Pair
+		out = append(out, pairSpec{base: p.Base, l: match.L, r: match.R,
+			li: p.Left, ri: p.Right, fee: 2 * (p.Left.TakerFee + p.Right.TakerFee) * 1e4})
+	}
+	return out, nil
 }

@@ -61,3 +61,35 @@ func TestSMAAcceptsPreEpochTimestamps(t *testing.T) {
 		t.Fatalf("pre-epoch stats=%+v", st)
 	}
 }
+
+func TestSMAWarmupRequiresElapsedTimeAndRestartsAfterEmptyWindow(t *testing.T) {
+	start := time.Unix(1_000_000, 999_000_000)
+	s := NewSMA(Params{Window: 10 * time.Second, MinWarmup: 5 * time.Second, MinCoverage: .8, Interval: time.Second})
+	// Six buckets can be touched in just over four seconds when samples lie
+	// either side of the bucket boundaries. Bucket count is not elapsed time.
+	s.Update(start, 1)
+	for i := 1; i <= 5; i++ {
+		s.Update(start.Truncate(time.Second).Add(time.Duration(i)*time.Second), 1)
+	}
+	last := start.Truncate(time.Second).Add(5 * time.Second)
+	if s.Ready() || s.StatsAt(last).Ready {
+		t.Fatal("bucket span bypassed actual warmup duration")
+	}
+	s.Update(start.Add(5*time.Second), 1)
+	if !s.Ready() || !s.StatsAt(start.Add(5*time.Second)).Ready {
+		t.Fatal("full warmup did not become ready")
+	}
+	// Once every old sample has expired, a new observation starts cold.
+	s.Update(start.Add(time.Minute), 2)
+	if s.Ready() || s.StatsAt(start.Add(time.Minute)).Ready {
+		t.Fatal("window emptied but kept previous warmup age")
+	}
+	// Warmup equal to the rolling window must remain achievable after eviction.
+	s = NewSMA(Params{Window: 5 * time.Second, MinWarmup: 5 * time.Second, MinCoverage: 1, Interval: time.Second})
+	for i := 0; i <= 5; i++ {
+		s.Update(start.Add(time.Duration(i)*time.Second), 1)
+	}
+	if !s.Ready() || s.Stats().Samples != 5 {
+		t.Fatalf("full-window warmup became impossible: %+v", s.Stats())
+	}
+}

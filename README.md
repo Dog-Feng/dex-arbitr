@@ -5,6 +5,8 @@ Currently integrated venues: **Lighter mainnet** (`kind: lighter`, chain 304) an
 
 本轮 F01–F26 修复、回归测试及恢复边界见 [交易安全与生命周期修复说明](docs/trading-safety-fixes.md)。代码检查只运行测试和编译，不自动启动项目或服务；下文运行命令由操作者明确选择执行。
 
+`arbitrage / volume` 与 `manual / auto` 的四种组合、预热及参数规则见 [策略与选币完整链路](docs/strategy-selection-flow.md)。两种策略都采用配置中的 2 小时滚动窗口、1 小时预热；volume 的额外开平阈值固定为零，手续费、深度和所配置的波动过滤仍生效。
+
 升级时请保留完整 `state_dir` 与配置，并注意：
 
 - 同一状态目录只允许一个写入进程；停止信号保存状态，不承诺自动平仓。

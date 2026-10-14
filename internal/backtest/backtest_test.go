@@ -51,15 +51,25 @@ func TestReplayCapturesOscillation(t *testing.T) {
 	}
 }
 
+func TestReplayRequiresActualWarmupDuration(t *testing.T) {
+	r, err := ReplayChecked(legacySeries(20), replayParams()) // 1.9s, below the configured 2s
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.MeanReady || r.Opens != 0 {
+		t.Fatalf("replay traded before elapsed warmup: %+v", r)
+	}
+}
+
 func TestReplayPreservesInventoryAndDollarLossAcrossPriceDrift(t *testing.T) {
 	start := time.Unix(1000, 0)
 	var samples []Sample
-	for i := 0; i <= 10; i++ {
+	for i := 0; i <= 20; i++ {
 		samples = append(samples, pricedSample(start.Add(time.Duration(i)*100*time.Millisecond), 100, 100.02, 100, 100.02, 100))
 	}
-	entry := pricedSample(start.Add(1200*time.Millisecond), 99.98, 100, 102, 102.02, 100)
-	exit := pricedSample(start.Add(1400*time.Millisecond), 200, 200.02, 202.98, 203, 100)
-	samples = append(samples, pricedSample(start.Add(1100*time.Millisecond), 100, 100.02, 100, 100.02, 100), entry, pricedSample(start.Add(1300*time.Millisecond), 99.98, 100, 102, 102.02, 100), exit)
+	entry := pricedSample(start.Add(2200*time.Millisecond), 99.98, 100, 102, 102.02, 100)
+	exit := pricedSample(start.Add(2400*time.Millisecond), 200, 200.02, 202.98, 203, 100)
+	samples = append(samples, pricedSample(start.Add(2100*time.Millisecond), 100, 100.02, 100, 100.02, 100), entry, pricedSample(start.Add(2300*time.Millisecond), 99.98, 100, 102, 102.02, 100), exit)
 	p := replayParams()
 	r, err := ReplayChecked(samples, p)
 	if err != nil {
@@ -84,9 +94,9 @@ func TestReplayUsesDepthAndMarksWithoutForcedClose(t *testing.T) {
 	start := time.Unix(1000, 0)
 	makeSeries := func(size float64) []Sample {
 		var samples []Sample
-		for i := 0; i <= 14; i++ {
+		for i := 0; i <= 24; i++ {
 			s := pricedSample(start.Add(time.Duration(i)*100*time.Millisecond), 100, 100.02, 100, 100.02, 100)
-			if i >= 12 {
+			if i >= 22 {
 				s = pricedSample(time.Unix(0, s.Ts), 99.98, 100, 102, 102.02, size)
 			}
 			samples = append(samples, s)

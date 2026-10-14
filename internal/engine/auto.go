@@ -258,55 +258,37 @@ func (rt *runtime) matchAll(ctx context.Context) (cands []*candidate, matchErr e
 			}
 		}
 	}()
-	type ven struct {
-		name  string
-		venue exchange.Venue
-		inst  []domain.Instrument
-	}
-	var vs []ven
-	names := make([]string, 0, len(rt.venues))
-	for name := range rt.venues {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	for _, name := range names {
-		slog.Info("auto: fetching instruments", "venue", name)
-		inst, err := rt.venues[name].Instruments(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("%s instruments: %w", name, err)
-		}
-		vs = append(vs, ven{name: name, venue: rt.venues[name], inst: inst})
+	matches, err := scan.MatchAll(ctx, rt.matcher, rt.venues)
+	if err != nil {
+		return nil, err
 	}
 	whitelist := map[string]bool{}
 	for _, b := range rt.cfg.Auto.Candidates {
 		whitelist[rt.matcher.Normalize(b)] = true
 	}
-	for i := 0; i < len(vs); i++ {
-		for j := i + 1; j < len(vs); j++ {
-			for _, p := range symbols.Match(rt.matcher, vs[i].inst, vs[j].inst) {
-				est, vol, volL, volR, err := rt.newStats()
-				if err != nil {
-					return nil, err
-				}
-				var samples *store.SampleSink
-				if rt.cfg.SamplesDir != "" {
-					samples, err = store.NewSampleSink(filepath.Join(rt.cfg.SamplesDir, fmt.Sprintf("%s_%s_%s.jsonl", p.Base, vs[i].name, vs[j].name)))
-					if err != nil {
-						return nil, err
-					}
-				}
-				out = append(out, &candidate{
-					base: p.Base, key: pairKey(p.Base, vs[i].name, vs[j].name, rt.cfg.DryRun),
-					pair: p, l: vs[i].venue, r: vs[j].venue,
-					est: est, vol: vol, volL: volL, volR: volR,
-					health:   scan.NewHealthTracker(600),
-					notional: rt.cfg.Auto.NotionalPerLeg, depthRatio: rt.cfg.Auto.DepthUseRatio,
-					tick:       maxTick(p.Left, p.Right),
-					maxBookAge: rt.cfg.Strategy.MaxBookAge, samples: samples,
-					excluded: len(whitelist) > 0 && !whitelist[p.Base],
-				})
+	for _, match := range matches {
+		p, l, r := match.Pair, match.L, match.R
+		est, vol, volL, volR, err := rt.newStats()
+		if err != nil {
+			return nil, err
+		}
+		var samples *store.SampleSink
+		if rt.cfg.SamplesDir != "" {
+			samples, err = store.NewSampleSink(filepath.Join(rt.cfg.SamplesDir, fmt.Sprintf("%s_%s_%s.jsonl", p.Base, l.Name(), r.Name())))
+			if err != nil {
+				return nil, err
 			}
 		}
+		out = append(out, &candidate{
+			base: p.Base, key: pairKey(p.Base, l.Name(), r.Name(), rt.cfg.DryRun),
+			pair: p, l: l, r: r,
+			est: est, vol: vol, volL: volL, volR: volR,
+			health:   scan.NewHealthTracker(600),
+			notional: rt.cfg.Auto.NotionalPerLeg, depthRatio: rt.cfg.Auto.DepthUseRatio,
+			tick:       maxTick(p.Left, p.Right),
+			maxBookAge: rt.cfg.Strategy.MaxBookAge, samples: samples,
+			excluded: len(whitelist) > 0 && !whitelist[p.Base],
+		})
 	}
 	return out, nil
 }

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Dog-Feng/dex-arbitr/internal/strategy"
 	"github.com/Dog-Feng/dex-arbitr/internal/symbols"
 
 	"gopkg.in/yaml.v3"
@@ -81,7 +82,7 @@ type Config struct {
 		MinInventory      int     `yaml:"min_inventory"`       // floor steps held while churning
 		DailyVolumeTarget float64 `yaml:"daily_volume_target"` // USD; 0 = unlimited
 		DailyCostBudget   float64 `yaml:"daily_cost_budget"`   // USD max daily loss; 0 = unlimited
-		LossToleranceBps  float64 `yaml:"loss_tolerance_bps"`  // per-trade allowed loss (bps) on open
+		LossToleranceBps  float64 `yaml:"loss_tolerance_bps"`  // legacy option; volume requires 0
 	} `yaml:"volume"`
 	Execution struct {
 		PriceTicks    int     `yaml:"price_ticks"`     // fixed allowance; fallback while sigma is not ready
@@ -292,6 +293,9 @@ func (c *Config) validate() error {
 	if err := finiteFields(reflect.ValueOf(*c), ""); err != nil {
 		return err
 	}
+	if _, err := strategy.New(c.Strategy.Kind); err != nil {
+		return fmt.Errorf("strategy.kind: %w", err)
+	}
 	for _, d := range []struct {
 		name  string
 		value time.Duration
@@ -430,8 +434,8 @@ func (c *Config) validate() error {
 	default:
 		return fmt.Errorf("strategy.close_order must be best|lifo|fifo")
 	}
-	if c.Strategy.VolK <= 0 {
-		return fmt.Errorf("strategy.vol_k must be > 0")
+	if c.Strategy.VolK < 0 {
+		return fmt.Errorf("strategy.vol_k must be >= 0")
 	}
 	if c.Volume.MinInventory < 0 {
 		return fmt.Errorf("volume.min_inventory must be >= 0")
@@ -441,6 +445,9 @@ func (c *Config) validate() error {
 	}
 	if c.Volume.LossToleranceBps < 0 {
 		return fmt.Errorf("volume.loss_tolerance_bps must be >= 0")
+	}
+	if c.Strategy.Kind == "volume" && c.Volume.LossToleranceBps != 0 {
+		return fmt.Errorf("volume.loss_tolerance_bps must be 0: volume uses open_bps=0 and close_bps=0")
 	}
 	switch c.Strategy.PairSelection {
 	case "manual", "auto":

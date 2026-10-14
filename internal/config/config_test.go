@@ -197,3 +197,33 @@ func TestLoadPairSelection(t *testing.T) {
 		})
 	}
 }
+
+func TestStrategyKindsUseCommonWindowAndExplicitVolumePolicy(t *testing.T) {
+	for _, kind := range []string{"arbitrage", "volume"} {
+		for _, mode := range []string{"manual", "auto"} {
+			t.Run(kind+"/"+mode, func(t *testing.T) {
+				c, err := loadTestConfig(t, "strategy:\n  kind: "+kind+"\n  pair_selection: "+mode+"\n  vol_k: 0\n")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if c.Estimator.Window != 2*time.Hour || c.Estimator.MinWarmup != time.Hour || c.Estimator.Interval != time.Second || c.Estimator.MinCoverage != .8 {
+					t.Fatalf("strategy/selection changed sampling defaults: %+v", c.Estimator)
+				}
+				if c.Strategy.VolK != 0 {
+					t.Fatal("explicitly disabled volatility buffer was overwritten")
+				}
+			})
+		}
+	}
+	for _, tc := range []struct{ name, data, want string }{
+		{"unknown strategy", "strategy:\n  kind: typo\n  pair_selection: auto\n", "strategy.kind"},
+		{"negative volatility multiplier", "strategy:\n  vol_k: -1\n", "vol_k"},
+		{"volume negative edge", "strategy:\n  kind: volume\nvolume:\n  loss_tolerance_bps: 0.5\n", "volume.loss_tolerance_bps must be 0"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := loadTestConfig(t, tc.data); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Load=%v, want %s", err, tc.want)
+			}
+		})
+	}
+}

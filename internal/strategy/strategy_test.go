@@ -129,3 +129,72 @@ func TestVolumeStrategyRegistered(t *testing.T) {
 		t.Fatalf("volume strategy: %v", err)
 	}
 }
+
+func TestVolumeOwnsZeroThresholdsAndRetainsTradingGuards(t *testing.T) {
+	q, ok := spread.Compute(book(99.99, 100, 1), book(100.05, 100.06, 1))
+	if !ok {
+		t.Fatal("invalid test quote")
+	}
+	p := Params{StepQty: .01, MaxSteps: 3, DepthMult: 2, OpenBps: 20, CloseBps: 20}
+	s := State{Mode: ModeRunning}
+	v := Volume{}
+	if got := v.Decide(p, s, q, 0, true, 0); got.Kind != Open {
+		t.Fatalf("volume retained arbitrage edge: %+v", got)
+	}
+	if got := (Arbitrage{}).Decide(p, s, q, 0, true, 0); got.Kind != None {
+		t.Fatalf("arbitrage lost configured edge: %+v", got)
+	}
+	for _, tc := range []struct {
+		name   string
+		params Params
+		state  State
+		ready  bool
+		sigma  float64
+	}{
+		{"warmup", p, s, false, 0},
+		{"paused", p, State{Mode: ModePaused}, true, 0},
+		{"reduce only", p, State{Mode: ModeReduceOnly}, true, 0},
+		{"fees", func() Params { x := p; x.FeeBps = 10; return x }(), s, true, 0},
+		{"volatility", func() Params { x := p; x.VolK = 1; return x }(), s, true, 10},
+		{"depth", func() Params { x := p; x.DepthMult = 200; return x }(), s, true, 0},
+		{"max steps", func() Params { x := p; x.MaxSteps = 1; return x }(), State{Mode: ModeRunning, Steps: []Step{testStep(1, DirLS, -100)}}, true, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := v.Decide(tc.params, tc.state, q, 0, tc.ready, tc.sigma); got.Kind != None {
+				t.Fatalf("volume bypassed %s: %+v", tc.name, got)
+			}
+		})
+	}
+	// Positive net profit below the arbitrage target still closes in volume.
+	st := Step{ID: 1, Dir: DirLS, Qty: .01, OriginalQty: .01, OpenL: 99.98, OpenR: 100.06}
+	s = State{Mode: ModeReduceOnly, Steps: []Step{st}}
+	if got := v.Decide(p, s, q, 0, false, 0); got.Kind != Close {
+		t.Fatalf("volume retained nonzero close edge: %+v", got)
+	}
+	if got := (Arbitrage{}).Decide(p, s, q, 0, false, 0); got.Kind != None {
+		t.Fatalf("arbitrage ignored close target: %+v", got)
+	}
+}
+
+func TestOpeningMarginsAgreeWithBothStrategyThresholds(t *testing.T) {
+	q, ok := spread.Compute(book(99.99, 100, 1), book(100.3, 100.31, 1))
+	if !ok {
+		t.Fatal("invalid quote")
+	}
+	for _, kind := range []string{"arbitrage", "volume"} {
+		t.Run(kind, func(t *testing.T) {
+			s, err := New(kind)
+			if err != nil {
+				t.Fatal(err)
+			}
+			p := Parameters(s, Params{StepQty: .01, MaxSteps: 3, DepthMult: 2, OpenBps: 5, CloseBps: 7, VolK: 1.2, TakerFeeL: .0003, TakerFeeR: .0001})
+			for _, mu := range []float64{0, 30, 60} {
+				ls, sl := OpeningMargins(p, q, mu, 2)
+				a := s.Decide(p, State{Mode: ModeRunning}, q, mu, true, 2)
+				if (a.Kind == Open) != (ls >= 0 || sl >= 0) {
+					t.Fatalf("scanner/execution disagree: ls=%v sl=%v action=%+v", ls, sl, a)
+				}
+			}
+		})
+	}
+}

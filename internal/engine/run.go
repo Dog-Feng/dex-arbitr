@@ -69,10 +69,9 @@ func (rt *runtime) buildActor(pair symbols.Pair, qty float64, maxSteps int, l, r
 		return nil, err
 	}
 	feeBps := 2 * (pair.Left.TakerFee + pair.Right.TakerFee) * 1e4
-	openBps, closeBps, minInv := c.Strategy.OpenBps, c.Strategy.CloseBps, 0
+	minInv := 0
 	volTarget, volBudget := 0.0, 0.0
 	if c.Strategy.Kind == "volume" {
-		openBps, closeBps = -c.Volume.LossToleranceBps, 0
 		minInv = c.Volume.MinInventory
 		volTarget, volBudget = c.Volume.DailyVolumeTarget, c.Volume.DailyCostBudget
 	}
@@ -89,9 +88,9 @@ func (rt *runtime) buildActor(pair symbols.Pair, qty float64, maxSteps int, l, r
 			Low: c.Adaptive.FailLow, Up: c.Adaptive.UpFactor, Down: c.Adaptive.DownFactor,
 			Min: c.Adaptive.MinK, Max: c.Adaptive.MaxK},
 		Monitor: rt.mon,
-		Params: strategy.Params{StepQty: qty, MaxSteps: maxSteps, OpenBps: openBps, CloseBps: closeBps,
+		Params: strategy.Parameters(strat, strategy.Params{StepQty: qty, MaxSteps: maxSteps, OpenBps: c.Strategy.OpenBps, CloseBps: c.Strategy.CloseBps,
 			DepthMult: c.Strategy.DepthMult, CloseOrder: c.Strategy.CloseOrder, VolK: c.Strategy.VolK, FeeBps: feeBps,
-			MinInventory: minInv, TakerFeeL: pair.Left.TakerFee, TakerFeeR: pair.Right.TakerFee},
+			MinInventory: minInv, TakerFeeL: pair.Left.TakerFee, TakerFeeR: pair.Right.TakerFee}),
 	})
 }
 

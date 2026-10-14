@@ -64,7 +64,7 @@ ts,midBps,lsBps,slBps,Lbid,Lask,Rbid,Rask,refMid,LbidQty,LaskQty,RbidQty,RaskQty
 
 回测默认拒绝采样缺口；显式选择 `-allow_gaps` 后会报告缺口并重置采样统计，不能把长间隔误算成短期收益。校准工具也排除跨越长缺口的增量，并拒绝损坏、非有限和乱序数据。对应 `backtest.TestReplayChecksInputsAndGaps`、`TestReplayRejectsMixedPriceModels`、`TestReplayUsesDepthAndMarksWithoutForcedClose`、`volcal.TestIncrementsExcludeLongGaps` 以及 `backtest.TestRunReportsApproximateInventoryAndAssumptions`（命令包）。
 
-2026-10-15 完成最终集成验证（Go 1.23.4）：18 个测试包的竞态检查通过，220 个顶层测试、含子用例共 556 项通过，无失败或跳过的测试用例；另外 3 个包没有测试文件。`go vet ./...`、五个命令的编译、gofmt 和差异格式检查通过。依赖声明和锁文件没有变更。即时救援还覆盖零成交、部分成交、缺少全部/单腿盘口时返回未完成结果，并在后续恢复中保留累计成交。
+2026-10-15 完成集成验证及 [四种策略/选币组合的补充检查](strategy-selection-flow.md)（Go 1.23.4）：18 个测试包的竞态检查通过，233 个顶层测试、含子用例共 595 项通过，无失败或跳过的测试用例；另外 3 个包没有测试文件。`go vet ./...`、五个命令的编译、gofmt 和差异格式检查通过。依赖声明和锁文件没有变更。即时救援还覆盖零成交、部分成交、缺少全部/单腿盘口时返回未完成结果，并在后续恢复中保留累计成交。
 
 可以使用以下命令复核代码，这些命令不启动项目或提交交易：
 

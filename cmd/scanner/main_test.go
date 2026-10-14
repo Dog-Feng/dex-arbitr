@@ -105,3 +105,56 @@ func TestRenderReturnsOutputError(t *testing.T) {
 		t.Fatalf("error=%v, want %v", err, want)
 	}
 }
+
+func TestReadOnlyOptionsKeepConfiguredMarketSource(t *testing.T) {
+	input := map[string]string{"host": "https://example.test", "ws_url": "wss://example.test/ws", "chain_id": "304", "book_depth": "7", "private_key": "test-only-secret", "account_index": "12", "api_key_index": "4"}
+	got := readOnlyOptions(input)
+	for _, key := range []string{"host", "ws_url", "chain_id", "book_depth"} {
+		if got[key] != input[key] {
+			t.Fatalf("scanner lost source option %s", key)
+		}
+	}
+	for _, key := range []string{"private_key", "account_index", "api_key_index"} {
+		if _, exists := got[key]; exists {
+			t.Fatalf("scanner received credential option %s", key)
+		}
+	}
+	got["host"] = "changed"
+	if input["host"] != "https://example.test" || input["private_key"] != "test-only-secret" {
+		t.Fatal("read-only setup mutated trading configuration")
+	}
+}
+
+func TestBoardPreservesSameBaseOnDifferentVenues(t *testing.T) {
+	now := time.Now()
+	b := newBoard(nil)
+	for _, s := range []scan.Score{
+		{Base: "BTC", Left: "A", Right: "B", Ts: now, NetBps: 3, MuReady: true, VolReady: true},
+		{Base: "BTC", Left: "A", Right: "C", Ts: now, NetBps: 2, MuReady: true, VolReady: true},
+	} {
+		b.set(s)
+	}
+	rows := b.sorted(now)
+	if len(rows) != 2 || rows[0].Right != "B" || rows[1].Right != "C" {
+		t.Fatalf("venue combinations overwritten: %+v", rows)
+	}
+	var out bytes.Buffer
+	if err := render(&out, b, false, now); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "A/B") || !strings.Contains(out.String(), "A/C") {
+		t.Fatal("scanner does not identify venue combinations")
+	}
+}
+
+func TestBoardAllowsExplicitlyDisabledVolatilityFilter(t *testing.T) {
+	now := time.Now()
+	s := scan.Score{Base: "TEST", Ts: now, MuReady: true, VolReady: false, VolOptional: true, NetBps: 1}
+	if status := scoreStatus(s, now); status != "" {
+		t.Fatalf("disabled volatility filter hides valid score: %s", status)
+	}
+	s.MuReady = false
+	if status := scoreStatus(s, now); status != "unavailable" {
+		t.Fatalf("disabled volatility filter bypassed mean warmup: %s", status)
+	}
+}

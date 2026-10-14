@@ -99,7 +99,7 @@ SL    = (L.bid1 - R.ask1) / mid      // 卖左买右的可成交价差
 - σ（价差）：`Mid` 的实现波动率，100ms 采样、500ms 窗口 sum(Δs)^2 滚动和 + EWMA（半衰期 1m），σ=sqrt(RV)。
 - σ（腿价）：`bookL.Mid()`/`bookR.Mid()` 各自估计，用于单腿让价（腿价波动 = 标的 + 价差，比价差 σ 大）。
 - 开仓门槛：`dev >= open_bps + fee_bps + vol_k*σ`，其中 `devLS = LS-μ`、`devSL = SL+μ`，`fee_bps` 为该 pair 的往返 taker 费（由两所 TakerFee 合成，净成本）。
-- 平仓门槛：该步往返净利 `EntryBps + 反向可成交价差 - fee_bps >= close_bps`。
+- 平仓门槛：按两腿实际开平价差计算 USD 毛利，减去存储的入场费用和预计退出费用，再以固定入场参考价格转换 bps，要求净利 `>= close_bps`。不同价格基准的入场/退出 bps 不能直接相加。
 - EntryBps：开仓成交价差的真实值，分母用成交时 mid `(lPx+rPx)/2`。
 
 ## 6. 状态机
@@ -126,7 +126,7 @@ WARMUP --(μ 就绪)--> RUNNING <-> REDUCE_ONLY
 `engine.Run` 完成公共组装后打印 `engine starting`，按 `strategy.pair_selection` 分流：
 
 - `manual`（默认）：`runManual` 只跑配置里的 `pairs`，每个 pair 自建并自采样 μ/σ，预热 1h 后执行策略，行为与历史版本一致。
-- `auto`：`runAuto` 全量匹配所有候选对，启动共享数据面持续预热，picker 按 churn score 选出 top-Y 动态晋升/降出，晋升时复用共享统计、免二次预热。
+- `auto`：`runAuto` 从扫描模块 `scan.MatchAll` 取得全部匹配候选，启动共享数据面持续预热，picker 按 churn score 选出 top-Y 动态晋升/降出，晋升时复用共享统计、免二次预热。`pairs` 不参与自动发现。
 
 两者共享 `runtime.buildActor`（建 PairActor）、`runtime.newStats`（建估计器）与 `runtime.applyLeverage`（自适应杠杆），只是「活跃对从哪来、统计从哪来」不同。
 
@@ -134,7 +134,7 @@ WARMUP --(μ 就绪)--> RUNNING <-> REDUCE_ONLY
 
 1. `config.Load`：读 YAML、${ENV} 展开、填默认值、校验。
 2. `engine.Run`：构建 monitor（可选 HTTP）、按注册表构建 venues；实盘校验凭证并建 OrderTracker。
-3. 对每个候选/配置 pair：拉永续列表 -> 前缀匹配 -> 精度对齐（size_decimals 取短、min_qty 取大）。
+3. 对每个候选/配置 pair：拉永续列表 -> 标的归一化后完全匹配 -> 精度对齐（size_decimals 取短、min_qty 取大并向上对齐）。
 4. 实盘时为每个市场的杠杆做自适应解析（见 §8.1）：`min(配置 leverage, 市场最大杠杆)`，失败降级为交易所当前杠杆。
 5. manual 模式每个 pair 起一个 PairActor；auto 模式先起数据面收集器（全量预热），picker 后续才起活跃对 actor。
 
@@ -155,7 +155,7 @@ WARMUP --(μ 就绪)--> RUNNING <-> REDUCE_ONLY
 2. 再开仓：仅 RUNNING 且 μ 就绪；`dev >= open_bps + fee_bps + vol_k*σ`、同方向、`|counter| < max_steps`、两腿一档深度 >= `step_qty*depth_mult`。
 3. 都不满足则不动。
 
-注：`volume` 策略在 build 阶段把 `open_bps/close_bps` 覆盖为 `-loss_tolerance_bps / 0`，即「覆盖成本就开、回本即平」，故 config 里这两项在 volume 模式下不生效，真正调激进程度的是 `vol_k` 与 `loss_tolerance_bps`。
+注：`volume` 策略自己将额外 `open_bps/close_bps` 固定为 `0 / 0`，扫描器与 actor 共用该参数规则；手续费、`vol_k`、深度和预算仍生效。显式 `vol_k: 0` 可关闭波动过滤，不跳过均值预热。旧兼容字段 `volume.loss_tolerance_bps` 在 volume 模式下必须为零，避免把零门槛改成负门槛。四种组合详见 [策略与选币完整链路](strategy-selection-flow.md)。
 
 ### 7.4 一次执行（Executor）
 

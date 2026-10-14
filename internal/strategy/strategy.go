@@ -88,9 +88,27 @@ type Strategy interface {
 // Arbitrage is the mean-reversion step strategy.
 type Arbitrage struct{}
 
-// Volume is the minimal-cost churn strategy: the same mean-reversion mechanics,
-// driven by Params to open at cost and close at break-even above a floor.
-type Volume struct{ Arbitrage }
+// Volume uses the same mean-reversion mechanics with zero additional open and
+// close edge. Fees, volatility, depth and inventory limits still apply.
+type Volume struct{}
+
+// Parameters applies a registered strategy's parameter policy. Drivers use it
+// for both scanning and execution so their effective thresholds agree.
+func Parameters(s Strategy, p Params) Params {
+	if policy, ok := s.(interface{ Parameters(Params) Params }); ok {
+		return policy.Parameters(p)
+	}
+	return p
+}
+
+func (Volume) Parameters(p Params) Params {
+	p.OpenBps, p.CloseBps = 0, 0
+	return p
+}
+
+func (v Volume) Decide(p Params, s State, q spread.Quote, mu float64, muReady bool, vol float64) Action {
+	return (Arbitrage{}).Decide(v.Parameters(p), s, q, mu, muReady, vol)
+}
 
 // State is the pair state the strategy needs.
 type State struct {
@@ -211,6 +229,22 @@ func openFeeBps(p Params, q spread.Quote, d Dir) float64 {
 	return RoundTripFeeUSD(st, lpx, rpx, 1, p.TakerFeeL, p.TakerFeeR) / q.RefMid * 1e4
 }
 
+func openingThreshold(p Params, q spread.Quote, d Dir, vol float64) float64 {
+	return p.OpenBps + openFeeBps(p, q, d) + p.VolK*vol
+}
+
+// OpeningMargins reports each direction's remaining edge after the same fee
+// and volatility reservation used by Decide. It does not bypass warmup, sizing
+// or inventory gates; a scanner score alone is never a trading instruction.
+func OpeningMargins(p Params, q spread.Quote, mu, vol float64) (ls, sl float64) {
+	if _, ok := spread.Compute(q.L, q.R); !ok || !validPrice(q.RefMid) || !finite(q.LS) || !finite(q.SL) ||
+		!finite(mu) || !finite(vol) || vol < 0 || !finite(p.OpenBps) || !finite(p.VolK) || p.VolK < 0 ||
+		!finite(p.FeeBps) || p.FeeBps < 0 || !finite(p.TakerFeeL) || p.TakerFeeL < 0 || !finite(p.TakerFeeR) || p.TakerFeeR < 0 {
+		return math.NaN(), math.NaN()
+	}
+	return q.LS - mu - openingThreshold(p, q, DirLS, vol), q.SL + mu - openingThreshold(p, q, DirSL, vol)
+}
+
 func depthOK(q spread.Quote, l, r domain.Side, need float64) bool {
 	top := func(b domain.Book, s domain.Side) float64 {
 		if s == domain.Buy {
@@ -296,7 +330,7 @@ func (Arbitrage) Decide(p Params, s State, q spread.Quote, mu float64, muReady b
 	}
 	try := func(d Dir, dev float64) (Action, bool) {
 		feeBps := openFeeBps(p, q, d)
-		needDev := p.OpenBps + feeBps + p.VolK*vol
+		needDev := openingThreshold(p, q, d, vol)
 		if math.IsNaN(dev) || math.IsInf(dev, 0) || math.IsNaN(needDev) || math.IsInf(needDev, 0) {
 			return Action{Reason: "invalid threshold"}, true
 		}

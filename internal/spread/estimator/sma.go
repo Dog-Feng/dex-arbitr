@@ -12,13 +12,14 @@ func init() {
 // SMA is a time-bucketed simple moving average: one slot per Interval,
 // ring buffer + running sum, O(1) per update.
 type SMA struct {
-	p      Params
-	slots  []slot
-	sum    float64
-	n      int
-	first  int64 // first bucket observed (for span)
-	lastBk int64
-	last   time.Time
+	p       Params
+	slots   []slot
+	sum     float64
+	n       int
+	first   int64 // first bucket observed (for span)
+	lastBk  int64
+	last    time.Time
+	started time.Time // actual first sample of this window history, for warmup
 }
 
 type slot struct {
@@ -54,6 +55,9 @@ func (s *SMA) Update(t time.Time, x float64) {
 	}
 	bk := s.bucket(t)
 	s.evict(bk)
+	if s.n == 0 {
+		s.started = t
+	}
 	i := int(bk % int64(len(s.slots)))
 	if i < 0 {
 		i += len(s.slots)
@@ -143,7 +147,7 @@ func (s *SMA) Stats() Stats {
 	spanBk := s.lastBk - s.first + 1
 	st.Span = time.Duration(spanBk) * s.p.Interval
 	st.Coverage = float64(s.n) / float64(spanBk)
-	st.Ready = st.Span >= s.p.MinWarmup && st.Coverage >= s.p.MinCoverage
+	st.Ready = s.last.Sub(s.started) >= s.p.MinWarmup && st.Span >= s.p.MinWarmup && st.Coverage >= s.p.MinCoverage
 	return st
 }
 
@@ -175,7 +179,7 @@ func (s *SMA) StatsAt(now time.Time) Stats {
 	spanBk := bk - first + 1
 	st.Span = time.Duration(spanBk) * s.p.Interval
 	st.Coverage = float64(st.Samples) / float64(spanBk)
-	st.Ready = now.Sub(s.last) <= 2*s.p.Interval && st.Span >= s.p.MinWarmup && st.Coverage >= s.p.MinCoverage
+	st.Ready = now.Sub(s.last) <= 2*s.p.Interval && now.Sub(s.started) >= s.p.MinWarmup && st.Span >= s.p.MinWarmup && st.Coverage >= s.p.MinCoverage
 	return st
 }
 
