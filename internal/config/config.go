@@ -105,14 +105,16 @@ type Config struct {
 // Auto configures the auto pair-selection loop (only used when
 // strategy.pair_selection = auto).
 type Auto struct {
-	TopY           int           `yaml:"top_y"`            // active pair count
-	MaxSteps       int           `yaml:"max_steps"`        // steps allowed per active pair
-	NotionalPerLeg float64       `yaml:"notional_per_leg"` // USD notional cap per leg
-	DepthUseRatio  float64       `yaml:"depth_use_ratio"`  // max fraction of top depth used
-	MinChurnScore  float64       `yaml:"min_churn_score"`  // below this a pair is not selected
-	PromoteMargin  float64       `yaml:"promote_margin"`   // relative score lead required to swap
-	Dwell          time.Duration `yaml:"dwell"`            // sustained lead/lag before swapping
-	Candidates     []string      `yaml:"candidates"`       // optional whitelist; empty = all matched
+	TopY             int           `yaml:"top_y"`              // active pair count
+	MaxSteps         int           `yaml:"max_steps"`          // steps allowed per active pair
+	NotionalPerLeg   float64       `yaml:"notional_per_leg"`   // USD notional cap per leg
+	DepthUseRatio    float64       `yaml:"depth_use_ratio"`    // max fraction of top depth used
+	MinChurnScore    float64       `yaml:"min_churn_score"`    // below this a pair is not selected
+	PromoteMargin    float64       `yaml:"promote_margin"`     // relative score lead required to swap
+	Dwell            time.Duration `yaml:"dwell"`              // sustained lead/lag before swapping
+	MaxFailRate      float64       `yaml:"max_fail_rate"`      // one-leg failure rate above which a pair is disabled
+	MaxTotalNotional float64       `yaml:"max_total_notional"` // account-level notional budget; 0 = unlimited
+	Candidates       []string      `yaml:"candidates"`         // optional whitelist; empty = all matched
 }
 
 // Load reads and validates a config file.
@@ -268,6 +270,9 @@ func (c *Config) defaults() {
 	if au.Dwell == 0 {
 		au.Dwell = time.Minute
 	}
+	if au.MaxFailRate == 0 {
+		au.MaxFailRate = 0.3
+	}
 }
 
 func (c *Config) validate() error {
@@ -382,6 +387,12 @@ func (c *Config) validate() error {
 		}
 		if c.Auto.Dwell < 0 {
 			return fmt.Errorf("auto.dwell must be >= 0")
+		}
+		if c.Auto.MaxFailRate <= 0 || c.Auto.MaxFailRate > 1 {
+			return fmt.Errorf("auto.max_fail_rate must be in (0, 1]")
+		}
+		if c.Auto.MaxTotalNotional < 0 {
+			return fmt.Errorf("auto.max_total_notional must be >= 0")
 		}
 	}
 	return nil

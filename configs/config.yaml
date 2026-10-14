@@ -69,6 +69,8 @@ auto:                       # only used when strategy.pair_selection = auto
   min_churn_score: 1        # pairs below this score are never selected
   promote_margin: 0.05      # relative score lead required to displace an active pair
   dwell: 1m                 # sustained lead/lag before promoting/demoting
+  max_fail_rate: 0.3        # one-leg failure rate above which a pair is disabled
+  max_total_notional: 0     # account-level notional budget (USD); 0 = unlimited
   candidates: []            # optional base whitelist; empty = all matched pairs
 
 execution:

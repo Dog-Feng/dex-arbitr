@@ -76,6 +76,8 @@ func TestLoadPairSelection(t *testing.T) {
 		{name: "auto needs top_y", yaml: "dry_run: true\nstrategy:\n  pair_selection: auto\nauto:\n  top_y: -1\n", wantErr: "top_y"},
 		{name: "auto needs notional", yaml: "dry_run: true\nstrategy:\n  pair_selection: auto\nauto:\n  notional_per_leg: -5\n", wantErr: "notional_per_leg"},
 		{name: "auto depth ratio bounds", yaml: "dry_run: true\nstrategy:\n  pair_selection: auto\nauto:\n  depth_use_ratio: 2\n", wantErr: "depth_use_ratio"},
+		{name: "auto fail rate bounds", yaml: "dry_run: true\nstrategy:\n  pair_selection: auto\nauto:\n  max_fail_rate: 1.5\n", wantErr: "max_fail_rate"},
+		{name: "auto notional cap", yaml: "dry_run: true\nstrategy:\n  pair_selection: auto\nauto:\n  max_total_notional: 10000\n", want: "auto"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -97,7 +99,7 @@ func TestLoadPairSelection(t *testing.T) {
 				t.Fatalf("pair_selection=%q, want %q", cfg.Strategy.PairSelection, tc.want)
 			}
 			if tc.want == "auto" {
-				if cfg.Auto.TopY != 5 || cfg.Auto.MaxSteps != 3 || cfg.Auto.NotionalPerLeg != 200 {
+				if cfg.Auto.TopY != 5 || cfg.Auto.MaxSteps != 3 || cfg.Auto.NotionalPerLeg != 200 || cfg.Auto.MaxFailRate != 0.3 {
 					t.Fatalf("unexpected auto defaults: %+v", cfg.Auto)
 				}
 			}

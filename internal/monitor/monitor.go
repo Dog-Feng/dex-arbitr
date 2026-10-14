@@ -144,6 +144,7 @@ type pairAcc struct {
 	openSteps                                          int
 	volumeUSD, realizedUSD                             float64
 	muBps, sigmaBps, tickK                             float64
+	failRate                                           float64
 	score, depthQ, tickQ, stability, reverts           float64
 	coverage                                           float64
 	samples                                            int
@@ -162,6 +163,14 @@ func (m *Monitor) acc(pair string) *pairAcc {
 		m.pairs[pair] = a
 	}
 	return a
+}
+
+// RollingFailRate returns the latest rolling one-leg failure rate reported for
+// a pair (0 before any status), for use by the pair picker.
+func (m *Monitor) RollingFailRate(pair string) float64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.acc(pair).failRate
 }
 
 // Record applies one event.
@@ -217,7 +226,7 @@ func (m *Monitor) Record(e Event) {
 		m.muBps, m.sigmaBps, m.tickK, m.failRate = e.MuBps, e.SigmaBps, e.TickK, e.FailRate
 		a := m.acc(e.Pair)
 		a.openSteps = e.Steps
-		a.muBps, a.sigmaBps, a.tickK = e.MuBps, e.SigmaBps, e.TickK
+		a.muBps, a.sigmaBps, a.tickK, a.failRate = e.MuBps, e.SigmaBps, e.TickK, e.FailRate
 	case KindPairPromoted:
 		a := m.acc(e.Pair)
 		a.active = true

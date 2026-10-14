@@ -206,6 +206,7 @@ func (c *candidate) sizedQty() (float64, bool) {
 type activeRun struct {
 	actor  *PairActor
 	cancel context.CancelFunc
+	budget float64 // reserved worst-case notional (X * max_steps)
 }
 
 // matchAll resolves every matched pair across the configured venues, in a
@@ -341,9 +342,19 @@ func (rt *runtime) selectPairs(ctx context.Context, cands []*candidate, active m
 	for base := range active {
 		desired[base] = true
 	}
+	// A pair whose one-leg failure rate exceeded the cap is disabled: active
+	// ones drain and demote once flat, standbys are never promoted.
+	for base := range desired {
+		if c := byBase[base]; rt.mon.RollingFailRate(c.key) > rt.cfg.Auto.MaxFailRate {
+			delete(desired, base)
+		}
+	}
 	var standbys []entry
 	for _, e := range entries {
 		if !e.ready || e.score < rt.cfg.Auto.MinChurnScore {
+			continue
+		}
+		if rt.mon.RollingFailRate(e.c.key) > rt.cfg.Auto.MaxFailRate {
 			continue
 		}
 		if _, ok := active[e.c.base]; !ok {
@@ -425,6 +436,16 @@ func (rt *runtime) selectPairs(ctx context.Context, cands []*candidate, active m
 
 // promote sizes the pair and starts its actor on the shared warm stats.
 func (rt *runtime) promote(ctx context.Context, c *candidate, active map[string]*activeRun, wg *sync.WaitGroup) error {
+	budget := rt.cfg.Auto.NotionalPerLeg * float64(rt.cfg.Auto.MaxSteps)
+	if rt.cfg.Auto.MaxTotalNotional > 0 {
+		used := 0.0
+		for _, ar := range active {
+			used += ar.budget
+		}
+		if used+budget > rt.cfg.Auto.MaxTotalNotional {
+			return fmt.Errorf("notional budget exceeded")
+		}
+	}
 	qty, ok := c.sizedQty()
 	if !ok {
 		return fmt.Errorf("size unavailable")
@@ -443,7 +464,7 @@ func (rt *runtime) promote(ctx context.Context, c *candidate, active map[string]
 	}
 	a.cfg.View = c
 	actx, cancel := context.WithCancel(ctx)
-	active[c.base] = &activeRun{actor: a, cancel: cancel}
+	active[c.base] = &activeRun{actor: a, cancel: cancel, budget: budget}
 	rt.mon.Record(monitor.Event{Time: time.Now(), Pair: c.key, Kind: monitor.KindPairPromoted, Score: c.healthSnapshot().Score})
 	slog.Info("pair promoted", "base", c.base, "qty", qty)
 	wg.Add(1)
