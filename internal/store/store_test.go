@@ -5,7 +5,6 @@ import (
 	"errors"
 	"math"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -119,23 +118,8 @@ func TestConcurrentSaveSameKey(t *testing.T) {
 	}
 }
 
-func TestStoreProcessLock(t *testing.T) {
-	if dir := os.Getenv("DEX_STORE_LOCK_TEST_DIR"); dir != "" {
-		s, err := New(dir)
-		if err == nil {
-			if closeErr := s.Close(); closeErr != nil {
-				t.Error(closeErr)
-			}
-			t.Fatal("second process acquired state directory")
-		}
-		return
-	}
+func TestStoreCloseAndReopen(t *testing.T) {
 	s := newTestStore(t)
-	cmd := exec.Command(os.Args[0], "-test.run=^TestStoreProcessLock$")
-	cmd.Env = append(os.Environ(), "DEX_STORE_LOCK_TEST_DIR="+s.dir)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("child lock test: %s: %v", out, err)
-	}
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -144,6 +128,12 @@ func TestStoreProcessLock(t *testing.T) {
 	}
 	reopened, err := New(s.dir)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.Save("test", PairState{NextID: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reopened.Load("test"); err != nil {
 		t.Fatal(err)
 	}
 	if err := reopened.Close(); err != nil {

@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/Dog-Feng/dex-arbitr/internal/strategy"
@@ -27,32 +26,24 @@ type PairState struct {
 	PnLUSD       float64         `json:"pnl_usd,omitempty"`
 }
 
-// Store owns an exclusive process lock on its directory. Close releases it.
+// Store serializes access to a directory of pair-state JSON files.
 type Store struct {
 	dir    string
-	lock   *os.File
 	mu     sync.RWMutex
 	closed bool
 	keysMu sync.Mutex
 	keys   map[string]*sync.Mutex
 }
 
-// New creates the directory and rejects a second writer using the same state.
+// New creates the state directory.
 func New(dir string) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("create state directory: %w", err)
 	}
-	f, err := os.OpenFile(filepath.Join(dir, ".lock"), os.O_CREATE|os.O_RDWR, 0o600)
-	if err != nil {
-		return nil, fmt.Errorf("open state lock: %w", err)
-	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		return nil, errors.Join(fmt.Errorf("state directory is already in use: %w", err), f.Close())
-	}
-	return &Store{dir: dir, lock: f, keys: make(map[string]*sync.Mutex)}, nil
+	return &Store{dir: dir, keys: make(map[string]*sync.Mutex)}, nil
 }
 
-// Close releases the directory lock after all outstanding operations complete.
+// Close marks the store closed; further Load/Save/List calls fail.
 func (s *Store) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -60,7 +51,7 @@ func (s *Store) Close() error {
 		return nil
 	}
 	s.closed = true
-	return errors.Join(syscall.Flock(int(s.lock.Fd()), syscall.LOCK_UN), s.lock.Close())
+	return nil
 }
 
 func validKey(key string) error {
@@ -193,11 +184,7 @@ func (s *Store) write(key string, b []byte) (retErr error) {
 	if err := os.Rename(f.Name(), s.path(key)); err != nil {
 		return err
 	}
-	d, err := os.Open(s.dir)
-	if err != nil {
-		return err
-	}
-	return errors.Join(d.Sync(), d.Close())
+	return syncDir(s.dir)
 }
 
 func finite(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0) }
