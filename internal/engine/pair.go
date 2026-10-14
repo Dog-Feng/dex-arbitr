@@ -8,6 +8,7 @@ import (
 	"math"
 	"math/rand"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Dog-Feng/dex-arbitr/internal/adaptive"
@@ -50,6 +51,17 @@ type PairConfig struct {
 	VolCostBudget float64 // max daily realized loss (USD); 0 = unlimited
 	Adaptive      adaptive.Config
 	Monitor       *monitor.Monitor
+	View          PairView // shared stats/books in auto mode; nil = actor-owned
+}
+
+// PairView is the shared, continuously-updated market view an auto-mode actor
+// reads instead of subscribing to books and sampling its own estimators.
+type PairView interface {
+	Book(venue string) (domain.Book, bool)
+	Quote(now time.Time, maxAge time.Duration) (spread.Quote, bool)
+	Mean() (float64, bool) // mean bps, ready
+	VolBps() float64
+	LegVol(venue string) float64
 }
 
 // PairActor owns the trading state of one pair (single goroutine).
@@ -71,6 +83,7 @@ type PairActor struct {
 	margin   marginMonitor
 	volAcc   volumeAcc
 	adaptive *adaptive.K
+	cnt      atomic.Int64 // signed step counter, readable by the picker
 }
 
 // volumeAcc accumulates daily traded volume and realized PnL for the volume
@@ -131,10 +144,7 @@ func NewPairActor(cfg PairConfig) (*PairActor, error) {
 	if cfg.Strategy == nil {
 		cfg.Strategy = strategy.Arbitrage{}
 	}
-	key := fmt.Sprintf("%s_%s_%s", cfg.Pair.Base, cfg.L.Name(), cfg.R.Name())
-	if cfg.DryRun {
-		key += "_paper"
-	}
+	key := pairKey(cfg.Pair.Base, cfg.L.Name(), cfg.R.Name(), cfg.DryRun)
 	a := &PairActor{cfg: cfg, key: key, log: slog.With("pair", cfg.Pair.Base, "L", cfg.L.Name(), "R", cfg.R.Name())}
 	a.margin = marginMonitor{cfg: cfg.Risk}
 	st, err := cfg.Store.Load(key)
@@ -143,6 +153,7 @@ func NewPairActor(cfg PairConfig) (*PairActor, error) {
 	}
 	a.state = strategy.State{Mode: strategy.ModeWarmup, Steps: st.Steps}
 	a.next = st.NextID
+	a.cnt.Store(int64(a.state.Counter()))
 	if !cfg.DryRun {
 		// Live trading stays paused until reconciliation succeeds.
 		a.state.Mode = strategy.ModePaused
@@ -156,7 +167,37 @@ func NewPairActor(cfg PairConfig) (*PairActor, error) {
 	return a, nil
 }
 
+// syncCounter mirrors the step ledger into the atomic counter.
+func (a *PairActor) syncCounter() { a.cnt.Store(int64(a.state.Counter())) }
+
+// Flat reports whether no steps are open, without racing the actor goroutine.
+func (a *PairActor) Flat() bool { return a.cnt.Load() == 0 }
+
+// mean returns the spread mean and readiness from the view or the actor's own
+// estimator.
+func (a *PairActor) mean() (float64, bool) {
+	if a.cfg.View != nil {
+		return a.cfg.View.Mean()
+	}
+	return a.cfg.Est.Mean(), a.cfg.Est.Ready()
+}
+
+func (a *PairActor) meanReady() bool { _, ok := a.mean(); return ok }
+
+// statsSnapshot reports estimator state for logs, from either source.
+func (a *PairActor) statsSnapshot() estimator.Stats {
+	if a.cfg.View != nil {
+		m, ready := a.cfg.View.Mean()
+		return estimator.Stats{Kind: "shared", Mean: m, Ready: ready}
+	}
+	return a.cfg.Est.Stats()
+}
+
 func (a *PairActor) book(venue string, _ int) (domain.Book, bool) {
+	if a.cfg.View != nil {
+		b, ok := a.cfg.View.Book(venue)
+		return b, ok && time.Since(b.Ts) <= a.cfg.MaxBookAge
+	}
 	a.bookMu.RLock()
 	defer a.bookMu.RUnlock()
 	b := a.bookR
@@ -235,23 +276,25 @@ func (a *PairActor) reconcile(ctx context.Context) error {
 func (a *PairActor) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	chL, err := a.cfg.L.SubscribeBook(ctx, a.cfg.Pair.Left)
-	if err != nil {
-		return err
+	if a.cfg.View == nil {
+		chL, err := a.cfg.L.SubscribeBook(ctx, a.cfg.Pair.Left)
+		if err != nil {
+			return err
+		}
+		chR, err := a.cfg.R.SubscribeBook(ctx, a.cfg.Pair.Right)
+		if err != nil {
+			return err
+		}
+		booksDone := make(chan struct{})
+		go func() {
+			defer close(booksDone)
+			a.collectBooks(ctx, chL, chR)
+		}()
+		defer func() {
+			cancel()
+			<-booksDone
+		}()
 	}
-	chR, err := a.cfg.R.SubscribeBook(ctx, a.cfg.Pair.Right)
-	if err != nil {
-		return err
-	}
-	booksDone := make(chan struct{})
-	go func() {
-		defer close(booksDone)
-		a.collectBooks(ctx, chL, chR)
-	}()
-	defer func() {
-		cancel()
-		<-booksDone
-	}()
 	if a.cfg.Samples != nil {
 		defer a.cfg.Samples.Close()
 	}
@@ -269,10 +312,14 @@ func (a *PairActor) Run(ctx context.Context) error {
 	if a.cfg.Vol != nil && a.cfg.VolMaxAge == 0 {
 		a.cfg.VolMaxAge = 50 * time.Millisecond
 	}
-	sample := time.NewTicker(a.cfg.SampleEvery)
-	defer sample.Stop()
+	var sample <-chan time.Time
+	if a.cfg.View == nil {
+		st := time.NewTicker(a.cfg.SampleEvery)
+		defer st.Stop()
+		sample = st.C
+	}
 	var volC <-chan time.Time
-	if a.cfg.Vol != nil {
+	if a.cfg.View == nil && a.cfg.Vol != nil {
 		vt := time.NewTicker(a.cfg.VolEvery)
 		defer vt.Stop()
 		volC = vt.C
@@ -296,13 +343,9 @@ func (a *PairActor) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			a.persist()
 			return nil
-		case now := <-sample.C:
+		case now := <-sample:
 			if q, ok := a.quote(now); ok {
 				a.cfg.Est.Update(now, q.Mid)
-			}
-			if a.state.Mode == strategy.ModeWarmup && a.cfg.Est.Ready() {
-				a.state.Mode = strategy.ModeRunning
-				a.log.Info("mean ready -> RUNNING", "stats", a.cfg.Est.Stats())
 			}
 		case now := <-volC:
 			if q, ok := a.volQuote(now); ok {
@@ -320,12 +363,9 @@ func (a *PairActor) Run(ctx context.Context) error {
 		case now := <-riskC:
 			a.risk(ctx, now)
 		case <-report.C:
-			st := a.cfg.Est.Stats()
+			st := a.statsSnapshot()
 			q, _ := a.quote(time.Now())
-			vol := 0.0
-			if a.cfg.Vol != nil {
-				vol = a.cfg.Vol.Vol()
-			}
+			vol := a.volBps()
 			a.log.Info("status", "mode", a.state.Mode, "steps", a.state.Counter(), "mu_bps", round2(st.Mean),
 				"samples", st.Samples, "span", st.Span.Round(time.Second), "coverage", round2(st.Coverage),
 				"LS_bps", round2(q.LS), "SL_bps", round2(q.SL), "mid_bps", round2(q.Mid),
@@ -338,6 +378,10 @@ func (a *PairActor) Run(ctx context.Context) error {
 			})
 			a.lat.reset()
 		case now := <-decide.C:
+			if a.state.Mode == strategy.ModeWarmup && a.meanReady() {
+				a.state.Mode = strategy.ModeRunning
+				a.log.Info("mean ready -> RUNNING", "stats", a.statsSnapshot())
+			}
 			if now.Before(nextAt) || a.state.Mode == strategy.ModePaused {
 				continue
 			}
@@ -345,7 +389,8 @@ func (a *PairActor) Run(ctx context.Context) error {
 			if !ok {
 				continue
 			}
-			act := a.cfg.Strategy.Decide(a.cfg.Params, a.state, q, a.cfg.Est.Mean(), a.cfg.Est.Ready(), a.volBps())
+			mu, ready := a.mean()
+			act := a.cfg.Strategy.Decide(a.cfg.Params, a.state, q, mu, ready, a.volBps())
 			if act.Kind == strategy.None {
 				continue
 			}
@@ -361,6 +406,9 @@ func (a *PairActor) Run(ctx context.Context) error {
 }
 
 func (a *PairActor) quote(now time.Time) (spread.Quote, bool) {
+	if a.cfg.View != nil {
+		return a.cfg.View.Quote(now, a.cfg.MaxBookAge)
+	}
 	a.bookMu.RLock()
 	l, r := a.bookL, a.bookR
 	a.bookMu.RUnlock()
@@ -388,6 +436,9 @@ func (a *PairActor) volQuote(now time.Time) (spread.Quote, bool) {
 
 // volBps is the current short-horizon spread volatility in bps, or 0.
 func (a *PairActor) volBps() float64 {
+	if a.cfg.View != nil {
+		return a.cfg.View.VolBps()
+	}
 	if a.cfg.Vol == nil {
 		return 0
 	}
@@ -408,6 +459,9 @@ func (a *PairActor) record(kind monitor.Kind, fill func(*monitor.Event)) {
 
 // legVol is the short-horizon leg-price volatility (price units) of a venue.
 func (a *PairActor) legVol(venue string) float64 {
+	if a.cfg.View != nil {
+		return a.cfg.View.LegVol(venue)
+	}
 	if venue == a.cfg.L.Name() && a.cfg.VolL != nil {
 		return a.cfg.VolL.Vol()
 	}
@@ -483,6 +537,7 @@ func (a *PairActor) emergency(ctx context.Context) {
 	}
 	a.posL, a.posR = res.PosL, res.PosR
 	a.state.Steps = nil
+	a.syncCounter()
 	a.state.Mode = strategy.ModePaused
 	a.log.Error("emergency unwind done", "rescue_orders", res.RescueOrders, "posL", res.PosL, "posR", res.PosR,
 		"took", res.Duration.Round(time.Millisecond))
@@ -539,6 +594,7 @@ func (a *PairActor) apply(ctx context.Context, act strategy.Action, q spread.Quo
 			EntryBps: strategy.EntryBps(act.Dir, pxL, pxR), OpenL: pxL, OpenR: pxR, OpenedAt: time.Now()}
 		a.next++
 		a.state.Steps = append(a.state.Steps, st)
+		a.syncCounter()
 		a.log.Info("step opened", "id", st.ID, "entry_bps", round2(st.EntryBps), "counter", a.state.Counter())
 		a.record(monitor.KindStepOpened, func(e *monitor.Event) { e.Dir = act.Dir.String(); e.Qty = st.Qty })
 	case strategy.Close:
@@ -567,6 +623,7 @@ func (a *PairActor) apply(ctx context.Context, act strategy.Action, q spread.Quo
 			if a.state.Steps[i].Qty < eps {
 				realized := a.state.Steps[i].Realized
 				a.state.Steps = append(a.state.Steps[:i], a.state.Steps[i+1:]...)
+				a.syncCounter()
 				a.log.Info("step closed", "id", act.StepID, "profit_bps", round2(act.ExpectedBps), "counter", a.state.Counter())
 				a.record(monitor.KindStepClosed, func(e *monitor.Event) {
 					e.Dir = act.Dir.String()

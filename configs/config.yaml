@@ -45,6 +45,7 @@ risk:
 
 strategy:
   kind: volume           # arbitrage | volume (registered strategies)
+  pair_selection: manual # manual | auto (auto = picker-driven top-Y from shared stats)
   open_bps: 1          # open when deviation from mean >= 1bps
   close_bps: 1         # close when step gross profit >= 1bps
   depth_mult: 2        # top-of-book qty >= step_qty * 2 on both legs
@@ -59,6 +60,16 @@ volume:                     # only used when strategy.kind = volume
   daily_volume_target: 0    # USD; 0 = unlimited
   daily_cost_budget: 0      # USD max daily loss; 0 = unlimited
   loss_tolerance_bps: 0     # per-trade allowed loss (bps) on open; 0 = break-even
+
+auto:                       # only used when strategy.pair_selection = auto
+  top_y: 5                  # number of active pairs
+  max_steps: 3              # steps allowed per active pair
+  notional_per_leg: 200     # USD notional cap per leg
+  depth_use_ratio: 0.25     # max fraction of top-of-book depth used for sizing
+  min_churn_score: 1        # pairs below this score are never selected
+  promote_margin: 0.05      # relative score lead required to displace an active pair
+  dwell: 1m                 # sustained lead/lag before promoting/demoting
+  candidates: []            # optional base whitelist; empty = all matched pairs
 
 execution:
   price_ticks: 30      # fixed IOC allowance; fallback while sigma is not ready

@@ -1,0 +1,145 @@
+package engine
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"path/filepath"
+	"sync"
+
+	"github.com/Dog-Feng/dex-arbitr/internal/adaptive"
+	"github.com/Dog-Feng/dex-arbitr/internal/config"
+	"github.com/Dog-Feng/dex-arbitr/internal/domain"
+	"github.com/Dog-Feng/dex-arbitr/internal/exchange"
+	"github.com/Dog-Feng/dex-arbitr/internal/execution"
+	"github.com/Dog-Feng/dex-arbitr/internal/monitor"
+	"github.com/Dog-Feng/dex-arbitr/internal/spread/estimator"
+	"github.com/Dog-Feng/dex-arbitr/internal/store"
+	"github.com/Dog-Feng/dex-arbitr/internal/strategy"
+	"github.com/Dog-Feng/dex-arbitr/internal/symbols"
+	"github.com/Dog-Feng/dex-arbitr/internal/volatility"
+)
+
+// runtime holds the shared services an engine run wires together. Manual and
+// auto pair selection share it; they differ only in which pairs are active and
+// where the per-pair stats come from.
+type runtime struct {
+	cfg     *config.Config
+	venues  map[string]exchange.Venue
+	store   *store.Store
+	tracker *execution.Tracker
+	mon     *monitor.Monitor
+	matcher symbols.Matcher
+	ids     *execution.IDGen
+}
+
+// pairKey is the stable identifier used for persistence and monitor grouping.
+func pairKey(base, l, r string, dryRun bool) string {
+	key := fmt.Sprintf("%s_%s_%s", base, l, r)
+	if dryRun {
+		key += "_paper"
+	}
+	return key
+}
+
+// newStats builds one estimator plus three volatility estimators (spread and
+// per-leg). Manual mode owns a fresh set per actor; auto mode shares them.
+func (rt *runtime) newStats() (estimator.Estimator, *volatility.Estimator, *volatility.Estimator, *volatility.Estimator, error) {
+	c := rt.cfg
+	est, err := estimator.New(c.Estimator.Kind, estimator.Params{
+		Window: c.Estimator.Window, MinWarmup: c.Estimator.MinWarmup,
+		MinCoverage: c.Estimator.MinCoverage, Interval: c.Estimator.Interval,
+	})
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	vol := volatility.New(volatility.Params{Interval: c.Volatility.Interval, Horizon: c.Volatility.Horizon, HalfLife: c.Volatility.HalfLife})
+	volL := volatility.New(volatility.Params{Interval: c.Volatility.Interval, Horizon: c.Volatility.Horizon, HalfLife: c.Volatility.HalfLife})
+	volR := volatility.New(volatility.Params{Interval: c.Volatility.Interval, Horizon: c.Volatility.Horizon, HalfLife: c.Volatility.HalfLife})
+	return est, vol, volL, volR, nil
+}
+
+// buildActor constructs a PairActor around the supplied stats and quantity.
+func (rt *runtime) buildActor(pair symbols.Pair, qty float64, maxSteps int, l, r exchange.Venue,
+	est estimator.Estimator, vol, volL, volR *volatility.Estimator, samples *store.SampleSink) (*PairActor, error) {
+	c := rt.cfg
+	strat, err := strategy.New(c.Strategy.Kind)
+	if err != nil {
+		return nil, err
+	}
+	feeBps := 2 * (pair.Left.TakerFee + pair.Right.TakerFee) * 1e4
+	openBps, closeBps, minInv := c.Strategy.OpenBps, c.Strategy.CloseBps, 0
+	volTarget, volBudget := 0.0, 0.0
+	if c.Strategy.Kind == "volume" {
+		openBps, closeBps = -c.Volume.LossToleranceBps, 0
+		minInv = c.Volume.MinInventory
+		volTarget, volBudget = c.Volume.DailyVolumeTarget, c.Volume.DailyCostBudget
+	}
+	return NewPairActor(PairConfig{
+		Pair: pair, L: l, R: r, Strategy: strat, Est: est, DryRun: c.DryRun, Store: rt.store, Tracker: rt.tracker, IDs: rt.ids,
+		ExecCfg: ExecutionConfig(c), SampleEvery: c.Estimator.Interval,
+		IntervalMin: c.Strategy.IntervalMin, IntervalMax: c.Strategy.IntervalMax, MaxBookAge: c.Strategy.MaxBookAge,
+		Vol: vol, VolL: volL, VolR: volR, VolEvery: c.Volatility.Interval, VolMaxAge: c.Volatility.MaxAge, Samples: samples,
+		Risk: marginConfig{floor: c.Risk.MarginFloorRatio, trigger: c.Risk.MarginTriggerRatio,
+			hysteresis: c.Risk.MarginHysteresis, refresh: c.Risk.PositionRefresh, marketBps: c.Risk.EmergencyMarketBps,
+			maxNotional: c.Risk.MaxNotional},
+		VolTarget: volTarget, VolCostBudget: volBudget,
+		Adaptive: adaptive.Config{Init: c.Execution.TickK, Window: c.Adaptive.Window, High: c.Adaptive.FailHigh,
+			Low: c.Adaptive.FailLow, Up: c.Adaptive.UpFactor, Down: c.Adaptive.DownFactor,
+			Min: c.Adaptive.MinK, Max: c.Adaptive.MaxK},
+		Monitor: rt.mon,
+		Params: strategy.Params{StepQty: qty, MaxSteps: maxSteps, OpenBps: openBps, CloseBps: closeBps,
+			DepthMult: c.Strategy.DepthMult, CloseOrder: c.Strategy.CloseOrder, VolK: c.Strategy.VolK, FeeBps: feeBps,
+			MinInventory: minInv},
+	})
+}
+
+// runManual trades exactly the configured pairs, each warming its own stats.
+func (rt *runtime) runManual(ctx context.Context) error {
+	var wg sync.WaitGroup
+	for _, pc := range rt.cfg.Pairs {
+		l, r := rt.venues[pc.Left], rt.venues[pc.Right]
+		pair, err := ResolvePair(ctx, rt.matcher, pc.Base, l, r)
+		if err != nil {
+			return err
+		}
+		qty := pair.AlignQty(pc.StepQty)
+		if ok, why := pair.ValidQty(qty, 0); !ok || qty != domain.Round(pc.StepQty, pair.SizeDecimals) {
+			return fmt.Errorf("pair %s: step_qty %v invalid (%s; aligned decimals %d, min %v)", pc.Base, pc.StepQty, why, pair.SizeDecimals, pair.MinQty)
+		}
+		if !rt.cfg.DryRun {
+			if err := setLeverage(ctx, l, pair.Left, rt.cfg.Leverage); err != nil {
+				return err
+			}
+			if err := setLeverage(ctx, r, pair.Right, rt.cfg.Leverage); err != nil {
+				return err
+			}
+		}
+		est, vol, volL, volR, err := rt.newStats()
+		if err != nil {
+			return err
+		}
+		var samples *store.SampleSink
+		if rt.cfg.SamplesDir != "" {
+			samples, err = store.NewSampleSink(filepath.Join(rt.cfg.SamplesDir, fmt.Sprintf("%s_%s_%s.jsonl", pair.Base, l.Name(), r.Name())))
+			if err != nil {
+				return err
+			}
+		}
+		a, err := rt.buildActor(pair, qty, pc.MaxSteps, l, r, est, vol, volL, volR, samples)
+		if err != nil {
+			return err
+		}
+		slog.Info("pair resolved", "base", pair.Base, "left", fmt.Sprintf("%s#%d", l.Name(), pair.Left.MarketID),
+			"right", fmt.Sprintf("%s#%d", r.Name(), pair.Right.MarketID), "size_decimals", pair.SizeDecimals, "min_qty", pair.MinQty)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := a.Run(ctx); err != nil {
+				slog.Error("pair actor stopped", "pair", pair.Base, "err", err)
+			}
+		}()
+	}
+	wg.Wait()
+	return nil
+}

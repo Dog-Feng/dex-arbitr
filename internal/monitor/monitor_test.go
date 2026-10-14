@@ -41,6 +41,28 @@ func TestMonitorAlerts(t *testing.T) {
 	}
 }
 
+func TestMonitorPerPair(t *testing.T) {
+	m := New(nil)
+	m.Record(Event{Kind: KindPairPromoted, Pair: "SPY", Score: 3.2})
+	m.Record(Event{Kind: KindExecuted, Pair: "SPY", USD: 31, OneLeg: true})
+	m.Record(Event{Kind: KindPairHealth, Pair: "SPY", Score: 2.1, DepthQ: 0.9, TickQ: 1, Stability: 0.8, Reverts: 4})
+	m.Record(Event{Kind: KindPairWarmup, Pair: "QQQ", Samples: 3600, Coverage: 0.5, Ready: false})
+	g := m.Metrics()
+	spy, ok := g.Pairs["SPY"]
+	if !ok {
+		t.Fatalf("missing SPY pair metrics: %+v", g.Pairs)
+	}
+	if !spy.Active || spy.Executions != 1 || spy.OneLegFails != 1 {
+		t.Fatalf("SPY pair metrics: %+v", spy)
+	}
+	if spy.FailRate != 1 || spy.Score != 2.1 || spy.DepthQ != 0.9 {
+		t.Fatalf("SPY pair gauges: %+v", spy)
+	}
+	if qqq, ok := g.Pairs["QQQ"]; !ok || qqq.Samples != 3600 || qqq.Ready {
+		t.Fatalf("QQQ pair warmup: %+v", g.Pairs["QQQ"])
+	}
+}
+
 func TestHandlerAuth(t *testing.T) {
 	m := New(nil)
 	h := m.Handler("secret")

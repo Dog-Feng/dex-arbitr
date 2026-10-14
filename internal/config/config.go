@@ -59,15 +59,16 @@ type Config struct {
 		MaxNotional        float64       `yaml:"max_notional"`         // per-venue aggregate notional cap (USD); 0 = unlimited
 	} `yaml:"risk"`
 	Strategy struct {
-		Kind        string        `yaml:"kind"` // arbitrage | volume (registered strategies)
-		OpenBps     float64       `yaml:"open_bps"`
-		CloseBps    float64       `yaml:"close_bps"`
-		DepthMult   float64       `yaml:"depth_mult"`
-		CloseOrder  string        `yaml:"close_order"`
-		VolK        float64       `yaml:"vol_k"` // one-sided sigma buffer on top of open_bps
-		IntervalMin time.Duration `yaml:"interval_min"`
-		IntervalMax time.Duration `yaml:"interval_max"`
-		MaxBookAge  time.Duration `yaml:"max_book_age"`
+		Kind          string        `yaml:"kind"`           // arbitrage | volume (registered strategies)
+		PairSelection string        `yaml:"pair_selection"` // manual | auto
+		OpenBps       float64       `yaml:"open_bps"`
+		CloseBps      float64       `yaml:"close_bps"`
+		DepthMult     float64       `yaml:"depth_mult"`
+		CloseOrder    string        `yaml:"close_order"`
+		VolK          float64       `yaml:"vol_k"` // one-sided sigma buffer on top of open_bps
+		IntervalMin   time.Duration `yaml:"interval_min"`
+		IntervalMax   time.Duration `yaml:"interval_max"`
+		MaxBookAge    time.Duration `yaml:"max_book_age"`
 	} `yaml:"strategy"`
 	Volume struct {
 		MinInventory      int     `yaml:"min_inventory"`       // floor steps held while churning
@@ -97,7 +98,21 @@ type Config struct {
 		Addr  string `yaml:"addr"`  // HTTP metrics endpoint; empty = disabled
 		Token string `yaml:"token"` // bearer token; empty = no auth
 	} `yaml:"monitor"`
+	Auto  Auto   `yaml:"auto"`
 	Pairs []Pair `yaml:"pairs"`
+}
+
+// Auto configures the auto pair-selection loop (only used when
+// strategy.pair_selection = auto).
+type Auto struct {
+	TopY           int           `yaml:"top_y"`            // active pair count
+	MaxSteps       int           `yaml:"max_steps"`        // steps allowed per active pair
+	NotionalPerLeg float64       `yaml:"notional_per_leg"` // USD notional cap per leg
+	DepthUseRatio  float64       `yaml:"depth_use_ratio"`  // max fraction of top depth used
+	MinChurnScore  float64       `yaml:"min_churn_score"`  // below this a pair is not selected
+	PromoteMargin  float64       `yaml:"promote_margin"`   // relative score lead required to swap
+	Dwell          time.Duration `yaml:"dwell"`            // sustained lead/lag before swapping
+	Candidates     []string      `yaml:"candidates"`       // optional whitelist; empty = all matched
 }
 
 // Load reads and validates a config file.
@@ -204,6 +219,9 @@ func (c *Config) defaults() {
 	if s.Kind == "" {
 		s.Kind = "arbitrage"
 	}
+	if s.PairSelection == "" {
+		s.PairSelection = "manual"
+	}
 	if s.OpenBps == 0 {
 		s.OpenBps = 1
 	}
@@ -227,6 +245,28 @@ func (c *Config) defaults() {
 	}
 	if s.MaxBookAge == 0 {
 		s.MaxBookAge = 10 * time.Second
+	}
+	au := &c.Auto
+	if au.TopY == 0 {
+		au.TopY = 5
+	}
+	if au.MaxSteps == 0 {
+		au.MaxSteps = 3
+	}
+	if au.NotionalPerLeg == 0 {
+		au.NotionalPerLeg = 200
+	}
+	if au.DepthUseRatio == 0 {
+		au.DepthUseRatio = 0.25
+	}
+	if au.MinChurnScore == 0 {
+		au.MinChurnScore = 1
+	}
+	if au.PromoteMargin == 0 {
+		au.PromoteMargin = 0.05
+	}
+	if au.Dwell == 0 {
+		au.Dwell = time.Minute
 	}
 }
 
@@ -315,6 +355,34 @@ func (c *Config) validate() error {
 	}
 	if c.Volume.LossToleranceBps < 0 {
 		return fmt.Errorf("volume.loss_tolerance_bps must be >= 0")
+	}
+	switch c.Strategy.PairSelection {
+	case "manual", "auto":
+	default:
+		return fmt.Errorf("strategy.pair_selection must be manual|auto")
+	}
+	if c.Strategy.PairSelection == "auto" {
+		if c.Auto.TopY <= 0 {
+			return fmt.Errorf("auto.top_y must be > 0")
+		}
+		if c.Auto.MaxSteps <= 0 {
+			return fmt.Errorf("auto.max_steps must be > 0")
+		}
+		if c.Auto.NotionalPerLeg <= 0 {
+			return fmt.Errorf("auto.notional_per_leg must be > 0")
+		}
+		if c.Auto.DepthUseRatio <= 0 || c.Auto.DepthUseRatio > 1 {
+			return fmt.Errorf("auto.depth_use_ratio must be in (0, 1]")
+		}
+		if c.Auto.MinChurnScore < 0 {
+			return fmt.Errorf("auto.min_churn_score must be >= 0")
+		}
+		if c.Auto.PromoteMargin < 0 {
+			return fmt.Errorf("auto.promote_margin must be >= 0")
+		}
+		if c.Auto.Dwell < 0 {
+			return fmt.Errorf("auto.dwell must be >= 0")
+		}
 	}
 	return nil
 }

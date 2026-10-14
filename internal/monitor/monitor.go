@@ -17,14 +17,18 @@ import (
 type Kind string
 
 const (
-	KindStepOpened Kind = "step_opened"
-	KindStepClosed Kind = "step_closed"
-	KindExecuted   Kind = "executed"
-	KindRescue     Kind = "rescue"
-	KindMargin     Kind = "margin"
-	KindEmergency  Kind = "emergency"
-	KindError      Kind = "error"
-	KindStatus     Kind = "status"
+	KindStepOpened   Kind = "step_opened"
+	KindStepClosed   Kind = "step_closed"
+	KindExecuted     Kind = "executed"
+	KindRescue       Kind = "rescue"
+	KindMargin       Kind = "margin"
+	KindEmergency    Kind = "emergency"
+	KindError        Kind = "error"
+	KindStatus       Kind = "status"
+	KindPairPromoted Kind = "pair_promoted"
+	KindPairDemoted  Kind = "pair_demoted"
+	KindPairHealth   Kind = "pair_health"
+	KindPairWarmup   Kind = "pair_warmup"
 )
 
 // Event is a structured runtime event. Fields are interpreted by Kind.
@@ -45,6 +49,16 @@ type Event struct {
 	SigmaBps float64
 	TickK    float64
 	FailRate float64
+
+	Mode      string
+	Score     float64
+	DepthQ    float64
+	TickQ     float64
+	Stability float64
+	Reverts   float64
+	Coverage  float64
+	Samples   int
+	Ready     bool
 }
 
 // AlertFunc receives an alert message (log, webhook, ...).
@@ -74,7 +88,36 @@ type Metrics struct {
 	TickK    float64 `json:"tick_k"`
 	FailRate float64 `json:"fail_rate"`
 
-	Alerts []string `json:"alerts"`
+	Alerts []string               `json:"alerts"`
+	Pairs  map[string]PairMetrics `json:"pairs"`
+}
+
+// PairMetrics is the per-pair slice of the snapshot.
+type PairMetrics struct {
+	Base        string  `json:"base"`
+	Active      bool    `json:"active"`
+	Mode        string  `json:"mode"`
+	Opens       uint64  `json:"opens"`
+	Closes      uint64  `json:"closes"`
+	Executions  uint64  `json:"executions"`
+	OneLegFails uint64  `json:"one_leg_fails"`
+	Rescues     uint64  `json:"rescues"`
+	Errors      uint64  `json:"errors"`
+	OpenSteps   int     `json:"open_steps"`
+	VolumeUSD   float64 `json:"volume_usd"`
+	RealizedUSD float64 `json:"realized_usd"`
+	MuBps       float64 `json:"mu_bps"`
+	SigmaBps    float64 `json:"sigma_bps"`
+	TickK       float64 `json:"tick_k"`
+	FailRate    float64 `json:"fail_rate"`
+	Score       float64 `json:"score"`
+	DepthQ      float64 `json:"depth_q"`
+	TickQ       float64 `json:"tick_q"`
+	Stability   float64 `json:"stability"`
+	Reverts     float64 `json:"reverts_per_min"`
+	Coverage    float64 `json:"coverage"`
+	Samples     int     `json:"samples"`
+	Ready       bool    `json:"ready"`
 }
 
 // Monitor consumes events, aggregates metrics and fires alerts.
@@ -89,11 +132,36 @@ type Monitor struct {
 	latN, latSum, latMax                                            float64
 	muBps, sigmaBps, tickK, failRate                                float64
 	alerts                                                          []string
+	pairs                                                           map[string]*pairAcc
+}
+
+// pairAcc is one pair's rolling counters and latest gauges.
+type pairAcc struct {
+	base                                               string
+	active                                             bool
+	mode                                               string
+	opens, closes, executions, oneLeg, rescues, errors uint64
+	openSteps                                          int
+	volumeUSD, realizedUSD                             float64
+	muBps, sigmaBps, tickK                             float64
+	score, depthQ, tickQ, stability, reverts           float64
+	coverage                                           float64
+	samples                                            int
+	ready                                              bool
 }
 
 // New builds a monitor; alert may be nil.
 func New(alert AlertFunc) *Monitor {
-	return &Monitor{start: time.Now(), alert: alert}
+	return &Monitor{start: time.Now(), alert: alert, pairs: map[string]*pairAcc{}}
+}
+
+func (m *Monitor) acc(pair string) *pairAcc {
+	a, ok := m.pairs[pair]
+	if !ok {
+		a = &pairAcc{base: pair}
+		m.pairs[pair] = a
+	}
+	return a
 }
 
 // Record applies one event.
@@ -104,15 +172,28 @@ func (m *Monitor) Record(e Event) {
 	case KindStepOpened:
 		m.opens++
 		m.openSteps++
+		a := m.acc(e.Pair)
+		a.opens++
+		a.openSteps++
 	case KindStepClosed:
 		m.closes++
 		m.openSteps--
 		m.realizedUSD += e.USD
+		a := m.acc(e.Pair)
+		a.closes++
+		a.openSteps--
+		a.realizedUSD += e.USD
 	case KindExecuted:
 		m.executions++
 		m.volumeUSD += e.USD
 		if e.OneLeg {
 			m.oneLeg++
+		}
+		a := m.acc(e.Pair)
+		a.executions++
+		a.volumeUSD += e.USD
+		if e.OneLeg {
+			a.oneLeg++
 		}
 		if e.LatencyMs > 0 {
 			m.latN++
@@ -123,15 +204,33 @@ func (m *Monitor) Record(e Event) {
 		}
 	case KindRescue:
 		m.rescues++
+		m.acc(e.Pair).rescues++
 	case KindEmergency:
 		m.emergencies++
 		m.alertf("emergency unwind on %s", e.Pair)
 	case KindError:
 		m.errors++
+		m.acc(e.Pair).errors++
 		m.alertf("error on %s: %s", e.Pair, e.Msg)
 	case KindStatus:
 		m.openSteps = e.Steps
 		m.muBps, m.sigmaBps, m.tickK, m.failRate = e.MuBps, e.SigmaBps, e.TickK, e.FailRate
+		a := m.acc(e.Pair)
+		a.openSteps = e.Steps
+		a.muBps, a.sigmaBps, a.tickK = e.MuBps, e.SigmaBps, e.TickK
+	case KindPairPromoted:
+		a := m.acc(e.Pair)
+		a.active = true
+		a.score = e.Score
+	case KindPairDemoted:
+		m.acc(e.Pair).active = false
+	case KindPairHealth:
+		a := m.acc(e.Pair)
+		a.score = e.Score
+		a.depthQ, a.tickQ, a.stability, a.reverts = e.DepthQ, e.TickQ, e.Stability, e.Reverts
+	case KindPairWarmup:
+		a := m.acc(e.Pair)
+		a.samples, a.coverage, a.ready = e.Samples, e.Coverage, e.Ready
 	}
 }
 
@@ -159,6 +258,22 @@ func (m *Monitor) Metrics() Metrics {
 	if m.executions > 0 {
 		fail = float64(m.oneLeg) / float64(m.executions)
 	}
+	pairs := make(map[string]PairMetrics, len(m.pairs))
+	for key, a := range m.pairs {
+		pfail := 0.0
+		if a.executions > 0 {
+			pfail = float64(a.oneLeg) / float64(a.executions)
+		}
+		pairs[key] = PairMetrics{
+			Base: a.base, Active: a.active, Mode: a.mode,
+			Opens: a.opens, Closes: a.closes, Executions: a.executions,
+			OneLegFails: a.oneLeg, Rescues: a.rescues, Errors: a.errors,
+			OpenSteps: a.openSteps, VolumeUSD: a.volumeUSD, RealizedUSD: a.realizedUSD,
+			MuBps: a.muBps, SigmaBps: a.sigmaBps, TickK: a.tickK, FailRate: pfail,
+			Score: a.score, DepthQ: a.depthQ, TickQ: a.tickQ, Stability: a.stability, Reverts: a.reverts,
+			Coverage: a.coverage, Samples: a.samples, Ready: a.ready,
+		}
+	}
 	return Metrics{
 		UptimeSec:    time.Since(m.start).Seconds(),
 		Opens:        m.opens,
@@ -179,6 +294,7 @@ func (m *Monitor) Metrics() Metrics {
 		TickK:        m.tickK,
 		FailRate:     fail,
 		Alerts:       append([]string(nil), m.alerts...),
+		Pairs:        pairs,
 	}
 }
 
