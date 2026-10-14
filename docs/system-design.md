@@ -17,6 +17,7 @@
 - Actor 模型：每个套利对一个 goroutine，独占步列表、状态、决策节奏，基本无锁（仅盘口缓存用读写锁）。
 - 可插拔纯策略：`strategy.Strategy` 接口 + 注册表（`Arbitrage` / `Volume`），输入（状态 + 盘口 + μ + σ）输出动作，不做 IO，可直接回放回测。
 - 接口 + 注册表：交易所、均值估计器、策略按名字注册，配置选择。
+- 选对驱动解耦：`engine.Run` 只做公共组装（venues/store/tracker/monitor），按 `strategy.pair_selection` 分发到 `runManual` / `runAuto` 两个平级驱动源；二者共享 `runtime`（newStats / buildActor / applyLeverage），互不侵入。
 - 只读旁路模块：monitor / backtest / scan 三个模块只读，不 import 交易引擎，也不被引擎反向依赖（引擎仅单向向 monitor 发事件）。
 
 ## 3. 目录与依赖
@@ -37,12 +38,12 @@ internal/spread     价差计算（LS/SL/Mid，单位 bps）
 internal/volatility 波动率估计器（实现波动率 RV，价差/腿价通用）
 internal/strategy   Strategy 接口 + Arbitrage/Volume + Step/State/Params
 internal/execution  双腿 IOC 执行器、订单追踪、补救阶梯、动态让价
-internal/engine     PairActor + 组装 + 保证金风控 + 量记账
+internal/engine     PairActor + 组装(build.go/run.go) + 自动选对(auto.go) + 保证金风控 + 量记账
 internal/adaptive   AIMD 自适应系数控制器（tick_k）
 internal/store      步状态持久化（JSON）+ 样本落盘（JSONL）
 internal/monitor    运行监控（事件聚合 + 指标 + 告警 + HTTP，只读）
 internal/backtest   离线回放（复用 strategy/spread/volatility，不碰引擎）
-internal/scan       套利检测（净机会 Eval/Watch，只读）
+internal/scan       套利检测（Eval/Watch）+ 刷量健康度打分（HealthTracker），只读
 ```
 
 依赖方向：交易核心各包 -> `domain`；`strategy` 不依赖 `exchange/store`；`monitor/backtest/scan` 复用共享统计包，但不 import `engine`，也不被 `engine` 反向依赖（engine 仅单向调用 monitor 的 Record）。
@@ -57,6 +58,9 @@ internal/scan       套利检测（净机会 Eval/Watch，只读）
 | Counter | 有符号步数：负=左多右空（DirLS），正=左空右多（DirSL） |
 | Quote | 盘口价差：LS/SL 可成交、Mid 中间价（bps） |
 | μ / σ | 价差中枢（2h SMA）/ 短周期波动率（500ms 实现波动率）；另有腿价 σ（让价用） |
+| Candidate | 自动模式下每个匹配对的共享市场视图：盘口缓存 + μ/σ/腿σ + 刷量健康度，实现 `PairView` |
+| Churn score | 刷量适宜度：σ_bps × 深度质量 × tick质量 × 稳定性 × 频率因子，乘法合成，任一为 0 即归零 |
+| Picker | 自动选对器：按分数排序 + 显著性/驻留滞回选 top-Y，动态晋升/降出交易对 |
 
 关键结构（当前实现）：
 
@@ -117,13 +121,22 @@ WARMUP --(μ 就绪)--> RUNNING <-> REDUCE_ONLY
 
 ## 7. 运行时完整链路
 
+### 7.0 模式分发
+
+`engine.Run` 完成公共组装后打印 `engine starting`，按 `strategy.pair_selection` 分流：
+
+- `manual`（默认）：`runManual` 只跑配置里的 `pairs`，每个 pair 自建并自采样 μ/σ，预热 1h 后执行策略，行为与历史版本一致。
+- `auto`：`runAuto` 全量匹配所有候选对，启动共享数据面持续预热，picker 按 churn score 选出 top-Y 动态晋升/降出，晋升时复用共享统计、免二次预热。
+
+两者共享 `runtime.buildActor`（建 PairActor）、`runtime.newStats`（建估计器）与 `runtime.applyLeverage`（自适应杠杆），只是「活跃对从哪来、统计从哪来」不同。
+
 ### 7.1 启动
 
 1. `config.Load`：读 YAML、${ENV} 展开、填默认值、校验。
 2. `engine.Run`：构建 monitor（可选 HTTP）、按注册表构建 venues；实盘校验凭证并建 OrderTracker。
-3. 对每个 pair：拉永续列表 -> 前缀匹配 -> 精度对齐（size_decimals 取短、min_qty 取大）。
-4. 实盘启动时为每个市场提交 updateLeverage（杠杆 leverage，默认 10x，即初始保证金比例 1000 bps，全仓）。
-5. 每个 pair 起一个 PairActor goroutine。
+3. 对每个候选/配置 pair：拉永续列表 -> 前缀匹配 -> 精度对齐（size_decimals 取短、min_qty 取大）。
+4. 实盘时为每个市场的杠杆做自适应解析（见 §8.1）：`min(配置 leverage, 市场最大杠杆)`，失败降级为交易所当前杠杆。
+5. manual 模式每个 pair 起一个 PairActor；auto 模式先起数据面收集器（全量预热），picker 后续才起活跃对 actor。
 
 ### 7.2 Actor 内部（单 goroutine 事件循环）
 
@@ -141,6 +154,8 @@ WARMUP --(μ 就绪)--> RUNNING <-> REDUCE_ONLY
 1. 先平仓：满足 `profit >= close_bps + fee_bps` 的步按 close_order 排序取最优；`|counter| > min_inventory` 才平（刷量库存地板）。
 2. 再开仓：仅 RUNNING 且 μ 就绪；`dev >= open_bps + fee_bps + vol_k*σ`、同方向、`|counter| < max_steps`、两腿一档深度 >= `step_qty*depth_mult`。
 3. 都不满足则不动。
+
+注：`volume` 策略在 build 阶段把 `open_bps/close_bps` 覆盖为 `-loss_tolerance_bps / 0`，即「覆盖成本就开、回本即平」，故 config 里这两项在 volume 模式下不生效，真正调激进程度的是 `vol_k` 与 `loss_tolerance_bps`。
 
 ### 7.4 一次执行（Executor）
 
@@ -188,6 +203,48 @@ ticks = max( ticks, 走到 step_qty 实际成交档位所需的 tick 数 )
 - 后续接有手续费的 DEX：`TakerFee` 从该所合约元数据读取，自动抬高门槛，无需改代码（即"手续费作为损耗点、提高阈值"）。
 - 注意：当前只算 taker 费（执行是 taker IOC）；未来 maker 模式需把 maker 费/返佣加入成本模型。
 
+### 7.8 自动选对模式（auto）
+
+auto 模式把「选哪些对」从静态配置变成运行时闭环，核心链路分四层。
+
+数据面（全量预热，只读）：
+
+1. `matchAll` 拉取所有 venues 的永续列表，`symbols.Match` 生成候选对（可配 `auto.candidates` 白名单过滤）。
+2. 每个候选建一个 `candidate`（实现 `PairView`），起 `collect` goroutine：订阅两腿盘口，1s 喂 SMA μ，100ms 喂价差 σ 与腿价 σ，并维护刷量健康度（`scan.HealthTracker`）。
+3. 全量候选一直保持温热（预热 1h + 覆盖率 80%），所以晋升时无需二次预热；可选把 100ms 样本落盘到 samples_dir。
+
+健康度打分（`scan.HealthTracker`，乘法合成）：
+
+```
+score = σ_bps × DepthQuality × TickQuality × Stability × min(1, reverts_per_min / 10)
+DepthQuality = 两腿四侧 top 深度都 >= notional/mid 的样本占比
+TickQuality  = clamp(σ_bps / tick_bps / 5, 0, 1)     // 边际相对最小 tick 的余量
+Stability    = σ 均值 / (σ 均值 + 2×σ 标准差)          // 反比 σ 的变异系数
+```
+
+任一项为 0 直接归零；`min_churn_score=0` 表示只按分数排序、不设硬门槛。
+
+picker（稳定选对）：
+
+1. 每 2s 计算各候选 score，先保留现任（incumbent），再用备选填满空位。
+2. 换人需显著性 + 驻留：备选分数要高于最弱现任 `×(1+promote_margin)`，并持续 `dwell`（默认 1m）才晋升；现任落后且持续 `dwell`、且 `Flat()`（步数为 0）才降出。
+3. 硬剔除走快速门限，不参与软排序：`auto.max_fail_rate` 超限的备选永不晋升、已在跑的自动 drain 并平仓后降出。
+4. 账户级名义帽：`auto.max_total_notional > 0` 时，晋升前按 `sum(active 的 notional_per_leg × max_steps)` 预占，超出则拒绝晋升。
+
+定容（晋升时）：
+
+```
+qty = floor( min(notional_per_leg, depth_use_ratio × min(四侧 top 深度) × mid) / mid )
+```
+
+再 floor 到 pair 的 size_decimals，校验 >= min_qty；不过则跳过该对。深盘吃满预算、薄盘自动缩量。
+
+动态生命周期：
+
+- 晋升：`applyLeverage` -> `buildActor`（View=candidate，共享 μ/σ/腿σ 与盘口）-> 起 actor goroutine。
+- 降出：cancel actor ctx -> actor 持久化后退出；候选仍留在数据面继续温热，随时可再晋升。
+- 晋升失败：退避一个 dwell 再重试，不刷屏。
+
 ## 8. 保证金风控（risk）
 
 主动监控（不挂单）。每秒评估，每 position_refresh（15s）用 REST 刷新两所 LiquidationPrice；mark 用 book mid（新鲜才评估）。
@@ -203,6 +260,16 @@ ticks = max( ticks, 走到 step_qty 实际成交档位所需的 tick 数 )
 - 账户级名义上限：max_notional > 0 时按 venue 汇总该账户所有市场的 |qty|*avgEntry 名义，超限即 REDUCE_ONLY。
 - trigger=0 或 dry_run 时风控禁用。
 
+### 8.1 自适应杠杆（resolveLeverage）
+
+不同市场的最大杠杆不同（低流动性币会压低上限，lighter 以 21113 拒绝过高的初始保证金率）。系统不依赖未公开接口，按「交易所是否接受」反推：
+
+1. 先提交配置杠杆；成功即用配置值（绝大多数市场的单次路径）。
+2. 被 `domain.ErrLeverageRejected`（lighter 把 21113 映射为它）拒绝时，在 `[1, 配置-1]` 内二分查找最大可接受杠杆，取 `min(配置, 市场最大)`。
+3. 非杠杆类错误（网络/签名等）不当作「太高一档」，直接放弃本次设置；`applyLeverage` 尽力而为，失败只打 WARN 并沿用交易所当前杠杆，不阻断该对。
+
+与账户名义两套口径：`risk.max_notional` 是 venue 侧实际持仓名义（被动，超限 REDUCE_ONLY）；`auto.max_total_notional` 是 picker 晋升前的预占预算（主动，超限拒绝晋升）。
+
 ## 9. 只读旁路模块
 
 交易核心是唯一会下单的；下面三个模块只读、独立、不互相 import。
@@ -211,7 +278,9 @@ ticks = max( ticks, 走到 step_qty 实际成交档位所需的 tick 数 )
 
 职责：盯系统自己的交易数据（仓位、成交量、成功/失败率、盈亏、延迟、保证金、补救/应急/错误）。
 
-- 引擎在关键点发类型化事件（step_opened/step_closed/executed/rescue/status/emergency/error），monitor.Monitor.Record 聚合指标并告警。
+- 引擎在关键点发类型化事件（step_opened/step_closed/executed/rescue/status/emergency/error），picker 另发 pair_promoted/pair_demoted/pair_health/pair_warmup；monitor.Monitor.Record 按 pair 归集指标并告警。
+- 双视图：`/metrics` 顶层是全局汇总（跨对合计），新增 `pairs` 字段是每个交易对的明细（状态、步数、成交量、盈亏、μ/σ、tick_k、失败率、churn score 分量、预热覆盖度、是否活跃）。
+- 滚动失败率：`RollingFailRate(pair)` 暴露 actor 上报的滚动单腿失败率（AIMD 窗口），供 picker 做硬剔除，线程安全。
 - 可选 HTTP：monitor.addr 非空时 arbd 内起服务，GET /metrics 返回 JSON；monitor.token 非空时要求 Authorization: Bearer <token> 或 ?token=（常量时间比较，401 拒绝）。
 - 只读、不 import engine。
 
@@ -225,6 +294,7 @@ ticks = max( ticks, 走到 step_qty 实际成交档位所需的 tick 数 )
 
 - scan.Eval 是核心纯函数：net = dev - fee_bps - vol_k*σ - open_bps，>0 即机会（与交易策略口径一致）。
 - scan.Watch 订阅两腿盘口（只读 WS），维护 μ/σ，按四层条件（可交易/数据新鲜/统计就绪/净机会>0）发机会。
+- scan.HealthTracker 是刷量健康度打分器（σ_bps / 反转频率 / 深度质量 / tick 质量 / 稳定性），供 auto picker 使用；纯统计、不碰引擎。
 - 命令：go run ./cmd/scanner -config <file> 用只读 venue 扫描所有匹配对，去重后打日志；不 import engine。
 
 ## 10. 配置全景
@@ -257,6 +327,7 @@ risk:
 
 strategy:
   kind: arbitrage
+  pair_selection: manual   # manual | auto
   open_bps: 1
   close_bps: 1
   depth_mult: 2
@@ -271,6 +342,18 @@ volume:
   daily_volume_target: 0
   daily_cost_budget: 0
   loss_tolerance_bps: 0
+
+auto:                      # 仅 pair_selection=auto 生效
+  top_y: 5
+  max_steps: 3
+  notional_per_leg: 200
+  depth_use_ratio: 0.25
+  min_churn_score: 0
+  promote_margin: 0.05
+  dwell: 1m
+  max_fail_rate: 0.3
+  max_total_notional: 0
+  candidates: []
 
 execution:
   price_ticks: 30
@@ -315,6 +398,13 @@ pairs:
 
 | 消息 | 含义 / 排查 |
 |---|---|
+| engine starting | 模式分发前：pair_selection / strategy / dry_run |
+| auto: fetching instruments | auto 模式拉取某 venue 永续列表（停在这 = 网络卡住） |
+| auto pair selection / auto collectors started | 候选数与预热窗口，确认 auto 已进入预热 |
+| picker status（每 30s） | candidates/ready/warming/active 计数，预热进度 |
+| pair promoted / pair demoted | 自动选对的晋升/降出 |
+| leverage set / leverage resolve failed; using venue default | 自适应杠杆结果（失败则沿用交易所当前杠杆） |
+| pair promote failed（WARN） | 晋升失败，退避一个 dwell 后重试 |
 | pair actor started | 启动参数 |
 | positions / position reconciliation passed | 启动仓位核对；失败即 PAUSED |
 | mean ready -> RUNNING | μ 采样满 60m 就绪 |
@@ -350,3 +440,7 @@ pairs:
 - 自适应只管 tick_k：vol_k / min_ticks 也可挂 adaptive.K 模式，暂未做。
 - 无 10 档价差曲线：μ/σ 用第一档，深档风险由让价深度感知近似。
 - 1:1 计价假设：USDC/USDG 不换算，脱锚会直接表现为价差（不在本次范围）。
+- 杠杆无公开查询接口：市场最大杠杆由「交易所是否接受」二分反推（§8.1），无法先验读取 max_leverage。
+- churn score 是乘法合成的无量纲值（量级约 0.1~0.5）：`min_churn_score` 默认 0 只排序，要设门槛需先按 `/metrics` 的 pairs 分布校准。
+- auto 名义预占按 `notional_per_leg × max_steps` 保守计（实际定容受深度 cap 只会更小）。
+- auto 的 `pair_promoted` 等事件与 status 的 per-pair 字段来自同一 monitor 归集，promote/demote 历史只保留当前状态（未做时间序列留存）。
