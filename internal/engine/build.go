@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -73,17 +74,49 @@ func ResolvePair(ctx context.Context, m symbols.Matcher, base string, l, r excha
 	return symbols.Pair{}, fmt.Errorf("%s not listed as perp on both %s and %s", base, l.Name(), r.Name())
 }
 
-// setLeverage applies the configured leverage on venues that support it.
-func setLeverage(ctx context.Context, v exchange.Venue, inst domain.Instrument, leverage int) error {
+// resolveLeverage applies min(configured, market maximum) leverage. The common
+// path is a single call; when the market rejects the requested leverage as too
+// high it binary-searches downward for the maximum it accepts.
+func resolveLeverage(ctx context.Context, ls exchange.LeverageSetter, inst domain.Instrument, configured int) (int, error) {
+	if configured < 1 {
+		return 0, fmt.Errorf("leverage %d out of range", configured)
+	}
+	if err := ls.SetLeverage(ctx, inst, configured); err == nil {
+		return configured, nil
+	} else if !errors.Is(err, domain.ErrLeverageRejected) {
+		return 0, err
+	}
+	best := 0
+	lo, hi := 1, configured-1
+	for lo <= hi {
+		mid := (lo + hi) / 2
+		if err := ls.SetLeverage(ctx, inst, mid); err == nil {
+			best, lo = mid, mid+1
+		} else if errors.Is(err, domain.ErrLeverageRejected) {
+			hi = mid - 1
+		} else {
+			return 0, err
+		}
+	}
+	if best == 0 {
+		return 0, fmt.Errorf("market %d accepts no leverage in [1,%d]", inst.MarketID, configured)
+	}
+	return best, nil
+}
+
+// applyLeverage resolves and applies leverage best-effort: a failure never
+// blocks a pair, which then trades at the venue's current leverage.
+func (rt *runtime) applyLeverage(ctx context.Context, v exchange.Venue, inst domain.Instrument) {
 	ls, ok := v.(exchange.LeverageSetter)
 	if !ok {
-		return nil
+		return
 	}
-	if err := ls.SetLeverage(ctx, inst, leverage); err != nil {
-		return fmt.Errorf("%s set leverage %dx on market %d: %w", v.Name(), leverage, inst.MarketID, err)
+	lev, err := resolveLeverage(ctx, ls, inst, rt.cfg.Leverage)
+	if err != nil {
+		slog.Warn("leverage resolve failed; using venue default", "venue", v.Name(), "market", inst.MarketID, "err", err)
+		return
 	}
-	slog.Info("leverage set", "venue", v.Name(), "market", inst.MarketID, "leverage", leverage)
-	return nil
+	slog.Info("leverage set", "venue", v.Name(), "market", inst.MarketID, "leverage", lev)
 }
 
 // Run performs shared setup, then runs the configured pair-selection mode.

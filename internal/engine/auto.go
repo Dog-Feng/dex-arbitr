@@ -438,6 +438,7 @@ func (rt *runtime) selectPairs(ctx context.Context, cands []*candidate, active m
 		}
 		if err := rt.promote(ctx, c, active, wg); err != nil {
 			slog.Warn("pair promote failed", "base", base, "err", err)
+			promoteSince[base] = now // back off one dwell before retrying
 			continue
 		}
 		delete(promoteSince, base)
@@ -466,12 +467,8 @@ func (rt *runtime) promote(ctx context.Context, c *candidate, active map[string]
 		return fmt.Errorf("size unavailable")
 	}
 	if !rt.cfg.DryRun {
-		if err := setLeverage(ctx, c.l, c.pair.Left, rt.cfg.Leverage); err != nil {
-			return err
-		}
-		if err := setLeverage(ctx, c.r, c.pair.Right, rt.cfg.Leverage); err != nil {
-			return err
-		}
+		rt.applyLeverage(ctx, c.l, c.pair.Left)
+		rt.applyLeverage(ctx, c.r, c.pair.Right)
 	}
 	a, err := rt.buildActor(c.pair, qty, rt.cfg.Auto.MaxSteps, c.l, c.r, c.est, c.vol, c.volL, c.volR, nil)
 	if err != nil {

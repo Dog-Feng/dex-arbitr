@@ -147,6 +147,9 @@ var (
 	ErrRejected = errors.New("order rejected")
 	// ErrNoCredentials: venue is read-only.
 	ErrNoCredentials = errors.New("venue has no trading credentials")
+	// ErrLeverageRejected: the venue rejected the requested leverage because the
+	// market's maximum leverage is lower than requested.
+	ErrLeverageRejected = errors.New("venue rejected leverage")
 )
 
 // Round rounds v to d decimals.

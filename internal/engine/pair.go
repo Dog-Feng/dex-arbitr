@@ -62,6 +62,7 @@ type PairView interface {
 	Mean() (float64, bool) // mean bps, ready
 	VolBps() float64
 	LegVol(venue string) float64
+	Stats() estimator.Stats
 }
 
 // PairActor owns the trading state of one pair (single goroutine).
@@ -187,8 +188,7 @@ func (a *PairActor) meanReady() bool { _, ok := a.mean(); return ok }
 // statsSnapshot reports estimator state for logs, from either source.
 func (a *PairActor) statsSnapshot() estimator.Stats {
 	if a.cfg.View != nil {
-		m, ready := a.cfg.View.Mean()
-		return estimator.Stats{Kind: "shared", Mean: m, Ready: ready}
+		return a.cfg.View.Stats()
 	}
 	return a.cfg.Est.Stats()
 }

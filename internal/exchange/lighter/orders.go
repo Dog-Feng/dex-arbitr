@@ -139,6 +139,9 @@ func (v *Venue) SetLeverage(ctx context.Context, inst domain.Instrument, leverag
 	}
 	if _, err := v.rest.sendTx(ctx, txInfo.GetTxType(), body); err != nil {
 		v.nonce.invalidate()
+		if ae, ok := apiErrorOf(err); ok && ae.Code == 21113 {
+			return fmt.Errorf("%w: %v", domain.ErrLeverageRejected, err)
+		}
 		return err
 	}
 	return nil

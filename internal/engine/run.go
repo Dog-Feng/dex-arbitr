@@ -108,12 +108,8 @@ func (rt *runtime) runManual(ctx context.Context) error {
 			return fmt.Errorf("pair %s: step_qty %v invalid (%s; aligned decimals %d, min %v)", pc.Base, pc.StepQty, why, pair.SizeDecimals, pair.MinQty)
 		}
 		if !rt.cfg.DryRun {
-			if err := setLeverage(ctx, l, pair.Left, rt.cfg.Leverage); err != nil {
-				return err
-			}
-			if err := setLeverage(ctx, r, pair.Right, rt.cfg.Leverage); err != nil {
-				return err
-			}
+			rt.applyLeverage(ctx, l, pair.Left)
+			rt.applyLeverage(ctx, r, pair.Right)
 		}
 		est, vol, volL, volR, err := rt.newStats()
 		if err != nil {

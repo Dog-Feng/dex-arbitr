@@ -190,3 +190,12 @@ func isAPIError(err error) bool {
 	var ae *apiError
 	return errors.As(err, &ae)
 }
+
+// apiErrorOf unwraps the venue's definitive API rejection, if any.
+func apiErrorOf(err error) (*apiError, bool) {
+	var ae *apiError
+	if errors.As(err, &ae) {
+		return ae, true
+	}
+	return nil, false
+}
