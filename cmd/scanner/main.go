@@ -1,10 +1,12 @@
-// Command scanner watches matched pairs and logs arbitrage opportunities. It is
-// read-only and needs no trading credentials.
+// Command scanner renders a live, fixed-size ranking of arbitrage opportunities
+// across every matched pair, sorted by net opportunity. It is read-only and
+// needs no trading credentials.
 package main
 
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -23,8 +25,10 @@ import (
 
 func main() {
 	path := flag.String("config", "configs/config.yaml", "config file")
+	refresh := flag.Duration("refresh", 2*time.Second, "panel refresh interval")
 	flag.Parse()
-	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, nil)))
+
 	c, err := config.Load(*path)
 	if err != nil {
 		slog.Error("config", "err", err)
@@ -56,11 +60,23 @@ func main() {
 		m.Separators = c.Matching.Separators
 	}
 	pairs := matchAll(ctx, m, venues)
-	slog.Info("scanner started", "pairs", len(pairs))
+	board := newBoard(pairs)
+	tty := isTTY()
+
+	go func() {
+		t := time.NewTicker(*refresh)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				render(board, tty)
+			}
+		}
+	}()
 
 	var wg sync.WaitGroup
-	var mu sync.Mutex
-	last := map[string]time.Time{}
 	for _, p := range pairs {
 		p := p
 		wg.Add(1)
@@ -68,20 +84,69 @@ func main() {
 			defer wg.Done()
 			_ = scan.Watch(ctx, p.base, p.l, p.r, p.li, p.ri, scan.Config{
 				OpenBps: c.Strategy.OpenBps, VolK: c.Strategy.VolK, FeeBps: p.fee, MaxBookAge: c.Strategy.MaxBookAge},
-				func(o scan.Opportunity) {
-					k := o.Base + o.Dir.String()
-					mu.Lock()
-					if time.Since(last[k]) < 5*time.Second {
-						mu.Unlock()
-						return
-					}
-					last[k] = time.Now()
-					mu.Unlock()
-					slog.Info("opportunity", "pair", o.Base, "dir", o.Dir, "net_bps", round2(o.NetBps))
-				})
+				func(s scan.Score) { board.set(s) })
 		}()
 	}
 	wg.Wait()
+}
+
+type board struct {
+	mu sync.Mutex
+	m  map[string]scan.Score
+}
+
+func newBoard(pairs []pairSpec) *board {
+	b := &board{m: map[string]scan.Score{}}
+	for _, p := range pairs {
+		b.m[p.base] = scan.Score{Base: p.base}
+	}
+	return b
+}
+
+func (b *board) set(s scan.Score) {
+	b.mu.Lock()
+	b.m[s.Base] = s
+	b.mu.Unlock()
+}
+
+func (b *board) sorted() []scan.Score {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	out := make([]scan.Score, 0, len(b.m))
+	for _, s := range b.m {
+		out = append(out, s)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].NetBps != out[j].NetBps {
+			return out[i].NetBps > out[j].NetBps
+		}
+		return out[i].Base < out[j].Base
+	})
+	return out
+}
+
+func render(b *board, tty bool) {
+	rows := b.sorted()
+	if tty {
+		fmt.Print("\033[2J\033[H") // clear screen, home cursor
+	}
+	fmt.Printf("== pair scan  %d pairs  %s ==\n", len(rows), time.Now().Format("15:04:05"))
+	fmt.Printf("%-4s %-12s %-18s %s\n", "#", "PAIR", "DIR", "NET_BPS")
+	for i, s := range rows {
+		dir, net := "—", "warming"
+		if s.MuReady {
+			if s.NetBps > 0 {
+				dir = s.Dir.String()
+			}
+			net = fmt.Sprintf("%+.2f", s.NetBps)
+		}
+		fmt.Printf("%-4d %-12s %-18s %s\n", i+1, s.Base, dir, net)
+	}
+}
+
+func isTTY() bool {
+	fi, err := os.Stdout.Stat()
+	return err == nil && fi.Mode()&os.ModeCharDevice != 0
 }
 
 type pairSpec struct {
@@ -104,13 +169,12 @@ func matchAll(ctx context.Context, m symbols.Matcher, venues map[string]exchange
 	}
 	sort.Strings(names) // deterministic left/right: lighter before rhlighter
 	for _, name := range names {
-		v := venues[name]
-		inst, err := v.Instruments(ctx)
+		inst, err := venues[name].Instruments(ctx)
 		if err != nil {
 			slog.Warn("instruments", "venue", name, "err", err)
 			continue
 		}
-		vs = append(vs, ven{name: name, venue: v, inst: inst})
+		vs = append(vs, ven{name: name, venue: venues[name], inst: inst})
 	}
 	var out []pairSpec
 	for i := 0; i < len(vs); i++ {
@@ -123,5 +187,3 @@ func matchAll(ctx context.Context, m symbols.Matcher, venues map[string]exchange
 	}
 	return out
 }
-
-func round2(v float64) float64 { return float64(int(v*100+0.5)) / 100 }

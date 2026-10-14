@@ -20,8 +20,8 @@ func TestEval(t *testing.T) {
 	}
 }
 
-func TestOpportunityFields(t *testing.T) {
-	o := Opportunity{Base: "SPY", Dir: strategy.DirLS, NetBps: 2.5}
+func TestScoreFields(t *testing.T) {
+	o := Score{Base: "SPY", Dir: strategy.DirLS, NetBps: 2.5, MuReady: true}
 	if o.Base != "SPY" || o.NetBps != 2.5 {
 		t.Fatalf("%+v", o)
 	}

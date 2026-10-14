@@ -15,11 +15,12 @@ import (
 	"github.com/Dog-Feng/dex-arbitr/internal/volatility"
 )
 
-// Opportunity is one detected signal.
-type Opportunity struct {
-	Base   string
-	Dir    strategy.Dir
-	NetBps float64 // executable deviation above fee + volatility buffer + target
+// Score is one pair's current opportunity snapshot.
+type Score struct {
+	Base    string
+	Dir     strategy.Dir
+	NetBps  float64 // best executable deviation above fee + vol buffer + target
+	MuReady bool    // the mean is warmed up and the score is meaningful
 }
 
 // Eval returns the net deviation (bps) of each direction; > 0 is tradeable.
@@ -36,8 +37,9 @@ type Config struct {
 	MaxBookAge time.Duration
 }
 
-// Watch subscribes to both legs of a pair and calls on with each opportunity.
-func Watch(ctx context.Context, base string, l, r exchange.Venue, li, ri domain.Instrument, cfg Config, on func(Opportunity)) error {
+// Watch subscribes to both legs of a pair and calls on with the score every
+// evaluation tick (NetBps is 0 until the mean is ready).
+func Watch(ctx context.Context, base string, l, r exchange.Venue, li, ri domain.Instrument, cfg Config, on func(Score)) error {
 	chL, err := l.SubscribeBook(ctx, li)
 	if err != nil {
 		return err
@@ -79,14 +81,18 @@ func Watch(ctx context.Context, base string, l, r exchange.Venue, li, ri domain.
 			}
 			mu.Update(now, q.Mid)
 			vol.Add(q.Mid)
-			if !mu.Ready() {
+			ls, sl := Eval(q, mu.Mean(), vol.Vol(), cfg.FeeBps, cfg.OpenBps, cfg.VolK)
+			s := Score{Base: base, MuReady: mu.Ready()}
+			if !s.MuReady {
+				on(s)
 				continue
 			}
-			if ls, sl := Eval(q, mu.Mean(), vol.Vol(), cfg.FeeBps, cfg.OpenBps, cfg.VolK); ls > 0 {
-				on(Opportunity{Base: base, Dir: strategy.DirLS, NetBps: ls})
-			} else if sl > 0 {
-				on(Opportunity{Base: base, Dir: strategy.DirSL, NetBps: sl})
+			if ls >= sl {
+				s.Dir, s.NetBps = strategy.DirLS, ls
+			} else {
+				s.Dir, s.NetBps = strategy.DirSL, sl
 			}
+			on(s)
 		}
 	}
 }
