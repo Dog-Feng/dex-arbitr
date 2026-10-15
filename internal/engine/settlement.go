@@ -58,6 +58,8 @@ func (a *PairActor) watchRisk(ctx context.Context) {
 	m := a.margin
 	t := time.NewTicker(time.Second)
 	defer t.Stop()
+	var reported, lastBlocked bool
+	var lastReason string
 	for {
 		now := time.Now()
 		if now.Sub(m.lastRefresh) >= m.cfg.refresh {
@@ -66,8 +68,18 @@ func (a *PairActor) watchRisk(ctx context.Context) {
 		ml, mr, fresh := a.riskMarks()
 		// A stale peer must block admission without hiding a liquidation
 		// trigger on the leg whose price is still known.
-		action := m.assessAt(time.Now(), ml, mr, ml > 0 || mr > 0)
-		a.riskBlocked.Store(!fresh || m.armed || action == marginArm || action == marginTrigger)
+		assessedAt := time.Now()
+		action := m.assessAt(assessedAt, ml, mr, ml > 0 || mr > 0)
+		blocked := !fresh || m.armed || action == marginArm || action == marginTrigger
+		a.riskBlocked.Store(blocked)
+		reason := m.reason
+		if !fresh && action != marginTrigger {
+			reason = "book_unavailable"
+		}
+		if !reported || blocked != lastBlocked || blocked && reason != lastReason {
+			a.logRiskState(assessedAt, m, ml, mr, blocked, reason)
+			reported, lastBlocked, lastReason = true, blocked, reason
+		}
 		if action == marginTrigger && a.emergencyRequested.CompareAndSwap(false, true) {
 			a.execMu.Lock()
 			if a.execCancel != nil {
@@ -80,6 +92,40 @@ func (a *PairActor) watchRisk(ctx context.Context) {
 			return
 		case <-t.C:
 		}
+	}
+}
+
+// logRiskState records transitions rather than repeating the same reason each
+// second. These inputs explain a block without logging account identifiers.
+func (a *PairActor) logRiskState(now time.Time, m marginMonitor, markL, markR float64, blocked bool, reason string) {
+	ageMS := func(t time.Time) int64 {
+		if t.IsZero() {
+			return -1
+		}
+		return now.Sub(t).Milliseconds()
+	}
+	lb, _ := a.book(a.cfg.L.Name(), a.cfg.Pair.Left.MarketID)
+	rb, _ := a.book(a.cfg.R.Name(), a.cfg.Pair.Right.MarketID)
+	args := []any{
+		"blocked", blocked, "reason", reason, "assessment_reason", m.reason,
+		"qty_l", m.qtyL, "qty_r", m.qtyR,
+		"entry_l", m.entryL, "entry_r", m.entryR,
+		"liquidation_l", m.liqL, "liquidation_r", m.liqR,
+		"mark_l", markL, "mark_r", markR,
+		"position_age_l_ms", ageMS(m.lastL), "position_age_r_ms", ageMS(m.lastR),
+		"book_age_l_ms", ageMS(lb.Ts), "book_age_r_ms", ageMS(rb.Ts),
+		"snapshot_notional_l", m.notionalL, "snapshot_notional_r", m.notionalR,
+	}
+	if m.crossL != nil {
+		args = append(args, "cross_equity_l", m.crossL.Equity, "cross_maintenance_l", m.crossL.Maintenance)
+	}
+	if m.crossR != nil {
+		args = append(args, "cross_equity_r", m.crossR.Equity, "cross_maintenance_r", m.crossR.Maintenance)
+	}
+	if blocked {
+		a.log.Warn("risk state", args...)
+	} else {
+		a.log.Info("risk state", args...)
 	}
 }
 

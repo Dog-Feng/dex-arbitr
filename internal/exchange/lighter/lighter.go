@@ -278,8 +278,17 @@ func (v *Venue) Instruments(ctx context.Context) ([]domain.Instrument, error) {
 
 // Positions returns non-zero positions of the configured account.
 func (v *Venue) Positions(ctx context.Context) ([]domain.Position, error) {
-	if v.tx == nil {
-		return nil, domain.ErrNoCredentials
+	snapshot, err := v.AccountSnapshot(ctx)
+	if err != nil {
+		return nil, err
 	}
-	return v.rest.positions(ctx, v.cfg.AccountIndex)
+	return snapshot.Positions, nil
+}
+
+// AccountSnapshot returns positions and cross-margin risk from one account read.
+func (v *Venue) AccountSnapshot(ctx context.Context) (domain.AccountSnapshot, error) {
+	if v.tx == nil {
+		return domain.AccountSnapshot{}, domain.ErrNoCredentials
+	}
+	return v.rest.accountSnapshot(ctx, v.cfg.AccountIndex)
 }

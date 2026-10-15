@@ -167,42 +167,54 @@ func (r *restClient) apiKey(ctx context.Context, account int64, key uint8) (stri
 }
 
 func (r *restClient) positions(ctx context.Context, account int64) ([]domain.Position, error) {
+	snapshot, err := r.accountSnapshot(ctx, account)
+	if err != nil {
+		return nil, err
+	}
+	return snapshot.Positions, nil
+}
+
+func (r *restClient) accountSnapshot(ctx context.Context, account int64) (domain.AccountSnapshot, error) {
 	var out struct {
 		Accounts []struct {
 			Positions *[]struct {
-				MarketID         *int   `json:"market_id"`
-				Symbol           string `json:"symbol"`
-				Sign             int    `json:"sign"`
-				Position         string `json:"position"`
-				AvgEntry         string `json:"avg_entry_price"`
-				LiquidationPrice string `json:"liquidation_price"`
+				MarketID         *int            `json:"market_id"`
+				Symbol           string          `json:"symbol"`
+				Sign             int             `json:"sign"`
+				Position         string          `json:"position"`
+				AvgEntry         string          `json:"avg_entry_price"`
+				LiquidationPrice string          `json:"liquidation_price"`
+				MarginMode       json.RawMessage `json:"margin_mode"`
+				PositionValue    json.RawMessage `json:"position_value"`
 			} `json:"positions"`
+			CrossAssetValue             json.RawMessage `json:"cross_asset_value"`
+			CrossMaintenanceRequirement json.RawMessage `json:"cross_maintenance_margin_requirement"`
 		} `json:"accounts"`
 	}
 	q := url.Values{"by": {"index"}, "value": {strconv.FormatInt(account, 10)}}
 	if err := r.get(ctx, "account", q, &out); err != nil {
-		return nil, err
+		return domain.AccountSnapshot{}, err
 	}
 	if len(out.Accounts) != 1 || out.Accounts[0].Positions == nil {
-		return nil, fmt.Errorf("account %d: missing or ambiguous positions", account)
+		return domain.AccountSnapshot{}, fmt.Errorf("account %d: missing or ambiguous positions", account)
 	}
-	var ps []domain.Position
+	var snapshot domain.AccountSnapshot
 	seen := make(map[int]bool)
 	for _, p := range *out.Accounts[0].Positions {
 		if p.MarketID == nil {
-			return nil, fmt.Errorf("missing position market")
+			return domain.AccountSnapshot{}, fmt.Errorf("missing position market")
 		}
 		marketID := *p.MarketID
 		if _, err := marketIndex(domain.Instrument{MarketID: marketID}); err != nil || seen[marketID] {
-			return nil, fmt.Errorf("invalid or repeated position market %d", marketID)
+			return domain.AccountSnapshot{}, fmt.Errorf("invalid or repeated position market %d", marketID)
 		}
 		seen[marketID] = true
 		qty, err := finiteDecimal(p.Position)
 		if err != nil || qty < 0 {
-			return nil, fmt.Errorf("market %d: invalid position", marketID)
+			return domain.AccountSnapshot{}, fmt.Errorf("market %d: invalid position", marketID)
 		}
 		if qty != 0 && p.Sign != -1 && p.Sign != 1 {
-			return nil, fmt.Errorf("market %d: invalid position sign", marketID)
+			return domain.AccountSnapshot{}, fmt.Errorf("market %d: invalid position sign", marketID)
 		}
 		if p.Sign < 0 {
 			qty = -qty
@@ -212,15 +224,52 @@ func (r *restClient) positions(ctx context.Context, account int64) ([]domain.Pos
 		}
 		avg, err := finiteDecimal(p.AvgEntry)
 		if err != nil || avg <= 0 {
-			return nil, fmt.Errorf("market %d: invalid entry price", marketID)
+			return domain.AccountSnapshot{}, fmt.Errorf("market %d: invalid entry price", marketID)
 		}
 		liq, err := finiteDecimal(p.LiquidationPrice)
 		if err != nil || liq < 0 {
-			return nil, fmt.Errorf("market %d: invalid liquidation price", marketID)
+			return domain.AccountSnapshot{}, fmt.Errorf("market %d: invalid liquidation price", marketID)
 		}
-		ps = append(ps, domain.Position{MarketID: marketID, Symbol: p.Symbol, Qty: qty, AvgEntry: avg, LiquidationPrice: liq})
+		notional, ok := optionalDecimal(p.PositionValue)
+		if !ok || notional <= 0 {
+			notional = 0
+		}
+		snapshot.Positions = append(snapshot.Positions, domain.Position{
+			MarketID: marketID, Symbol: p.Symbol, Qty: qty, AvgEntry: avg,
+			LiquidationPrice: liq, MarginMode: positionMarginMode(p.MarginMode), Notional: notional,
+		})
 	}
-	return ps, nil
+	equity, equityOK := optionalDecimal(out.Accounts[0].CrossAssetValue)
+	maintenance, maintenanceOK := optionalDecimal(out.Accounts[0].CrossMaintenanceRequirement)
+	if equityOK && maintenanceOK && maintenance >= 0 {
+		snapshot.CrossMargin = &domain.CrossMarginRisk{Equity: equity, Maintenance: maintenance}
+	}
+	return snapshot, nil
+}
+
+// Optional risk fields must not discard otherwise valid position data.
+func optionalDecimal(raw json.RawMessage) (float64, bool) {
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return 0, false
+	}
+	v, err := finiteDecimal(s)
+	return v, err == nil
+}
+
+func positionMarginMode(raw json.RawMessage) domain.MarginMode {
+	var mode *int
+	if err := json.Unmarshal(raw, &mode); err != nil || mode == nil {
+		return domain.MarginUnknown
+	}
+	switch *mode {
+	case 0:
+		return domain.MarginCross
+	case 1:
+		return domain.MarginIsolated
+	default:
+		return domain.MarginUnknown
+	}
 }
 
 // wsOrder mirrors the Lighter Order object (subset).
