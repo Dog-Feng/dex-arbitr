@@ -40,27 +40,33 @@ type marginMonitor struct {
 	lastRefresh  time.Time
 	lastL, lastR time.Time
 
-	have           bool
-	liqL, liqR     float64
-	entryL, entryR float64
-	qtyL, qtyR     float64
-	aggL, aggR     float64
+	have                 bool
+	liqL, liqR           float64
+	entryL, entryR       float64
+	qtyL, qtyR           float64
+	aggL, aggR           float64
+	modeL, modeR         domain.MarginMode
+	notionalL, notionalR float64
+	crossL, crossR       *domain.CrossMarginRisk
+	reason               string
 }
 
 // refresh updates each successful venue independently. A failed peer must not
 // discard liquidation data that was successfully read from the other venue.
 func (m *marginMonitor) refresh(ctx context.Context, l, r exchange.Venue, leftID, rightID int) {
 	m.lastRefresh = time.Now()
-	pl, aggL, errL := venuePositions(ctx, l, leftID)
+	pl, aggL, crossL, errL := venueMarginSnapshot(ctx, l, leftID)
 	if errL == nil {
 		m.liqL, m.entryL, m.qtyL, m.aggL = pl.LiquidationPrice, pl.AvgEntry, pl.Qty, aggL
+		m.modeL, m.notionalL, m.crossL = pl.MarginMode, pl.Notional, crossL
 		m.lastL = time.Now()
 	} else {
 		slog.Warn("margin positions refresh", "venue", l.Name(), "err", errL)
 	}
-	pr, aggR, errR := venuePositions(ctx, r, rightID)
+	pr, aggR, crossR, errR := venueMarginSnapshot(ctx, r, rightID)
 	if errR == nil {
 		m.liqR, m.entryR, m.qtyR, m.aggR = pr.LiquidationPrice, pr.AvgEntry, pr.Qty, aggR
+		m.modeR, m.notionalR, m.crossR = pr.MarginMode, pr.Notional, crossR
 		m.lastR = time.Now()
 	} else {
 		slog.Warn("margin positions refresh", "venue", r.Name(), "err", errR)
@@ -76,19 +82,29 @@ func (m *marginMonitor) assess(markL, markR float64, fresh bool) marginAction {
 }
 
 func (m *marginMonitor) assessAt(now time.Time, markL, markR float64, fresh bool) marginAction {
-	if !fresh {
-		return marginNone
-	}
+	m.reason = "healthy"
 	validL, validR := m.cacheFresh(now, m.lastL), m.cacheFresh(now, m.lastR)
 	// Hand-built monitors with no refresh interval are used by pure decision
 	// tests. Production monitors always track individual successful reads.
 	if m.cfg.refresh <= 0 && m.have && m.lastL.IsZero() && m.lastR.IsZero() {
 		validL, validR = true, true
 	}
+	// A known exhausted cross account is actionable without a book mark or a
+	// usable peer. Do not let missing liquidation data mask that evidence.
+	if (validL && crossMarginExhausted(m.qtyL, m.modeL, m.crossL)) ||
+		(validR && crossMarginExhausted(m.qtyR, m.modeR, m.crossR)) {
+		m.armed = false
+		m.reason = "cross_margin_exhausted"
+		return marginTrigger
+	}
+	if !fresh {
+		m.reason = "mark_unavailable"
+		return marginNone
+	}
 	minR := 1.0
 	considered := false
 	unknown := !validL || !validR
-	if r, ok := remainingMargin(m.qtyL, m.entryL, m.liqL, markL); ok && validL {
+	if r, ok := remainingPositionMargin(m.qtyL, m.entryL, m.liqL, markL, m.modeL, m.notionalL, m.crossL); ok && validL {
 		considered = true
 		if r < minR {
 			minR = r
@@ -96,7 +112,7 @@ func (m *marginMonitor) assessAt(now time.Time, markL, markR float64, fresh bool
 	} else if validL && m.qtyL != 0 {
 		unknown = true
 	}
-	if r, ok := remainingMargin(m.qtyR, m.entryR, m.liqR, markR); ok && validR {
+	if r, ok := remainingPositionMargin(m.qtyR, m.entryR, m.liqR, markR, m.modeR, m.notionalR, m.crossR); ok && validR {
 		considered = true
 		if r < minR {
 			minR = r
@@ -108,9 +124,19 @@ func (m *marginMonitor) assessAt(now time.Time, markL, markR float64, fresh bool
 	// and missing peer data.
 	if considered && minR <= m.cfg.trigger {
 		m.armed = false
+		m.reason = "liquidation_distance"
 		return marginTrigger
 	}
-	if unknown || (m.cfg.maxNotional > 0 && (m.aggL > m.cfg.maxNotional || m.aggR > m.cfg.maxNotional)) {
+	if unknown {
+		m.reason = "position_risk_unknown"
+		if !validL || !validR {
+			m.reason = "position_cache_stale"
+		}
+		m.armed = true
+		return marginArm
+	}
+	if m.cfg.maxNotional > 0 && (m.aggL > m.cfg.maxNotional || m.aggR > m.cfg.maxNotional) {
+		m.reason = "account_notional_cap"
 		m.armed = true
 		return marginArm
 	}
@@ -123,11 +149,15 @@ func (m *marginMonitor) assessAt(now time.Time, markL, markR float64, fresh bool
 	}
 	switch {
 	case minR <= m.cfg.floor:
+		m.reason = "margin_floor"
 		m.armed = true
 		return marginArm
 	case m.armed && minR > m.cfg.floor+m.cfg.hysteresis:
 		m.armed = false
 		return marginDisarm
+	}
+	if m.armed {
+		m.reason = "margin_hysteresis"
 	}
 	return marginNone
 }
@@ -137,8 +167,40 @@ func (m *marginMonitor) cacheFresh(now, last time.Time) bool {
 		return false
 	}
 	maxAge := 2 * m.cfg.refresh
-	return maxAge > 0 && now.Sub(last) <= maxAge
+	return maxAge > 0 && !now.Before(last) && now.Sub(last) <= maxAge
 }
+
+// remainingPositionMargin keeps the ordinary liquidation-distance calculation
+// unchanged. Only an explicitly cross-margined long with sufficient account
+// headroom may use zero as a conservative liquidation bound. Both headroom and
+// position value must come from the same fresh REST account snapshot: using
+// today's book value could incorrectly approve a position after a price fall.
+func remainingPositionMargin(qty, entry, liq, mark float64, mode domain.MarginMode, value float64, cross *domain.CrossMarginRisk) (float64, bool) {
+	if r, ok := remainingMargin(qty, entry, liq, mark); ok {
+		return r, true
+	}
+	if mode != domain.MarginCross || qty <= 0 || !finite(qty) || liq != 0 ||
+		entry <= 0 || !finite(entry) || mark <= 0 || !finite(mark) ||
+		value <= 0 || !finite(value) || !validCrossMargin(cross) {
+		return 0, false
+	}
+	headroom := cross.Equity - cross.Maintenance
+	if !finite(headroom) || headroom < value {
+		return 0, false
+	}
+	ratio := mark / entry
+	return ratio, finite(ratio)
+}
+
+func validCrossMargin(cross *domain.CrossMarginRisk) bool {
+	return cross != nil && finite(cross.Equity) && finite(cross.Maintenance) && cross.Maintenance >= 0
+}
+
+func crossMarginExhausted(qty float64, mode domain.MarginMode, cross *domain.CrossMarginRisk) bool {
+	return qty != 0 && finite(qty) && mode == domain.MarginCross && validCrossMargin(cross) && cross.Equity <= cross.Maintenance
+}
+
+func finite(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0) }
 
 // remainingMargin returns the fraction of initial margin still available (0 at
 // liquidation), or ok=false when the data is unusable.
@@ -170,20 +232,44 @@ func remainingMargin(qty, entry, liq, mark float64) (float64, bool) {
 // venuePositions returns the pair's position on marketID and the venue's total
 // notional aggregated across all markets (the account-level exposure).
 func venuePositions(ctx context.Context, v exchange.Venue, marketID int) (domain.Position, float64, error) {
-	ps, err := v.Positions(ctx)
+	pos, agg, _, err := venueMarginSnapshot(ctx, v, marketID)
+	return pos, agg, err
+}
+
+// venueMarginSnapshot obtains positions and optional account evidence in one
+// request. A snapshot failure must not fall back to a separate positions read:
+// combining those responses could approve a position with stale account data.
+func venueMarginSnapshot(ctx context.Context, v exchange.Venue, marketID int) (domain.Position, float64, *domain.CrossMarginRisk, error) {
+	var ps []domain.Position
+	var cross *domain.CrossMarginRisk
+	var err error
+	if s, ok := v.(exchange.AccountSnapshotter); ok {
+		var snapshot domain.AccountSnapshot
+		snapshot, err = s.AccountSnapshot(ctx)
+		ps = snapshot.Positions
+		if snapshot.CrossMargin != nil {
+			copyRisk := *snapshot.CrossMargin
+			cross = &copyRisk
+		}
+	} else {
+		ps, err = v.Positions(ctx)
+	}
 	if err != nil {
-		return domain.Position{}, 0, err
+		return domain.Position{}, 0, nil, err
 	}
 	var pos domain.Position
 	var agg float64
 	for _, p := range ps {
 		if math.IsNaN(p.Qty) || math.IsInf(p.Qty, 0) || math.IsNaN(p.AvgEntry) || math.IsInf(p.AvgEntry, 0) || p.AvgEntry < 0 || math.IsNaN(p.LiquidationPrice) || math.IsInf(p.LiquidationPrice, 0) {
-			return domain.Position{}, 0, fmt.Errorf("%s market %d has invalid position data", v.Name(), p.MarketID)
+			return domain.Position{}, 0, nil, fmt.Errorf("%s market %d has invalid position data", v.Name(), p.MarketID)
 		}
 		agg += math.Abs(p.Qty) * p.AvgEntry
+		if !finite(agg) {
+			return domain.Position{}, 0, nil, fmt.Errorf("%s has invalid aggregate position value", v.Name())
+		}
 		if p.MarketID == marketID {
 			pos = p
 		}
 	}
-	return pos, agg, nil
+	return pos, agg, cross, nil
 }

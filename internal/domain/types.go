@@ -134,6 +134,15 @@ type SubmitAck struct {
 	TxHash   string
 }
 
+// MarginMode identifies which pool of collateral backs a position.
+type MarginMode uint8
+
+const (
+	MarginUnknown MarginMode = iota
+	MarginCross
+	MarginIsolated
+)
+
 // Position on a venue market. Qty is signed (+long / -short).
 type Position struct {
 	MarketID         int
@@ -141,6 +150,21 @@ type Position struct {
 	Qty              float64
 	AvgEntry         float64
 	LiquidationPrice float64
+	MarginMode       MarginMode
+	Notional         float64 // absolute USD position value; 0 means unavailable
+}
+
+// CrossMarginRisk is account-wide cross equity and its maintenance requirement.
+// Equity can be negative; Maintenance is nonnegative. Both must be finite.
+type CrossMarginRisk struct {
+	Equity      float64
+	Maintenance float64
+}
+
+// AccountSnapshot keeps positions and account risk from one venue response.
+type AccountSnapshot struct {
+	Positions   []Position
+	CrossMargin *CrossMarginRisk // nil means unavailable or invalid
 }
 
 var (

@@ -260,6 +260,12 @@ qty = floor( min(notional_per_leg, depth_use_ratio × min(四侧 top 深度) × 
 - 账户级名义上限：max_notional > 0 时按 venue 汇总该账户所有市场的 |qty|*avgEntry 名义，超限即 REDUCE_ONLY。
 - trigger=0 或 dry_run 时风控禁用。
 
+全仓多仓的 REST 清算价可能为 `0`（网页显示 NA）。适配器通过一次账户响应同步提供仓位、`position_value`、全仓权益和维持保证金。仅当明确为全仓多仓，且同一份新鲜快照满足 `权益 - 维持保证金 >= position_value > 0`，才允许用 0 作为保守清算边界，剩余比例按 `mark / entry` 计算。该充分条件保证其余快照条件不变时，此多仓跌到 0 的损失仍被账户盈余覆盖；没有将现有 floor/trigger/hysteresis 改成账户保证金使用率。验证必须使用快照名义额，不能将旧权益与价格下跌后的盘口名义额混合。
+
+零清算价空仓、逐仓、未知保证金模式、缺失或无效的风险证据仍限开；缓存过期规则保持不变。新鲜快照显示持有全仓仓位且全仓权益已不高于维持保证金时，直接触发应急保护。已知风险优先于另一腿的数据缺失。
+
+`risk state` 日志在限开状态或原因变化时记录 `blocked`、`reason`、两腿仓位/入场价/清算价/盘口中价、数据年龄及可用的全仓风险证据，恢复时同样记录。不会输出账户索引或凭据。
+
 ### 8.1 自适应杠杆（resolveLeverage）
 
 不同市场的最大杠杆不同（低流动性币会压低上限，lighter 以 21113 拒绝过高的初始保证金率）。系统不依赖未公开接口，按「交易所是否接受」反推：
@@ -414,7 +420,7 @@ pairs:
 | step opened / step pnl / step closed | 步账本与已实现盈亏 |
 | rescue order / rescue complete（WARN） | 补救单与完成 |
 | hedge invariant broken; pausing（ERROR） | 账本与仓位不一致，已 PAUSED |
-| margin floor reached; reduce only（WARN） | 剩余保证金 <= floor |
+| risk state（WARN/INFO） | 风险阻断或恢复；reason 区分清算距离、账户权益耗尽、数据未知/过期、盘口不可用与名义额上限 |
 | ALERT: liquidation risk, emergency unwind（ERROR） | 应急平仓触发 |
 | order state unresolved; will infer from positions（WARN） | 订单终态超时，从仓位差推断 |
 | ws read error, reconnecting（WARN） | WS 断线自动重连 |

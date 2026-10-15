@@ -37,6 +37,12 @@ type LeverageSetter interface {
 	SetLeverage(ctx context.Context, inst domain.Instrument, leverage int) error
 }
 
+// AccountSnapshotter supplies positions and cross-margin risk from one response.
+// It is optional so venues without account-wide risk retain the Venue contract.
+type AccountSnapshotter interface {
+	AccountSnapshot(ctx context.Context) (domain.AccountSnapshot, error)
+}
+
 // Factory builds a venue from a generic option map.
 type Factory func(name string, opts map[string]string) (Venue, error)
 
