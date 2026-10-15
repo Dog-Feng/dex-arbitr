@@ -85,13 +85,14 @@ type Config struct {
 		LossToleranceBps  float64 `yaml:"loss_tolerance_bps"`  // legacy option; volume requires 0
 	} `yaml:"volume"`
 	Execution struct {
-		PriceTicks    int     `yaml:"price_ticks"`     // fixed allowance; fallback while sigma is not ready
-		DynamicTicks  bool    `yaml:"dynamic_ticks"`   // scale the allowance by volatility
-		TickK         float64 `yaml:"tick_k"`          // one-sided coverage coefficient
-		TickMin       int     `yaml:"min_ticks"`       // floor for the dynamic allowance
-		TickMax       int     `yaml:"max_ticks"`       // cap for the dynamic allowance; 0 = no cap
-		DepthMinMult  float64 `yaml:"depth_min_mult"`  // depth multiple below which allowance widens
-		DepthMaxScale float64 `yaml:"depth_max_scale"` // max multiplier on thin books
+		PriceTicks      int             `yaml:"price_ticks"`      // fixed allowance; fallback while sigma is not ready
+		DynamicTicks    bool            `yaml:"dynamic_ticks"`    // scale the allowance by volatility
+		TickK           float64         `yaml:"tick_k"`           // one-sided coverage coefficient
+		TickMin         int             `yaml:"min_ticks"`        // floor for the dynamic allowance
+		TickMax         int             `yaml:"max_ticks"`        // cap for the dynamic allowance; 0 = no cap
+		DepthMinMult    float64         `yaml:"depth_min_mult"`   // depth multiple below which allowance widens
+		DepthMaxScale   float64         `yaml:"depth_max_scale"`  // max multiplier on thin books
+		AdaptiveLatency AdaptiveLatency `yaml:"adaptive_latency"` // volatility window follows measured leg latency
 	} `yaml:"execution"`
 	Adaptive struct {
 		Window     int     `yaml:"window"`      // outcomes before adjusting; 0 = disabled
@@ -108,6 +109,18 @@ type Config struct {
 	} `yaml:"monitor"`
 	Auto  Auto   `yaml:"auto"`
 	Pairs []Pair `yaml:"pairs"`
+}
+
+// AdaptiveLatency derives the volatility window from measured leg latency.
+// It lives under execution.adaptive_latency.
+type AdaptiveLatency struct {
+	Enabled        bool          `yaml:"enabled"`
+	MinSamples     int           `yaml:"min_samples"`     // cold start: fixed window below this count
+	WindowMin      time.Duration `yaml:"window_min"`      // lower clamp for the latency-derived window
+	WindowMax      time.Duration `yaml:"window_max"`      // upper clamp, also the estimator ring capacity
+	CoverageK      float64       `yaml:"coverage_k"`      // one-sided coverage (mean + k*std)
+	RingN          int           `yaml:"ring_n"`          // latency sample ring size
+	UpdateInterval time.Duration `yaml:"update_interval"` // how often the window is re-derived
 }
 
 // Auto configures the auto pair-selection loop (only used when
@@ -169,6 +182,25 @@ func (c *Config) defaults() {
 	}
 	if x.DepthMaxScale == 0 {
 		x.DepthMaxScale = 4
+	}
+	al := &x.AdaptiveLatency
+	if al.MinSamples == 0 {
+		al.MinSamples = 8
+	}
+	if al.WindowMin == 0 {
+		al.WindowMin = 200 * time.Millisecond
+	}
+	if al.WindowMax == 0 {
+		al.WindowMax = 3 * time.Second
+	}
+	if al.CoverageK == 0 {
+		al.CoverageK = 1.3
+	}
+	if al.RingN == 0 {
+		al.RingN = 32
+	}
+	if al.UpdateInterval == 0 {
+		al.UpdateInterval = time.Second
 	}
 	a := &c.Adaptive
 	if a.FailHigh == 0 {
@@ -343,6 +375,21 @@ func (c *Config) validate() error {
 	}
 	if c.Execution.DepthMaxScale < 1 {
 		return fmt.Errorf("execution.depth_max_scale must be >= 1")
+	}
+	if c.Execution.AdaptiveLatency.Enabled {
+		al := c.Execution.AdaptiveLatency
+		if al.MinSamples <= 0 || al.RingN < 2 || al.CoverageK <= 0 || al.UpdateInterval <= 0 {
+			return fmt.Errorf("adaptive_latency: min_samples/ring_n/coverage_k/update_interval must be valid")
+		}
+		if al.WindowMin <= 0 || al.WindowMax < al.WindowMin {
+			return fmt.Errorf("adaptive_latency: require 0 < window_min <= window_max")
+		}
+		if al.WindowMin < c.Volatility.Interval {
+			return fmt.Errorf("adaptive_latency.window_min must be >= volatility.interval")
+		}
+		if al.WindowMax < c.Volatility.Horizon {
+			return fmt.Errorf("adaptive_latency.window_max must be >= volatility.horizon (the ring must hold the warmup window)")
+		}
 	}
 	if c.Adaptive.Window < 0 {
 		return fmt.Errorf("adaptive.window must be >= 0")

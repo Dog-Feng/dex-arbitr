@@ -2,6 +2,8 @@
 
 > 目标：以最小净成本产生最大成交额，用于赚积分/空投。本文档描述两种刷量形态（taker churn 与对冲做市），以及它们共享的地基。积分回报率暂不量化。
 
+> **当前实现状态**：方案一（taker churn）已实现（`strategy: volume`）。实现细节与本文档草案的差异以 [system-design.md](system-design.md) 为准：volume 的额外开平阈值固定为 `0/0`（`loss_tolerance_bps` 必须为 0）；开平仓受 σ 就绪准入闸约束；每日预算跨天清零计数但 `pnl_uncertain` 粘性保留。方案二（对冲做市）未实现。
+
 > 本文包含早期方案与未实现的草案。当前实现以 [策略与选币完整链路](strategy-selection-flow.md) 为准：volume 也需 2 小时滚动窗口、1 小时预热，额外开平阈值固定为零，手续费与配置的过滤条件仍生效；未实现定时无条件交易或 maker 路径。
 
 ## 1. 前提与地基
@@ -116,9 +118,9 @@ volume:
   step_qty: 0.1
   max_steps: 20
   min_inventory: 8        # 库存地板（大仓位与量并存）
-  churn_interval: 2s      # 时间兜底的固定节奏
+  churn_interval: 2s      # 时间兜底的固定节奏（草案，当前未实现；实际节奏由 strategy.interval_min/max 控制）
   daily_volume_target: 1000000   # USD
-  daily_cost_budget: 100         # bps
+  daily_cost_budget: 100         # USD（草案示例；当前配置为 USD 绝对额）
   loss_tolerance_bps: 0    # 当前 volume 必须为 0，不能通过此项降低开仓门槛
   close_at_breakeven: true
 

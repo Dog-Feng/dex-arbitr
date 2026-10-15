@@ -1,6 +1,6 @@
 # 自适应延迟窗口（σ horizon）实施方案清单
 
-> 分支：`fix/adaptive-latency-horizon-20261016`。本文档是实施清单，尚未改代码。
+> 分支：`fix/adaptive-latency-horizon-20261016`。**状态：已实现并测试通过。**
 > 背景：实测开平仓延迟在 500ms–1s 之间波动，而当前三个波动率估计器（价差 σ、左腿 σ、右腿 σ）共用固定的 `volatility.horizon=500ms`。慢腿让价不足、快腿多付滑点、价差缓冲低估对冲完成时间。
 
 ## 0. 目标与判定标准
@@ -11,6 +11,15 @@
 - 延迟统计只纳入"一次性正常成交"，排除补救、超时推断与未知终态。
 
 验收：模拟 L≈300ms / R≈1000ms 时，`horizon_L < horizon_R`，两腿让价 tick 比例与延迟比例一致，价差窗口 = max(两腿分位)；开关关闭时行为与当前 `horizon=500ms` 完全一致。
+
+## 已落地的决策
+
+- `coverage_k` 默认 1.3（mean + 1.3×std，约 p90）；
+- 窗口钳制 `window_min=200ms`、`window_max=3s`；
+- 更新节奏 `update_interval=1s`（decide tick 内节流，窗口变化才写）；
+- 价差窗口 = `max(腿L窗口, 腿R窗口)`；
+- 就绪门槛固定在 `horizon/interval`（warm 增量数），与运行时窗口解耦：扩窗渐近使用已有历史、缩窗立即生效，任何窗口变化都不会让已 warm 的估计器失 ready；
+- 延迟统计只纳入"一次性正常成交"（`Resolved && Filled && Latency>0`，且该次执行 `RescueOrders==0`）。
 
 ## 1. 延迟统计层（新增，engine 内）
 
@@ -39,7 +48,7 @@ coverage_k 默认 1.3（约 p90，正态假设）
 
 1.4 冷启动：样本数 < `min_samples`（默认 8）时返回固定 `horizon`（500ms），不参与自适应。
 
-1.5 存放位置：`PairActor` 每腿一个 `latencyStat`（现有 `latencyStat` 只做展示并每分钟清零，需要新增持久滚动版；保留原展示版不动）。
+1.5 存放位置（已实现）：`PairActor` 每腿一个 `latencySeries`（`engine/latency.go`，定长环形、O(N) 重算均值/方差，不清零）；原 `latencyStat` 展示版保留不动。
 
 ## 2. 估计器层（volatility 改造）
 
@@ -74,6 +83,7 @@ window_spread = max(window_L, window_R)
 ```
 
 分别 `SetWindow` 到左腿 σ、右腿 σ、价差 σ。窗口未变化时不写。
+（实现采用 `update_interval=1s` 节流，decide tick 内调用 `applyAdaptiveWindows`。）
 
 3.3 联动（无需额外代码）：
 
@@ -112,9 +122,10 @@ execution:
 | T6 | `engine.TestAdaptiveWindowDisabledMatchesFixed` | enabled=false 与固定 horizon 行为一致 |
 | T7 | 回归 | 现有 volgate、count-based、admission 测试全部保持通过 |
 
-## 6. 待拍板的决策点
+## 6. 决策记录
 
-- `coverage_k` 取值（1.3 起步，可用历史延迟分布校准）；
-- `window_min/max` 边界（建议 200ms–3s）；
-- 更新节奏（建议 1s 一次，避免每笔都改窗口）；
-- 价差窗口用 `max(两腿)` 还是独立 EWMA（建议 max，对冲风险由慢腿决定）。
+- `coverage_k` = 1.3（mean + 1.3×std，约 p90），可用历史延迟分布再校准；
+- 边界 `window_min=200ms`、`window_max=3s`；
+- 更新节奏 `update_interval=1s`（decide tick 内节流，窗口变化才写）；
+- 价差窗口 = `max(腿L窗口, 腿R窗口)`（对冲风险由慢腿决定）；
+- 就绪门槛固定为 warm 增量数，窗口缩至 warm 以下不影响 ready。

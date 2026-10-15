@@ -66,9 +66,9 @@ func (rt *runtime) newStats() (estimator.Estimator, *volatility.Estimator, *vola
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
-	vol := volatility.New(volatility.Params{Interval: c.Volatility.Interval, Horizon: c.Volatility.Horizon, HalfLife: c.Volatility.HalfLife})
-	volL := volatility.New(volatility.Params{Interval: c.Volatility.Interval, Horizon: c.Volatility.Horizon, HalfLife: c.Volatility.HalfLife})
-	volR := volatility.New(volatility.Params{Interval: c.Volatility.Interval, Horizon: c.Volatility.Horizon, HalfLife: c.Volatility.HalfLife})
+	vol := volatility.New(volatility.Params{Interval: c.Volatility.Interval, Horizon: c.Volatility.Horizon, HalfLife: c.Volatility.HalfLife, MaxHorizon: c.Execution.AdaptiveLatency.WindowMax})
+	volL := volatility.New(volatility.Params{Interval: c.Volatility.Interval, Horizon: c.Volatility.Horizon, HalfLife: c.Volatility.HalfLife, MaxHorizon: c.Execution.AdaptiveLatency.WindowMax})
+	volR := volatility.New(volatility.Params{Interval: c.Volatility.Interval, Horizon: c.Volatility.Horizon, HalfLife: c.Volatility.HalfLife, MaxHorizon: c.Execution.AdaptiveLatency.WindowMax})
 	return est, vol, volL, volR, nil
 }
 
@@ -96,6 +96,12 @@ func (rt *runtime) buildActor(pair symbols.Pair, qty float64, maxSteps int, l, r
 			hysteresis: c.Risk.MarginHysteresis, refresh: c.Risk.PositionRefresh, marketBps: c.Risk.EmergencyMarketBps,
 			maxNotional: c.Risk.MaxNotional},
 		VolTarget: volTarget, VolCostBudget: volBudget,
+		AdaptiveLatency: adaptiveLatencyCfg{
+			enabled: c.Execution.AdaptiveLatency.Enabled, minSamples: c.Execution.AdaptiveLatency.MinSamples,
+			ringN: c.Execution.AdaptiveLatency.RingN, windowMin: c.Execution.AdaptiveLatency.WindowMin,
+			windowMax: c.Execution.AdaptiveLatency.WindowMax, coverageK: c.Execution.AdaptiveLatency.CoverageK,
+			updateInterval: c.Execution.AdaptiveLatency.UpdateInterval,
+		},
 		Adaptive: adaptive.Config{Init: c.Execution.TickK, Window: c.Adaptive.Window, High: c.Adaptive.FailHigh,
 			Low: c.Adaptive.FailLow, Up: c.Adaptive.UpFactor, Down: c.Adaptive.DownFactor,
 			Min: c.Adaptive.MinK, Max: c.Adaptive.MaxK},

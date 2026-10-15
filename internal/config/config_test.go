@@ -77,6 +77,8 @@ func TestLoadStrictValidation(t *testing.T) {
 		{"horizon below cadence", "volatility:\n  horizon: 10ms\n", "horizon >= interval"},
 		{"negative margin refresh", "risk:\n  position_refresh: -1s\n", "position_refresh"},
 		{"zero emergency limit", "risk:\n  emergency_market_bps: 0\n", "emergency_market_bps"},
+		{"adaptive window below horizon", "execution:\n  adaptive_latency:\n    enabled: true\n    window_max: 200ms\n", "window_max must be >= volatility.horizon"},
+		{"adaptive window below interval", "execution:\n  adaptive_latency:\n    enabled: true\n    window_min: 50ms\n", "window_min must be >= volatility.interval"},
 		{"empty matching suffix", "matching:\n  strip_suffixes: [USD, '']\n", "empty suffix"},
 		{"blank matching suffix", "matching:\n  strip_suffixes: [' ']\n", "empty suffix"},
 	} {

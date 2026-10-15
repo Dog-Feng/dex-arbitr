@@ -1,7 +1,7 @@
 # dex-arbitr 系统设计文档（当前实现）
 
 > 本文档描述代码的实际实现状态，与 `docs/spread-arb-design.md`（早期设计稿）互补；以本文档为准。
-> 分支：`codex/vol-latency-leverage`。
+> 分支：`main`。
 
 ## 1. 系统定位
 
@@ -96,8 +96,9 @@ SL    = (L.bid1 - R.ask1) / mid      // 卖左买右的可成交价差
 ```
 
 - μ：`Mid` 的滑动均值（SMA），窗口 2h、1s 采样、60m 预热、覆盖率 >=80%，O(1) 更新。
-- σ（价差）：`Mid` 的实现波动率，100ms 采样、500ms 窗口 sum(Δs)^2 滚动和 + EWMA（半衰期 1m），σ=sqrt(RV)。
+- σ（价差）：`Mid` 的实现波动率，100ms 采样、500ms 窗口 sum(Δs)^2 滚动和 + EWMA（半衰期 1m），σ=sqrt(RV)。**就绪按增量计数**：攒满 `horizon/interval` 个增量即 ready，此后不因断流/时间缺口作废；断流产生的下一次大增量直接放大 σ，由开仓门槛公式兜底。
 - σ（腿价）：`bookL.Mid()`/`bookR.Mid()` 各自估计，用于单腿让价（腿价波动 = 标的 + 价差，比价差 σ 大）。
+- 自适应窗口（可选，`execution.adaptive_latency.enabled`）：按每腿近期成交延迟（mean + coverage_k×std，钳制 window_min/window_max）每 update_interval 重算 σ 窗口；价差窗口取两腿较大者；扩窗使用已有历史、缩窗立即生效，窗口变化不重置预热。
 - 开仓门槛：`dev >= open_bps + fee_bps + vol_k*σ`，其中 `devLS = LS-μ`、`devSL = SL+μ`，`fee_bps` 为该 pair 的往返 taker 费（由两所 TakerFee 合成，净成本）。**σ 链路必须就绪才允许开平仓**：σ 是反向波动的预扣缓冲，缺失时门槛退化为纯手续费、平仓也无法对短期反向移动定价，因此 actor 在 σ 未 warm（未攒满增量）时拦截策略的 Open 与 Close；仅救援、drain 与应急清仓等安全退出路径继续执行。σ 一旦就绪不因断流作废：断流会把下一次增量放大、σ 随之变大，开仓门槛自然抬高，由公式兜底。
 - 平仓门槛：按两腿实际开平价差计算 USD 毛利，减去存储的入场费用和预计退出费用，再以固定入场参考价格转换 bps，要求净利 `>= close_bps`。不同价格基准的入场/退出 bps 不能直接相加。
 - EntryBps：开仓成交价差的真实值，分母用成交时 mid `(lPx+rPx)/2`。
@@ -107,17 +108,17 @@ SL    = (L.bid1 - R.ask1) / mid      // 卖左买右的可成交价差
 ```
 WARMUP --(μ 就绪)--> RUNNING <-> REDUCE_ONLY
    |                     |
-   +--(恢复)-- PAUSED <--+  数据过期 / 单腿失败 / 对冲不变量破坏 / 应急平仓
+   +--(恢复)-- PAUSED <--+  核对失败 / 未决执行 / 账本仓位不一致 / 应急平仓
 ```
 
 | 状态 | 开仓 | 平仓 | 采样 |
 |---|---|---|---|
-| WARMUP | 否 | 是 | 是 |
-| RUNNING | 是 | 是 | 是 |
-| REDUCE_ONLY | 否 | 是 | 是 |
+| WARMUP | 否 | 是（需 σ 就绪） | 是 |
+| RUNNING | 是（需 σ 就绪） | 是（需 σ 就绪） | 是 |
+| REDUCE_ONLY | 否 | 是（需 σ 就绪） | 是 |
 | PAUSED | 否 | 否 | 是 |
 
-状态迁移：μ 就绪（WARMUP->RUNNING）；保证金超 floor（RUNNING->REDUCE_ONLY）；保证金恢复（REDUCE_ONLY->RUNNING）；保证金超 trigger 应急平仓（->PAUSED）；checkHedge 不变量破坏（->PAUSED）；启动 reconcile 失败（->PAUSED）。
+状态迁移：μ 就绪（WARMUP->RUNNING）；保证金超 floor（RUNNING->REDUCE_ONLY）；保证金恢复（REDUCE_ONLY->RUNNING）；保证金超 trigger 应急平仓（->PAUSED）；结算后确认仓位与账本不一致（->PAUSED）；启动 reconcile 失败（->PAUSED）。
 
 ## 7. 运行时完整链路
 
@@ -145,15 +146,18 @@ WARMUP --(μ 就绪)--> RUNNING <-> REDUCE_ONLY
 | 盘口 WS 推送 | 事件驱动 | collectBooks goroutine 更新 bookL/bookR 缓存 |
 | sample | 1s | 算 Mid 喂 SMA（μ）；μ 就绪则 WARMUP->RUNNING |
 | volC | 100ms | 门控后喂价差 σ、腿价 σ（VolL/VolR）+ 样本落盘 |
-| riskC | 1s | 保证金风控 |
-| decide | 200ms | 到点且非 PAUSED 时 Decide -> apply |
+| decide | 200ms | 到点且非 PAUSED 时 Decide -> apply；每 update_interval 重算自适应波动窗口 |
 | report | 1min | 状态日志 + 向 monitor 发 status 事件 |
+
+保证金风控运行在独立的 `watchRisk` goroutine（1s 循环），与决策循环解耦，可中断长执行并把应急请求交给恢复路径。
 
 ### 7.3 一次决策（Decide，纯函数）
 
-1. 先平仓：满足 `profit >= close_bps + fee_bps` 的步按 close_order 排序取最优；`|counter| > min_inventory` 才平（刷量库存地板）。
+1. 先平仓：满足 `profit >= close_bps + fee_bps` 的步按 close_order 排序取最优；`|counter| > min_inventory` 才平（刷量库存地板）；候选逐个检查深度，大步骤深度不足顺延到下一个可盈利步骤。
 2. 再开仓：仅 RUNNING、μ 就绪且 σ 就绪；`dev >= open_bps + fee_bps + vol_k*σ`、同方向、`|counter| < max_steps`、两腿一档深度 >= `step_qty*depth_mult`。
 3. 都不满足则不动。
+
+**σ 就绪准入闸**：σ 未攒满增量时，策略的 Open 与 Close 都被拦截（30s 节流告警 `trading blocked until short-horizon volatility is ready`）；仅救援、drain 与应急清仓等安全退出路径不受影响。
 
 注：`volume` 策略自己将额外 `open_bps/close_bps` 固定为 `0 / 0`，扫描器与 actor 共用该参数规则；手续费、`vol_k`、深度和预算仍生效。显式 `vol_k: 0` 可关闭波动过滤，不跳过均值预热。旧兼容字段 `volume.loss_tolerance_bps` 在 volume 模式下必须为零，避免把零门槛改成负门槛。四种组合详见 [策略与选币完整链路](strategy-selection-flow.md)。
 
@@ -167,32 +171,35 @@ WARMUP --(μ 就绪)--> RUNNING <-> REDUCE_ONLY
 动态让价（用腿价 σ）：
 
 ```
-ticks = clamp( ceil( price * tick_k * σ_leg / 1e4 / tick ), min_ticks, max_ticks )
+ticks = ceil( tick_k × σ_leg / tick × depthScale )     // σ_leg 为腿价波动（价格单位）
 ticks = max( ticks, 走到 step_qty 实际成交档位所需的 tick 数 )
+ticks = clamp( ticks, min_ticks, max_ticks )            // max_ticks=0 表示不设上限
 ```
 
 - tick_k 由 adaptive AIMD 控制器按实测单腿失败率动态调整（失败率高放宽、低收紧，夹在 [min_k,max_k]）；窗口未满用配置初值。
 - σ_leg 未就绪或 dynamic_ticks=false 时回退固定 price_ticks。
+- 限价按收紧方向取整（买 Floor、卖 Ceil），不因舍入放宽最差成交价。
+- 启用 adaptive_latency 时，σ_leg 的窗口跟随该腿实测延迟。
 
 补救阶梯（rescue）：严格第一档（3 次）-> 逐 tick 让价（5 tick）-> 保护性市价（mid ±30bps）。Immediate=true 时（应急）从第一笔就是保护性市价。
 
 ### 7.5 平账、量记账与持久化
 
 - 开仓：对冲量 h=min(fillL,fillR)，h<半单位则放弃；记 Step（EntryBps 用成交时 mid，OpenL/OpenR 存成交价）。
-- 平仓：closed=max(fillL,fillR)，零成交腿用补救价；realized = EntryBps + 反向 EntryBps - 往返费 累计进 Step.Realized；Qty 归零则移除。
+- 平仓：平仓量由确认后的两腿仓位差推导（cl=|beforeL|-|posL|），逐腿按实际成交量（含补救成交）加权计价，零成交腿不参与计价；已实现盈亏按 USD 现金流计算、以入场名义折算 bps 累计进 Step.Realized；Qty 归零则移除。
 - 统一量记账：volume_usd += (fillL + fillR + rescue_qty) * mid（失败开仓的单腿成交+补救也计入）；补救滑点 rescue_cost_usd 从 day_pnl_usd 扣除。
-- 每日预算闸：刷量模式下 daily_volume_target / daily_cost_budget 达限停止开仓，跨天清零。
-- checkHedge：每次 apply 后校验 posL/posR 与步账本一致，漂移即 PAUSED。
+- 每日预算闸：刷量模式下 daily_volume_target / daily_cost_budget 达限停止开仓，跨天清零计数；`pnl_uncertain` 粘性保留，不随日切或步骤全部退出自动解除。
+- 账本一致性：每次结算后校验确认仓位与更新后的步账本一致，漂移即 PAUSED。
 - persist：步状态 JSON 原子写（state_dir/<pair_key>.json）。
 
 ### 7.6 一次完整往返（启动 -> 订阅 -> 下单时机 -> 平仓时机）
 
 1. 启动与订阅：构建 venue -> 对 pair 的左右市场 `SubscribeBook`（WS 推 `subscribed/order_book` 快照 + `update/order_book` 增量，50ms 批量）；本地维护 bookL/bookR，nonce 连续性校验、gap 自动重订阅。
 2. 采样与价差：1s sample 算第一档 `Mid` 喂 SMA（2h 窗口、60m 预热、覆盖率 80% 才 Ready）；100ms vol 门控后喂价差 σ 与腿价 σ，并落样本。
-3. 下单时机：decide 循环 200ms 检查，到 next_action_at（7-10s 抖动）且 RUNNING；`dev >= open_bps + fee_bps + vol_k*σ`、同方向、未满 max_steps、两腿一档深度够 -> 双腿并发 IOC 开仓。
+3. 下单时机：decide 循环 200ms 检查，到 next_action_at（默认 7-10s 抖动，可配 1-2s）且 RUNNING；μ 与 σ 均就绪、`dev >= open_bps + fee_bps + vol_k*σ`、同方向、未满 max_steps、两腿一档深度够 -> 双腿并发 IOC 开仓。
 4. 持仓：开仓后记 Step（EntryBps、OpenL/OpenR），持有对冲仓位，步数 ±1。
-5. 平仓时机：decide 循环里平仓优先；`profit = EntryBps + 反向可成交价差 - fee_bps >= close_bps` 且 `|counter| > min_inventory` -> 平仓。
-6. 平账：双腿成交后 realized 累计、移除步、checkHedge 校验、持久化。
+5. 平仓时机：decide 循环里平仓优先；σ 就绪且 `profit = 入场基准下的净利 >= close_bps + fee_bps` 且 `|counter| > min_inventory` -> 平仓。
+6. 平账：双腿成交后 realized 累计、移除步、结算后校验确认仓位与账本一致、持久化。
 
 注：μ/σ 都用第一档；"10 档价差曲线"未实现，深档风险由让价的深度感知（depthTicks）近似覆盖；如需多档 σ，需另加每档估计器。
 
@@ -234,10 +241,11 @@ picker（稳定选对）：
 定容（晋升时）：
 
 ```
-qty = floor( min(notional_per_leg, depth_use_ratio × min(四侧 top 深度) × mid) / mid )
+qty = floor( min(notional_per_leg, depth_use_ratio × min(四侧 top 深度) × price) / price )
+price = max(左腿 ask1, 右腿 ask1)   // 任一腿都可能成为买腿，按更高 ask 计价
 ```
 
-再 floor 到 pair 的 size_decimals，校验 >= min_qty；不过则跳过该对。深盘吃满预算、薄盘自动缩量。
+再 floor 到 pair 的 size_decimals，校验 >= min_qty 与名义下限；不过则跳过该对。深盘吃满预算、薄盘自动缩量。定容失败只禁止新增 Open，存量步骤仍可 Close。恢复的旧仓后续每轮决策都按共享视图重新定容（`refreshSizing`），不会沿用历史下单量。
 
 动态生命周期：
 
@@ -286,20 +294,20 @@ qty = floor( min(notional_per_leg, depth_use_ratio × min(四侧 top 深度) × 
 
 - 引擎在关键点发类型化事件（step_opened/step_closed/executed/rescue/status/emergency/error），picker 另发 pair_promoted/pair_demoted/pair_health/pair_warmup；monitor.Monitor.Record 按 pair 归集指标并告警。
 - 双视图：`/metrics` 顶层是全局汇总（跨对合计），新增 `pairs` 字段是每个交易对的明细（状态、步数、成交量、盈亏、μ/σ、tick_k、失败率、churn score 分量、预热覆盖度、是否活跃）。
-- 滚动失败率：`RollingFailRate(pair)` 暴露 actor 上报的滚动单腿失败率（AIMD 窗口），供 picker 做硬剔除，线程安全。
+- 滚动失败率：actor 独立维护失败滚动窗口（`FailRate()`，atomic），picker 通过 candidate 读取做硬剔除；`/metrics` 同时给出 `fail_rate`（终身）与 `rolling_fail_rate`（最近窗口）。
 - 可选 HTTP：monitor.addr 非空时 arbd 内起服务，GET /metrics 返回 JSON；monitor.token 非空时要求 Authorization: Bearer <token> 或 ?token=（常量时间比较，401 拒绝）。
 - 只读、不 import engine。
 
 ### 9.2 backtest（回放标定）
 
-- 离线：backtest.Load 读样本（unixNano,midBps,lsBps,slBps），backtest.Replay 复用 strategy.Arbitrage + SMA/波动率在可成交价差上模拟成交，算净 EV。
-- 命令：go run ./cmd/backtest -samples <file> 扫 open_bps * close_bps 网格，输出 trips / net_bps / avg_bps。
+- 离线：backtest.Load 读样本（旧四列 unixNano,midBps,lsBps,slBps，或新十五列含两腿价/深度/时间戳），ReplayChecked 复用 strategy.Arbitrage + SMA/波动率在可成交价差上模拟成交；校验乱序/缺口/混合格式，缺口默认拒绝、显式允许后重置预热。
+- 命令：go run ./cmd/backtest -samples <file> 扫 open_bps × close_bps 网格，输出 trips / net_bps / avg_bps。
 - 只依赖 strategy/spread/volatility，不碰引擎与交易所。
 
 ### 9.3 scan（套利检测）
 
-- scan.Eval 是核心纯函数：net = dev - fee_bps - vol_k*σ - open_bps，>0 即机会（与交易策略口径一致）。
-- scan.Watch 订阅两腿盘口（只读 WS），维护 μ/σ，按四层条件（可交易/数据新鲜/统计就绪/净机会>0）发机会。
+- scan.Eval 委托 strategy.OpeningMargins：net = dev - fee_bps - vol_k*σ - open_bps，>0 即机会（与交易策略口径一致，含 per-leg 费率）。
+- scan.Watch 订阅两腿盘口（只读 WS），按配置 cadence 维护 μ/σ，按四层条件（可交易/数据新鲜/统计就绪/净机会>0）发机会。
 - scan.HealthTracker 是刷量健康度打分器（σ_bps / 反转频率 / 深度质量 / tick 质量 / 稳定性），供 auto picker 使用；纯统计、不碰引擎。
 - 命令：go run ./cmd/scanner -config <file> 用只读 venue 扫描所有匹配对，去重后打日志；不 import engine。
 
@@ -367,6 +375,7 @@ execution:
   tick_k: 2.5
   min_ticks: 1
   max_ticks: 0
+  adaptive_latency: { enabled: false, min_samples: 8, window_min: 200ms, window_max: 3s, coverage_k: 1.3, ring_n: 32, update_interval: 1s }
 
 adaptive:
   window: 0
@@ -414,12 +423,13 @@ pairs:
 | pair actor started | 启动参数 |
 | positions / position reconciliation passed | 启动仓位核对；失败即 PAUSED |
 | mean ready -> RUNNING | μ 采样满 60m 就绪 |
-| status | 每分钟：mode/steps/mu/σ/价差/tick_k/fail_rate/day_volume/day_pnl/latency |
+| status | 每分钟：mode/steps/day_volume/day_pnl/fail_rate/sigma_bps/vol_ready；μ/σ/价差/tick_k 经 monitor status 事件到 /metrics |
 | action | 决策：kind/dir/qty/两腿价/expected_bps/reason |
 | executed | 成交：fill/px/status/rescue/rescue_cost_usd/pos/took/latency |
 | step opened / step pnl / step closed | 步账本与已实现盈亏 |
 | rescue order / rescue complete（WARN） | 补救单与完成 |
-| hedge invariant broken; pausing（ERROR） | 账本与仓位不一致，已 PAUSED |
+| confirmed positions do not match updated ledger（ERROR） | 结算后的确认仓位与账本不一致，已 PAUSED |
+| trading blocked until short-horizon volatility is ready（WARN，30s 节流） | σ 未攒满增量，策略开平仓被准入闸拦截 |
 | risk state（WARN/INFO） | 风险阻断或恢复；reason 区分清算距离、账户权益耗尽、数据未知/过期、盘口不可用与名义额上限 |
 | ALERT: liquidation risk, emergency unwind（ERROR） | 应急平仓触发 |
 | order state unresolved; will infer from positions（WARN） | 订单终态超时，从仓位差推断 |
@@ -443,10 +453,10 @@ pairs:
 - mark 用 book mid 近似：更准可用 WS 的 market_stats.mark_price。
 - liq 为 15s REST 缓存：单币单仓近似稳定；多仓共担保证金需提高刷新频率。
 - 步数上限不等于名义仓位上限：max_steps 限步数，部分平仓可能残留碎步。
-- 自适应只管 tick_k：vol_k / min_ticks 也可挂 adaptive.K 模式，暂未做。
+- 自适应有两处：adaptive.AIMD 调 tick_k（让价系数）；execution.adaptive_latency 按实测延迟调 σ 窗口（默认关闭）。vol_k / min_ticks 暂未挂自适应。
 - 无 10 档价差曲线：μ/σ 用第一档，深档风险由让价深度感知近似。
 - 1:1 计价假设：USDC/USDG 不换算，脱锚会直接表现为价差（不在本次范围）。
 - 杠杆无公开查询接口：市场最大杠杆由「交易所是否接受」二分反推（§8.1），无法先验读取 max_leverage。
 - churn score 是乘法合成的无量纲值（量级约 0.1~0.5）：`min_churn_score` 默认 0 只排序，要设门槛需先按 `/metrics` 的 pairs 分布校准。
-- auto 名义预占按 `notional_per_leg × max_steps` 保守计（实际定容受深度 cap 只会更小）。
+- auto 恢复预占按 `max(每步左右腿名义, 当前单步额度) + 空余步数×当前额度` 计算，并把 venue 查询到的实际名义并入；晋升预占仍按 `notional_per_leg × max_steps`。
 - auto 的 `pair_promoted` 等事件与 status 的 per-pair 字段来自同一 monitor 归集，promote/demote 历史只保留当前状态（未做时间序列留存）。

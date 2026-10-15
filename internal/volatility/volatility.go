@@ -11,6 +11,10 @@ type Params struct {
 	Interval time.Duration // nominal sampling interval
 	Horizon  time.Duration // increment horizon whose volatility is estimated
 	HalfLife time.Duration // EWMA half-life of the realized variance
+	// MaxHorizon is the ring capacity upper bound. When larger than Horizon,
+	// the window can be widened at runtime via SetWindow without rebuilding
+	// the ring or losing the warmup chain. Zero means Horizon.
+	MaxHorizon time.Duration
 }
 
 // Estimator tracks sigma of the horizon-length increment of a series using
@@ -22,7 +26,9 @@ type Params struct {
 // therefore sigma, which raises the opening threshold; it never restarts the
 // chain.
 type Estimator struct {
-	step  int     // Horizon / Interval increments
+	warmK int     // Horizon / Interval increments required for readiness
+	maxK  int     // ring capacity in increments
+	reqK  int     // requested window; the effective window never drops below warmK
 	alpha float64 // EWMA weight per sample
 
 	rets   []float64 // ring of per-sample returns
@@ -50,18 +56,64 @@ func New(p Params) *Estimator {
 	if step < 1 {
 		step = 1
 	}
+	maxK := step
+	if p.MaxHorizon > p.Horizon {
+		if m := int(p.MaxHorizon / p.Interval); m > maxK {
+			maxK = m
+		}
+	}
 	return &Estimator{
-		step:  step,
+		warmK: step,
+		maxK:  maxK,
+		reqK:  step,
 		alpha: 1 - math.Exp(-math.Ln2*float64(p.Interval)/float64(p.HalfLife)),
-		rets:  make([]float64, step),
+		rets:  make([]float64, maxK),
 	}
 }
 
 // Reset discards both the previous price and the variance history.
 func (e *Estimator) Reset() {
-	e.rets = make([]float64, e.step)
+	e.rets = make([]float64, e.maxK)
 	e.rv, e.sum, e.idx, e.cnt = 0, 0, 0, 0
 	e.last, e.have, e.haveRV = 0, false, false
+}
+
+// Window returns the effective window in increments. Readiness stays gated by
+// the warmup size (see Ready), so a runtime change can shrink the summation
+// window below it without un-readying the estimator.
+func (e *Estimator) Window() int {
+	k := e.reqK
+	if k > e.maxK {
+		k = e.maxK
+	}
+	return k
+}
+
+// SetWindow adjusts the runtime window in increments. Widening beyond the
+// stored history uses the history that exists (the window grows as samples
+// arrive); shrinking is immediate. The warmup chain is never restarted.
+func (e *Estimator) SetWindow(k int) {
+	if k < 1 {
+		k = 1
+	}
+	if k > e.maxK {
+		k = e.maxK
+	}
+	if k == e.reqK {
+		return
+	}
+	e.reqK = k
+	// Recompute the trailing sum over the (possibly new) effective window.
+	eff := min(e.Window(), e.cnt)
+	e.sum = 0
+	for i := 0; i < eff; i++ {
+		j := e.idx - 1 - i
+		for j < 0 {
+			j += e.maxK
+		}
+		j %= e.maxK
+		e.sum += e.rets[j] * e.rets[j]
+	}
 }
 
 // Add is the compatibility entry point for a regular sample series.
@@ -79,14 +131,22 @@ func (e *Estimator) AddAt(_ time.Time, x float64) bool {
 	}
 	if e.have {
 		r := x - e.last
-		old := e.rets[e.idx]
-		e.sum += r*r - old*old
+		k := e.Window()
+		if e.cnt >= k {
+			j := e.idx - k
+			for j < 0 {
+				j += e.maxK
+			}
+			j %= e.maxK
+			e.sum -= e.rets[j] * e.rets[j]
+		}
+		e.sum += r * r
 		e.rets[e.idx] = r
 		e.idx = (e.idx + 1) % len(e.rets)
 		if e.cnt < len(e.rets) {
 			e.cnt++
 		}
-		if e.cnt >= len(e.rets) {
+		if e.cnt >= e.warmK {
 			if !e.haveRV {
 				e.rv, e.haveRV = e.sum, true
 			} else {
@@ -101,7 +161,7 @@ func (e *Estimator) AddAt(_ time.Time, x float64) bool {
 
 // Ready reports whether a full horizon of increments has been observed. It
 // never expires: once warm, the chain stays warm across any gap.
-func (e *Estimator) Ready() bool { return e.cnt >= len(e.rets) }
+func (e *Estimator) Ready() bool { return e.cnt >= e.warmK }
 
 // ReadyAt is a pure read retained for interface compatibility. Readiness does
 // not depend on real time.

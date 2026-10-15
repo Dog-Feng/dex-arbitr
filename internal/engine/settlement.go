@@ -597,6 +597,7 @@ func (a *PairActor) accountExecution(act strategy.Action, q spread.Quote, before
 		a.volAcc.pnlUncertain = true
 		a.log.Warn("PnL includes protective-price estimates", "pair", a.key)
 	}
+	a.feedLatency(res)
 	return nil
 }
 

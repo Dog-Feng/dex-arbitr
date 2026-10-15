@@ -79,3 +79,32 @@ func TestInvalidSamplesDoNotMutate(t *testing.T) {
 		t.Fatal("reset retained state")
 	}
 }
+
+func TestSetWindowWidensAndShrinksWithoutReset(t *testing.T) {
+	e := New(Params{Interval: 100 * time.Millisecond, Horizon: 200 * time.Millisecond, HalfLife: time.Minute, MaxHorizon: 2 * time.Second})
+	for i := 0; i <= 4; i++ {
+		e.Add(float64(i))
+	}
+	if !e.Ready() {
+		t.Fatal("warmup failed")
+	}
+	before := e.Vol()
+	// Widening beyond the stored history keeps the chain; the window uses the
+	// history that exists and grows as samples arrive.
+	e.SetWindow(5)
+	if !e.Ready() {
+		t.Fatal("window change restarted the warmup chain")
+	}
+	if e.Vol() != before {
+		t.Fatal("window change mutated sigma without new samples")
+	}
+	e.Add(5)
+	if e.Vol() <= before {
+		t.Fatal("widened window did not include the new increment")
+	}
+	// Shrinking below the warmup size still leaves the estimator ready.
+	e.SetWindow(2)
+	if !e.Ready() || e.Window() != 2 {
+		t.Fatalf("shrink failed: ready=%t window=%d", e.Ready(), e.Window())
+	}
+}

@@ -55,6 +55,7 @@ type PairConfig struct {
 	View            PairView    // shared stats/books in auto mode; nil = actor-owned
 	MaxOpenNotional float64     // per-leg auto opening cap; 0 leaves manual sizing unchanged
 	MayOpen         func() bool // optional account startup recovery admission
+	AdaptiveLatency adaptiveLatencyCfg
 	// Checkpoint recovery: after a restart with an unresolved pre-send
 	// checkpoint, positions are re-verified every CheckpointCheckEvery and the
 	// checkpoint is cleared once positions match the ledger continuously for
@@ -72,6 +73,7 @@ type PairView interface {
 	VolBps() float64
 	VolReady() bool // short-horizon volatility warm and fresh
 	LegVol(venue string) float64
+	SetVolWindows(spreadK, legLK, legRK int)
 	Stats() estimator.Stats
 }
 
@@ -119,6 +121,9 @@ type PairActor struct {
 	checkpointExitSince time.Time
 	startupRecovered    atomic.Bool
 	volBlockLoggedAt    time.Time
+	latL                *latencySeries
+	latR                *latencySeries
+	winUpdatedAt        time.Time
 }
 
 // volumeAcc accumulates daily traded volume and realized PnL for the volume
@@ -186,6 +191,11 @@ func NewPairActor(cfg PairConfig) (*PairActor, error) {
 	key := pairKey(cfg.Pair.Base, cfg.L.Name(), cfg.R.Name(), cfg.DryRun)
 	a := &PairActor{cfg: cfg, key: key, log: slog.With("pair", cfg.Pair.Base, "L", cfg.L.Name(), "R", cfg.R.Name()), drainWake: make(chan struct{}, 1)}
 	a.margin = marginMonitor{cfg: cfg.Risk}
+	ringN := cfg.AdaptiveLatency.ringN
+	if ringN < 2 {
+		ringN = 32
+	}
+	a.latL, a.latR = newLatencySeries(ringN), newLatencySeries(ringN)
 	st, err := cfg.Store.Load(key)
 	if err != nil {
 		return nil, err
@@ -580,6 +590,7 @@ func (a *PairActor) Run(ctx context.Context) (retErr error) {
 			if a.state.Mode == strategy.ModePaused {
 				continue
 			}
+			a.applyAdaptiveWindows(now)
 			if a.riskBlocked.Load() {
 				a.state.Mode = strategy.ModeReduceOnly
 			} else if a.state.Mode == strategy.ModeReduceOnly && a.meanReady() {
@@ -709,6 +720,62 @@ func (a *PairActor) volReady(now time.Time) bool {
 		return false
 	}
 	return a.cfg.Vol.ReadyAt(now)
+}
+
+// applyAdaptiveWindows periodically re-derives the volatility window from the
+// recent per-leg fill latencies. The spread window takes the larger leg, as
+// the hedge is only complete once the slower leg fills.
+func (a *PairActor) applyAdaptiveWindows(now time.Time) {
+	cfg := a.cfg.AdaptiveLatency
+	if !cfg.enabled || cfg.updateInterval <= 0 {
+		return
+	}
+	if now.Sub(a.winUpdatedAt) < cfg.updateInterval {
+		return
+	}
+	a.winUpdatedAt = now
+	interval := a.cfg.VolEvery
+	if interval <= 0 {
+		interval = 100 * time.Millisecond
+	}
+	kL, okL := targetWindowSlots(a.latL, cfg, interval)
+	kR, okR := targetWindowSlots(a.latR, cfg, interval)
+	if !okL && !okR {
+		return
+	}
+	spread := max(kL, kR)
+	a.applyVolWindows(spread, kL, kR)
+}
+
+func (a *PairActor) applyVolWindows(kSpread, kL, kR int) {
+	if a.cfg.View != nil {
+		a.cfg.View.SetVolWindows(kSpread, kL, kR)
+		return
+	}
+	if a.cfg.Vol != nil && kSpread > 0 {
+		a.cfg.Vol.SetWindow(kSpread)
+	}
+	if a.cfg.VolL != nil && kL > 0 {
+		a.cfg.VolL.SetWindow(kL)
+	}
+	if a.cfg.VolR != nil && kR > 0 {
+		a.cfg.VolR.SetWindow(kR)
+	}
+}
+
+// feedLatency records the per-leg submit-to-terminal latency of a clean,
+// one-shot execution. Rescue rounds and unresolved outcomes are excluded so
+// the statistics describe the normal fill path only.
+func (a *PairActor) feedLatency(res execution.Result) {
+	if !a.cfg.AdaptiveLatency.enabled || res.RescueOrders > 0 {
+		return
+	}
+	if res.L.Resolved && res.L.Status == domain.StatusFilled && res.L.Latency > 0 {
+		a.latL.add(res.L.Latency)
+	}
+	if res.R.Resolved && res.R.Status == domain.StatusFilled && res.R.Latency > 0 {
+		a.latR.add(res.R.Latency)
+	}
 }
 
 func round4(v float64) float64 { return math.Round(v*10000) / 10000 }

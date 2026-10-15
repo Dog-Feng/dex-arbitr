@@ -3,7 +3,7 @@
 Cross-DEX perpetual spread step arbitrage (design: `docs/spread-arb-design.md`).
 Currently integrated venues: **Lighter mainnet** (`kind: lighter`, chain 304) and **RH Lighter mainnet** (`kind: rhlighter`, chain 466324).
 
-本轮 F01–F26 修复、回归测试及恢复边界见 [交易安全与生命周期修复说明](docs/trading-safety-fixes.md)。代码检查只运行测试和编译，不自动启动项目或服务；下文运行命令由操作者明确选择执行。
+本轮 F01–F40 修复、回归测试及恢复边界见 [交易安全与生命周期修复说明](docs/trading-safety-fixes.md)。代码检查只运行测试和编译，不自动启动项目或服务；下文运行命令由操作者明确选择执行。
 
 `arbitrage / volume` 与 `manual / auto` 的四种组合、预热及参数规则见 [策略与选币完整链路](docs/strategy-selection-flow.md)。两种策略都采用配置中的 2 小时滚动窗口、1 小时预热；volume 的额外开平阈值固定为零，手续费、深度和所配置的波动过滤仍生效。
 
@@ -55,7 +55,9 @@ execution:
   price_ticks: 30
 ```
 
-固定模式下，买单限价为决策价格加 N 个 tick，卖单为决策价格减 N 个 tick；tick 是各交易所的最小价格单位。设为 `0` 时使用决策价格，省略时默认 `30`，负数配置会报错。启用 `dynamic_ticks` 且波动已就绪时，改用波动、盘口深度及 min/max ticks 计算范围；未就绪时回退到 `price_ticks`。普通补救使用 IOC 价格阶梯；应急退出和 drain 使用 reduce-only 保护市价单，并确认每腿分别归零。修改配置在操作者重启后生效。
+固定模式下，买单限价为决策价格加 N 个 tick，卖单为决策价格减 N 个 tick；tick 是各交易所的最小价格单位。设为 `0` 时使用决策价格，省略时默认 `30`，负数配置会报错。启用 `dynamic_ticks` 且波动已就绪时，改用波动、盘口深度及 min/max ticks 计算范围；未就绪时回退到 `price_ticks`。可选开启 `execution.adaptive_latency` 后，波动窗口按实测腿延迟自适应（价差窗口取两腿较大者）。普通补救使用 IOC 价格阶梯；应急退出和 drain 使用 reduce-only 保护市价单，并确认每腿分别归零。修改配置在操作者重启后生效。
+
+开平仓均要求短周期波动率 σ 就绪（按增量计数，攒满 `volatility.horizon/interval` 个增量即 ready，断链不作废）；σ 未就绪时策略开平仓被拦截，仅救援、drain 与应急清仓可用。
 
 > Lighter blocks order submission (`sendTx`, authenticated WS) from restricted jurisdictions (e.g. US IPs, code 20558).
 > Run live trading from a permitted region.
@@ -183,7 +185,7 @@ systemctl stop arbd               # 停止（收到 SIGTERM 会先保存步数�
 cat /opt/dex-arbitr/state/*.json  # 当前持有的步
 ```
 
-- 均值需先采样 60 分钟才开始开仓（日志出现 `mean ready -> RUNNING`）。
+- 均值需先采样 60 分钟、且 σ 预热完成后才开始开仓（日志出现 `mean ready -> RUNNING`；σ 未就绪时日志出现 `trading blocked until short-horizon volatility is ready`）。
 - 实盘启动时先核对两边持仓；只有两边查询成功、相互对冲且分别与本地步骤记录一致，才允许开平仓。查询失败或持仓不一致时保持 `PAUSED`，处理后重启重新核对；均值就绪不会解除暂停。
 - 限制日志占用：`/etc/systemd/journald.conf` 中设 `SystemMaxUse=500M`，然后 `systemctl restart systemd-journald`。
 

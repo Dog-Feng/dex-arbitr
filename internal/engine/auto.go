@@ -112,6 +112,20 @@ func (c *candidate) LegVol(venue string) float64 {
 	return 0
 }
 
+func (c *candidate) SetVolWindows(spreadK, legLK, legRK int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.vol != nil && spreadK > 0 {
+		c.vol.SetWindow(spreadK)
+	}
+	if c.volL != nil && legLK > 0 {
+		c.volL.SetWindow(legLK)
+	}
+	if c.volR != nil && legRK > 0 {
+		c.volR.SetWindow(legRK)
+	}
+}
+
 func (c *candidate) healthSnapshot() scan.Health {
 	c.mu.RLock()
 	defer c.mu.RUnlock()

@@ -31,6 +31,8 @@ flowchart TD
 
 公共入口是 `engine.Run`；manual/auto 分别进入 `runManual/runAuto`，最终都调用 `runtime.buildActor` 和同一 `PairActor`、执行器、风控、账本及监控。
 
+除流程图中的门槛外，策略的 Open 与 Close 都受 **σ 就绪准入闸**约束：σ 按增量计数就绪（攒满 `horizon/interval` 个增量即 ready，断链不作废），未就绪时仅救援、drain 与应急清仓可用。可选开启 `execution.adaptive_latency` 后，σ 窗口按实测腿延迟自适应，价差窗口取两腿较大者。
+
 manual 只订阅配置对的合约，不会因为扫描发现了其他币而自行添加。auto 的候选由 `scan.MatchAll` 在启动时发现，与独立 `cmd/scanner` 共用匹配和左右腿顺序；`auto.candidates` 仅限制新交易的白名单。auto 不读取 scanner 的终端输出，也不要求额外启动 scanner 进程。
 
 auto 的 picker 按 `scan.HealthTracker` 健康评分排序；独立 scanner 面板显示的是扣除费用与缓冲后的净机会，两者排序指标不同。候选被晋升只表示可以交给策略评估，不表示必须下单。成交仍需该时刻的策略、深度和风险条件全部满足。旧仓恢复先于新晋升；退出遵守 drain 与未决订单确认流程。
@@ -63,7 +65,7 @@ manual 由 actor 采样；auto 由候选收集器采样，actor 晋升后直接�
 
 arbitrage 使用 `strategy.open_bps/close_bps`；volume 的注册实现自己固定这两项为零，避免换入口后丢失规则。`strategy.Parameters` 应用有效参数，`strategy.OpeningMargins` 为 scanner 和交易策略提供同一费用与波动门槛。
 
-零额外门槛仍需覆盖手续费、满足盘口深度、持仓方向和步数约束。`vol_k` 默认 1.28；显式配置 `0` 可关闭波动过滤，均值预热仍必须完成。扫描器会保留实际波动是否就绪的状态，过滤关闭时无需等待无用的波动就绪。
+零额外门槛仍需覆盖手续费、满足盘口深度、持仓方向和步数约束，且 σ 必须就绪。`vol_k` 默认 1.28；显式配置 `0` 可关闭波动过滤（σ 仍须就绪，因让价依赖腿价 σ），均值预热仍必须完成。扫描器会保留实际波动是否就绪的状态，过滤关闭时无需等待无用的波动就绪。
 
 volume 额外使用 `min_inventory`、`daily_volume_target`、`daily_cost_budget`。这些设置不改变交易对来源和均值配置。旧 `loss_tolerance_bps` 字段仅保留零值兼容，active volume 配成非零会立即报错，不能把额外开仓门槛变成负数。未知 `strategy.kind` 也在加载时即报错，无须等 auto 晋升才发现。
 
@@ -80,4 +82,4 @@ scanner 使用配置的行情端点、链和盘口深度，移除交易凭证。
 
 全部验证仅使用单元测试、内存行情和模拟成交；没有启动项目、scanner 命令、服务或真实交易。
 
-2026-10-15 的完整验证：18 个测试包、233 个顶层测试、含子用例共 595 项通过 race；vet、五个命令编译与格式检查通过。3 个包无测试文件，无测试用例被跳过。
+2026-10-16 的完整验证：全部测试包 `go test -race ./...`、`go vet ./...`、五个命令编译与格式检查通过（含 σ 计数就绪准入闸与自适应波动窗口的回归用例）。
