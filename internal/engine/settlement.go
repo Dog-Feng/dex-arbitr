@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"time"
@@ -22,7 +23,12 @@ type pendingExecution struct {
 	result           execution.Result
 	unwind           bool
 	lastAttempt      time.Time
+	stalls           int
 }
+
+// interventionStallLimit is how many consecutive inconsistent settlements are
+// tolerated before the actor assumes external interference on the account.
+const interventionStallLimit = 3
 
 func (a *PairActor) syncPositionState() {
 	a.flatPositions.Store(math.Abs(a.posL) < math.Pow10(-a.cfg.Pair.Left.SizeDecimals)/2 &&
@@ -122,14 +128,30 @@ func (a *PairActor) resolvePending(ctx context.Context) {
 			a.posL, a.posR = res.PosL, res.PosR
 			a.syncPositionState()
 		}
+		if errors.Is(res.Err, execution.ErrUnexpectedPosition) {
+			p.stalls++
+			if p.stalls >= interventionStallLimit {
+				a.recoverExternalIntervention(ctx, p, res)
+			}
+		}
 		return
 	}
 	if p.unwind {
 		if err := a.finishUnwind(res); err != nil {
-			a.log.Error("unwind accounting", "err", err)
+			p.stalls++
+			if p.stalls >= interventionStallLimit {
+				a.recoverExternalIntervention(ctx, p, res)
+			} else {
+				a.log.Error("unwind accounting", "err", err)
+			}
 			return
 		}
 	} else if err := a.accountExecution(p.action, p.quote, p.beforeL, p.beforeR, res); err != nil {
+		p.stalls++
+		if p.stalls >= interventionStallLimit {
+			a.recoverExternalIntervention(ctx, p, res)
+			return
+		}
 		a.state.Mode = strategy.ModePaused
 		a.record(monitor.KindError, func(e *monitor.Event) { e.Msg = err.Error() })
 		return
@@ -150,6 +172,93 @@ func (a *PairActor) resolvePending(ctx context.Context) {
 		}
 		a.emergencyRequested.Store(false)
 	}
+}
+
+// recoverExternalIntervention flattens whatever exposure is left after an
+// account was modified outside this process, then clears the ledger without
+// claiming any profit. Only our own confirmed fills' fees enter the books and
+// daily PnL is marked uncertain.
+func (a *PairActor) recoverExternalIntervention(ctx context.Context, p *pendingExecution, res execution.Result) {
+	a.pending = nil
+	a.volAcc.pnlUncertain = true
+	a.record(monitor.KindError, func(e *monitor.Event) {
+		e.Msg = "execution recovery stalled on inconsistent positions; assuming external intervention, flattening and clearing the ledger"
+	})
+	if res.PositionsKnown {
+		a.posL, a.posR = res.PosL, res.PosR
+		a.syncPositionState()
+	}
+	epsL := math.Pow10(-a.cfg.Pair.Left.SizeDecimals) / 2
+	epsR := math.Pow10(-a.cfg.Pair.Right.SizeDecimals) / 2
+	flat := res.PositionsKnown && math.Abs(a.posL) < epsL && math.Abs(a.posR) < epsR
+	if !flat {
+		execCtx, finish := a.executionContext(ctx)
+		l, r := a.legSpecs(p.action)
+		l.Side, r.Side = 0, 0
+		var err error
+		if a.emergencyRequested.Load() {
+			res, err = a.exec.EmergencyFlatten(execCtx, l, r, 0, a.posL, a.posR)
+		} else {
+			res, err = a.exec.FlattenToZero(execCtx, l, r)
+		}
+		finish()
+		if err != nil || res.Err != nil || !res.PositionsKnown || !res.SettlementKnown {
+			a.state.Mode = strategy.ModePaused
+			a.log.Error("external intervention flatten pending", "err", errors.Join(err, res.Err))
+			return
+		}
+		a.posL, a.posR = res.PosL, res.PosR
+		a.syncPositionState()
+	}
+	if err := a.finishIntervention(res); err != nil {
+		a.state.Mode = strategy.ModePaused
+		a.log.Error("external intervention accounting", "err", err)
+		return
+	}
+	a.checkpoint = false
+	if err := a.persist(); err != nil {
+		a.log.Error("persist external intervention", "err", err)
+		return
+	}
+	a.settled.Store(true)
+	if a.draining.Load() {
+		a.drainConfirmed.Store(true)
+	}
+	a.emergencyRequested.Store(false)
+}
+
+// finishIntervention clears the step ledger once both legs are confirmed flat.
+func (a *PairActor) finishIntervention(res execution.Result) error {
+	if res.Err != nil || !res.PositionsKnown || !res.SettlementKnown ||
+		math.Abs(res.PosL) >= math.Pow10(-a.cfg.Pair.Left.SizeDecimals)/2 ||
+		math.Abs(res.PosR) >= math.Pow10(-a.cfg.Pair.Right.SizeDecimals)/2 {
+		return fmt.Errorf("intervention requires confirmed flat positions")
+	}
+	nl, err := legNotional(res.L)
+	if err != nil {
+		return err
+	}
+	nr, err := legNotional(res.R)
+	if err != nil {
+		return err
+	}
+	fees := nl*a.cfg.Pair.Left.TakerFee + nr*a.cfg.Pair.Right.TakerFee
+	closed := len(a.state.Steps)
+	a.state.Steps = nil
+	a.posL, a.posR = res.PosL, res.PosR
+	a.syncCounter()
+	a.syncPositionState()
+	a.state.Mode = strategy.ModePaused
+	a.resetVolumeIfNewDay(time.Now())
+	a.volAcc.volumeUSD += nl + nr
+	a.volAcc.pnlUSD -= fees
+	a.volAcc.pnlUncertain = true
+	for i := 0; i < closed; i++ {
+		a.record(monitor.KindStepClosed, nil)
+	}
+	a.record(monitor.KindExecuted, func(e *monitor.Event) { e.USD = nl + nr })
+	a.record(monitor.KindPnL, func(e *monitor.Event) { e.USD = -fees })
+	return nil
 }
 
 func (a *PairActor) legSpecs(act strategy.Action) (execution.LegSpec, execution.LegSpec) {
@@ -383,6 +492,10 @@ func (a *PairActor) accountExecution(act strategy.Action, q spread.Quote, before
 		a.record(monitor.KindRescue, func(e *monitor.Event) { e.Qty = res.RescueQty })
 	}
 	if uncertain {
+		// Uncertainty is sticky: an estimated entry basis never becomes exact
+		// through a later exact exit, and the marker is never silently dropped
+		// by a day rollover (resetVolumeIfNewDay preserves it). Operators can
+		// reset it explicitly in the state file after reviewing the books.
 		a.volAcc.pnlUncertain = true
 		a.log.Warn("PnL includes protective-price estimates", "pair", a.key)
 	}

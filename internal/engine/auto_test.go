@@ -49,7 +49,7 @@ func TestCandidateSizedQty(t *testing.T) {
 				notional:   tc.notional,
 				depthRatio: tc.depthRatio,
 			}
-			got, ok := c.sizedQty()
+			got, ok := c.SizedQty()
 			if tc.want == 0 {
 				if ok {
 					t.Fatalf("expected rejection, got qty=%v", got)

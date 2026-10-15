@@ -33,6 +33,7 @@ func TestLoadStrictValidation(t *testing.T) {
 		{"zero warmup", "estimator:\n  min_warmup: 0s\n", "estimator.min_warmup must be > 0"},
 		{"warmup beyond window", "estimator:\n  window: 1m\n  min_warmup: 2m\n", "must not exceed window"},
 		{"interval beyond window", "estimator:\n  window: 1m\n  min_warmup: 1m\n  interval: 2m\n", "must not exceed window"},
+		{"unreachable warmup span", "estimator:\n  window: 5s\n  min_warmup: 5s\n  interval: 2s\n", "unreachable"},
 		{"coverage above one", "estimator:\n  min_coverage: 1.1\n", "min_coverage"},
 		{"zero action interval", "strategy:\n  interval_min: 0s\n", "strategy.interval_min must be > 0"},
 		{"negative book age", "strategy:\n  max_book_age: -1s\n", "strategy.max_book_age must be > 0"},

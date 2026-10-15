@@ -222,8 +222,8 @@ func TestSettlementUnknownBasisAndEstimatePersistBudgetGate(t *testing.T) {
 				t.Fatal("actor restart forgot uncertainty")
 			}
 			b.resetVolumeIfNewDay(time.Now().Add(24 * time.Hour))
-			if !b.canOpenVolume() {
-				t.Fatal("next day's budget did not reset")
+			if b.canOpenVolume() || !b.volAcc.pnlUncertain {
+				t.Fatal("day rollover cleared the uncertainty marker and reopened the cost budget")
 			}
 		})
 	}

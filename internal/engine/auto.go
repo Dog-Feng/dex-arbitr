@@ -212,10 +212,10 @@ func (c *candidate) collect(ctx context.Context, sampleEvery, volEvery, volMaxAg
 	}
 }
 
-// sizedQty derives the order quantity from the notional cap and the usable
+// SizedQty derives the order quantity from the notional cap and the usable
 // top-of-book depth, floored to the pair's size precision and checked against
 // the minimum quantity.
-func (c *candidate) sizedQty() (float64, bool) {
+func (c *candidate) SizedQty() (float64, bool) {
 	c.mu.RLock()
 	l, r := c.bookL, c.bookR
 	c.mu.RUnlock()
@@ -690,7 +690,7 @@ func (rt *runtime) promote(ctx context.Context, c *candidate, active map[string]
 			return fmt.Errorf("notional budget exceeded")
 		}
 	}
-	qty, ok := c.sizedQty()
+	qty, ok := c.SizedQty()
 	if !ok {
 		return fmt.Errorf("size unavailable")
 	}

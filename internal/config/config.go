@@ -312,6 +312,9 @@ func (c *Config) validate() error {
 	if c.Estimator.MinWarmup > c.Estimator.Window || c.Estimator.Interval > c.Estimator.Window {
 		return fmt.Errorf("estimator min_warmup and interval must not exceed window")
 	}
+	if maxSpan := (c.Estimator.Window / c.Estimator.Interval) * c.Estimator.Interval; c.Estimator.MinWarmup > maxSpan {
+		return fmt.Errorf("estimator.min_warmup (%s) is unreachable: a %s window sampled every %s can span at most %s", c.Estimator.MinWarmup, c.Estimator.Window, c.Estimator.Interval, maxSpan)
+	}
 	if c.Estimator.MinCoverage <= 0 || c.Estimator.MinCoverage > 1 {
 		return fmt.Errorf("estimator.min_coverage must be in (0, 1]")
 	}

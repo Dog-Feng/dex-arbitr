@@ -37,6 +37,24 @@ func testVenue(t *testing.T, signing bool) *Venue {
 	return v
 }
 
+func TestOrderRequestRoundsBoundTightly(t *testing.T) {
+	inst := domain.Instrument{MarketID: 1, SizeDecimals: 2, PriceDecimals: 2}
+	req, err := orderRequest(domain.OrderReq{ClientID: 1, Inst: inst, Side: domain.Buy, Qty: 1, Price: 100.005, Type: domain.Limit})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Price != 10000 {
+		t.Fatalf("buy worst-case bound widened by rounding: price=%d", req.Price)
+	}
+	req, err = orderRequest(domain.OrderReq{ClientID: 2, Inst: inst, Side: domain.Sell, Qty: 1, Price: 99.995, Type: domain.Limit})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Price != 10000 {
+		t.Fatalf("sell worst-case bound widened by rounding: price=%d", req.Price)
+	}
+}
+
 func validRequest() domain.OrderReq {
 	return domain.OrderReq{ClientID: 1, Inst: domain.Instrument{MarketID: 1, SizeDecimals: 3, PriceDecimals: 2}, Side: domain.Buy, Qty: 0.01, Price: 100}
 }

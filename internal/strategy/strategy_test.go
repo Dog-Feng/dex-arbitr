@@ -42,6 +42,24 @@ func TestOpenLS(t *testing.T) {
 	}
 }
 
+func TestCloseFallsBackToNextBestWhenTopStepLacksDepth(t *testing.T) {
+	l := domain.Book{Bids: []domain.Level{{Price: 100.3, Size: 0.03}}, Asks: []domain.Level{{Price: 100.4, Size: 1}}}
+	r := domain.Book{Bids: []domain.Level{{Price: 101.0, Size: 1}}, Asks: []domain.Level{{Price: 101.1, Size: 5}}}
+	q, ok := spread.Compute(l, r)
+	if !ok {
+		t.Fatal("invalid quote")
+	}
+	p := Params{StepQty: 0.1, MaxSteps: 3, OpenBps: 0, CloseBps: 0, DepthMult: 2, CloseOrder: "best"}
+	state := State{Mode: ModeRunning, Steps: []Step{
+		{ID: 1, Dir: DirLS, Qty: 0.2, OpenL: 100, OpenR: 101},
+		{ID: 2, Dir: DirLS, Qty: 0.01, OpenL: 100, OpenR: 101},
+	}}
+	a := (Arbitrage{}).Decide(p, state, q, 0, true, 0)
+	if a.Kind != Close || a.StepID != 2 || a.Qty != 0.01 {
+		t.Fatalf("expected the small depth-sufficient step to close, got %+v", a)
+	}
+}
+
 func TestNoOpenWhenMeanAbsorbsSpread(t *testing.T) {
 	q, _ := spread.Compute(book(999.9, 1000, 1), book(1001, 1001.1, 1))    // LS ~ 10bps
 	a := (Arbitrage{}).Decide(P, State{Mode: ModeRunning}, q, 10, true, 0) // mean already 10bps

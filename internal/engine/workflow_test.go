@@ -58,7 +58,7 @@ func TestStrategySelectionMatrixWarmsTradesAndRetainsTwoHourWindow(t *testing.T)
 				c := &candidate{pair: pair, l: l, r: r, est: est, vol: vol, volL: vl, volR: vr, bookL: bl, bookR: br, notional: 10, depthRatio: .25}
 				if mode == "auto" {
 					var ok bool
-					qty, ok = c.sizedQty()
+					qty, ok = c.SizedQty()
 					if !ok {
 						t.Fatal("scanned pair cannot be sized")
 					}

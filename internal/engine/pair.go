@@ -125,9 +125,12 @@ type volumeAcc struct {
 
 func (a *PairActor) resetVolumeIfNewDay(now time.Time) {
 	today := now.UTC().Format("2006-01-02")
-	if a.volAcc.day != today {
-		a.volAcc = volumeAcc{day: today}
+	if a.volAcc.day == today {
+		return
 	}
+	// An uncertainty marker from a recovered or estimated execution must
+	// survive the UTC day rollover; the daily budget only resets the counters.
+	a.volAcc = volumeAcc{day: today, pnlUncertain: a.volAcc.pnlUncertain}
 }
 
 // canOpenVolume reports whether the daily volume/cost budget allows another open.
@@ -364,7 +367,9 @@ func (a *PairActor) reconcile(ctx context.Context) error {
 	for _, st := range a.state.Steps {
 		if st.OpenL <= 0 || st.OpenR <= 0 {
 			a.legacyPrices = true
-			return fmt.Errorf("step %d lacks entry prices; normal trading paused, drain remains available", st.ID)
+			if !a.checkpoint {
+				return fmt.Errorf("step %d lacks entry prices; normal trading paused, drain remains available", st.ID)
+			}
 		}
 	}
 	if a.checkpoint {
@@ -379,6 +384,11 @@ func (a *PairActor) reconcile(ctx context.Context) error {
 		a.log.Warn("unresolved execution from a previous run; positions match the ledger, verifying stability before resuming")
 		return nil
 	}
+	if a.legacyPrices {
+		a.state.Mode = strategy.ModePaused
+		a.log.Warn("ledger contains steps without entry prices; normal trading stays paused, drain and emergency remain available")
+		return nil
+	}
 	a.state.Mode = strategy.ModeWarmup
 	a.log.Info("position reconciliation passed")
 	return nil
@@ -391,7 +401,7 @@ func (a *PairActor) reconcile(ctx context.Context) error {
 func (a *PairActor) recoverCheckpoint(ctx context.Context, now time.Time) {
 	every := a.cfg.CheckpointCheckEvery
 	if every <= 0 {
-		every = 5 * time.Second
+		every = 15 * time.Second
 	}
 	if now.Sub(a.checkpointCheckedAt) < every {
 		return
@@ -407,7 +417,9 @@ func (a *PairActor) recoverCheckpoint(ctx context.Context, now time.Time) {
 	}
 	grace := a.cfg.CheckpointGrace
 	if grace <= 0 {
-		grace = 30 * time.Second
+		// Signed transactions can remain executable well beyond a few
+		// seconds; observe position stability for longer than that window.
+		grace = 15 * time.Minute
 	}
 	if now.Sub(a.checkpointSince) < grace {
 		return
@@ -491,7 +503,7 @@ func (a *PairActor) Run(ctx context.Context) (retErr error) {
 			return nil
 		case <-a.drainWake:
 			// Drain is an actor-owned transition; it cannot be overwritten by risk recovery.
-			if a.reconciled && !a.checkpoint {
+			if a.reconciled {
 				a.state.Mode = strategy.ModeReduceOnly
 			}
 		case <-sample:
@@ -534,13 +546,13 @@ func (a *PairActor) Run(ctx context.Context) (retErr error) {
 				a.recoverCheckpoint(ctx, now)
 				continue
 			}
-			if a.emergencyRequested.Load() && a.reconciled && !a.checkpoint {
+			if a.emergencyRequested.Load() && a.reconciled {
 				a.emergency(ctx)
 				nextAt = now.Add(a.jitter())
 				continue
 			}
 			if a.draining.Load() {
-				if a.reconciled && !a.checkpoint {
+				if a.reconciled {
 					a.drain(ctx)
 				}
 				continue
@@ -562,6 +574,9 @@ func (a *PairActor) Run(ctx context.Context) (retErr error) {
 			q, ok := a.quote(now)
 			if !ok {
 				continue
+			}
+			if a.cfg.View != nil {
+				a.refreshSizing()
 			}
 			mu, ready := a.mean()
 			act := a.cfg.Strategy.Decide(a.cfg.Params, a.state, q, mu, ready, a.volBps())
@@ -600,6 +615,23 @@ func (a *PairActor) quote(now time.Time) (spread.Quote, bool) {
 		return spread.Quote{}, false
 	}
 	return spread.Compute(l, r)
+}
+
+// refreshSizing realigns the open quantity of an auto-mode actor with the
+// current shared depth-based sizing (config notional and depth caps). Existing
+// steps keep their own quantities; only new opens use the refreshed size, so
+// a restored actor can no longer add at a stale, oversized step quantity.
+func (a *PairActor) refreshSizing() {
+	if a.cfg.View == nil {
+		return
+	}
+	sizer, ok := a.cfg.View.(interface{ SizedQty() (float64, bool) })
+	if !ok {
+		return
+	}
+	if qty, ok := sizer.SizedQty(); ok && qty > 0 {
+		a.cfg.Params.StepQty = qty
+	}
 }
 
 // volQuote returns a spread sample only when both books are fresh and mutually

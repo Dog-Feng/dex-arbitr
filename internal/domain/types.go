@@ -164,6 +164,12 @@ func Floor(v float64, d int) float64 {
 	return math.Floor(v*p+1e-9) / p
 }
 
+// Ceil rounds v up to d decimals (with epsilon tolerance).
+func Ceil(v float64, d int) float64 {
+	p := math.Pow10(d)
+	return math.Ceil(v*p-1e-9) / p
+}
+
 // ParseF parses a decimal string, returning 0 on error.
 func ParseF(s string) float64 {
 	f, _ := strconv.ParseFloat(s, 64)

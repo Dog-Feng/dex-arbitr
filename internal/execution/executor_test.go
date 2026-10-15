@@ -26,6 +26,19 @@ func newFake(name string, f func(int, domain.OrderReq) float64) *fakeVenue {
 	return &fakeVenue{name: name, ch: make(chan domain.OrderUpdate, 100), fillFn: f}
 }
 
+func TestLimitPriceRoundsTightly(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.PriceTicks = 0
+	e := NewExecutor(cfg, nil, nil, nil, nil, nil, nil)
+	inst := domain.Instrument{MarketID: 1, SizeDecimals: 4, PriceDecimals: 2}
+	if got := e.limitPrice(LegSpec{Inst: inst, Side: domain.Buy, Price: 100.005}, 1); got != 100.00 {
+		t.Fatalf("buy limit rounded outward: %v", got)
+	}
+	if got := e.limitPrice(LegSpec{Inst: inst, Side: domain.Sell, Price: 99.995}, 1); got != 100.00 {
+		t.Fatalf("sell limit rounded outward: %v", got)
+	}
+}
+
 func (f *fakeVenue) Name() string                                             { return f.name }
 func (f *fakeVenue) Instruments(context.Context) ([]domain.Instrument, error) { return nil, nil }
 func (f *fakeVenue) SubscribeBook(context.Context, domain.Instrument) (<-chan domain.Book, error) {

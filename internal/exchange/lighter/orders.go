@@ -100,7 +100,15 @@ func orderRequest(r domain.OrderReq) (*types.CreateOrderTxReq, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: qty: %v", domain.ErrRejected, err)
 	}
-	price, err := toPrice(r.Price, r.Inst.PriceDecimals)
+	// Round to native precision in the tightening direction so the submitted
+	// bound can never be wider than the requested worst-acceptable price.
+	price := r.Price
+	if r.Side == domain.Buy {
+		price = domain.Floor(price, r.Inst.PriceDecimals)
+	} else if r.Side == domain.Sell {
+		price = domain.Ceil(price, r.Inst.PriceDecimals)
+	}
+	scaledPrice, err := toPrice(price, r.Inst.PriceDecimals)
 	if err != nil {
 		return nil, fmt.Errorf("%w: price: %v", domain.ErrRejected, err)
 	}
@@ -117,7 +125,7 @@ func orderRequest(r domain.OrderReq) (*types.CreateOrderTxReq, error) {
 	if r.Type != domain.Limit && r.Type != domain.Market {
 		return nil, fmt.Errorf("%w: invalid order type", domain.ErrRejected)
 	}
-	req := &types.CreateOrderTxReq{MarketIndex: market, ClientOrderIndex: r.ClientID, BaseAmount: base, Price: price, Type: uint8(txtypes.LimitOrder), TimeInForce: uint8(txtypes.ImmediateOrCancel), TriggerPrice: txtypes.NilOrderTriggerPrice, OrderExpiry: txtypes.NilOrderExpiry}
+	req := &types.CreateOrderTxReq{MarketIndex: market, ClientOrderIndex: r.ClientID, BaseAmount: base, Price: scaledPrice, Type: uint8(txtypes.LimitOrder), TimeInForce: uint8(txtypes.ImmediateOrCancel), TriggerPrice: txtypes.NilOrderTriggerPrice, OrderExpiry: txtypes.NilOrderExpiry}
 	if r.Side == domain.Sell {
 		req.IsAsk = 1
 	}

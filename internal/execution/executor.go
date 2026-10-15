@@ -109,6 +109,10 @@ var ErrUnresolved = errors.New("order outcome unresolved")
 // been reached. Retain Result and retry recovery without releasing the actor.
 var ErrIncomplete = errors.New("rescue targets not reached")
 
+// ErrUnexpectedPosition means confirmed fills and the resulting position
+// change disagree in a way that cannot self-heal (e.g. an external close).
+var ErrUnexpectedPosition = errors.New("unexpected position change")
+
 // BookFn returns the latest book for a venue/market (for rescue pricing).
 type BookFn func(venue string, marketID int) (domain.Book, bool)
 
@@ -364,19 +368,19 @@ func verifyDelta(lr *LegResult, delta, qty float64, inst domain.Instrument) erro
 		return fmt.Errorf("invalid position or filled quantity")
 	}
 	if delta < -eps || delta-qty >= eps {
-		return fmt.Errorf("unexpected position change %.8f for quantity %.8f", delta, qty)
+		return fmt.Errorf("%w: %.8f for quantity %.8f", ErrUnexpectedPosition, delta, qty)
 	}
 	if lr.Resolved {
 		if lr.Filled-qty >= eps || lr.Status == domain.StatusRejected && lr.Filled >= eps || lr.Status == domain.StatusFilled && math.Abs(lr.Filled-qty) >= eps {
 			return fmt.Errorf("invalid terminal fill %.8f for status %s and quantity %.8f", lr.Filled, lr.Status, qty)
 		}
 		if math.Abs(delta-lr.Filled) >= eps {
-			return fmt.Errorf("position change %.8f does not reflect confirmed fill %.8f", delta, lr.Filled)
+			return fmt.Errorf("%w: %.8f does not reflect confirmed fill %.8f", ErrUnexpectedPosition, delta, lr.Filled)
 		}
 		return nil
 	}
 	if lr.Filled-delta >= eps {
-		return fmt.Errorf("position change %.8f is behind observed fill %.8f", delta, lr.Filled)
+		return fmt.Errorf("%w: %.8f is behind observed fill %.8f", ErrUnexpectedPosition, delta, lr.Filled)
 	}
 	if math.Abs(delta-qty) >= eps {
 		return fmt.Errorf("%w: confirmed %.8f of requested %.8f", ErrUnresolved, delta, qty)
@@ -417,7 +421,7 @@ func (e *Executor) runLeg(ctx context.Context, leg LegSpec, qty float64, reduceO
 func (e *Executor) limitPrice(leg LegSpec, qty float64) float64 {
 	n := e.allowance(leg, qty)
 	if n <= 0 {
-		return leg.Price
+		return boundPrice(leg)
 	}
 	off := float64(n) * leg.Inst.Tick()
 	px := leg.Price + off
@@ -427,7 +431,21 @@ func (e *Executor) limitPrice(leg LegSpec, qty float64) float64 {
 			return leg.Price
 		}
 	}
-	return domain.Round(px, leg.Inst.PriceDecimals)
+	// Round in the tightening direction so the native-precision price can
+	// never widen the worst-acceptable bound by half a tick.
+	rounded := domain.Floor(px, leg.Inst.PriceDecimals)
+	if leg.Side == domain.Sell {
+		rounded = domain.Ceil(px, leg.Inst.PriceDecimals)
+	}
+	return rounded
+}
+
+// boundPrice rounds the decision price itself in the tightening direction.
+func boundPrice(leg LegSpec) float64 {
+	if leg.Side == domain.Sell {
+		return domain.Ceil(leg.Price, leg.Inst.PriceDecimals)
+	}
+	return domain.Floor(leg.Price, leg.Inst.PriceDecimals)
 }
 
 // allowance is the IOC tick allowance for a leg: the fixed PriceTicks, or when
@@ -682,6 +700,26 @@ func (e *Executor) EmergencyFlatten(ctx context.Context, l, r LegSpec, target, p
 	pl, pr, err = e.positions(ctx, l, r)
 	if err != nil {
 		return res, fmt.Errorf("emergency positions: %w", err)
+	}
+	res.PosL, res.PosR, res.PositionsKnown, res.SettlementKnown = pl, pr, true, true
+	err = e.flatten(ctx, l, r, 0, 0, &res, res.rescue)
+	return res, err
+}
+
+// FlattenToZero reduces both market positions to zero using the normal rescue
+// price ladder (not emergency prices), for post-intervention recovery where
+// the priority is a confirmed flat account rather than immediacy.
+func (e *Executor) FlattenToZero(ctx context.Context, l, r LegSpec) (res Result, err error) {
+	start := time.Now()
+	defer func() { res.Duration = time.Since(start); res.Err = err }()
+	res.targetL, res.targetR, res.targetsKnown = 0, 0, true
+	res.rescue = e.cfg.Rescue
+	if err = ctx.Err(); err != nil {
+		return res, err
+	}
+	var pl, pr float64
+	if pl, pr, err = e.positions(ctx, l, r); err != nil {
+		return res, fmt.Errorf("recovery positions: %w", err)
 	}
 	res.PosL, res.PosR, res.PositionsKnown, res.SettlementKnown = pl, pr, true, true
 	err = e.flatten(ctx, l, r, 0, 0, &res, res.rescue)

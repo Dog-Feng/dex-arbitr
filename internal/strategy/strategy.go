@@ -304,15 +304,19 @@ func (Arbitrage) Decide(p Params, s State, q spread.Quote, mu float64, muReady b
 			default: // best
 				sort.SliceStable(cs, func(i, j int) bool { return cs[i].pf > cs[j].pf })
 			}
-			c := cs[0]
-			ol, or := c.st.Dir.LegSides()
-			l, r := ol.Opposite(), or.Opposite()
-			if !depthOK(q, l, r, c.st.Qty*p.DepthMult) {
-				return Action{Reason: fmt.Sprintf("close step %d profitable (%.2fbps) but top-of-book depth < %.4f", c.st.ID, c.pf, c.st.Qty*p.DepthMult)}
+			// Try candidates in order so a depth-starved large step cannot
+			// block a smaller, profitable step that has enough liquidity.
+			for _, c := range cs {
+				ol, or := c.st.Dir.LegSides()
+				l, r := ol.Opposite(), or.Opposite()
+				if !depthOK(q, l, r, c.st.Qty*p.DepthMult) {
+					continue
+				}
+				la, ra := legs(q, l, r)
+				return Action{Kind: Close, Dir: c.st.Dir, StepID: c.st.ID, Qty: c.st.Qty, L: la, R: ra, ExpectedBps: c.pf,
+					Reason: fmt.Sprintf("close step %d profit %.2fbps >= %.2f+%.2f (net)", c.st.ID, c.pf, p.CloseBps, closeFeeBps(p, c.st, q))}
 			}
-			la, ra := legs(q, l, r)
-			return Action{Kind: Close, Dir: c.st.Dir, StepID: c.st.ID, Qty: c.st.Qty, L: la, R: ra, ExpectedBps: c.pf,
-				Reason: fmt.Sprintf("close step %d profit %.2fbps >= %.2f+%.2f (net)", c.st.ID, c.pf, p.CloseBps, closeFeeBps(p, c.st, q))}
+			return Action{Reason: fmt.Sprintf("%d profitable close candidate(s) but none has top-of-book depth for its size", len(cs))}
 		}
 	}
 
