@@ -84,8 +84,8 @@ func TestCheckpointKeepsPauseWhilePositionsDiverge(t *testing.T) {
 func TestRestoredExposureRespectsAccountNotionalBudget(t *testing.T) {
 	rt := lifecycleRuntime(t)
 	rt.cfg.Auto.TopY = 2
-	// Each saved step reserves max(leg notional)=50.5; the second restored
-	// pair crosses the 60 cap and must drain while the first keeps trading.
+	// Existing exposure is 101 before either actor starts. Both must drain;
+	// allowing the first actor to trade would ignore its still-held peer.
 	rt.cfg.Auto.MaxTotalNotional = 60
 	a, b := lifecycleCandidate("A", "L", "R", 1, 0), lifecycleCandidate("B", "L", "R", 2, 0)
 	for _, c := range []*candidate{a, b} {
@@ -99,7 +99,7 @@ func TestRestoredExposureRespectsAccountNotionalBudget(t *testing.T) {
 	if err := rt.restorePairs(context.Background(), []*candidate{a, b}, active, &wg); err != nil {
 		t.Fatal(err)
 	}
-	if active[a.key] == nil || active[a.key].draining || active[b.key] == nil || !active[b.key].draining {
+	if active[a.key] == nil || !active[a.key].draining || active[b.key] == nil || !active[b.key].draining {
 		t.Fatalf("restored exposure must respect the account notional budget: active=%v", active)
 	}
 }

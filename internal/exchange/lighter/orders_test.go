@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"mime"
 	"mime/multipart"
@@ -52,6 +53,100 @@ func TestOrderRequestRoundsBoundTightly(t *testing.T) {
 	}
 	if req.Price != 10000 {
 		t.Fatalf("sell worst-case bound widened by rounding: price=%d", req.Price)
+	}
+}
+
+func TestOrderRequestPreservesNativePriceUnits(t *testing.T) {
+	units := []uint32{1, 2, 9, 10, 99, 100, 101, 1<<24 - 1, 1 << 24, 1<<25 - 1, 1<<25 + 1, 33554401, 33554404, 1 << 31, math.MaxUint32 - 1, math.MaxUint32}
+	// Exercise the whole supported uint32 price range at every precision.
+	seed := uint32(1)
+	for i := 0; i < 128; i++ {
+		seed = 1664525*seed + 1013904223
+		units = append(units, max(1, seed))
+	}
+	for decimals := 0; decimals <= 18; decimals++ {
+		t.Run(fmt.Sprintf("decimals_%d", decimals), func(t *testing.T) {
+			for _, want := range units {
+				price := float64(want) / math.Pow10(decimals)
+				for _, side := range []domain.Side{domain.Buy, domain.Sell} {
+					r := validRequest()
+					r.Inst.PriceDecimals, r.Side = decimals, side
+					// The executor aligns before the adapter aligns again.
+					r.Price = domain.Floor(price, decimals)
+					if side == domain.Sell {
+						r.Price = domain.Ceil(price, decimals)
+					}
+					req, err := orderRequest(r)
+					if err != nil || req.Price != want {
+						t.Fatalf("side=%s native=%d price=%.17g request=%+v error=%v", side, want, price, req, err)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestOrderRequestTightBoundNearNativeTick(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		side    domain.Side
+		price   float64
+		units   uint32
+		rejects bool
+	}{
+		{name: "buy below minimum", side: domain.Buy, price: .01 - 5e-12, rejects: true},
+		{name: "buy one ulp below minimum", side: domain.Buy, price: math.Nextafter(.01, 0), rejects: true},
+		{name: "buy above tick", side: domain.Buy, price: .01 + 5e-12, units: 1},
+		{name: "sell above tick", side: domain.Sell, price: .01 + 5e-12, units: 2},
+		{name: "sell one ulp above tick", side: domain.Sell, price: math.Nextafter(.01, 1), units: 2},
+		{name: "sell below tick", side: domain.Sell, price: .01 - 5e-12, units: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := validRequest()
+			r.Side, r.Price = tc.side, tc.price
+			req, err := orderRequest(r)
+			if tc.rejects {
+				if !errors.Is(err, domain.ErrRejected) {
+					t.Fatalf("unrepresentable bound accepted: request=%+v error=%v", req, err)
+				}
+				return
+			}
+			if err != nil || req.Price != tc.units {
+				t.Fatalf("bound=%.17g request=%+v error=%v, want native price %d", tc.price, req, err, tc.units)
+			}
+		})
+	}
+}
+
+func TestSignedNativePriceBounds(t *testing.T) {
+	v := testVenue(t, true)
+	for _, tc := range []struct {
+		name     string
+		side     domain.Side
+		decimals int
+		units    uint32
+	}{
+		{name: "native buy regression", side: domain.Buy, decimals: 3, units: 33554401},
+		{name: "native sell regression", side: domain.Sell, decimals: 3, units: 33554404},
+		{name: "maximum integer price", side: domain.Buy, units: math.MaxUint32},
+		{name: "maximum fractional price", side: domain.Sell, decimals: 18, units: math.MaxUint32},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := validRequest()
+			r.Side, r.Inst.PriceDecimals = tc.side, tc.decimals
+			r.Price = float64(tc.units) / math.Pow10(tc.decimals)
+			body, err := v.SignOnly(r, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var signed txtypes.L2CreateOrderTxInfo
+			if err := json.Unmarshal([]byte(body), &signed); err != nil {
+				t.Fatal(err)
+			}
+			if signed.Price != tc.units {
+				t.Fatalf("signed price=%d, want %d", signed.Price, tc.units)
+			}
+		})
 	}
 }
 

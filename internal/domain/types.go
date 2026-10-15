@@ -5,6 +5,7 @@ import (
 	"errors"
 	"math"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -158,16 +159,68 @@ func Round(v float64, d int) float64 {
 	return math.Round(v*p) / p
 }
 
-// Floor floors v to d decimals (with epsilon tolerance).
+// Floor rounds v down to d decimal places, using its shortest round-trip
+// decimal representation. It preserves native decimal values without adding
+// an epsilon that could increase a quantity just below a size step.
 func Floor(v float64, d int) float64 {
-	p := math.Pow10(d)
-	return math.Floor(v*p+1e-9) / p
+	return roundDecimal(v, d, false)
 }
 
-// Ceil rounds v up to d decimals (with epsilon tolerance).
+// Ceil rounds v up to d decimal places using the same decimal representation
+// as Floor. Negative d rounds to powers of ten before the decimal point.
 func Ceil(v float64, d int) float64 {
-	p := math.Pow10(d)
-	return math.Ceil(v*p-1e-9) / p
+	return roundDecimal(v, d, true)
+}
+
+func roundDecimal(v float64, d int, up bool) float64 {
+	if v == 0 || math.IsNaN(v) || math.IsInf(v, 0) || d >= 324 {
+		return v
+	}
+	// Rounding a negative value down increases its magnitude.
+	increase := up != math.Signbit(v)
+	if d < -308 {
+		if increase {
+			return math.Copysign(math.Inf(1), v)
+		}
+		return math.Copysign(0, v)
+	}
+
+	// Working with decimal digits avoids v*10^d crossing an integer because of
+	// binary multiplication error. The coefficient has at most 17 digits, so
+	// its truncated prefix and a carry both fit in uint64.
+	mantissa, exponent, ok := strings.Cut(strconv.FormatFloat(math.Abs(v), 'e', -1, 64), "e")
+	if !ok {
+		return math.NaN()
+	}
+	e, err := strconv.Atoi(exponent)
+	if err != nil {
+		return math.NaN()
+	}
+	digits := strings.ReplaceAll(mantissa, ".", "")
+	keep := e + 1 + d
+	if keep >= len(digits) {
+		return v
+	}
+	var units uint64
+	if keep > 0 {
+		units, err = strconv.ParseUint(digits[:keep], 10, 64)
+		if err != nil {
+			return math.NaN()
+		}
+	}
+	// A shortest coefficient has no trailing zero, so a truncated suffix
+	// always contains a nonzero digit.
+	if increase {
+		units++
+	}
+	if units == 0 {
+		return math.Copysign(0, v)
+	}
+	rounded, err := strconv.ParseFloat(strconv.FormatUint(units, 10)+"e"+strconv.Itoa(-d), 64)
+	if err != nil && !errors.Is(err, strconv.ErrRange) {
+		return math.NaN()
+	}
+	return math.Copysign(rounded, v)
 }
 
 // ParseF parses a decimal string, returning 0 on error.

@@ -34,19 +34,21 @@
 | F24 | Marshal 失败覆盖旧账本，落盘错误仅记录日志。 | 保存前验证及序列化；同 key 写入串行，临时文件 Sync、Rename、目录 Sync。发送前写未决 checkpoint；保存失败暂停并返回运行错误。采样写入/同步失败也传播。 | `store.TestSavePreservesPreviousStateOnInvalidInput`；`TestRejectInvalidSettlementBeforeReplacingState`；`TestSaveWriteFailureCleansTemporaryFile`；`TestStoreCloseAndReopen`；`TestSamplePropagatesWriteAndCloseErrors` |
 | F25 | selfcheck 前置失败仍 live，有底仓或错误注入遗留仓位。 | [live.go](../cmd/selfcheck/live.go) 要求两腿零基线；任一前置检查失败即停止。rescue 注入是明确的本地拒绝；每次退出先恢复旧订单结果，再用独立有时限的清理 context 减仓并复核两腿。只读签名使用实际 venue/链配置。 | `selfcheck.TestRunChecksFailureStopsBeforeTrading`；`TestLiveFlowRequiresZeroBaseline`；`TestLiveRoundTripAndRescueAreFlat`；`TestLiveUnknownOpeningOutcomeRecoveredWithoutResubmit`；`TestReadOnlySigningUsesActualVenueEphemeralSigner` |
 | F26 | 数量校验放过额外精度，空匹配后缀导致死循环。 | [matcher.go](../internal/symbols/matcher.go) 只容忍浮点表示误差，检查有限数值和精度；最小数量向上对齐。Normalize 忽略空后缀，配置入口也拒绝空后缀。 | `symbols.TestValidQtyAllowsRepresentationErrorOnly`；`TestValidQtyRejectsUntradableInputs`；`TestNormalizeIgnoresEmptySuffixes`；`TestPairMinimumDoesNotRoundDownFractionOfStep` |
-| F27 | 重启后未决 checkpoint 与账本一致时永久暂停，没有自动恢复路径。 | [pair.go](../internal/engine/pair.go) 仓位与账本一致时先通过核对，但保持 PAUSED 并进入稳定性观察：每 5s 重新核对，连续 30s（均可配置）一致才清除 checkpoint，期间不认证 Flat/Drained；清除后每日 PnL 标记不确定并持久化。仓位出现分歧仍暂停待人工处理。 | `engine.TestCheckpointClearsAfterStablePositionMatch`；`TestCheckpointKeepsPauseWhilePositionsDiverge` |
-| F28 | 恢复的历史持仓不占用账户名义预算，总额闸门只约束晋升。 | [auto.go](../internal/engine/auto.go) 恢复时按 `max(pair_budget, 实际名义)` 预留预算并累计；超出 `auto.max_total_notional` 的恢复对直接进入 drain，预算内且有空位才恢复交易。 | `engine.TestRestoredExposureRespectsAccountNotionalBudget` |
+| F27 | 重启后未决 checkpoint 与账本一致时永久暂停，没有自动恢复路径。 | [pair.go](../internal/engine/pair.go) 默认每15s重新核对，连续15m一致后恢复并标记PnL未知；有退出请求时进入持久化隔离退出，期间不认证Flat/Drained。 | `engine.TestCheckpointClearsAfterStablePositionMatch`；`TestCheckpointRunCanReduceBeforeGraceWithoutCertifyingFlat` |
+| F28 | 恢复的历史持仓不占用账户名义预算，总额闸门只约束晋升。 | [auto.go](../internal/engine/auto.go) 在启动任何actor前计入全部旧仓，再为可交易actor分配新开/替换步骤的固定额度；drain未完成不释放占用。 | `engine.TestAutoRecoveryCountsEveryRetainedPositionBeforeOpening`；`TestAutoRecoveryReservesOldExposureAndNewSteps` |
 | F29 | 应急/降出平仓用账本数量与成交量强等，精度尘埃使退账本卡在重试循环。 | [settlement.go](../internal/engine/settlement.go) 按每条腿实际平仓量（直接成交+补救）计算均价与 PnL，账本数量与成交量超过原生精度时仅标记不确定，不再报错卡死。 | `engine.TestUnwindAccountingToleratesFinePrecisionDust` |
 | F30 | `volume.min_inventory >= max_steps` 使库存地板永不可平，静默停止 churn。 | [config.go](../internal/config/config.go) 校验 volume 策略下 `min_inventory` 必须小于对应 `max_steps`（manual 逐对、auto 按 `auto.max_steps`），否则拒绝启动。 | `config.TestLoadVenueAndPairIdentity`（`volume floor at pair/auto max steps`） |
-| F31 | 缺入场价的旧账本与未决 checkpoint 并存时永久暂停，drain/应急退出也被 checkpoint 挡住。 | [pair.go](../internal/engine/pair.go) 缺价只暂停普通交易，不再阻塞 checkpoint 稳定性判定；drain 与应急退出只依赖 `reconciled`。 | `engine.TestLegacyLedgerWithCheckpointCanStillDrain` |
-| F32 | 恢复的旧仓沿用历史下单量，预算累计只按排序前缀判断，总名义可突破上限。 | [pair.go](../internal/engine/pair.go) auto actor 每次决策前用共享视图的实时定容刷新 `StepQty`（存量步保持原数量）；恢复预算仍按 `max(pair_budget, 实际名义)` 预留，新增开仓量因此被当前配置的名义与深度约束。 | `engine.TestAutoActorRefreshesSizingFromSharedView`；`TestRestoredExposureRespectsAccountNotionalBudget` |
+| F31 | 缺入场价旧账本与checkpoint并存时，完整主循环阻塞退出。 | [checkpoint.go](../internal/engine/checkpoint.go) 退出先持久化checkpoint_exit标记，可提前reduce-only减仓；旧请求隔离期内继续管理迟到仓位，满期且新单终态/两腿已平才释放。 | `engine.TestCheckpointRunCanReduceBeforeGraceWithoutCertifyingFlat`；`TestCheckpointExitReducesLateFillAndOnlyReleasesAfterExpiry` |
+| F32 | 恢复旧数量和排序前缀预算使账户超限，定容失败又回退旧大额。 | [admission.go](../internal/engine/admission.go) 覆盖每个旧步骤与其替换额度；全旧仓先计入；实时定容失败只禁Open；实际IOC价格计划按单步上限约束。 | `engine.TestRecoveryReservationCoversReplacementOfCheapHistoricalStep`；`TestAutoSizingFailureBlocksOpenButPreservesClose`；`TestConcurrentAutoActorsRemainWithinFixedAccountAllocations` |
 | F33 | 仓位匹配 30 秒便解除 checkpoint，短于已签名交易的有效窗口，无法排除迟到成交。 | 稳定性观察默认加长到 15 分钟（`CheckpointGrace` 可配置），检查频率 15 秒；期间任何分歧重置计时。订单均为 IOC，观察窗口覆盖签名交易可执行窗口。 | `engine.TestCheckpointClearsAfterStablePositionMatch`；`TestCheckpointKeepsPauseWhilePositionsDiverge` |
-| F34 | 一腿被外部平仓后恢复循环永久 pending；两腿均被外部平仓时漏记未知损益。 | [settlement.go](../internal/engine/settlement.go) 连续 3 次仓位与成交不一致/结算失败时判定外部干预：用正常阶梯把两腿清到零（应急请求时用应急价），清空账本、只记本进程成交的手续费，Pnl 标记不确定并持久化。 | `engine.TestExternalInterventionRecoveryFlattensAndClearsLedger` |
-| F35 | 恢复或估算产生的不确定标记在首次 UTC 日切被清掉，重新放开成本预算。 | [pair.go](../internal/engine/pair.go) `resetVolumeIfNewDay` 只重置计数器、保留 `pnlUncertain`；不确定标记跟随账本，所有估算价格的步全部以精确价格平掉后自动清除。 | `engine.TestDayRolloverPreservesPnLUncertainty` |
-| F36 | 部分合法采样配置（如窗口 5s/预热 5s/间隔 2s）因桶化永远无法预热。 | [config.go](../internal/config/config.go) 校验 `min_warmup <= floor(window/interval)*interval`，不可达的预热配置拒绝启动。 | `config.TestLoadStrictValidation`（`unreachable warmup span`） |
-| F37 | 默认 best 平仓中，大步骤深度不足会挡住可盈利的小步骤；适配器四舍五入可能放宽最差成交价。 | [strategy.go](../internal/strategy/strategy.go) 平仓候选按序尝试深度；[executor.go](../internal/execution/executor.go) 与 [orders.go](../internal/exchange/lighter/orders.go) 按收紧方向取整（买 Floor、卖 Ceil）。 | `strategy.TestCloseFallsBackToNextBestWhenTopStepLacksDepth`；`execution.TestLimitPriceRoundsTightly`；`lighter.TestOrderRequestRoundsBoundTightly` |
+| F34 | 外部平仓后卡pending或漏记未知损益，恢复又丢旧/新未决订单。 | [settlement.go](../internal/engine/settlement.go) 分开原单终态核验与新zero-target平仓阶段，保留两份执行结果；新平仓未决继续恢复；零成交缺口记未知，原/新成交费用只累计一次。 | `engine.TestInterventionWaitsForUnknownOriginalBeforeFlatten`；`TestInterventionRetainsPartialUnknownFlatten`；`TestInterventionAlreadyFlatClearsLedgerAfterTerminalOrders`；`TestUnwindExternalZeroFillMarksPnLUncertain` |
+| F35 | 恢复/估算产生的不确定标记在UTC日切被清掉。 | 日切只重置每日计数，永久保留pnlUncertain；即使步骤后来全部退出也不自动解除。操作员需核对成交及费用后，在停止写入进程的情况下处理状态。 | `engine.TestDayRolloverPreservesPnLUncertainty`；`TestSettlementUnknownBasisAndEstimatePersistBudgetGate` |
+| F36 | 不可达桶跨度或单槽替换使配置永久无法预热。 | config与backtest拒绝不可达跨度；单槽连续采样保留真实预热起点，允许半个采样间隔抖动，漏采样或长缺口仍重新预热。 | `config.TestSingleSlotEstimatorWarmsForAllStrategySelections`；`estimator.TestSMASingleSlotWarmsAcrossContinuousSamplesAndRestartsAfterGap`；`backtest.TestReplaySingleSlotWarmupAndGap` |
+| F37 | best平仓被大步骤挡住，或定向舍入放宽/多收紧原生价格。 | 平仓依序尝试可执行盈利步骤；Floor/Ceil按最短往返十进制表示定向取整，保留原生价格，quantity不因epsilon增大。原生量格的算术差值先还原原生精度。 | `strategy.TestCloseFallsBackToNextBestWhenTopStepLacksDepth`；`domain.TestDecimalRoundingStaysConservativeAndIdempotent`；`execution.TestZeroTicksPreservesNativeDecisionPrice` |
 
 除上述映射外，适配器回归还覆盖 WS 在 Dial/Close 竞态下关闭连接、订阅取消与通道关闭、订单数值缩放边界、完整仓位响应、订单 marketID 隔离和查询历史范围不足。Tracker 覆盖流关闭、关闭时等待消费者、拥塞时保留终态与晚到消息。这些测试使用本地替身，不证明远端 API 在所有错误码下的行为。
+
+本次恢复与预算修复的状态机、十项回归及明确边界见[恢复与预算约束](recovery-budget-guards.md)。
 
 ## 重启、升级和持仓恢复边界
 
@@ -55,10 +57,10 @@
 - 每次可能发送实盘订单前先保存 `Unresolved=true`。同一进程内保留原订单和补救批次，后续恢复确认后才结算，避免重复下单及重复记账。
 - 即时 drain/应急退出按有限批次尝试。暂时没有有效盘口或已确认批次仍未达到目标时，结果保留在 pending，由 actor 后续周期继续恢复；未确认两腿平仓前仍占用 slot 和额度，不把一次尝试结束当成退出完成。
 - **跨进程恢复：checkpoint 未序列化原请求的精确 clientID、订单参数及私有执行批次，因此新进程不重放旧订单。** 启动核对时若左右腿仓位与账本一致，actor 保持 `PAUSED` 进入稳定性观察：每 `CheckpointCheckEvery`（默认 15s）重新核对仓位，连续 `CheckpointGrace`（默认 15m，覆盖已签名交易的有效窗口）一致后自动清除 checkpoint、把当日 PnL 标记为不确定并持久化，随后回到 WARMUP。观察期内仓位出现任何分歧或查询失败都会保持暂停并告警，需人工核实交易所订单终态后再处理。缺入场价的旧账本只暂停普通交易，不阻塞 drain/应急退出。所有本系统订单均为 IOC，观察窗口用于覆盖"已提交交易迟到落地"的窗口；若交易所实现提供订单终态查询，可在此基础上增加按 clientID 的显式复核。
-- 实盘启动需要左右腿仓位查询成功、相互对冲并分别符合账本；不符合时保持暂停。auto 在候选预热/选币之前恢复历史持仓；不能匹配的已持仓市场或无可恢复账本的账户仓位使启动报错。
+- 普通交易恢复需要左右腿仓位查询成功、相互对冲并分别符合账本；不符合时保持暂停。已持久化checkpoint_exit的退出恢复只减当前确认仓位，不要求其继续匹配旧账本。auto 在候选预热/选币之前恢复历史持仓；不能匹配的已持仓市场或无可恢复账本的账户仓位使启动报错。
 - 旧账本缺少 `OpenL/OpenR` 时，没有可靠的入场 PnL 基准，普通策略保持暂停。已成功核对的仓位仍允许显式 drain 和风险应急退出；完成退出必须确认两腿分别平仓且旧订单已完成确认，不会把“净额为零”当作退出。
 - 旧账本的 `OriginalQty=0` 表示无法确认历史入场费用或此前部分成交的分配；即使价格基准存在，也标记为估计。缺少入场价格的退出不声称已知毛利；使用估计价格的普通/补救成交也标记为估计，并持久化每日 `PnLUncertain`。
-- 使用 volume 策略并配置 `volume.daily_cost_budget > 0` 时，当日 PnL 不确定会阻止新开仓，减仓和应急退出仍可执行。预算按 UTC 日期更新；延迟结算记在确认日。历史估计持仓在后续日期结算时仍会使该日预算不确定，不能把估计盈利当成可靠的预算余额。
+- 使用 volume 策略并配置 `volume.daily_cost_budget > 0` 时，PnL不确定标记会持续阻止新开仓，减仓和应急退出仍可执行；标记不随UTC日切自动清除。预算按 UTC 日期更新；延迟结算记在确认日。历史估计持仓在后续日期结算时仍会使该日预算不确定，不能把估计盈利当成可靠的预算余额。
 - auto 退出 actor 前保留它占用的 slot 和额度，只有 `Drained()` 成立并收到 actor 退出结果才释放。SIGTERM 负责取消、保存和等待消费者，不承诺主动清空现有持仓；若执行尚未确认，会留下上述暂停 checkpoint。
 
 ## 采样、回测和验证范围
