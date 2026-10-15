@@ -53,6 +53,12 @@ type PairConfig struct {
 	Adaptive      adaptive.Config
 	Monitor       *monitor.Monitor
 	View          PairView // shared stats/books in auto mode; nil = actor-owned
+	// Checkpoint recovery: after a restart with an unresolved pre-send
+	// checkpoint, positions are re-verified every CheckpointCheckEvery and the
+	// checkpoint is cleared once positions match the ledger continuously for
+	// CheckpointGrace (defaults 5s / 30s). PnL is then marked uncertain.
+	CheckpointCheckEvery time.Duration
+	CheckpointGrace      time.Duration
 }
 
 // PairView is the shared, continuously-updated market view an auto-mode actor
@@ -78,32 +84,34 @@ type PairActor struct {
 	posR  float64
 	exec  *execution.Executor
 
-	bookMu             sync.RWMutex
-	bookL              domain.Book
-	bookR              domain.Book
-	lat                latencyStat
-	margin             marginMonitor
-	volAcc             volumeAcc
-	adaptive           *adaptive.K
-	cnt                atomic.Int64 // signed step counter, readable by the picker
-	busy               atomic.Bool
-	flatPositions      atomic.Bool
-	settled            atomic.Bool
-	draining           atomic.Bool
-	drainConfirmed     atomic.Bool
-	emergencyRequested atomic.Bool
-	riskBlocked        atomic.Bool
-	failBits           atomic.Uint64
-	execMu             sync.Mutex
-	execCancel         context.CancelFunc
-	drainWake          chan struct{}
-	reconciled         bool
-	legacyPrices       bool
-	checkpoint         bool
-	pending            *pendingExecution
-	fatalErr           error
-	failures           []bool
-	failureIndex       int
+	bookMu              sync.RWMutex
+	bookL               domain.Book
+	bookR               domain.Book
+	lat                 latencyStat
+	margin              marginMonitor
+	volAcc              volumeAcc
+	adaptive            *adaptive.K
+	cnt                 atomic.Int64 // signed step counter, readable by the picker
+	busy                atomic.Bool
+	flatPositions       atomic.Bool
+	settled             atomic.Bool
+	draining            atomic.Bool
+	drainConfirmed      atomic.Bool
+	emergencyRequested  atomic.Bool
+	riskBlocked         atomic.Bool
+	failBits            atomic.Uint64
+	execMu              sync.Mutex
+	execCancel          context.CancelFunc
+	drainWake           chan struct{}
+	reconciled          bool
+	legacyPrices        bool
+	checkpoint          bool
+	pending             *pendingExecution
+	fatalErr            error
+	failures            []bool
+	failureIndex        int
+	checkpointSince     time.Time
+	checkpointCheckedAt time.Time
 }
 
 // volumeAcc accumulates daily traded volume and realized PnL for the volume
@@ -352,10 +360,6 @@ func (a *PairActor) reconcile(ctx context.Context) error {
 	}
 	a.reconciled = true
 	a.syncPositionState()
-	if a.checkpoint {
-		a.settled.Store(false)
-		return fmt.Errorf("previous execution is unresolved; verify outstanding orders before resuming")
-	}
 	a.settled.Store(true)
 	for _, st := range a.state.Steps {
 		if st.OpenL <= 0 || st.OpenR <= 0 {
@@ -363,9 +367,62 @@ func (a *PairActor) reconcile(ctx context.Context) error {
 			return fmt.Errorf("step %d lacks entry prices; normal trading paused, drain remains available", st.ID)
 		}
 	}
+	if a.checkpoint {
+		// A previous execution was checkpointed before sending. Positions now
+		// match the ledger, but a late order could still land. Keep trading
+		// paused and require a stable observation window before clearing.
+		a.settled.Store(false)
+		a.state.Mode = strategy.ModePaused
+		if a.checkpointSince.IsZero() {
+			a.checkpointSince = time.Now()
+		}
+		a.log.Warn("unresolved execution from a previous run; positions match the ledger, verifying stability before resuming")
+		return nil
+	}
 	a.state.Mode = strategy.ModeWarmup
 	a.log.Info("position reconciliation passed")
 	return nil
+}
+
+// recoverCheckpoint re-verifies positions after a restart left an unresolved
+// pre-send checkpoint. The checkpoint is cleared only after positions match
+// the ledger continuously for the configured grace period; daily PnL is then
+// marked uncertain because the interrupted execution's fills are unknown.
+func (a *PairActor) recoverCheckpoint(ctx context.Context, now time.Time) {
+	every := a.cfg.CheckpointCheckEvery
+	if every <= 0 {
+		every = 5 * time.Second
+	}
+	if now.Sub(a.checkpointCheckedAt) < every {
+		return
+	}
+	a.checkpointCheckedAt = now
+	if err := a.reconcile(ctx); err != nil {
+		// A mismatch restarts the stability window; clearing requires the
+		// positions to match continuously for the whole grace period.
+		a.checkpointSince = time.Time{}
+		a.log.Error("checkpoint recovery re-reconcile", "err", err)
+		a.record(monitor.KindError, func(e *monitor.Event) { e.Msg = fmt.Sprintf("checkpoint recovery: %v", err) })
+		return
+	}
+	grace := a.cfg.CheckpointGrace
+	if grace <= 0 {
+		grace = 30 * time.Second
+	}
+	if now.Sub(a.checkpointSince) < grace {
+		return
+	}
+	a.checkpoint = false
+	a.volAcc.pnlUncertain = true
+	if err := a.persist(); err != nil {
+		a.log.Error("persist checkpoint recovery", "err", err)
+		return
+	}
+	a.settled.Store(true)
+	if !a.legacyPrices {
+		a.state.Mode = strategy.ModeWarmup
+	}
+	a.log.Warn("cleared unresolved checkpoint after a stable position match; daily PnL marked uncertain")
 }
 
 // Run the actor until ctx is done.
@@ -471,6 +528,10 @@ func (a *PairActor) Run(ctx context.Context) (retErr error) {
 			now := time.Now()
 			if a.pending != nil {
 				a.resolvePending(ctx)
+				continue
+			}
+			if a.checkpoint {
+				a.recoverCheckpoint(ctx, now)
 				continue
 			}
 			if a.emergencyRequested.Load() && a.reconciled && !a.checkpoint {

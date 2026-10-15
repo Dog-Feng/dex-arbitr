@@ -34,16 +34,20 @@
 | F24 | Marshal 失败覆盖旧账本，落盘错误仅记录日志。 | 保存前验证及序列化；同 key 写入串行，临时文件 Sync、Rename、目录 Sync。发送前写未决 checkpoint；保存失败暂停并返回运行错误。采样写入/同步失败也传播。 | `store.TestSavePreservesPreviousStateOnInvalidInput`；`TestRejectInvalidSettlementBeforeReplacingState`；`TestSaveWriteFailureCleansTemporaryFile`；`TestStoreCloseAndReopen`；`TestSamplePropagatesWriteAndCloseErrors` |
 | F25 | selfcheck 前置失败仍 live，有底仓或错误注入遗留仓位。 | [live.go](../cmd/selfcheck/live.go) 要求两腿零基线；任一前置检查失败即停止。rescue 注入是明确的本地拒绝；每次退出先恢复旧订单结果，再用独立有时限的清理 context 减仓并复核两腿。只读签名使用实际 venue/链配置。 | `selfcheck.TestRunChecksFailureStopsBeforeTrading`；`TestLiveFlowRequiresZeroBaseline`；`TestLiveRoundTripAndRescueAreFlat`；`TestLiveUnknownOpeningOutcomeRecoveredWithoutResubmit`；`TestReadOnlySigningUsesActualVenueEphemeralSigner` |
 | F26 | 数量校验放过额外精度，空匹配后缀导致死循环。 | [matcher.go](../internal/symbols/matcher.go) 只容忍浮点表示误差，检查有限数值和精度；最小数量向上对齐。Normalize 忽略空后缀，配置入口也拒绝空后缀。 | `symbols.TestValidQtyAllowsRepresentationErrorOnly`；`TestValidQtyRejectsUntradableInputs`；`TestNormalizeIgnoresEmptySuffixes`；`TestPairMinimumDoesNotRoundDownFractionOfStep` |
+| F27 | 重启后未决 checkpoint 与账本一致时永久暂停，没有自动恢复路径。 | [pair.go](../internal/engine/pair.go) 仓位与账本一致时先通过核对，但保持 PAUSED 并进入稳定性观察：每 5s 重新核对，连续 30s（均可配置）一致才清除 checkpoint，期间不认证 Flat/Drained；清除后每日 PnL 标记不确定并持久化。仓位出现分歧仍暂停待人工处理。 | `engine.TestCheckpointClearsAfterStablePositionMatch`；`TestCheckpointKeepsPauseWhilePositionsDiverge` |
+| F28 | 恢复的历史持仓不占用账户名义预算，总额闸门只约束晋升。 | [auto.go](../internal/engine/auto.go) 恢复时按 `max(pair_budget, 实际名义)` 预留预算并累计；超出 `auto.max_total_notional` 的恢复对直接进入 drain，预算内且有空位才恢复交易。 | `engine.TestRestoredExposureRespectsAccountNotionalBudget` |
+| F29 | 应急/降出平仓用账本数量与成交量强等，精度尘埃使退账本卡在重试循环。 | [settlement.go](../internal/engine/settlement.go) 按每条腿实际平仓量（直接成交+补救）计算均价与 PnL，账本数量与成交量超过原生精度时仅标记不确定，不再报错卡死。 | `engine.TestUnwindAccountingToleratesFinePrecisionDust` |
+| F30 | `volume.min_inventory >= max_steps` 使库存地板永不可平，静默停止 churn。 | [config.go](../internal/config/config.go) 校验 volume 策略下 `min_inventory` 必须小于对应 `max_steps`（manual 逐对、auto 按 `auto.max_steps`），否则拒绝启动。 | `config.TestLoadVenueAndPairIdentity`（`volume floor at pair/auto max steps`） |
 
 除上述映射外，适配器回归还覆盖 WS 在 Dial/Close 竞态下关闭连接、订阅取消与通道关闭、订单数值缩放边界、完整仓位响应、订单 marketID 隔离和查询历史范围不足。Tracker 覆盖流关闭、关闭时等待消费者、拥塞时保留终态与晚到消息。这些测试使用本地替身，不证明远端 API 在所有错误码下的行为。
 
 ## 重启、升级和持仓恢复边界
 
 - 本轮仅修改代码和执行测试/编译，不会自动启动 arbd、scanner、selfcheck、监控端口或 systemd。README 中的运行/部署命令需要操作者明确选择执行。
-- `state_dir` 是单写者目录。第二个进程使用同一目录会被锁拒绝；paper 与 live 状态仍分别使用原有文件 key。升级前保留完整状态目录和配置，不能把空步骤文件视为没有未决订单。
+- `state_dir` 应由单个进程独占使用。本版本已移除目录级进程锁（Windows 兼容性），并发双进程写入会互相覆盖状态；paper 与 live 状态仍分别使用原有文件 key。升级前保留完整状态目录和配置，不能把空步骤文件视为没有未决订单。
 - 每次可能发送实盘订单前先保存 `Unresolved=true`。同一进程内保留原订单和补救批次，后续恢复确认后才结算，避免重复下单及重复记账。
 - 即时 drain/应急退出按有限批次尝试。暂时没有有效盘口或已确认批次仍未达到目标时，结果保留在 pending，由 actor 后续周期继续恢复；未确认两腿平仓前仍占用 slot 和额度，不把一次尝试结束当成退出完成。
-- **跨进程恢复仍有限制：checkpoint 未序列化原请求的精确 clientID、订单参数及私有执行批次。** 进程退出后，新 actor 不能自动重放这些请求，也不能仅凭当前零仓位证明没有迟到订单。发现 `Unresolved=true` 时保持 `PAUSED`，包括步骤为空的状态；需要先核实交易所的订单终态与左右腿实际仓位，再处理状态恢复。本修复没有提供跨进程自动重放或状态修复命令。
+- **跨进程恢复：checkpoint 未序列化原请求的精确 clientID、订单参数及私有执行批次，因此新进程不重放旧订单。** 启动核对时若左右腿仓位与账本一致，actor 保持 `PAUSED` 进入稳定性观察：每 `CheckpointCheckEvery`（默认 5s）重新核对仓位，连续 `CheckpointGrace`（默认 30s）一致后自动清除 checkpoint、把当日 PnL 标记为不确定并持久化，随后回到 WARMUP。观察期内仓位出现任何分歧或查询失败都会保持暂停并告警，需人工核实交易所订单终态后再处理。所有本系统订单均为 IOC，观察窗口用于覆盖"已提交交易迟到落地"的窗口；若交易所实现提供订单终态查询，可在此基础上增加按 clientID 的显式复核。
 - 实盘启动需要左右腿仓位查询成功、相互对冲并分别符合账本；不符合时保持暂停。auto 在候选预热/选币之前恢复历史持仓；不能匹配的已持仓市场或无可恢复账本的账户仓位使启动报错。
 - 旧账本缺少 `OpenL/OpenR` 时，没有可靠的入场 PnL 基准，普通策略保持暂停。已成功核对的仓位仍允许显式 drain 和风险应急退出；完成退出必须确认两腿分别平仓且旧订单已完成确认，不会把“净额为零”当作退出。
 - 旧账本的 `OriginalQty=0` 表示无法确认历史入场费用或此前部分成交的分配；即使价格基准存在，也标记为估计。缺少入场价格的退出不声称已知毛利；使用估计价格的普通/补救成交也标记为估计，并持久化每日 `PnLUncertain`。

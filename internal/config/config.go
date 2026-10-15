@@ -449,6 +449,19 @@ func (c *Config) validate() error {
 	if c.Strategy.Kind == "volume" && c.Volume.LossToleranceBps != 0 {
 		return fmt.Errorf("volume.loss_tolerance_bps must be 0: volume uses open_bps=0 and close_bps=0")
 	}
+	if c.Strategy.Kind == "volume" && c.Volume.MinInventory > 0 {
+		if c.Strategy.PairSelection == "auto" {
+			if c.Volume.MinInventory >= c.Auto.MaxSteps {
+				return fmt.Errorf("volume.min_inventory (%d) must be < auto.max_steps (%d), otherwise the inventory floor can never be closed", c.Volume.MinInventory, c.Auto.MaxSteps)
+			}
+		} else {
+			for _, p := range c.Pairs {
+				if c.Volume.MinInventory >= p.MaxSteps {
+					return fmt.Errorf("pair %s: volume.min_inventory (%d) must be < max_steps (%d), otherwise the inventory floor can never be closed", p.Base, c.Volume.MinInventory, p.MaxSteps)
+				}
+			}
+		}
+	}
 	switch c.Strategy.PairSelection {
 	case "manual", "auto":
 	default:

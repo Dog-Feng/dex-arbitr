@@ -437,6 +437,7 @@ func (rt *runtime) restorePairs(ctx context.Context, cands []*candidate, active 
 		}
 	}
 	trading := 0
+	reserved := 0.0
 	for _, key := range keys {
 		c, st := byKey[key], states[key]
 		qty, usedL, usedR := 0.0, 0.0, 0.0
@@ -456,14 +457,17 @@ func (rt *runtime) restorePairs(ctx context.Context, cands []*candidate, active 
 		}
 		// Restore every exposure, but constrain admission before the first
 		// picker tick. Excess saved pairs must not open during a short warmup
-		// or the demotion dwell period.
-		draining := c.excluded || trading >= rt.cfg.Auto.TopY
+		// or the demotion dwell period, and restored exposure is reserved
+		// against the account notional budget like a promoted pair would be.
+		budget := math.Max(rt.pairBudget(), math.Max(usedL, usedR))
+		reserved += budget
+		overBudget := rt.cfg.Auto.MaxTotalNotional > 0 && reserved > rt.cfg.Auto.MaxTotalNotional
+		draining := c.excluded || trading >= rt.cfg.Auto.TopY || overBudget
 		if draining {
 			a.Drain()
 		} else {
 			trading++
 		}
-		budget := math.Max(rt.pairBudget(), math.Max(usedL, usedR))
 		ar := rt.startActor(ctx, c, a, budget, active, wg)
 		ar.draining = draining
 	}

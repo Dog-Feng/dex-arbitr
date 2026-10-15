@@ -68,6 +68,8 @@ func TestLoadVenueAndPairIdentity(t *testing.T) {
 		{"shared market between combinations", venues + "pairs:\n  - {base: BTC, left: L, right: R, step_qty: 1, max_steps: 1}\n  - {base: BTCUSD, left: L, right: C, step_qty: 1, max_steps: 1}\n", "share market"},
 		{"nonfinite pair size", venues + "pairs:\n  - {base: BTC, left: L, right: R, step_qty: .nan, max_steps: 1}\n", "pairs[0].step_qty must be finite"},
 		{"zero pair size", venues + "pairs:\n  - {base: BTC, left: L, right: R, step_qty: 0, max_steps: 1}\n", "step_qty and max_steps"},
+		{"volume floor at pair max steps", venues + "strategy:\n  kind: volume\nvolume:\n  min_inventory: 2\npairs:\n  - {base: BTC, left: L, right: R, step_qty: 1, max_steps: 2}\n", "min_inventory"},
+		{"volume floor at auto max steps", venues + "strategy:\n  kind: volume\n  pair_selection: auto\nvolume:\n  min_inventory: 3\nauto:\n  top_y: 1\n  max_steps: 3\n", "min_inventory"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if _, err := loadTestConfig(t, tc.data); err == nil || !strings.Contains(err.Error(), tc.want) {

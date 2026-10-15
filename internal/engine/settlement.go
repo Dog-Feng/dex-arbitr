@@ -482,14 +482,23 @@ func (a *PairActor) finishUnwind(res execution.Result) error {
 	delta := -fees
 	uncertain := res.L.PriceEstimated || res.R.PriceEstimated || res.L.RescuePriceEstimated || res.R.RescuePriceEstimated
 	qty := math.Abs(a.expectedL())
-	if qty > 0 {
-		lp, err := closePrice(res.L, qty)
+	ql := res.L.Filled + res.L.RescueFilled
+	qr := res.R.Filled + res.R.RescueFilled
+	if qty > 0 && (ql > 0 || qr > 0) {
+		// Price each leg against the quantity it actually closed, not the
+		// ledger quantity: fine-precision dust on one venue must not wedge the
+		// unwind accounting in a retry loop after both legs are already flat.
+		lp, err := closePrice(res.L, ql)
 		if err != nil {
 			return err
 		}
-		rp, err := closePrice(res.R, qty)
+		rp, err := closePrice(res.R, qr)
 		if err != nil {
 			return err
+		}
+		if math.Abs(ql-qty) >= math.Pow10(-a.cfg.Pair.Left.SizeDecimals)/2 ||
+			math.Abs(qr-qty) >= math.Pow10(-a.cfg.Pair.Right.SizeDecimals)/2 {
+			uncertain = true
 		}
 		for _, st := range a.state.Steps {
 			uncertain = uncertain || st.PriceEstimated
