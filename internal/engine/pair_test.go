@@ -13,6 +13,7 @@ import (
 	"github.com/Dog-Feng/dex-arbitr/internal/store"
 	"github.com/Dog-Feng/dex-arbitr/internal/strategy"
 	"github.com/Dog-Feng/dex-arbitr/internal/symbols"
+	"github.com/Dog-Feng/dex-arbitr/internal/volatility"
 )
 
 type actorTestVenue struct {
@@ -94,6 +95,18 @@ func (e actorTestEstimator) Stats() estimator.Stats {
 func actorTestBook(name string, bid float64) domain.Book {
 	return domain.Book{Venue: name, MarketID: 1, Ts: time.Now(),
 		Bids: []domain.Level{{Price: bid, Size: 1}}, Asks: []domain.Level{{Price: bid + 0.1, Size: 1}}}
+}
+
+// readyVolEstimator returns a warmed short-horizon volatility estimator whose
+// most recent sample is current, so the volatility admission gate passes
+// without waiting for a live book cadence.
+func readyVolEstimator() *volatility.Estimator {
+	now := time.Now()
+	v := volatility.New(volatility.Params{Interval: 100 * time.Millisecond, Horizon: 500 * time.Millisecond, HalfLife: time.Minute})
+	for i := 0; i <= 5; i++ {
+		v.AddAt(now.Add(time.Duration(i-5)*100*time.Millisecond), float64(i))
+	}
+	return v
 }
 
 func awaitActorCondition(t *testing.T, description string, condition func() bool) {
@@ -179,6 +192,7 @@ func TestPairActorUpdatesBooksDuringExecutionAndRescue(t *testing.T) {
 					Params: strategy.Params{StepQty: 0.01, MaxSteps: 1, OpenBps: 1, CloseBps: 1, DepthMult: 2},
 					Est:    actorTestEstimator{mean: mean}, Store: st, Tracker: tracker, IDs: execution.NewIDGen(), ExecCfg: cfg,
 					SampleEvery: time.Millisecond, MaxBookAge: time.Second,
+					Vol: readyVolEstimator(), VolEvery: time.Hour, VolMaxAge: time.Second,
 					IntervalMin: 20 * time.Millisecond, IntervalMax: 20 * time.Millisecond,
 				})
 				if err != nil {

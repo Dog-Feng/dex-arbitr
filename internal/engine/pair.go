@@ -70,6 +70,7 @@ type PairView interface {
 	Quote(now time.Time, maxAge time.Duration) (spread.Quote, bool)
 	Mean() (float64, bool) // mean bps, ready
 	VolBps() float64
+	VolReady() bool // short-horizon volatility warm and fresh
 	LegVol(venue string) float64
 	Stats() estimator.Stats
 }
@@ -117,6 +118,7 @@ type PairActor struct {
 	checkpointExit      bool
 	checkpointExitSince time.Time
 	startupRecovered    atomic.Bool
+	volBlockLoggedAt    time.Time
 }
 
 // volumeAcc accumulates daily traded volume and realized PnL for the volume
@@ -547,7 +549,8 @@ func (a *PairActor) Run(ctx context.Context) (retErr error) {
 				e.Mode = a.state.Mode.String()
 				e.MuBps, e.SigmaBps, e.TickK, e.FailRate = st.Mean, a.volBps(), a.tickK(), a.FailRate()
 			})
-			a.log.Info("status", "mode", a.state.Mode, "steps", a.state.Counter(), "day_volume_usd", a.volAcc.volumeUSD, "day_pnl_usd", a.volAcc.pnlUSD, "fail_rate", a.FailRate())
+			a.log.Info("status", "mode", a.state.Mode, "steps", a.state.Counter(), "day_volume_usd", a.volAcc.volumeUSD,
+				"day_pnl_usd", a.volAcc.pnlUSD, "fail_rate", a.FailRate(), "sigma_bps", round4(a.volBps()), "vol_ready", a.volReady(time.Now()))
 			a.lat.reset()
 		case <-decide.C:
 			now := time.Now()
@@ -596,6 +599,17 @@ func (a *PairActor) Run(ctx context.Context) (retErr error) {
 			mu, ready := a.mean()
 			act := a.cfg.Strategy.Decide(a.cfg.Params, a.state, q, mu, ready, a.volBps())
 			if act.Kind == strategy.None {
+				continue
+			}
+			if (act.Kind == strategy.Open || act.Kind == strategy.Close) && !a.volReady(now) {
+				// Volatility is the key PnL protection: without it the open
+				// threshold loses its adverse-move buffer and closes cannot be
+				// priced against a trustworthy short-horizon move, so both are
+				// blocked until the short-horizon sigma chain is warm again.
+				if time.Since(a.volBlockLoggedAt) > 30*time.Second {
+					a.log.Warn("trading blocked until short-horizon volatility is ready", "kind", act.Kind, "sigma_bps", round4(a.volBps()))
+					a.volBlockLoggedAt = time.Now()
+				}
 				continue
 			}
 			a.resetVolumeIfNewDay(now)
@@ -683,6 +697,21 @@ func (a *PairActor) volBps() float64 {
 	}
 	return a.cfg.Vol.VolAt(time.Now())
 }
+
+// volReady reports whether the short-horizon volatility chain is warm and
+// fresh. Strategy openings and closings require it; only the safety exits
+// (rescue, drain and emergency unwind) proceed without it.
+func (a *PairActor) volReady(now time.Time) bool {
+	if a.cfg.View != nil {
+		return a.cfg.View.VolReady()
+	}
+	if a.cfg.Vol == nil {
+		return false
+	}
+	return a.cfg.Vol.ReadyAt(now)
+}
+
+func round4(v float64) float64 { return math.Round(v*10000) / 10000 }
 
 // record publishes a runtime event to the optional monitor.
 func (a *PairActor) record(kind monitor.Kind, fill func(*monitor.Event)) {

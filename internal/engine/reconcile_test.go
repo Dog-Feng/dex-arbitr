@@ -49,6 +49,7 @@ func newReconcileTestActor(t *testing.T, ctx context.Context, l, r *actorTestVen
 		Params: strategy.Params{StepQty: 0.01, MaxSteps: 1, OpenBps: 1, CloseBps: 1, DepthMult: 2},
 		Est:    est, Store: st, Tracker: tr, IDs: execution.NewIDGen(), ExecCfg: ec,
 		SampleEvery: time.Millisecond, MaxBookAge: time.Second,
+		Vol: readyVolEstimator(), VolEvery: time.Hour, VolMaxAge: time.Second,
 		IntervalMin: time.Millisecond, IntervalMax: time.Millisecond,
 	})
 	if err != nil {

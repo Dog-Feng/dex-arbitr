@@ -94,6 +94,12 @@ func (c *candidate) VolBps() float64 {
 	return c.vol.VolAt(time.Now())
 }
 
+func (c *candidate) VolReady() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.vol.ReadyAt(time.Now())
+}
+
 func (c *candidate) LegVol(venue string) float64 {
 	c.mu.RLock()
 	defer c.mu.RUnlock()

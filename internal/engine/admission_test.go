@@ -108,6 +108,12 @@ func TestAutoRecoveryReservesOldExposureAndNewSteps(t *testing.T) {
 			rt.cfg.Strategy.IntervalMin, rt.cfg.Strategy.IntervalMax = time.Millisecond, time.Millisecond
 			rt.cfg.Strategy.DepthMult = 1
 			c := lifecycleCandidate("A", "L", "R", 1, 0)
+			// Warm the shared volatility view before restoration, so funded
+			// recovery can exercise its allocated openings.
+			now := time.Now()
+			for i := 0; i <= 5; i++ {
+				c.vol.AddAt(now.Add(time.Duration(i-5)*100*time.Millisecond), float64(i))
+			}
 			if err := rt.store.Save(c.key, savedLifecycleStep()); err != nil {
 				t.Fatal(err)
 			}
@@ -165,6 +171,10 @@ func TestAutoSizingFailureBlocksOpenButPreservesClose(t *testing.T) {
 			rt.cfg.Strategy.DepthMult = 2
 			c := lifecycleCandidate("A", "L", "R", 1, 0)
 			c.notional = .1
+			now := time.Now()
+			for i := 0; i <= 5; i++ {
+				c.vol.AddAt(now.Add(time.Duration(i-5)*100*time.Millisecond), float64(i))
+			}
 			if profitable {
 				c.bookR = actorTestBook("R", 100)
 			}
@@ -268,6 +278,12 @@ func TestConcurrentAutoActorsRemainWithinFixedAccountAllocations(t *testing.T) {
 	rt.cfg.Strategy.IntervalMin, rt.cfg.Strategy.IntervalMax = time.Millisecond, time.Millisecond
 	rt.cfg.Strategy.DepthMult = 1
 	a, b := lifecycleCandidate("A", "L", "R", 1, 0), lifecycleCandidate("B", "L", "R", 2, 0)
+	now := time.Now()
+	for _, c := range []*candidate{a, b} {
+		for i := 0; i <= 5; i++ {
+			c.vol.AddAt(now.Add(time.Duration(i-5)*100*time.Millisecond), float64(i))
+		}
+	}
 	active := map[string]*activeRun{}
 	var wg sync.WaitGroup
 	stopLifecycleActors(t, active, &wg)

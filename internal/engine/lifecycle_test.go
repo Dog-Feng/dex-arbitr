@@ -364,6 +364,12 @@ func TestActorWaitsForInitialRiskAssessmentBeforeOpening(t *testing.T) {
 	}
 	rt.tracker, rt.ids = tr, execution.NewIDGen()
 	a := lifecycleActor(t, rt, c, false)
+	// Warm the shared volatility view: the actor must not open before the
+	// short-horizon sigma chain is ready, even after risk admission passes.
+	now := time.Now()
+	for i := 0; i <= 5; i++ {
+		c.vol.AddAt(now.Add(time.Duration(i-5)*100*time.Millisecond), float64(i))
+	}
 	done := make(chan error, 1)
 	go func() { done <- a.Run(ctx) }()
 	t.Cleanup(func() {

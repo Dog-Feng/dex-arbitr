@@ -6,29 +6,36 @@ import (
 	"time"
 )
 
+// Params configure a realized-variance volatility estimator.
 type Params struct {
-	Interval time.Duration
-	Horizon  time.Duration
-	HalfLife time.Duration
+	Interval time.Duration // nominal sampling interval
+	Horizon  time.Duration // increment horizon whose volatility is estimated
+	HalfLife time.Duration // EWMA half-life of the realized variance
 }
 
-type increment struct {
-	start, end time.Time
-	square     float64
-}
-
-// Estimator tracks realized variance over an actual time horizon. Disconnected
-// samples cannot be treated as short-horizon returns.
+// Estimator tracks sigma of the horizon-length increment of a series using
+// realized variance: every accepted sample contributes a return against the
+// previous one, the squared returns of the trailing horizon are summed, then
+// exponentially smoothed. Readiness is count-based: once the horizon's worth
+// of increments has accumulated, the estimator stays ready regardless of how
+// far apart samples arrive. A long disconnect inflates the next return and
+// therefore sigma, which raises the opening threshold; it never restarts the
+// chain.
 type Estimator struct {
-	p             Params
-	rets          []increment
-	rv            float64
-	last          float64
-	first, lastAt time.Time
-	ready         bool
-	haveRV        bool
+	step  int     // Horizon / Interval increments
+	alpha float64 // EWMA weight per sample
+
+	rets   []float64 // ring of per-sample returns
+	idx    int
+	cnt    int // number of returns in the ring
+	sum    float64
+	rv     float64
+	haveRV bool
+	last   float64
+	have   bool
 }
 
+// New builds an estimator; zero params fall back to 100ms / 500ms / 1m.
 func New(p Params) *Estimator {
 	if p.Interval <= 0 {
 		p.Interval = 100 * time.Millisecond
@@ -36,103 +43,77 @@ func New(p Params) *Estimator {
 	if p.Horizon <= 0 {
 		p.Horizon = 500 * time.Millisecond
 	}
-	if p.Horizon < p.Interval {
-		p.Horizon = p.Interval
-	}
 	if p.HalfLife <= 0 {
 		p.HalfLife = time.Minute
 	}
-	return &Estimator{p: p}
+	step := int(p.Horizon / p.Interval)
+	if step < 1 {
+		step = 1
+	}
+	return &Estimator{
+		step:  step,
+		alpha: 1 - math.Exp(-math.Ln2*float64(p.Interval)/float64(p.HalfLife)),
+		rets:  make([]float64, step),
+	}
 }
 
 // Reset discards both the previous price and the variance history.
 func (e *Estimator) Reset() {
-	e.rets = nil
-	e.rv = 0
-	e.last = 0
-	e.first = time.Time{}
-	e.lastAt = time.Time{}
-	e.ready = false
-	e.haveRV = false
+	e.rets = make([]float64, e.step)
+	e.rv, e.sum, e.idx, e.cnt = 0, 0, 0, 0
+	e.last, e.have, e.haveRV = 0, false, false
 }
 
-// Add is the compatibility entry point for an explicitly regular sample series.
-// Runtime and replay callers should use AddAt with the actual sample timestamp.
+// Add is the compatibility entry point for a regular sample series.
 func (e *Estimator) Add(x float64) bool {
-	t := e.lastAt.Add(e.p.Interval)
-	if e.lastAt.IsZero() {
-		t = time.Unix(0, 1)
-	}
-	return e.AddAt(t, x)
+	return e.AddAt(time.Time{}, x)
 }
 
-// AddAt accepts increasing timestamps and finite prices. A gap larger than one
-// and a half sampling intervals restarts warmup instead of inventing a return.
-func (e *Estimator) AddAt(t time.Time, x float64) bool {
-	if t.IsZero() || math.IsNaN(x) || math.IsInf(x, 0) {
+// AddAt feeds the next sample and reports readiness. The timestamp is not
+// used: samples count as increments regardless of how far apart they arrive,
+// matching the original count-based semantics. A gap produces a large return
+// and therefore a large sigma, which the opening threshold then blocks.
+func (e *Estimator) AddAt(_ time.Time, x float64) bool {
+	if math.IsNaN(x) || math.IsInf(x, 0) {
 		return false
 	}
-	if !e.lastAt.IsZero() && !t.After(e.lastAt) {
-		return e.ReadyAt(t)
-	}
-	if e.lastAt.IsZero() || t.Sub(e.lastAt) > e.p.Interval+e.p.Interval/2 {
-		e.Reset()
-		e.first, e.lastAt, e.last = t, t, x
-		return false
-	}
-	dt := t.Sub(e.lastAt)
-	r := x - e.last
-	e.rets = append(e.rets, increment{start: e.lastAt, end: t, square: r * r})
-	cutoff := t.Add(-e.p.Horizon)
-	first := 0
-	for first < len(e.rets) && !e.rets[first].end.After(cutoff) {
-		first++
-	}
-	if first > 0 {
-		copy(e.rets, e.rets[first:])
-		e.rets = e.rets[:len(e.rets)-first]
-	}
-	e.ready = t.Sub(e.first) >= e.p.Horizon
-	if e.ready {
-		sum := 0.0
-		for _, ret := range e.rets {
-			weight := 1.0
-			if ret.start.Before(cutoff) {
-				weight = float64(ret.end.Sub(cutoff)) / float64(ret.end.Sub(ret.start))
+	if e.have {
+		r := x - e.last
+		old := e.rets[e.idx]
+		e.sum += r*r - old*old
+		e.rets[e.idx] = r
+		e.idx = (e.idx + 1) % len(e.rets)
+		if e.cnt < len(e.rets) {
+			e.cnt++
+		}
+		if e.cnt >= len(e.rets) {
+			if !e.haveRV {
+				e.rv, e.haveRV = e.sum, true
+			} else {
+				e.rv += e.alpha * (e.sum - e.rv)
 			}
-			sum += weight * ret.square
-		}
-		if !e.haveRV {
-			e.rv = sum
-			e.haveRV = true
-		} else {
-			alpha := -math.Expm1(-math.Ln2 * float64(dt) / float64(e.p.HalfLife))
-			e.rv += alpha * (sum - e.rv)
 		}
 	}
-	e.lastAt, e.last = t, x
-	return e.ready
+	e.last = x
+	e.have = true
+	return e.Ready()
 }
 
-func (e *Estimator) Ready() bool { return e.ready }
+// Ready reports whether a full horizon of increments has been observed. It
+// never expires: once warm, the chain stays warm across any gap.
+func (e *Estimator) Ready() bool { return e.cnt >= len(e.rets) }
 
-// ReadyAt is a pure read: the most recent sample must still be fresh.
-func (e *Estimator) ReadyAt(t time.Time) bool {
-	return e.ready && !t.Before(e.lastAt) && t.Sub(e.lastAt) <= e.p.Interval+e.p.Interval/2
-}
+// ReadyAt is a pure read retained for interface compatibility. Readiness does
+// not depend on real time.
+func (e *Estimator) ReadyAt(time.Time) bool { return e.Ready() }
 
+// Vol returns sigma of the horizon increment, or 0 before Ready.
 func (e *Estimator) Vol() float64 {
-	if !e.ready || e.rv <= 0 {
+	if !e.Ready() || e.rv <= 0 {
 		return 0
 	}
 	return math.Sqrt(e.rv)
 }
 
-// VolAt returns zero for an expired or warming estimator. Use ReadyAt to
-// distinguish a valid zero volatility from missing data.
-func (e *Estimator) VolAt(t time.Time) float64 {
-	if !e.ReadyAt(t) {
-		return 0
-	}
-	return e.Vol()
-}
+// VolAt is a pure read; sigma stays available across gaps.
+func (e *Estimator) VolAt(time.Time) float64 { return e.Vol() }

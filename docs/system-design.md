@@ -98,7 +98,7 @@ SL    = (L.bid1 - R.ask1) / mid      // 卖左买右的可成交价差
 - μ：`Mid` 的滑动均值（SMA），窗口 2h、1s 采样、60m 预热、覆盖率 >=80%，O(1) 更新。
 - σ（价差）：`Mid` 的实现波动率，100ms 采样、500ms 窗口 sum(Δs)^2 滚动和 + EWMA（半衰期 1m），σ=sqrt(RV)。
 - σ（腿价）：`bookL.Mid()`/`bookR.Mid()` 各自估计，用于单腿让价（腿价波动 = 标的 + 价差，比价差 σ 大）。
-- 开仓门槛：`dev >= open_bps + fee_bps + vol_k*σ`，其中 `devLS = LS-μ`、`devSL = SL+μ`，`fee_bps` 为该 pair 的往返 taker 费（由两所 TakerFee 合成，净成本）。
+- 开仓门槛：`dev >= open_bps + fee_bps + vol_k*σ`，其中 `devLS = LS-μ`、`devSL = SL+μ`，`fee_bps` 为该 pair 的往返 taker 费（由两所 TakerFee 合成，净成本）。**σ 链路必须就绪才允许开平仓**：σ 是反向波动的预扣缓冲，缺失时门槛退化为纯手续费、平仓也无法对短期反向移动定价，因此 actor 在 σ 未 warm（未攒满增量）时拦截策略的 Open 与 Close；仅救援、drain 与应急清仓等安全退出路径继续执行。σ 一旦就绪不因断流作废：断流会把下一次增量放大、σ 随之变大，开仓门槛自然抬高，由公式兜底。
 - 平仓门槛：按两腿实际开平价差计算 USD 毛利，减去存储的入场费用和预计退出费用，再以固定入场参考价格转换 bps，要求净利 `>= close_bps`。不同价格基准的入场/退出 bps 不能直接相加。
 - EntryBps：开仓成交价差的真实值，分母用成交时 mid `(lPx+rPx)/2`。
 
@@ -152,7 +152,7 @@ WARMUP --(μ 就绪)--> RUNNING <-> REDUCE_ONLY
 ### 7.3 一次决策（Decide，纯函数）
 
 1. 先平仓：满足 `profit >= close_bps + fee_bps` 的步按 close_order 排序取最优；`|counter| > min_inventory` 才平（刷量库存地板）。
-2. 再开仓：仅 RUNNING 且 μ 就绪；`dev >= open_bps + fee_bps + vol_k*σ`、同方向、`|counter| < max_steps`、两腿一档深度 >= `step_qty*depth_mult`。
+2. 再开仓：仅 RUNNING、μ 就绪且 σ 就绪；`dev >= open_bps + fee_bps + vol_k*σ`、同方向、`|counter| < max_steps`、两腿一档深度 >= `step_qty*depth_mult`。
 3. 都不满足则不动。
 
 注：`volume` 策略自己将额外 `open_bps/close_bps` 固定为 `0 / 0`，扫描器与 actor 共用该参数规则；手续费、`vol_k`、深度和预算仍生效。显式 `vol_k: 0` 可关闭波动过滤，不跳过均值预热。旧兼容字段 `volume.loss_tolerance_bps` 在 volume 模式下必须为零，避免把零门槛改成负门槛。四种组合详见 [策略与选币完整链路](strategy-selection-flow.md)。
