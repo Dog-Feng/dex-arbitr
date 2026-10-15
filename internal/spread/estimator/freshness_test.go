@@ -93,3 +93,52 @@ func TestSMAWarmupRequiresElapsedTimeAndRestartsAfterEmptyWindow(t *testing.T) {
 		t.Fatalf("full-window warmup became impossible: %+v", s.Stats())
 	}
 }
+
+func TestSMASingleSlotWarmsAcrossContinuousSamplesAndRestartsAfterGap(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		window  time.Duration
+		offsets []time.Duration
+	}{
+		{"regular", 2 * time.Second, []time.Duration{0, 2 * time.Second, 4 * time.Second, 6 * time.Second}},
+		{"nonintegral window", 3 * time.Second, []time.Duration{0, 2 * time.Second, 4 * time.Second, 6 * time.Second}},
+		// Adjacent actual samples can overwrite the same bucket and then cross
+		// two buckets when the ticker jitters either side of a boundary.
+		{"ticker jitter", 2 * time.Second, []time.Duration{time.Millisecond, 2*time.Second - time.Millisecond, 4*time.Second + time.Millisecond, 6*time.Second - time.Millisecond}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := NewSMA(Params{Window: tc.window, MinWarmup: 2 * time.Second, MinCoverage: 1, Interval: 2 * time.Second})
+			start := time.Unix(1000, 0)
+			for i, offset := range tc.offsets {
+				at := start.Add(offset)
+				s.Update(at, float64(i))
+				wantReady := offset-tc.offsets[0] >= 2*time.Second
+				if s.Ready() != wantReady || s.StatsAt(at).Ready != wantReady {
+					t.Fatalf("sample %d: stats=%+v, want ready=%t", i, s.StatsAt(at), wantReady)
+				}
+				if st := s.StatsAt(at); st.Samples != 1 || st.Mean != float64(i) || st.Coverage != 1 {
+					t.Fatalf("single-slot replacement retained old values: %+v", st)
+				}
+			}
+			last := start.Add(tc.offsets[len(tc.offsets)-1])
+			if s.StatsAt(last.Add(4 * time.Second)).Ready {
+				t.Fatal("unsampled window stayed ready")
+			}
+			// Missing a complete expected sample is a real interruption, even
+			// for a one-slot ring. The next sample must begin a fresh warmup.
+			restart := last.Add(4 * time.Second)
+			s.Update(restart, 20)
+			if s.Ready() || s.StatsAt(restart).Ready {
+				t.Fatal("missing sampling interval retained previous warmup")
+			}
+			s.Update(restart.Add(time.Second), 21)
+			if s.Ready() || s.StatsAt(restart.Add(time.Second)).Ready {
+				t.Fatal("new history warmed before its elapsed warmup")
+			}
+			s.Update(restart.Add(2*time.Second), 22)
+			if !s.Ready() || !s.StatsAt(restart.Add(2*time.Second)).Ready {
+				t.Fatalf("continuous sampling after the gap did not rewarm: %+v", s.Stats())
+			}
+		})
+	}
+}

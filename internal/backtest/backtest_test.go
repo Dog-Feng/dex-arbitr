@@ -61,6 +61,47 @@ func TestReplayRequiresActualWarmupDuration(t *testing.T) {
 	}
 }
 
+func TestReplayRejectsUnreachableBucketWarmup(t *testing.T) {
+	p := replayParams()
+	p.Estimator = estimator.Params{Window: 5 * time.Second, MinWarmup: 5 * time.Second, Interval: 2 * time.Second, MinCoverage: 1}
+	samples := legacySeries(101)
+	if _, err := ReplayChecked(samples, p); err == nil || !strings.Contains(err.Error(), "unreachable") {
+		t.Fatalf("expected unreachable warmup error, got %v", err)
+	}
+	// The largest representable span of this nonintegral window is still valid.
+	p.Estimator.MinWarmup = 4 * time.Second
+	if r, err := ReplayChecked(samples, p); err != nil || !r.MeanReady {
+		t.Fatalf("reachable neighboring configuration failed: result=%+v err=%v", r, err)
+	}
+}
+
+func TestReplaySingleSlotWarmupAndGap(t *testing.T) {
+	p := replayParams()
+	p.Estimator = estimator.Params{Window: 2 * time.Second, MinWarmup: 2 * time.Second, Interval: 2 * time.Second, MinCoverage: 1}
+	samples := legacySeries(61)
+	r, err := ReplayChecked(samples, p)
+	if err != nil || !r.MeanReady || r.Opens == 0 {
+		t.Fatalf("single-slot history must warm and allow trading: result=%+v err=%v", r, err)
+	}
+	p.AllowGaps = true
+	beforeGap := samples[len(samples)-1]
+	afterGap := beforeGap
+	afterGap.Ts += int64(time.Minute)
+	samples = append(samples, afterGap)
+	r, err = ReplayChecked(samples, p)
+	if err != nil || r.MeanReady || r.GapCount != 1 {
+		t.Fatalf("long gap did not restart single-slot warmup: result=%+v err=%v", r, err)
+	}
+	for i := 1; i <= 20; i++ {
+		s := afterGap
+		s.Ts += int64(time.Duration(i) * 100 * time.Millisecond)
+		samples = append(samples, s)
+	}
+	if r, err := ReplayChecked(samples, p); err != nil || !r.MeanReady || r.GapCount != 1 {
+		t.Fatalf("single-slot history did not rewarm after gap: result=%+v err=%v", r, err)
+	}
+}
+
 func TestReplayPreservesInventoryAndDollarLossAcrossPriceDrift(t *testing.T) {
 	start := time.Unix(1000, 0)
 	var samples []Sample

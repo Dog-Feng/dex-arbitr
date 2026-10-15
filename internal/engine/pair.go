@@ -27,36 +27,38 @@ import (
 
 // PairConfig wires one pair actor.
 type PairConfig struct {
-	Pair          symbols.Pair
-	L, R          exchange.Venue
-	Params        strategy.Params
-	Strategy      strategy.Strategy
-	Est           estimator.Estimator
-	IntervalMin   time.Duration
-	IntervalMax   time.Duration
-	MaxBookAge    time.Duration
-	SampleEvery   time.Duration
-	DryRun        bool // paper trading: fills assumed at decision prices
-	Store         *store.Store
-	Tracker       *execution.Tracker // nil in dry run
-	ExecCfg       execution.Config
-	IDs           *execution.IDGen
-	Vol           *volatility.Estimator
-	VolL          *volatility.Estimator
-	VolR          *volatility.Estimator
-	VolEvery      time.Duration
-	VolMaxAge     time.Duration
-	Samples       *store.SampleSink
-	Risk          marginConfig
-	VolTarget     float64 // daily volume target (USD); 0 = unlimited
-	VolCostBudget float64 // max daily realized loss (USD); 0 = unlimited
-	Adaptive      adaptive.Config
-	Monitor       *monitor.Monitor
-	View          PairView // shared stats/books in auto mode; nil = actor-owned
+	Pair            symbols.Pair
+	L, R            exchange.Venue
+	Params          strategy.Params
+	Strategy        strategy.Strategy
+	Est             estimator.Estimator
+	IntervalMin     time.Duration
+	IntervalMax     time.Duration
+	MaxBookAge      time.Duration
+	SampleEvery     time.Duration
+	DryRun          bool // paper trading: fills assumed at decision prices
+	Store           *store.Store
+	Tracker         *execution.Tracker // nil in dry run
+	ExecCfg         execution.Config
+	IDs             *execution.IDGen
+	Vol             *volatility.Estimator
+	VolL            *volatility.Estimator
+	VolR            *volatility.Estimator
+	VolEvery        time.Duration
+	VolMaxAge       time.Duration
+	Samples         *store.SampleSink
+	Risk            marginConfig
+	VolTarget       float64 // daily volume target (USD); 0 = unlimited
+	VolCostBudget   float64 // max daily realized loss (USD); 0 = unlimited
+	Adaptive        adaptive.Config
+	Monitor         *monitor.Monitor
+	View            PairView    // shared stats/books in auto mode; nil = actor-owned
+	MaxOpenNotional float64     // per-leg auto opening cap; 0 leaves manual sizing unchanged
+	MayOpen         func() bool // optional account startup recovery admission
 	// Checkpoint recovery: after a restart with an unresolved pre-send
 	// checkpoint, positions are re-verified every CheckpointCheckEvery and the
 	// checkpoint is cleared once positions match the ledger continuously for
-	// CheckpointGrace (defaults 5s / 30s). PnL is then marked uncertain.
+	// CheckpointGrace (defaults 15s / 15m). PnL is then marked uncertain.
 	CheckpointCheckEvery time.Duration
 	CheckpointGrace      time.Duration
 }
@@ -112,6 +114,9 @@ type PairActor struct {
 	failureIndex        int
 	checkpointSince     time.Time
 	checkpointCheckedAt time.Time
+	checkpointExit      bool
+	checkpointExitSince time.Time
+	startupRecovered    atomic.Bool
 }
 
 // volumeAcc accumulates daily traded volume and realized PnL for the volume
@@ -187,6 +192,13 @@ func NewPairActor(cfg PairConfig) (*PairActor, error) {
 	a.next = st.NextID
 	a.volAcc = volumeAcc{day: st.Day, volumeUSD: st.VolumeUSD, pnlUSD: st.PnLUSD, pnlUncertain: st.PnLUncertain}
 	a.checkpoint = st.Unresolved
+	a.startupRecovered.Store(!st.Unresolved)
+	a.checkpointExit = st.CheckpointExit
+	if a.checkpointExit {
+		// Restart the quarantine: even an order sent just before the prior
+		// process stopped must expire before this actor can release its slot.
+		a.checkpointExitSince = time.Now()
+	}
 	if st.Unresolved {
 		a.state.Mode = strategy.ModePaused
 	}
@@ -316,7 +328,7 @@ func (a *PairActor) collectBooks(ctx context.Context, chL, chR <-chan domain.Boo
 }
 
 func (a *PairActor) persist() error {
-	err := a.cfg.Store.Save(a.key, store.PairState{NextID: a.next, Steps: a.state.Steps, Day: a.volAcc.day, VolumeUSD: a.volAcc.volumeUSD, PnLUSD: a.volAcc.pnlUSD, PnLUncertain: a.volAcc.pnlUncertain, Unresolved: a.checkpoint})
+	err := a.cfg.Store.Save(a.key, store.PairState{NextID: a.next, Steps: a.state.Steps, Day: a.volAcc.day, VolumeUSD: a.volAcc.volumeUSD, PnLUSD: a.volAcc.pnlUSD, PnLUncertain: a.volAcc.pnlUncertain, Unresolved: a.checkpoint, CheckpointExit: a.checkpointExit})
 	if err != nil {
 		a.state.Mode = strategy.ModePaused
 		a.settled.Store(false)
@@ -435,6 +447,7 @@ func (a *PairActor) recoverCheckpoint(ctx context.Context, now time.Time) {
 		a.state.Mode = strategy.ModeWarmup
 	}
 	a.log.Warn("cleared unresolved checkpoint after a stable position match; daily PnL marked uncertain")
+	a.startupRecovered.Store(true)
 }
 
 // Run the actor until ctx is done.
@@ -543,7 +556,11 @@ func (a *PairActor) Run(ctx context.Context) (retErr error) {
 				continue
 			}
 			if a.checkpoint {
-				a.recoverCheckpoint(ctx, now)
+				if a.checkpointExit || a.emergencyRequested.Load() || a.draining.Load() {
+					a.recoverCheckpointExit(ctx, now)
+				} else {
+					a.recoverCheckpoint(ctx, now)
+				}
 				continue
 			}
 			if a.emergencyRequested.Load() && a.reconciled {
@@ -575,16 +592,14 @@ func (a *PairActor) Run(ctx context.Context) (retErr error) {
 			if !ok {
 				continue
 			}
-			if a.cfg.View != nil {
-				a.refreshSizing()
-			}
+			canSize := a.refreshSizing()
 			mu, ready := a.mean()
 			act := a.cfg.Strategy.Decide(a.cfg.Params, a.state, q, mu, ready, a.volBps())
 			if act.Kind == strategy.None {
 				continue
 			}
 			a.resetVolumeIfNewDay(now)
-			if act.Kind == strategy.Open && (!a.canOpenVolume() || a.riskBlocked.Load()) {
+			if act.Kind == strategy.Open && (!canSize || !a.canOpenVolume() || a.riskBlocked.Load() || a.cfg.MayOpen != nil && !a.cfg.MayOpen()) {
 				continue
 			}
 			a.apply(ctx, act, q)
@@ -621,17 +636,21 @@ func (a *PairActor) quote(now time.Time) (spread.Quote, bool) {
 // current shared depth-based sizing (config notional and depth caps). Existing
 // steps keep their own quantities; only new opens use the refreshed size, so
 // a restored actor can no longer add at a stale, oversized step quantity.
-func (a *PairActor) refreshSizing() {
+func (a *PairActor) refreshSizing() bool {
 	if a.cfg.View == nil {
-		return
+		return true
 	}
 	sizer, ok := a.cfg.View.(interface{ SizedQty() (float64, bool) })
 	if !ok {
-		return
+		return true
 	}
 	if qty, ok := sizer.SizedQty(); ok && qty > 0 {
 		a.cfg.Params.StepQty = qty
+		return true
 	}
+	// Retain the prior positive parameter for closing existing steps, but
+	// never treat a failed current sizing attempt as permission to open.
+	return false
 }
 
 // volQuote returns a spread sample only when both books are fresh and mutually

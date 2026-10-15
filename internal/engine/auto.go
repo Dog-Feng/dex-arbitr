@@ -223,10 +223,14 @@ func (c *candidate) SizedQty() (float64, bool) {
 		return 0, false
 	}
 	mid := (l.Mid() + r.Mid()) / 2
+	// Either venue can be the buy leg. Using the more expensive ask keeps
+	// each leg within the configured notional before the executor applies
+	// its final IOC-price admission check.
+	price := math.Max(l.Asks[0].Price, r.Asks[0].Price)
 	top := min4(l.Bids[0].Size, l.Asks[0].Size, r.Bids[0].Size, r.Asks[0].Size)
-	capNotional := c.depthRatio * top * mid
+	capNotional := c.depthRatio * top * price
 	n := math.Min(c.notional, capNotional)
-	qty := c.pair.AlignQty(n / mid)
+	qty := c.pair.AlignQty(n / price)
 	if ok, _ := c.pair.ValidQty(qty, mid); !ok {
 		return 0, false
 	}
@@ -417,6 +421,7 @@ func (rt *runtime) restorePairs(ctx context.Context, cands []*candidate, active 
 			}
 		}
 	}
+	positionNotionals := map[string]float64{}
 	if !rt.cfg.DryRun {
 		covered := map[string]bool{}
 		for _, key := range keys {
@@ -433,18 +438,26 @@ func (rt *runtime) restorePairs(ctx context.Context, cands []*candidate, active 
 				if p.Qty != 0 && !covered[marketKey(name, p.MarketID)] {
 					return fmt.Errorf("%s market %d has a position without a recoverable step ledger", name, p.MarketID)
 				}
+				if p.Qty != 0 && finitePositive(p.AvgEntry) {
+					positionNotionals[marketKey(name, p.MarketID)] = math.Abs(p.Qty) * p.AvgEntry
+				}
 			}
 		}
 	}
-	trading := 0
+	type recovery struct {
+		c        *candidate
+		actor    *PairActor
+		used     float64
+		budget   float64
+		draining bool
+	}
+	plans := make([]recovery, 0, len(keys))
 	reserved := 0.0
 	for _, key := range keys {
 		c, st := byKey[key], states[key]
-		qty, usedL, usedR := 0.0, 0.0, 0.0
+		qty := 0.0
 		for _, step := range st.Steps {
 			qty = math.Max(qty, step.Qty)
-			usedL += step.Qty * step.OpenL
-			usedR += step.Qty * step.OpenR
 		}
 		if qty == 0 {
 			// An unresolved execution may have changed positions before adding
@@ -455,21 +468,50 @@ func (rt *runtime) restorePairs(ctx context.Context, cands []*candidate, active 
 		if err != nil {
 			return fmt.Errorf("restore %s: %w", key, err)
 		}
-		// Restore every exposure, but constrain admission before the first
-		// picker tick. Excess saved pairs must not open during a short warmup
-		// or the demotion dwell period, and restored exposure is reserved
-		// against the account notional budget like a promoted pair would be.
-		budget := math.Max(rt.pairBudget(), math.Max(usedL, usedR))
-		reserved += budget
-		overBudget := rt.cfg.Auto.MaxTotalNotional > 0 && reserved > rt.cfg.Auto.MaxTotalNotional
-		draining := c.excluded || trading >= rt.cfg.Auto.TopY || overBudget
-		if draining {
-			a.Drain()
+		used, budget, priced := recoveryReservation(st, rt.cfg.Auto.NotionalPerLeg, rt.cfg.Auto.MaxSteps)
+		// A position query can reveal more exposure than the saved ledger,
+		// even when this actor will remain paused for reconciliation. It must
+		// still consume capacity before any other actor is allowed to open.
+		actual := math.Max(positionNotionals[marketKey(c.l.Name(), c.pair.Left.MarketID)],
+			positionNotionals[marketKey(c.r.Name(), c.pair.Right.MarketID)])
+		if actual > used {
+			budget += actual - used
+			used = actual
+		}
+		// A legacy ledger without entry prices cannot quantify its exposure.
+		// Keep it in recovery and occupy the account cap until it exits.
+		if !priced && rt.cfg.Auto.MaxTotalNotional > 0 {
+			used = math.Max(used, rt.cfg.Auto.MaxTotalNotional)
+			budget = math.Max(budget, used)
+		}
+		plans = append(plans, recovery{c: c, actor: a, used: used, budget: budget, draining: c.excluded || !priced})
+		if st.Unresolved {
+			rt.recovering = append(rt.recovering, a)
+		}
+		reserved += used
+	}
+	// Count every retained position before granting any actor room to open.
+	// Reservations never grow while actors run: a close retains its allocation
+	// for replacement steps, and a draining actor keeps its actual exposure
+	// allocated until the picker receives its confirmed exit.
+	trading := 0
+	for i := range plans {
+		p := &plans[i]
+		extra := p.budget - p.used
+		overBudget := rt.cfg.Auto.MaxTotalNotional > 0 && reserved+extra > rt.cfg.Auto.MaxTotalNotional
+		p.draining = p.draining || trading >= rt.cfg.Auto.TopY || overBudget
+		if p.draining {
+			p.budget = p.used
+			p.actor.Drain()
 		} else {
+			reserved += extra
 			trading++
 		}
-		ar := rt.startActor(ctx, c, a, budget, active, wg)
-		ar.draining = draining
+	}
+	// Do not start an actor until every recovery reservation is final.
+	for _, p := range plans {
+		ar := rt.startActor(ctx, p.c, p.actor, p.budget, active, wg)
+		ar.draining = p.draining
 	}
 	return nil
 }
@@ -668,6 +710,9 @@ func (rt *runtime) pairBudget() float64 {
 }
 
 func (rt *runtime) promote(ctx context.Context, c *candidate, active map[string]*activeRun, wg *sync.WaitGroup) error {
+	if !rt.startupRecoveryReady() {
+		return fmt.Errorf("startup orders remain unresolved")
+	}
 	if len(active) >= rt.cfg.Auto.TopY {
 		return fmt.Errorf("active slots occupied")
 	}
@@ -711,6 +756,8 @@ func (rt *runtime) promote(ctx context.Context, c *candidate, active map[string]
 
 func (rt *runtime) startActor(ctx context.Context, c *candidate, a *PairActor, budget float64, active map[string]*activeRun, wg *sync.WaitGroup) *activeRun {
 	a.cfg.View = c
+	a.cfg.MayOpen = rt.startupRecoveryReady
+	a.cfg.MaxOpenNotional = rt.cfg.Auto.NotionalPerLeg
 	actx, cancel := context.WithCancel(ctx)
 	ar := &activeRun{actor: a, cancel: cancel, budget: budget, done: make(chan error, 1)}
 	active[c.key] = ar

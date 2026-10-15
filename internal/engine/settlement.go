@@ -24,6 +24,8 @@ type pendingExecution struct {
 	unwind           bool
 	lastAttempt      time.Time
 	stalls           int
+	intervention     bool
+	interrupted      *execution.Result // settled original orders, separate from the new flatten
 }
 
 // interventionStallLimit is how many consecutive inconsistent settlements are
@@ -112,6 +114,10 @@ func (a *PairActor) resolvePending(ctx context.Context) {
 		return
 	}
 	p.lastAttempt = time.Now()
+	if p.intervention {
+		a.recoverExternalIntervention(ctx, p, p.result)
+		return
+	}
 	l, r := a.legSpecs(p.action)
 	if p.unwind {
 		l.Side, r.Side = 0, 0
@@ -133,6 +139,8 @@ func (a *PairActor) resolvePending(ctx context.Context) {
 			if p.stalls >= interventionStallLimit {
 				a.recoverExternalIntervention(ctx, p, res)
 			}
+		} else {
+			p.stalls = 0
 		}
 		return
 	}
@@ -157,7 +165,7 @@ func (a *PairActor) resolvePending(ctx context.Context) {
 		return
 	}
 	a.pending = nil
-	a.checkpoint = false
+	a.completeExecutionCheckpoint()
 	if !a.draining.Load() && !a.emergencyRequested.Load() && !a.legacyPrices {
 		a.state.Mode = strategy.ModeWarmup
 	}
@@ -165,9 +173,9 @@ func (a *PairActor) resolvePending(ctx context.Context) {
 		a.log.Error("persist recovered execution", "err", err)
 		return
 	}
-	a.settled.Store(true)
+	a.settled.Store(!a.checkpoint)
 	if p.unwind {
-		if a.draining.Load() {
+		if a.draining.Load() && !a.checkpoint {
 			a.drainConfirmed.Store(true)
 		}
 		a.emergencyRequested.Store(false)
@@ -179,56 +187,67 @@ func (a *PairActor) resolvePending(ctx context.Context) {
 // claiming any profit. Only our own confirmed fills' fees enter the books and
 // daily PnL is marked uncertain.
 func (a *PairActor) recoverExternalIntervention(ctx context.Context, p *pendingExecution, res execution.Result) {
-	a.pending = nil
+	if !p.intervention {
+		p.intervention = true
+		a.record(monitor.KindError, func(e *monitor.Event) {
+			e.Msg = "execution recovery stalled on inconsistent positions; verifying old orders before flattening the account"
+		})
+	}
 	a.volAcc.pnlUncertain = true
-	a.record(monitor.KindError, func(e *monitor.Event) {
-		e.Msg = "execution recovery stalled on inconsistent positions; assuming external intervention, flattening and clearing the ledger"
-	})
+	a.state.Mode = strategy.ModePaused
+	execCtx, finish := a.executionContext(ctx)
+	defer finish()
+	l, r := a.legSpecs(p.action)
+	if p.interrupted == nil {
+		res = a.exec.ResolveTerminals(execCtx, l, r, res, p.action.Qty)
+		p.result = res
+		if res.Err != nil || !res.PositionsKnown || !execution.OrdersTerminal(res) {
+			return
+		}
+		// Keep the original fills intact. The new flatten has its own order
+		// identities and must never replace unresolved original quantities.
+		original := res
+		p.interrupted = &original
+		l.Side, r.Side = 0, 0
+		if a.emergencyRequested.Load() {
+			res, res.Err = a.exec.EmergencyFlatten(execCtx, l, r, 0, res.PosL, res.PosR)
+		} else {
+			res, res.Err = a.exec.FlattenToZero(execCtx, l, r)
+		}
+	} else {
+		l.Side, r.Side = 0, 0
+		if a.emergencyRequested.Load() || a.draining.Load() {
+			res = a.exec.EscalateOutstanding(res)
+		}
+		res = a.exec.ResolveOutstanding(execCtx, l, r, res, 0, 0, 0)
+	}
+	p.result = res
 	if res.PositionsKnown {
 		a.posL, a.posR = res.PosL, res.PosR
 		a.syncPositionState()
 	}
-	epsL := math.Pow10(-a.cfg.Pair.Left.SizeDecimals) / 2
-	epsR := math.Pow10(-a.cfg.Pair.Right.SizeDecimals) / 2
-	flat := res.PositionsKnown && math.Abs(a.posL) < epsL && math.Abs(a.posR) < epsR
-	if !flat {
-		execCtx, finish := a.executionContext(ctx)
-		l, r := a.legSpecs(p.action)
-		l.Side, r.Side = 0, 0
-		var err error
-		if a.emergencyRequested.Load() {
-			res, err = a.exec.EmergencyFlatten(execCtx, l, r, 0, a.posL, a.posR)
-		} else {
-			res, err = a.exec.FlattenToZero(execCtx, l, r)
-		}
-		finish()
-		if err != nil || res.Err != nil || !res.PositionsKnown || !res.SettlementKnown {
-			a.state.Mode = strategy.ModePaused
-			a.log.Error("external intervention flatten pending", "err", errors.Join(err, res.Err))
-			return
-		}
-		a.posL, a.posR = res.PosL, res.PosR
-		a.syncPositionState()
+	if res.Err != nil || !res.PositionsKnown || !res.SettlementKnown {
+		return
 	}
-	if err := a.finishIntervention(res); err != nil {
-		a.state.Mode = strategy.ModePaused
+	if err := a.finishIntervention(res, *p.interrupted); err != nil {
 		a.log.Error("external intervention accounting", "err", err)
 		return
 	}
-	a.checkpoint = false
+	a.pending = nil
+	a.completeExecutionCheckpoint()
 	if err := a.persist(); err != nil {
 		a.log.Error("persist external intervention", "err", err)
 		return
 	}
-	a.settled.Store(true)
-	if a.draining.Load() {
+	a.settled.Store(!a.checkpoint)
+	if a.draining.Load() && !a.checkpoint {
 		a.drainConfirmed.Store(true)
 	}
 	a.emergencyRequested.Store(false)
 }
 
 // finishIntervention clears the step ledger once both legs are confirmed flat.
-func (a *PairActor) finishIntervention(res execution.Result) error {
+func (a *PairActor) finishIntervention(res execution.Result, interrupted ...execution.Result) error {
 	if res.Err != nil || !res.PositionsKnown || !res.SettlementKnown ||
 		math.Abs(res.PosL) >= math.Pow10(-a.cfg.Pair.Left.SizeDecimals)/2 ||
 		math.Abs(res.PosR) >= math.Pow10(-a.cfg.Pair.Right.SizeDecimals)/2 {
@@ -241,6 +260,18 @@ func (a *PairActor) finishIntervention(res execution.Result) error {
 	nr, err := legNotional(res.R)
 	if err != nil {
 		return err
+	}
+	for _, original := range interrupted {
+		left, err := legNotional(original.L)
+		if err != nil {
+			return err
+		}
+		right, err := legNotional(original.R)
+		if err != nil {
+			return err
+		}
+		nl += left
+		nr += right
 	}
 	fees := nl*a.cfg.Pair.Left.TakerFee + nr*a.cfg.Pair.Right.TakerFee
 	closed := len(a.state.Steps)
@@ -267,8 +298,17 @@ func (a *PairActor) legSpecs(act strategy.Action) (execution.LegSpec, execution.
 }
 
 func (a *PairActor) apply(ctx context.Context, act strategy.Action, q spread.Quote) {
+	if act.Kind == strategy.Open && a.cfg.MayOpen != nil && !a.cfg.MayOpen() {
+		return
+	}
 	if a.draining.Load() || a.emergencyRequested.Load() || (act.Kind == strategy.Open && a.riskBlocked.Load()) {
 		return
+	}
+	if a.cfg.DryRun && act.Kind == strategy.Open && a.cfg.MaxOpenNotional > 0 && act.Qty*math.Max(act.L.Price, act.R.Price) > a.cfg.MaxOpenNotional {
+		act.Qty = domain.Floor(a.cfg.MaxOpenNotional/math.Max(act.L.Price, act.R.Price), a.cfg.Pair.SizeDecimals)
+		if act.Qty <= 0 || act.Qty < a.cfg.Pair.MinQty || act.Qty*act.L.Price < a.cfg.Pair.Left.MinQuote || act.Qty*act.R.Price < a.cfg.Pair.Right.MinQuote {
+			return
+		}
 	}
 	beforeL, beforeR := a.posL, a.posR
 	a.resetVolumeIfNewDay(time.Now())
@@ -289,17 +329,29 @@ func (a *PairActor) apply(ctx context.Context, act strategy.Action, q spread.Quo
 		// the execution cancel function. Recheck before sending either IOC.
 		if a.draining.Load() || a.emergencyRequested.Load() || (act.Kind == strategy.Open && a.riskBlocked.Load()) {
 			finish()
-			a.checkpoint = false
+			a.completeExecutionCheckpoint()
 			if err := a.persist(); err != nil {
 				a.log.Error("persist canceled decision", "err", err)
 				return
 			}
-			a.settled.Store(true)
+			a.settled.Store(!a.checkpoint)
 			return
 		}
 		l, r := a.legSpecs(act)
-		res = a.exec.Execute(execCtx, l, r, act.Qty, act.Kind == strategy.Close, beforeL, beforeR)
+		res = a.exec.ExecuteBounded(execCtx, l, r, act.Qty, act.Kind == strategy.Close, beforeL, beforeR, a.cfg.MaxOpenNotional)
 		finish()
+		if res.RequestedQty > 0 {
+			act.Qty = res.RequestedQty
+		}
+		if errors.Is(res.Err, execution.ErrNotionalBudget) {
+			a.completeExecutionCheckpoint()
+			if err := a.persist(); err != nil {
+				a.log.Error("persist declined opening budget", "err", err)
+				return
+			}
+			a.settled.Store(!a.checkpoint)
+			return
+		}
 	}
 	if res.Err != nil || !res.PositionsKnown || !res.SettlementKnown {
 		a.failSettlement(&pendingExecution{action: act, quote: q, beforeL: beforeL, beforeR: beforeR, result: res})
@@ -310,12 +362,12 @@ func (a *PairActor) apply(ctx context.Context, act strategy.Action, q spread.Quo
 		a.record(monitor.KindError, func(e *monitor.Event) { e.Msg = err.Error() })
 		return
 	}
-	a.checkpoint = false
+	a.completeExecutionCheckpoint()
 	if err := a.persist(); err != nil {
 		a.log.Error("persist execution", "err", err)
 		return
 	}
-	a.settled.Store(true)
+	a.settled.Store(!a.checkpoint)
 }
 
 func finitePositive(x float64) bool { return x > 0 && !math.IsNaN(x) && !math.IsInf(x, 0) }
@@ -566,13 +618,13 @@ func (a *PairActor) unwind(ctx context.Context, emergency bool) {
 		a.record(monitor.KindError, func(e *monitor.Event) { e.Msg = err.Error() })
 		return
 	}
-	a.checkpoint = false
+	a.completeExecutionCheckpoint()
 	if err := a.persist(); err != nil {
 		a.log.Error("persist unwind", "err", err)
 		return
 	}
-	a.settled.Store(true)
-	if a.draining.Load() {
+	a.settled.Store(!a.checkpoint)
+	if a.draining.Load() && !a.checkpoint {
 		a.drainConfirmed.Store(true)
 	}
 	a.emergencyRequested.Store(false)
@@ -597,7 +649,14 @@ func (a *PairActor) finishUnwind(res execution.Result) error {
 	qty := math.Abs(a.expectedL())
 	ql := res.L.Filled + res.L.RescueFilled
 	qr := res.R.Filled + res.R.RescueFilled
-	if qty > 0 && (ql > 0 || qr > 0) {
+	matchingFills := math.Abs(ql-qty) < math.Pow10(-a.cfg.Pair.Left.SizeDecimals)/2 &&
+		math.Abs(qr-qty) < math.Pow10(-a.cfg.Pair.Right.SizeDecimals)/2
+	if qty > 0 && !matchingFills {
+		// A flat account without our matching closing fills was modified
+		// externally. This includes the zero-fill case on both legs.
+		uncertain = true
+	}
+	if qty > 0 && matchingFills {
 		// Price each leg against the quantity it actually closed, not the
 		// ledger quantity: fine-precision dust on one venue must not wedge the
 		// unwind accounting in a retry loop after both legs are already flat.
@@ -608,10 +667,6 @@ func (a *PairActor) finishUnwind(res execution.Result) error {
 		rp, err := closePrice(res.R, qr)
 		if err != nil {
 			return err
-		}
-		if math.Abs(ql-qty) >= math.Pow10(-a.cfg.Pair.Left.SizeDecimals)/2 ||
-			math.Abs(qr-qty) >= math.Pow10(-a.cfg.Pair.Right.SizeDecimals)/2 {
-			uncertain = true
 		}
 		for _, st := range a.state.Steps {
 			uncertain = uncertain || st.PriceEstimated

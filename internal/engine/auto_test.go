@@ -27,7 +27,7 @@ func TestCandidateSizedQty(t *testing.T) {
 		{
 			name: "deep book takes full notional", notional: 1000, depthRatio: 0.25,
 			sizes: [4]float64{50, 50, 50, 50}, prices: [4]float64{778.0, 778.1, 778.05, 778.15},
-			want: domain.Floor(1000/778.075, 4),
+			want: domain.Floor(1000/778.15, 4),
 		},
 		{
 			name: "thin book caps by depth", notional: 1000, depthRatio: 0.25,

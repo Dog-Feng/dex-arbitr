@@ -17,13 +17,14 @@ import (
 
 // PairState persisted per pair. Missing daily fields in older files mean zero.
 type PairState struct {
-	Unresolved   bool            `json:"unresolved,omitempty"`
-	PnLUncertain bool            `json:"pnl_uncertain,omitempty"`
-	NextID       int64           `json:"next_id"`
-	Steps        []strategy.Step `json:"steps"`
-	Day          string          `json:"day,omitempty"`
-	VolumeUSD    float64         `json:"volume_usd,omitempty"`
-	PnLUSD       float64         `json:"pnl_usd,omitempty"`
+	Unresolved     bool            `json:"unresolved,omitempty"`
+	CheckpointExit bool            `json:"checkpoint_exit,omitempty"`
+	PnLUncertain   bool            `json:"pnl_uncertain,omitempty"`
+	NextID         int64           `json:"next_id"`
+	Steps          []strategy.Step `json:"steps"`
+	Day            string          `json:"day,omitempty"`
+	VolumeUSD      float64         `json:"volume_usd,omitempty"`
+	PnLUSD         float64         `json:"pnl_usd,omitempty"`
 }
 
 // Store serializes access to a directory of pair-state JSON files.
@@ -190,6 +191,9 @@ func (s *Store) write(key string, b []byte) (retErr error) {
 func finite(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0) }
 
 func validate(st PairState) error {
+	if st.CheckpointExit && !st.Unresolved {
+		return fmt.Errorf("checkpoint_exit requires unresolved execution")
+	}
 	if st.NextID < 1 {
 		return fmt.Errorf("next_id must be positive")
 	}

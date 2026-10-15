@@ -208,6 +208,9 @@ func normalize(p Params) (Params, error) {
 	if p.Estimator.Interval <= 0 || p.Estimator.Window < p.Estimator.Interval || p.Estimator.MinWarmup < 0 || p.Estimator.MinWarmup > p.Estimator.Window || !finite(p.Estimator.MinCoverage) || p.Estimator.MinCoverage <= 0 || p.Estimator.MinCoverage > 1 || p.Volatility.Interval <= 0 || p.Volatility.Horizon < p.Volatility.Interval || p.Volatility.HalfLife <= 0 || p.DecisionInterval <= 0 || p.MaxBookAge <= 0 || p.MaxVolBookAge <= 0 {
 		return p, fmt.Errorf("invalid replay sampling or freshness parameters")
 	}
+	if maxSpan := (p.Estimator.Window / p.Estimator.Interval) * p.Estimator.Interval; p.Estimator.MinWarmup > maxSpan {
+		return p, fmt.Errorf("estimator.min_warmup (%s) is unreachable: a %s window sampled every %s can span at most %s", p.Estimator.MinWarmup, p.Estimator.Window, p.Estimator.Interval, maxSpan)
+	}
 	return p, nil
 }
 

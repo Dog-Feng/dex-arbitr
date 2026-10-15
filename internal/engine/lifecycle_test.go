@@ -107,7 +107,11 @@ func TestAutoRestoresOpenPairsBeforeWarmupAndSelection(t *testing.T) {
 				t.Fatal(err)
 			}
 			ar := active[old.key]
-			if ar == nil || len(active) != 1 || ar.budget != 50.5 || ar.draining != excluded {
+			wantBudget := 70.5 // historical exposure plus two new ten-dollar steps
+			if excluded {
+				wantBudget = 50.5 // draining only retains its existing exposure
+			}
+			if ar == nil || len(active) != 1 || ar.budget != wantBudget || ar.draining != excluded {
 				t.Fatalf("saved exposure not restored: active=%v, run=%+v", active, ar)
 			}
 			if _, ready := old.Mean(); ready {

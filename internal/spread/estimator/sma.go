@@ -56,7 +56,14 @@ func (s *SMA) Update(t time.Time, x float64) {
 	bk := s.bucket(t)
 	s.evict(bk)
 	if s.n == 0 {
-		s.started = t
+		// A single-slot window replaces its only sample on every ordinary
+		// tick. Preserve elapsed warmup across that replacement, including
+		// ticker jitter of up to half an interval. Missing a whole sampling
+		// tick, or emptying a multi-slot window, still starts a new history.
+		continuous := len(s.slots) == 1 && !s.last.IsZero() && t.Sub(s.last)-s.p.Interval <= s.p.Interval/2
+		if !continuous {
+			s.started = t
+		}
 	}
 	i := int(bk % int64(len(s.slots)))
 	if i < 0 {

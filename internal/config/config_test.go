@@ -1,11 +1,14 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Dog-Feng/dex-arbitr/internal/spread/estimator"
 )
 
 func loadTestConfig(t *testing.T, data string) (*Config, error) {
@@ -15,6 +18,37 @@ func loadTestConfig(t *testing.T, data string) (*Config, error) {
 		t.Fatal(err)
 	}
 	return Load(path)
+}
+
+func TestSingleSlotEstimatorWarmsForAllStrategySelections(t *testing.T) {
+	for _, kind := range []string{"arbitrage", "volume"} {
+		for _, selection := range []string{"manual", "auto"} {
+			t.Run(kind+"/"+selection, func(t *testing.T) {
+				data := fmt.Sprintf("strategy:\n  kind: %s\n  pair_selection: %s\nestimator:\n  window: 2s\n  min_warmup: 2s\n  interval: 2s\n  min_coverage: 1\n", kind, selection)
+				c, err := loadTestConfig(t, data)
+				if err != nil {
+					t.Fatal(err)
+				}
+				e, err := estimator.New(c.Estimator.Kind, estimator.Params{Window: c.Estimator.Window, MinWarmup: c.Estimator.MinWarmup, MinCoverage: c.Estimator.MinCoverage, Interval: c.Estimator.Interval})
+				if err != nil {
+					t.Fatal(err)
+				}
+				start := time.Unix(1000, 0)
+				e.Update(start, 1)
+				if estimator.ReadyAt(e, start) {
+					t.Fatal("single sample bypassed elapsed warmup")
+				}
+				e.Update(start.Add(2*time.Second), 2)
+				if st := estimator.StatsAt(e, start.Add(2*time.Second)); !st.Ready || st.Mean != 2 || st.Samples != 1 {
+					t.Fatalf("single-slot configuration did not warm: %+v", st)
+				}
+				e.Update(start.Add(time.Minute), 3)
+				if estimator.ReadyAt(e, start.Add(time.Minute)) {
+					t.Fatal("long sampling gap did not restart warmup")
+				}
+			})
+		}
+	}
 }
 
 func TestLoadStrictValidation(t *testing.T) {

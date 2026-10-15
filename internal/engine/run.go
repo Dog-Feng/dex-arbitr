@@ -32,6 +32,18 @@ type runtime struct {
 	mon     *monitor.Monitor
 	matcher symbols.Matcher
 	ids     *execution.IDGen
+	// Set once during startup planning, before any actors are started. An
+	// old checkpoint has no request quantity to budget until it is recovered.
+	recovering []*PairActor
+}
+
+func (rt *runtime) startupRecoveryReady() bool {
+	for _, a := range rt.recovering {
+		if !a.startupRecovered.Load() {
+			return false
+		}
+	}
+	return true
 }
 
 // pairKey is the stable identifier used for persistence and monitor grouping.
