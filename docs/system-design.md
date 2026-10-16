@@ -296,6 +296,7 @@ price = max(左腿 ask1, 右腿 ask1)   // 任一腿都可能成为买腿，按�
 
 - 引擎在关键点发类型化事件（step_opened/step_closed/flip/executed/rescue/status/emergency/error），picker 另发 pair_promoted/pair_demoted/pair_health/pair_warmup；monitor.Monitor.Record 按 pair 归集指标并告警。
 - 双视图：`/metrics` 顶层是全局汇总（跨对合计，含 `flips` 反转计数），新增 `pairs` 字段是每个交易对的明细（状态、步数、成交量、盈亏、flips、μ/σ、tick_k、失败率、churn score 分量、预热覆盖度、是否活跃）。
+- 金额字段（`volume_usd` / `realized_usd`，以及 status 日志的 `volume_usd` / `pnl_usd`）以 8 位固定小数输出，避免浮点残差显示为科学计数法。
 - 滚动失败率：actor 独立维护失败滚动窗口（`FailRate()`，atomic），picker 通过 candidate 读取做硬剔除；`/metrics` 同时给出 `fail_rate`（终身）与 `rolling_fail_rate`（最近窗口）。
 - 可选 HTTP：monitor.addr 非空时 arbd 内起服务，GET /metrics 返回 JSON；monitor.token 非空时要求 Authorization: Bearer <token> 或 ?token=（常量时间比较，401 拒绝）。
 - 只读、不 import engine。

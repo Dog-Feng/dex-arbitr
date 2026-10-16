@@ -227,3 +227,22 @@ func TestFlipCounter(t *testing.T) {
 		t.Fatalf("flip counters wrong: %+v", g)
 	}
 }
+
+func TestFixed8MarshalsFixedDecimals(t *testing.T) {
+	for _, tc := range []struct {
+		in   Fixed8
+		want string
+	}{
+		{2.2737367544323206e-15, "0.00000000"},
+		{123.804, "123.80400000"},
+		{-0.0072, "-0.00720000"},
+	} {
+		b, err := tc.in.MarshalJSON()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(b) != tc.want {
+			t.Fatalf("Fixed8(%v) = %s, want %s", tc.in, b, tc.want)
+		}
+	}
+}

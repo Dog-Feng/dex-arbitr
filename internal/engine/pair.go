@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"math"
 	"math/rand"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -561,8 +562,10 @@ func (a *PairActor) Run(ctx context.Context) (retErr error) {
 				e.Mode = a.state.Mode.String()
 				e.MuBps, e.SigmaBps, e.TickK, e.FailRate = st.Mean, a.volBps(), a.tickK(), a.FailRate()
 			})
-			a.log.Info("status", "mode", a.state.Mode, "steps", a.state.Counter(), "volume_usd", a.procVolumeUSD,
-				"pnl_usd", a.procPnlUSD, "fail_rate", a.FailRate(), "sigma_bps", round4(a.volBps()), "vol_ready", a.volReady(time.Now()))
+			a.log.Info("status", "mode", a.state.Mode, "steps", a.state.Counter(),
+				"volume_usd", strconv.FormatFloat(a.procVolumeUSD, 'f', 8, 64),
+				"pnl_usd", strconv.FormatFloat(a.procPnlUSD, 'f', 8, 64),
+				"fail_rate", a.FailRate(), "sigma_bps", round4(a.volBps()), "vol_ready", a.volReady(time.Now()))
 			a.lat.reset()
 		case <-decide.C:
 			now := time.Now()

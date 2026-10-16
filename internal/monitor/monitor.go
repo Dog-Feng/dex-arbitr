@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -67,6 +68,15 @@ type Event struct {
 // AlertFunc receives an alert message (log, webhook, ...).
 type AlertFunc func(msg string)
 
+// Fixed8 marshals a USD amount as a fixed-point decimal with eight digits so
+// snapshots never render floating-point dust in scientific notation.
+type Fixed8 float64
+
+// MarshalJSON implements json.Marshaler with fixed 8-decimal output.
+func (f Fixed8) MarshalJSON() ([]byte, error) {
+	return []byte(strconv.FormatFloat(float64(f), 'f', 8, 64)), nil
+}
+
 // Metrics is a snapshot of the aggregated counters and gauges.
 type Metrics struct {
 	UptimeSec   float64 `json:"uptime_sec"`
@@ -79,9 +89,9 @@ type Metrics struct {
 	Emergencies uint64  `json:"emergencies"`
 	Errors      uint64  `json:"errors"`
 
-	OpenSteps   int     `json:"open_steps"`
-	VolumeUSD   float64 `json:"volume_usd"`
-	RealizedUSD float64 `json:"realized_usd"`
+	OpenSteps   int    `json:"open_steps"`
+	VolumeUSD   Fixed8 `json:"volume_usd"`
+	RealizedUSD Fixed8 `json:"realized_usd"`
 
 	LatencyN     uint64  `json:"latency_n"`
 	LatencyAvgMs float64 `json:"latency_avg_ms"`
@@ -109,8 +119,8 @@ type PairMetrics struct {
 	Rescues         uint64  `json:"rescues"`
 	Errors          uint64  `json:"errors"`
 	OpenSteps       int     `json:"open_steps"`
-	VolumeUSD       float64 `json:"volume_usd"`
-	RealizedUSD     float64 `json:"realized_usd"`
+	VolumeUSD       Fixed8  `json:"volume_usd"`
+	RealizedUSD     Fixed8  `json:"realized_usd"`
 	MuBps           float64 `json:"mu_bps"`
 	SigmaBps        float64 `json:"sigma_bps"`
 	TickK           float64 `json:"tick_k"`
@@ -293,7 +303,7 @@ func (m *Monitor) Metrics() Metrics {
 			Base: a.base, Active: a.active, Mode: a.mode,
 			Opens: a.opens, Closes: a.closes, Flips: a.flips, Executions: a.executions,
 			OneLegFails: a.oneLeg, Rescues: a.rescues, Errors: a.errors,
-			OpenSteps: a.openSteps, VolumeUSD: a.volumeUSD, RealizedUSD: a.realizedUSD,
+			OpenSteps: a.openSteps, VolumeUSD: Fixed8(a.volumeUSD), RealizedUSD: Fixed8(a.realizedUSD),
 			MuBps: a.muBps, SigmaBps: a.sigmaBps, TickK: a.tickK, FailRate: pfail,
 			Score: a.score, DepthQ: a.depthQ, TickQ: a.tickQ, Stability: a.stability, Reverts: a.reverts,
 			RollingFailRate: a.failRate,
@@ -311,8 +321,8 @@ func (m *Monitor) Metrics() Metrics {
 		Emergencies:  m.emergencies,
 		Errors:       m.errors,
 		OpenSteps:    m.openSteps,
-		VolumeUSD:    m.volumeUSD,
-		RealizedUSD:  m.realizedUSD,
+		VolumeUSD:    Fixed8(m.volumeUSD),
+		RealizedUSD:  Fixed8(m.realizedUSD),
 		LatencyN:     uint64(m.latN),
 		LatencyAvgMs: latAvg,
 		LatencyMaxMs: m.latMax,
