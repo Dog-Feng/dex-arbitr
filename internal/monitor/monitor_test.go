@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestMonitorAggregates(t *testing.T) {
@@ -244,5 +246,197 @@ func TestFixed8MarshalsFixedDecimals(t *testing.T) {
 		if string(b) != tc.want {
 			t.Fatalf("Fixed8(%v) = %s, want %s", tc.in, b, tc.want)
 		}
+	}
+}
+
+func testAnalytics() AnalyticsCfg {
+	return AnalyticsCfg{
+		Bucket:        15 * time.Minute,
+		RetainBuckets: 672,
+		Cooldown:      0,
+		Anomalies: AnomalyCfg{
+			ConsecutiveFails:  3,
+			FlipsWindowMin:    10,
+			FlipsThreshold:    3,
+			FullLoadHeadroom:  2,
+			FullLoadMinutes:   30,
+			OldestStepMinutes: 60,
+			LossBucketCount:   3,
+			LossPerBucketUSD:  0.05,
+			RescueSlipUSD:     0.01,
+			LatencyP95Ms:      600,
+			SilentMinutes:     30,
+			RiskFlapsPerHour:  8,
+			MuJumpSigma:       3,
+		},
+	}
+}
+
+func TestTimeBucketsAggregateAndRoll(t *testing.T) {
+	m := New(nil)
+	m.analytics = testAnalytics()
+	t0 := time.Date(2026, 10, 16, 9, 0, 0, 0, time.UTC)
+	m.Record(Event{Time: t0, Pair: "A", Kind: KindStepOpened})
+	m.Record(Event{Time: t0, Pair: "A", Kind: KindExecuted, USD: 31, LatencyLMs: 300, LatencyRMs: 340, OneLeg: true})
+	m.Record(Event{Time: t0, Pair: "A", Kind: KindPnL, USD: -0.005})
+	m.Record(Event{Time: t0.Add(16 * time.Minute), Pair: "A", Kind: KindStepClosed})
+	g := m.Metrics()
+	if len(g.TimeBuckets) != 4 {
+		t.Fatalf("buckets=%d, want 4 (2 buckets x global+pair)", len(g.TimeBuckets))
+	}
+	var globalFirst *BucketMetrics
+	for i := range g.TimeBuckets {
+		if g.TimeBuckets[i].Pair == "" && g.TimeBuckets[i].StartUTC == "2026-10-16T09:00:00Z" {
+			globalFirst = &g.TimeBuckets[i]
+		}
+	}
+	if globalFirst == nil {
+		t.Fatal("missing global bucket row")
+	}
+	if globalFirst.Opens != 1 || globalFirst.Executions != 1 || globalFirst.OneLegFails != 1 ||
+		globalFirst.VolumeUSD != 31 || globalFirst.RealizedUSD != -0.005 {
+		t.Fatalf("global bucket wrong: %+v", globalFirst)
+	}
+	if globalFirst.LatencyAvgMs != 320 || globalFirst.LatencyP95Ms != 340 || globalFirst.LatencyMaxMs != 340 {
+		t.Fatalf("latency aggregates wrong: %+v", globalFirst)
+	}
+}
+
+func TestAnomalyConsecutiveFails(t *testing.T) {
+	m := New(nil)
+	m.analytics = testAnalytics()
+	t0 := time.Date(2026, 10, 16, 9, 0, 0, 0, time.UTC)
+	for i := 0; i < 3; i++ {
+		m.Record(Event{Time: t0.Add(time.Duration(i) * time.Second), Pair: "A", Kind: KindExecuted, USD: 1, OneLeg: true})
+	}
+	if len(m.Metrics().Anomalies) != 1 || m.Metrics().Anomalies[0].Rule != "consecutive_fails" {
+		t.Fatalf("anomalies=%+v", m.Metrics().Anomalies)
+	}
+}
+
+func TestAnomalyFlipFriction(t *testing.T) {
+	m := New(nil)
+	m.analytics = testAnalytics()
+	t0 := time.Date(2026, 10, 16, 9, 0, 0, 0, time.UTC)
+	for i := 0; i < 3; i++ {
+		m.Record(Event{Time: t0.Add(time.Duration(i) * time.Minute), Pair: "A", Kind: KindFlip})
+	}
+	found := false
+	for _, a := range m.Metrics().Anomalies {
+		if a.Rule == "flip_friction" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("flip friction not fired: %+v", m.Metrics().Anomalies)
+	}
+}
+
+func TestAnomalyFullLoadAndOldestAgeAndSilent(t *testing.T) {
+	m := New(nil)
+	m.analytics = testAnalytics()
+	t0 := time.Date(2026, 10, 16, 9, 0, 0, 0, time.UTC)
+	m.Record(Event{Time: t0, Pair: "A", Kind: KindExecuted, USD: 1})
+	for i := 0; i <= 30; i++ {
+		at := t0.Add(time.Duration(i) * time.Minute)
+		m.Record(Event{Time: at, Pair: "A", Kind: KindStatus, Steps: 13, MaxSteps: 15, OldestStepAgeS: 7200})
+	}
+	got := map[string]bool{}
+	for _, a := range m.Metrics().Anomalies {
+		got[a.Rule] = true
+	}
+	if !got["full_load"] || !got["oldest_step_age"] || !got["silent"] {
+		t.Fatalf("expected full_load/oldest_step_age/silent, got %+v", m.Metrics().Anomalies)
+	}
+}
+
+func TestAnomalyLossBucketsAndMuJump(t *testing.T) {
+	m := New(nil)
+	m.analytics = testAnalytics()
+	t0 := time.Date(2026, 10, 16, 9, 0, 0, 0, time.UTC)
+	for i := 0; i < 4; i++ {
+		at := t0.Add(time.Duration(i) * 15 * time.Minute)
+		m.Record(Event{Time: at, Pair: "A", Kind: KindPnL, USD: -0.1})
+		m.Record(Event{Time: at, Pair: "A", Kind: KindStatus, MuBps: float64(i) * 5, SigmaBps: 1})
+	}
+	got := map[string]bool{}
+	for _, a := range m.Metrics().Anomalies {
+		got[a.Rule] = true
+	}
+	if !got["loss_buckets"] || !got["mu_jump"] {
+		t.Fatalf("expected loss_buckets/mu_jump, got %+v", m.Metrics().Anomalies)
+	}
+}
+
+func TestAnomalyRiskFlappingAndRescueSlip(t *testing.T) {
+	m := New(nil)
+	m.analytics = testAnalytics()
+	t0 := time.Date(2026, 10, 16, 9, 0, 0, 0, time.UTC)
+	for i := 0; i < 8; i++ {
+		m.Record(Event{Time: t0.Add(time.Duration(i) * time.Minute), Pair: "A", Kind: KindRiskState, Msg: "position_risk_unknown"})
+	}
+	m.Record(Event{Time: t0.Add(9 * time.Minute), Pair: "A", Kind: KindExecuted, USD: 1, RescueCostUSD: 0.02})
+	got := map[string]bool{}
+	for _, a := range m.Metrics().Anomalies {
+		got[a.Rule] = true
+	}
+	if !got["risk_flapping"] || !got["rescue_slippage"] {
+		t.Fatalf("expected risk_flapping/rescue_slippage, got %+v", m.Metrics().Anomalies)
+	}
+}
+
+func TestSessionSpecAndSessionOf(t *testing.T) {
+	if !ValidSessionSpec("21:30-04:00") {
+		t.Fatal("valid wrap spec rejected")
+	}
+	for _, bad := range []string{"", "25:00-04:00", "9:30-04:00", "21:30", "04:00-04:00", "21:60-04:00"} {
+		if ValidSessionSpec(bad) {
+			t.Fatalf("invalid spec %q accepted", bad)
+		}
+	}
+	sessions := map[string]string{"us_cash": "21:30-04:00"}
+	if got := SessionOf(time.Date(2026, 10, 16, 13, 30, 0, 0, time.UTC), sessions); got != "us_cash" {
+		t.Fatalf("21:30 Beijing labeled %q", got)
+	}
+	if got := SessionOf(time.Date(2026, 10, 16, 19, 59, 0, 0, time.UTC), sessions); got != "us_cash" {
+		t.Fatalf("04:00 Beijing wrap labeled %q", got)
+	}
+	if got := SessionOf(time.Date(2026, 10, 16, 6, 0, 0, 0, time.UTC), sessions); got != "" {
+		t.Fatalf("14:00 Beijing labeled %q", got)
+	}
+	if got := SessionOf(time.Now(), nil); got != "" {
+		t.Fatalf("no sessions labeled %q", got)
+	}
+}
+
+type fakeSink struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+func (f *fakeSink) WriteTrade(line []byte) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lines = append(f.lines, string(line))
+	return nil
+}
+
+func TestTradeSinkPersistsTradeKinds(t *testing.T) {
+	m := New(nil)
+	sink := &fakeSink{}
+	cfg := testAnalytics()
+	m.ConfigureAnalytics(cfg, sink)
+	t0 := time.Date(2026, 10, 16, 9, 0, 0, 0, time.UTC)
+	m.Record(Event{Time: t0, Pair: "A", Kind: KindExecuted, USD: 31, LatencyLMs: 300, LatencyRMs: 340, RescueCostUSD: 0.01})
+	m.Record(Event{Time: t0, Pair: "A", Kind: KindStatus, MuBps: 0.5, SigmaBps: 0.2, TickK: 2.5})
+	m.Record(Event{Time: t0, Pair: "A", Kind: KindPairPromoted, Score: 1})
+	if len(sink.lines) != 2 {
+		t.Fatalf("persisted %d lines, want 2: %q", len(sink.lines), sink.lines)
+	}
+	if !strings.Contains(sink.lines[0], `"pair":"A"`) || !strings.Contains(sink.lines[0], `"rescue_cost_usd":0.01`) {
+		t.Fatalf("executed line wrong: %s", sink.lines[0])
+	}
+	if !strings.Contains(sink.lines[1], `"kind":"status"`) || !strings.Contains(sink.lines[1], `"mu_bps":0.5`) {
+		t.Fatalf("status line wrong: %s", sink.lines[1])
 	}
 }

@@ -207,7 +207,7 @@ mv /opt/dex-arbitr/bin/arbd.new /opt/dex-arbitr/bin/arbd
 systemctl restart arbd && journalctl -u arbd -f
 ```
 
-- 已结算步骤与按 UTC 日滚动的量/盈亏审计记账保存在 `/opt/dex-arbitr/state`，重启后加载并核对两边实际仓位。`Unresolved=true` 的状态不会自动恢复下单，需先核实交易所订单终态及持仓；详见 [恢复边界](docs/trading-safety-fixes.md#重启升级和持仓恢复边界)。
+- 已结算步骤与按 UTC 日滚动的量/盈亏审计记账保存在 `/opt/dex-arbitr/state`，重启后加载并核对两边实际仓位；开启 `monitor.analytics` 时交易事件 JSONL 追加写入 `/opt/dex-arbitr/state/trades/trades.jsonl`，可用 `cmd/analytics` 离线统计。`Unresolved=true` 的状态不会自动恢复下单，需先核实交易所订单终态及持仓；详见 [恢复边界](docs/trading-safety-fixes.md#重启升级和持仓恢复边界)。
 - 建议确认全部订单和补救已结算后更新；仅日志暂时没有 `rescue order` 不足以证明不存在未决订单。
 
 **回滚：**

@@ -103,6 +103,27 @@ adaptive:
 monitor:
   addr: ":8080"            # HTTP metrics endpoint; empty = disabled
   token: ${SECRETS}                # bearer token; empty = no auth (use ${ENV} for secrets)
+  analytics:               # observational only: time buckets + anomaly rules (never affect trading)
+    bucket: 15m            # aggregation granularity; 0 = off
+    retain_buckets: 672    # in-memory retention (7 days @ 15m)
+    sessions:              # display-only Beijing windows (name: HH:MM-HH:MM)
+      us_cash: "21:30-04:00"
+      us_premarket: "16:00-21:30"
+      asia_day: "09:00-16:00"
+    anomalies:             # non-positive threshold disables a rule
+      consecutive_fails: 3
+      flips_window_min: 10
+      flips_threshold: 3
+      full_load_headroom: 2
+      full_load_minutes: 30
+      oldest_step_minutes: 60
+      loss_bucket_count: 3
+      loss_per_bucket_usd: 0.05
+      rescue_slip_usd: 0.01
+      latency_p95_ms: 600
+      silent_minutes: 30
+      risk_flaps_per_hour: 8
+      mu_jump_sigma: 3
 
 pairs:
   - base: SPY

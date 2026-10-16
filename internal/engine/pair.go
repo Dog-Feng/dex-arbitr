@@ -577,11 +577,14 @@ func (a *PairActor) Run(ctx context.Context) (retErr error) {
 				}
 			}
 		case <-report.C:
+			now := time.Now()
 			st := a.statsSnapshot()
 			a.record(monitor.KindStatus, func(e *monitor.Event) {
 				e.Steps = absCounter(a.state.Counter())
 				e.Mode = a.state.Mode.String()
 				e.MuBps, e.SigmaBps, e.TickK, e.FailRate = st.Mean, a.volBps(), a.tickK(), a.FailRate()
+				e.MaxSteps = a.cfg.Params.MaxSteps
+				e.OldestStepAgeS = a.oldestStepAge(now)
 			})
 			a.log.Info("status", "mode", a.state.Mode, "steps", a.state.Counter(),
 				"volume_usd", strconv.FormatFloat(a.procVolumeUSD, 'f', 8, 64),
@@ -666,6 +669,21 @@ func absCounter(n int) int {
 		return -n
 	}
 	return n
+}
+
+// oldestStepAge reports the age of the oldest open step in seconds (0 when
+// flat). It is observational only and never changes a trading decision.
+func (a *PairActor) oldestStepAge(now time.Time) float64 {
+	oldest := 0.0
+	for i := range a.state.Steps {
+		if a.state.Steps[i].OpenedAt.IsZero() {
+			continue
+		}
+		if d := now.Sub(a.state.Steps[i].OpenedAt).Seconds(); d > oldest {
+			oldest = d
+		}
+	}
+	return oldest
 }
 
 func (a *PairActor) quote(now time.Time) (spread.Quote, bool) {

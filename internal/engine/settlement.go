@@ -98,6 +98,12 @@ func (a *PairActor) watchRisk(ctx context.Context) {
 // logRiskState records transitions rather than repeating the same reason each
 // second. These inputs explain a block without logging account identifiers.
 func (a *PairActor) logRiskState(now time.Time, m marginMonitor, markL, markR float64, blocked bool, reason string) {
+	// Observational only: feed the monitor's risk-flapping anomaly rule. This
+	// is called from the risk watcher goroutine, so it bypasses a.record to
+	// avoid touching actor-owned state (a.state.Mode) from another goroutine.
+	if a.cfg.Monitor != nil {
+		a.cfg.Monitor.Record(monitor.Event{Time: now, Pair: a.key, Kind: monitor.KindRiskState, Msg: reason})
+	}
 	ageMS := func(t time.Time) int64 {
 		if t.IsZero() {
 			return -1
@@ -471,6 +477,7 @@ func (a *PairActor) accountExecution(act strategy.Action, q spread.Quote, before
 	steps := append([]strategy.Step(nil), a.state.Steps...)
 	var opened *strategy.Step
 	var removed *strategy.Step
+	var rescueCost, grossUSD float64
 	switch act.Kind {
 	case strategy.Open:
 		dl, dr := res.PosL-beforeL, res.PosR-beforeR
@@ -486,7 +493,9 @@ func (a *PairActor) accountExecution(act strategy.Action, q spread.Quote, before
 				if !finitePositive(leg.result.AvgPrice) {
 					return fmt.Errorf("cannot price an opening rollback")
 				}
-				deltaPnL += float64(leg.side) * leg.result.RescueFilled * (leg.result.RescuePrice - leg.result.AvgPrice)
+				cost := float64(leg.side) * leg.result.RescueFilled * (leg.result.RescuePrice - leg.result.AvgPrice)
+				deltaPnL += cost
+				rescueCost += cost
 			}
 		}
 		if h >= eps {
@@ -529,6 +538,7 @@ func (a *PairActor) accountExecution(act strategy.Action, q spread.Quote, before
 				if math.IsNaN(gross) || math.IsInf(gross, 0) {
 					return fmt.Errorf("step %d lacks a trustworthy entry basis", st.ID)
 				}
+				grossUSD = gross
 				entryFees := st.EntryFeesUSD * cl / st.Qty
 				partNet := gross - fees - entryFees
 				st.EntryFeesUSD -= entryFees
@@ -591,6 +601,10 @@ func (a *PairActor) accountExecution(act strategy.Action, q spread.Quote, before
 		e.USD = nl + nr
 		e.OneLeg = oneLeg
 		e.LatencyMs = float64(res.L.Latency+res.R.Latency) / float64(2*time.Millisecond)
+		e.LatencyLMs = float64(res.L.Latency) / float64(time.Millisecond)
+		e.LatencyRMs = float64(res.R.Latency) / float64(time.Millisecond)
+		e.RescueCostUSD = rescueCost
+		e.GrossUSD = grossUSD
 	})
 	a.record(monitor.KindPnL, func(e *monitor.Event) { e.USD = deltaPnL })
 	if res.RescueOrders > 0 {

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -143,6 +144,40 @@ func Run(ctx context.Context, c *config.Config) (runErr error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	mon := monitor.New(func(msg string) { slog.Error("ALERT", "msg", msg) })
+	an := c.Monitor.Analytics
+	var tradeLog *store.TradeLog
+	if an.Bucket > 0 && c.StateDir != "" {
+		tl, err := store.NewTradeLog(filepath.Join(c.StateDir, "trades", "trades.jsonl"))
+		if err != nil {
+			return fmt.Errorf("trade log: %w", err)
+		}
+		tradeLog = tl
+		defer func() {
+			if closeErr := tradeLog.Close(); closeErr != nil {
+				runErr = errors.Join(runErr, fmt.Errorf("close trade log: %w", closeErr))
+			}
+		}()
+	}
+	mon.ConfigureAnalytics(monitor.AnalyticsCfg{
+		Bucket:        an.Bucket,
+		RetainBuckets: an.RetainBuckets,
+		Sessions:      an.Sessions,
+		Anomalies: monitor.AnomalyCfg{
+			ConsecutiveFails:  an.Anomalies.ConsecutiveFails,
+			FlipsWindowMin:    an.Anomalies.FlipsWindowMin,
+			FlipsThreshold:    an.Anomalies.FlipsThreshold,
+			FullLoadHeadroom:  an.Anomalies.FullLoadHeadroom,
+			FullLoadMinutes:   an.Anomalies.FullLoadMinutes,
+			OldestStepMinutes: an.Anomalies.OldestStepMinutes,
+			LossBucketCount:   an.Anomalies.LossBucketCount,
+			LossPerBucketUSD:  an.Anomalies.LossPerBucketUSD,
+			RescueSlipUSD:     an.Anomalies.RescueSlipUSD,
+			LatencyP95Ms:      an.Anomalies.LatencyP95Ms,
+			SilentMinutes:     an.Anomalies.SilentMinutes,
+			RiskFlapsPerHour:  an.Anomalies.RiskFlapsPerHour,
+			MuJumpSigma:       an.Anomalies.MuJumpSigma,
+		},
+	}, tradeLog)
 	if c.Monitor.Addr != "" {
 		addr := c.Monitor.Addr
 		if !strings.Contains(addr, ":") {

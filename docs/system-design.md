@@ -299,6 +299,8 @@ price = max(左腿 ask1, 右腿 ask1)   // 任一腿都可能成为买腿，按�
 - 引擎在关键点发类型化事件（step_opened/step_closed/flip/executed/rescue/status/emergency/error），picker 另发 pair_promoted/pair_demoted/pair_health/pair_warmup；monitor.Monitor.Record 按 pair 归集指标并告警。
 - 双视图：`/metrics` 顶层是全局汇总（跨对合计，含 `flips` 反转计数），新增 `pairs` 字段是每个交易对的明细（状态、步数、成交量、盈亏、flips、μ/σ、tick_k、失败率、churn score 分量、预热覆盖度、是否活跃）。
 - 金额字段（`volume_usd` / `realized_usd`，以及 status 日志的 `volume_usd` / `pnl_usd`）以 8 位固定小数输出，避免浮点残差显示为科学计数法。
+- 时间桶与异常（纯观察，不影响任何交易决策）：`monitor.analytics` 配置 15 分钟桶（UTC 存储）与异常规则阈值，`/metrics` 输出 `time_buckets`（每桶全局/每对的开平、flips、量、盈亏、延迟分位、μ/σ、满仓峰值、最老步龄）与 `anomalies`（consecutive_fails / flip_friction / full_load / oldest_step_age / loss_buckets / latency_p95 / silent / risk_flapping / mu_jump / rescue_slippage / unrescued）；触发即走 ALERT 通道，详见 [监控统计与异常检测方案](monitoring-analytics-design.md)。
+- 交易事件落盘与离线分析：开启 analytics 时，step_opened/step_closed/executed/flip/rescue/status/pnl/risk_state/error/emergency 事件以 JSONL 追加写入 `state_dir/trades/trades.jsonl`（纯观察）；`go run ./cmd/analytics -trades <file> [-from/-to] [-sessions name:HH:MM-HH:MM]` 离线生成每桶/每会话报表，复用与 `/metrics.time_buckets` 相同的聚合口径。
 - 滚动失败率：actor 独立维护失败滚动窗口（`FailRate()`，atomic），picker 通过 candidate 读取做硬剔除；`/metrics` 同时给出 `fail_rate`（终身）与 `rolling_fail_rate`（最近窗口）。
 - 可选 HTTP：monitor.addr 非空时 arbd 内起服务，GET /metrics 返回 JSON；monitor.token 非空时要求 Authorization: Bearer <token> 或 ?token=（常量时间比较，401 拒绝）。
 - 只读、不 import engine。
@@ -411,6 +413,7 @@ pairs:
 | 挂单硬保证（未来） | 新增 Protector 能力接口，叠加在现有 risk 之上 |
 | 回放标定 | go run ./cmd/backtest -samples <file> |
 | 机会扫描 | go run ./cmd/scanner -config <file> |
+| 离线统计 | go run ./cmd/analytics -trades state/trades/trades.jsonl -from ... -to ... |
 | 监控接入 | monitor.addr/token 配好，前端带 token 读 /metrics |
 
 ## 12. 日志与排查

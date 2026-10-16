@@ -60,6 +60,7 @@ func TestLoadStrictValidation(t *testing.T) {
 		{"duplicate YAML key", "dry_run: true\ndry_run: false\n", "already defined"},
 		{"second YAML document", "dry_run: true\n---\ndry_run: false\n", "multiple YAML documents"},
 		{"nan threshold", "strategy:\n  open_bps: .nan\n", "strategy.open_bps must be finite"},
+		{"bad session spec", "monitor:\n  analytics:\n    sessions:\n      x: 9:30-04:00\n", "sessions"},
 		{"nonfinite inactive option", "auto:\n  notional_per_leg: -.inf\n", "auto.notional_per_leg must be finite"},
 		{"zero estimator interval", "estimator:\n  interval: 0s\n", "estimator.interval must be > 0"},
 		{"negative estimator window", "estimator:\n  window: -1s\n", "estimator.window must be > 0"},
@@ -223,6 +224,34 @@ func TestLoadCapacityHysteresisDefaultAndZero(t *testing.T) {
 	}
 	if _, err := loadTestConfig(t, "strategy:\n  cap_band: -1\n"); err == nil || !strings.Contains(err.Error(), "cap_band") {
 		t.Fatalf("negative cap_band accepted: %v", err)
+	}
+}
+
+func TestLoadMonitorAnalyticsDefaults(t *testing.T) {
+	c, err := loadTestConfig(t, "dry_run: true\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Monitor.Analytics.Bucket != 15*time.Minute || c.Monitor.Analytics.RetainBuckets != 672 {
+		t.Fatalf("analytics defaults wrong: %+v", c.Monitor.Analytics)
+	}
+	a := c.Monitor.Analytics.Anomalies
+	if a.ConsecutiveFails != 3 || a.FlipsWindowMin != 10 || a.FlipsThreshold != 3 ||
+		a.FullLoadHeadroom != 2 || a.FullLoadMinutes != 30 || a.OldestStepMinutes != 60 ||
+		a.LossBucketCount != 3 || a.LossPerBucketUSD != 0.05 || a.RescueSlipUSD != 0.01 ||
+		a.LatencyP95Ms != 600 || a.SilentMinutes != 30 || a.RiskFlapsPerHour != 8 || a.MuJumpSigma != 3 {
+		t.Fatalf("anomaly defaults wrong: %+v", a)
+	}
+	c, err = loadTestConfig(t, "monitor:\n  analytics:\n    bucket: 1h\n    anomalies:\n      consecutive_fails: -1\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Monitor.Analytics.Bucket != time.Hour || c.Monitor.Analytics.Anomalies.ConsecutiveFails != -1 {
+		t.Fatalf("explicit analytics values not honored: %+v", c.Monitor.Analytics)
+	}
+	c, err = loadTestConfig(t, "monitor:\n  analytics:\n    sessions:\n      us_cash: 21:30-04:00\n")
+	if err != nil || c.Monitor.Analytics.Sessions["us_cash"] != "21:30-04:00" {
+		t.Fatalf("sessions not parsed: %+v %v", c.Monitor.Analytics.Sessions, err)
 	}
 }
 
