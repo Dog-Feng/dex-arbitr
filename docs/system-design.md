@@ -161,6 +161,8 @@ WARMUP --(μ 就绪)--> RUNNING <-> REDUCE_ONLY
 
 **方向反转滞回**：从空仓反向再开仓时，门槛额外加上 `flip_hysteresis_sigma × σ`（默认 `1.0`，即反转需要比正常开仓多一个 σ 的偏离，配 `0` 关闭）。该缓冲只作用于「上次方向相反且当前空仓」的反转开仓，同方向续仓不受影响；上次方向仅保存在内存（重启后视为未知、不再加缓冲）。每次满足条件的反转成交会发 `flip` 事件并计入 monitor 的全局与 per-pair `flips` 计数。该状态由引擎维护，`Decide` 本身仍是纯函数（`State.LastDir` 由调用方传入）。
 
+**容量滞回**：步数一旦碰到 `max_steps` 就进入容量滞回状态，之后必须减到 `max_steps - cap_band`（默认 band=2）以下才重新解锁开仓，打断"15→14→15"的满仓边界一平一开循环；同时在最高的 `cap_band` 步内，开仓门槛额外加 `cap_hysteresis_sigma × σ`（默认 `1.0`），让贴着容量线的补仓需要更强的信号。两个参数配 `0` 即关闭；状态由引擎按账本维护（`State.CapEngaged` 传入，重启时从已加载步数重建），不改动平仓、drain 或应急路径。
+
 注：`volume` 策略自己将额外 `open_bps/close_bps` 固定为 `0 / 0`，扫描器与 actor 共用该参数规则；手续费、`vol_k`、深度仍生效。显式 `vol_k: 0` 可关闭波动过滤，不跳过均值预热。旧兼容字段 `volume.loss_tolerance_bps` 在 volume 模式下必须为零，避免把零门槛改成负门槛。四种组合详见 [策略与选币完整链路](strategy-selection-flow.md)。
 
 ### 7.4 一次执行（Executor）
@@ -351,6 +353,8 @@ strategy:
   close_order: best
   vol_k: 1.28
   flip_hysteresis_sigma: 1.0  # 反转需比正常开仓多出的 σ 缓冲（0 = 关闭）
+  cap_band: 2                 # 触顶后减到 max_steps-cap_band 才解锁开仓（0 = 关闭）
+  cap_hysteresis_sigma: 1.0   # 顶部 cap_band 步内开仓的额外 σ 缓冲（0 = 关闭）
   interval_min: 7s
   interval_max: 10s
   max_book_age: 10s

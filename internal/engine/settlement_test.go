@@ -320,6 +320,45 @@ func TestProcessLifetimeVolumeAccumulatesAcrossDays(t *testing.T) {
 	nearSettlement(t, "process pnl cumulative", a.procPnlUSD, .579)
 }
 
+func TestCapEngagedBandTransitions(t *testing.T) {
+	a := settlementActor(t)
+	a.cfg.Params = strategy.Params{MaxSteps: 5, CapBand: 2, StepQty: 1, DepthMult: 1}
+	for i := 0; i < 5; i++ {
+		l, r := strategy.DirLS.LegSides()
+		act := strategy.Action{Kind: strategy.Open, Dir: strategy.DirLS, Qty: 1,
+			L: strategy.Leg{Side: l, Price: 100}, R: strategy.Leg{Side: r, Price: 110}}
+		n := float64(i + 1)
+		if err := a.accountExecution(act, spread.Quote{}, n-1, -(n - 1), fillResult(1, 100, 1, 110, n, -n)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(a.state.Steps) != 5 {
+		t.Fatalf("steps=%d counter=%d", len(a.state.Steps), a.state.Counter())
+	}
+	if !a.capEngaged {
+		t.Fatal("cap not engaged at max steps")
+	}
+	closeAct := func(id int64) strategy.Action {
+		return strategy.Action{Kind: strategy.Close, Dir: strategy.DirLS, StepID: id, Qty: 1,
+			L: strategy.Leg{Side: domain.Sell, Price: 101}, R: strategy.Leg{Side: domain.Buy, Price: 110}}
+	}
+	if err := a.accountExecution(closeAct(1), spread.Quote{}, 5, -5, fillResult(1, 101, 1, 110, 4, -4)); err != nil {
+		t.Fatal(err)
+	}
+	if len(a.state.Steps) != 4 {
+		t.Fatalf("steps=%d counter=%d", len(a.state.Steps), a.state.Counter())
+	}
+	if !a.capEngaged {
+		t.Fatal("band disengaged at max-1")
+	}
+	if err := a.accountExecution(closeAct(2), spread.Quote{}, 4, -4, fillResult(1, 101, 1, 110, 3, -3)); err != nil {
+		t.Fatal(err)
+	}
+	if a.capEngaged {
+		t.Fatal("band stayed engaged below max-cap_band")
+	}
+}
+
 func TestSettlementCheckpointSurvivesEmptyLedgerRestart(t *testing.T) {
 	a := settlementActor(t)
 	a.checkpoint = true

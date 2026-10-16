@@ -75,6 +75,8 @@ type Config struct {
 		CloseOrder          string        `yaml:"close_order"`
 		VolK                float64       `yaml:"vol_k"`                 // one-sided sigma buffer on top of open_bps
 		FlipHysteresisSigma float64       `yaml:"flip_hysteresis_sigma"` // extra sigma before reversing direction
+		CapBand             int           `yaml:"cap_band"`              // steps below max_steps that unlock opens after hitting the cap
+		CapHysteresisSigma  float64       `yaml:"cap_hysteresis_sigma"`  // extra sigma to open inside the top cap_band steps
 		IntervalMin         time.Duration `yaml:"interval_min"`
 		IntervalMax         time.Duration `yaml:"interval_max"`
 		MaxBookAge          time.Duration `yaml:"max_book_age"`
@@ -148,6 +150,12 @@ func Load(path string) (*Config, error) {
 	c.defaults()
 	c.Execution.PriceTicks = 30
 	c.Strategy.FlipHysteresisSigma = 1.0
+	if c.Strategy.CapBand == 0 {
+		c.Strategy.CapBand = 2
+	}
+	if c.Strategy.CapHysteresisSigma == 0 {
+		c.Strategy.CapHysteresisSigma = 1.0
+	}
 	d := yaml.NewDecoder(bytes.NewBufferString(os.ExpandEnv(string(raw))))
 	d.KnownFields(true)
 	if err := d.Decode(&c); err != nil {
@@ -489,6 +497,9 @@ func (c *Config) validate() error {
 	}
 	if c.Strategy.FlipHysteresisSigma < 0 {
 		return fmt.Errorf("strategy.flip_hysteresis_sigma must be >= 0")
+	}
+	if c.Strategy.CapBand < 0 || c.Strategy.CapHysteresisSigma < 0 {
+		return fmt.Errorf("strategy.cap_band / cap_hysteresis_sigma must be >= 0")
 	}
 	if c.Volume.MinInventory < 0 {
 		return fmt.Errorf("volume.min_inventory must be >= 0")

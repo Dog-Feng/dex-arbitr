@@ -82,6 +82,14 @@ type Params struct {
 	// spread volatility, required before opening the opposite direction after
 	// a flat position. Same-direction additions are unaffected.
 	FlipHysteresisSigma float64
+	// CapBand is the capacity hysteresis band: once the step count touches
+	// MaxSteps, opens stay blocked until the count falls to MaxSteps-CapBand
+	// or below. 0 disables the band.
+	CapBand int
+	// CapHysteresisSigma is the extra deviation, in units of the current
+	// spread volatility, required to open inside the top CapBand steps. It
+	// prices the marginal cost of re-churning near the capacity line.
+	CapHysteresisSigma float64
 }
 
 // Strategy decides an action from the pair state and market view.
@@ -116,9 +124,10 @@ func (v Volume) Decide(p Params, s State, q spread.Quote, mu float64, muReady bo
 
 // State is the pair state the strategy needs.
 type State struct {
-	Mode    Mode
-	Steps   []Step // all same direction (single signed counter)
-	LastDir Dir    // direction last traded; 0 = unknown (e.g. after restart)
+	Mode       Mode
+	Steps      []Step // all same direction (single signed counter)
+	LastDir    Dir    // direction last traded; 0 = unknown (e.g. after restart)
+	CapEngaged bool   // capacity band engaged (steps touched MaxSteps since last reset)
 }
 
 // Counter is the signed step count (negative = long left / short right).
@@ -281,7 +290,7 @@ func (Arbitrage) Decide(p Params, s State, q spread.Quote, mu float64, muReady b
 	if _, ok := spread.Compute(q.L, q.R); !ok || !validPrice(q.RefMid) || !finite(q.LS) || !finite(q.SL) || !finite(q.Mid) {
 		return Action{Reason: "invalid quote"}
 	}
-	if s.Mode < ModeWarmup || s.Mode > ModePaused || !validPrice(p.StepQty) || p.MaxSteps <= 0 || !validPrice(p.DepthMult) || !finite(p.OpenBps) || !finite(p.CloseBps) || !finite(p.VolK) || p.VolK < 0 || !finite(p.FeeBps) || p.FeeBps < 0 || !finite(p.TakerFeeL) || p.TakerFeeL < 0 || !finite(p.TakerFeeR) || p.TakerFeeR < 0 || p.MinInventory < 0 || !finite(p.FlipHysteresisSigma) || p.FlipHysteresisSigma < 0 {
+	if s.Mode < ModeWarmup || s.Mode > ModePaused || !validPrice(p.StepQty) || p.MaxSteps <= 0 || !validPrice(p.DepthMult) || !finite(p.OpenBps) || !finite(p.CloseBps) || !finite(p.VolK) || p.VolK < 0 || !finite(p.FeeBps) || p.FeeBps < 0 || !finite(p.TakerFeeL) || p.TakerFeeL < 0 || !finite(p.TakerFeeR) || p.TakerFeeR < 0 || p.MinInventory < 0 || !finite(p.FlipHysteresisSigma) || p.FlipHysteresisSigma < 0 || p.CapBand < 0 || !finite(p.CapHysteresisSigma) || p.CapHysteresisSigma < 0 {
 		return Action{Reason: "invalid strategy parameters"}
 	}
 	need := p.StepQty * p.DepthMult
@@ -348,6 +357,18 @@ func (Arbitrage) Decide(p Params, s State, q spread.Quote, mu float64, muReady b
 		// forth. Same-direction continuation is never taxed.
 		if cnt == 0 && s.LastDir != 0 && s.LastDir != d && p.FlipHysteresisSigma > 0 {
 			needDev += p.FlipHysteresisSigma * vol
+		}
+		// The top CapBand steps are the most expensive re-churn: price the
+		// marginal open there with one extra sigma so a close-then-reopen at
+		// the capacity line requires a genuinely stronger signal.
+		if p.CapBand > 0 && p.CapHysteresisSigma > 0 && abs(cnt) >= p.MaxSteps-p.CapBand {
+			needDev += p.CapHysteresisSigma * vol
+		}
+		// Capacity band: once the count touched MaxSteps, holds open until it
+		// falls to MaxSteps-CapBand or below. This breaks the 15->14->15
+		// close-one/open-one cycle at the capacity line.
+		if p.CapBand > 0 && s.CapEngaged && abs(cnt) > p.MaxSteps-p.CapBand {
+			return Action{Reason: fmt.Sprintf("%s signal %.2fbps but capacity band engaged (reopen below %d steps)", d, dev, p.MaxSteps-p.CapBand)}, true
 		}
 		if dev < needDev {
 			return Action{}, false

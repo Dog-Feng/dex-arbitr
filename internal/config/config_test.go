@@ -209,6 +209,23 @@ func TestLoadFlipHysteresisDefaultAndZero(t *testing.T) {
 	}
 }
 
+func TestLoadCapacityHysteresisDefaultAndZero(t *testing.T) {
+	c, err := loadTestConfig(t, "dry_run: true\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Strategy.CapBand != 2 || c.Strategy.CapHysteresisSigma != 1.0 {
+		t.Fatalf("default cap hysteresis wrong: band=%d sigma=%v", c.Strategy.CapBand, c.Strategy.CapHysteresisSigma)
+	}
+	c, err = loadTestConfig(t, "strategy:\n  cap_band: 0\n  cap_hysteresis_sigma: 0\n")
+	if err != nil || c.Strategy.CapBand != 0 || c.Strategy.CapHysteresisSigma != 0 {
+		t.Fatalf("explicit zeros should disable the capacity hysteresis: %+v %v", c.Strategy, err)
+	}
+	if _, err := loadTestConfig(t, "strategy:\n  cap_band: -1\n"); err == nil || !strings.Contains(err.Error(), "cap_band") {
+		t.Fatalf("negative cap_band accepted: %v", err)
+	}
+}
+
 func TestLoadPairSelection(t *testing.T) {
 	cases := []struct {
 		name    string

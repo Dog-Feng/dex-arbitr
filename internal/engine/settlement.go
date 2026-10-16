@@ -325,6 +325,7 @@ func (a *PairActor) finishIntervention(res execution.Result, interrupted ...exec
 		a.lastDir = a.state.Steps[0].Dir
 	}
 	a.state.Steps = nil
+	a.syncCapEngaged()
 	a.posL, a.posR = res.PosL, res.PosR
 	a.syncCounter()
 	a.syncPositionState()
@@ -562,6 +563,7 @@ func (a *PairActor) accountExecution(act strategy.Action, q spread.Quote, before
 		return fmt.Errorf("confirmed positions %.8f/%.8f do not match updated ledger %.8f", res.PosL, res.PosR, expected)
 	}
 	a.state.Steps = steps
+	a.syncCapEngaged()
 	a.posL, a.posR = res.PosL, res.PosR
 	a.syncCounter()
 	a.syncPositionState()
@@ -738,6 +740,7 @@ func (a *PairActor) finishUnwind(res execution.Result) error {
 		a.lastDir = a.state.Steps[0].Dir
 	}
 	a.state.Steps = nil
+	a.syncCapEngaged()
 	a.posL, a.posR = res.PosL, res.PosR
 	a.syncCounter()
 	a.syncPositionState()

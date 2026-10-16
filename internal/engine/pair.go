@@ -126,6 +126,9 @@ type PairActor struct {
 	latR                *latencySeries
 	winUpdatedAt        time.Time
 	lastDir             strategy.Dir
+	// capEngaged records that the step count touched MaxSteps; opens stay
+	// blocked until the count falls to MaxSteps-CapBand or below.
+	capEngaged bool
 }
 
 // volumeAcc keeps a UTC-day-scoped volume/PnL audit trail and the sticky
@@ -157,6 +160,19 @@ func (a *PairActor) addSettled(volumeUSD, pnlUSD float64) {
 	a.volAcc.pnlUSD += pnlUSD
 	a.procVolumeUSD += volumeUSD
 	a.procPnlUSD += pnlUSD
+}
+
+// syncCapEngaged updates the capacity-band state from the current ledger. It
+// only changes when the count touches MaxSteps or falls back into the band.
+func (a *PairActor) syncCapEngaged() {
+	p := a.cfg.Params
+	n := absCounter(a.state.Counter())
+	if p.MaxSteps > 0 && n >= p.MaxSteps {
+		a.capEngaged = true
+	}
+	if p.CapBand > 0 && n <= p.MaxSteps-p.CapBand {
+		a.capEngaged = false
+	}
 }
 
 // latencyStat aggregates per-leg submit-to-result latency for the status report.
@@ -231,6 +247,7 @@ func NewPairActor(cfg PairConfig) (*PairActor, error) {
 			a.state.Mode = strategy.ModePaused
 		}
 	}
+	a.syncCapEngaged()
 	a.settled.Store(!st.Unresolved && cfg.DryRun)
 	a.posL, a.posR = a.expectedL(), -a.expectedL()
 	a.flatPositions.Store(cfg.DryRun && len(st.Steps) == 0)
@@ -615,6 +632,7 @@ func (a *PairActor) Run(ctx context.Context) (retErr error) {
 			mu, ready := a.mean()
 			st := a.state
 			st.LastDir = a.lastDir
+			st.CapEngaged = a.capEngaged
 			act := a.cfg.Strategy.Decide(a.cfg.Params, st, q, mu, ready, a.volBps())
 			if act.Kind == strategy.None {
 				continue

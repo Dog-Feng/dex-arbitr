@@ -2,6 +2,7 @@ package strategy
 
 import (
 	"math"
+	"strings"
 	"testing"
 
 	"github.com/Dog-Feng/dex-arbitr/internal/domain"
@@ -86,6 +87,52 @@ func TestFlipHysteresisGatesMarginalReversal(t *testing.T) {
 			a := (Arbitrage{}).Decide(p, State{Mode: ModeRunning, LastDir: tc.last}, q, 0, true, 0.5)
 			if tc.wantOpen != (a.Kind == Open) || (tc.wantOpen && a.Dir != DirSL) {
 				t.Fatalf("got %+v, wantOpen=%v", a, tc.wantOpen)
+			}
+		})
+	}
+}
+
+func TestCapacityBandAndHysteresis(t *testing.T) {
+	quote := func(slBps float64) spread.Quote {
+		lb := 100 + slBps*100/1e4
+		l := domain.Book{Bids: []domain.Level{{Price: lb, Size: 1}}, Asks: []domain.Level{{Price: lb + 0.01, Size: 1}}}
+		r := domain.Book{Bids: []domain.Level{{Price: 99.99, Size: 1}}, Asks: []domain.Level{{Price: 100, Size: 1}}}
+		q, _ := spread.Compute(l, r)
+		return q
+	}
+	steps := func(n int) []Step {
+		s := make([]Step, n)
+		for i := range s {
+			s[i] = Step{Dir: DirSL}
+		}
+		return s
+	}
+	for _, tc := range []struct {
+		name     string
+		engaged  bool
+		cnt      int
+		band     int
+		capSigma float64
+		slBps    float64
+		wantOpen bool
+		wantWhy  string
+	}{
+		{"band blocks reopen at max-1", true, 4, 2, 1, 5, false, "capacity band"},
+		{"cap hysteresis gates marginal top-band open", false, 4, 2, 1, 0.4, false, ""},
+		{"decisive top-band open allowed", false, 4, 2, 1, 0.6, true, ""},
+		{"below band unaffected", false, 2, 2, 1, 0.4, true, ""},
+		{"band disabled blocks nothing", false, 4, 0, 1, 0.4, true, ""},
+		{"cap sigma disabled adds no buffer", false, 4, 2, 0, 0.4, true, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := Params{StepQty: .01, MaxSteps: 5, OpenBps: 0, CloseBps: 0, DepthMult: 1, VolK: 0,
+				CapBand: tc.band, CapHysteresisSigma: tc.capSigma}
+			a := (Arbitrage{}).Decide(p, State{Mode: ModeRunning, Steps: steps(tc.cnt), CapEngaged: tc.engaged}, quote(tc.slBps), 0, true, 0.5)
+			if tc.wantOpen != (a.Kind == Open) {
+				t.Fatalf("got %+v, wantOpen=%v", a, tc.wantOpen)
+			}
+			if tc.wantWhy != "" && !strings.Contains(a.Reason, tc.wantWhy) {
+				t.Fatalf("reason %q missing %q", a.Reason, tc.wantWhy)
 			}
 		})
 	}
