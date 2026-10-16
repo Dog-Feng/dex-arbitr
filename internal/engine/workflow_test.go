@@ -6,6 +6,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -33,6 +34,24 @@ func workflowRuntime(t *testing.T, kind, mode string) *runtime {
 	}
 	rt.cfg = c
 	return rt
+}
+
+func TestBuildActorRejectsInventoryFloorAboveBandUnlock(t *testing.T) {
+	rt := workflowRuntime(t, "volume", "manual")
+	rt.cfg.Strategy.CapBand = 2
+	rt.cfg.Strategy.CapHysteresisSigma = 1
+	rt.cfg.Volume.MinInventory = 3
+	est, vol, vl, vr, err := rt.newStats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	inst := domain.Instrument{MarketID: 1, SizeDecimals: 4, PriceDecimals: 2}
+	pair := symbols.NewPair("TEST", inst, inst)
+	l, r := newActorTestVenue("L"), newActorTestVenue("R")
+	_, err = rt.buildActor(pair, rt.cfg.Pairs[0].StepQty, rt.cfg.Pairs[0].MaxSteps, l, r, est, vol, vl, vr, nil)
+	if err == nil || !strings.Contains(err.Error(), "capacity-band unlock") {
+		t.Fatalf("expected inventory-floor/band conflict, got %v", err)
+	}
 }
 
 func TestStrategySelectionMatrixWarmsTradesAndRetainsTwoHourWindow(t *testing.T) {

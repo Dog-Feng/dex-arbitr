@@ -85,6 +85,15 @@ func (rt *runtime) buildActor(pair symbols.Pair, qty float64, maxSteps int, l, r
 	if c.Strategy.Kind == "volume" {
 		minInv = c.Volume.MinInventory
 	}
+	if c.Strategy.CapBand > 0 && minInv > 0 {
+		band := c.Strategy.CapBand
+		if band > maxSteps {
+			band = maxSteps
+		}
+		if minInv >= maxSteps-band {
+			return nil, fmt.Errorf("pair %s: volume.min_inventory %d blocks the capacity-band unlock (max_steps %d, cap_band %d)", pair.Base, minInv, maxSteps, c.Strategy.CapBand)
+		}
+	}
 	return NewPairActor(PairConfig{
 		Pair: pair, L: l, R: r, Strategy: strat, Est: est, DryRun: c.DryRun, Store: rt.store, Tracker: rt.tracker, IDs: rt.ids,
 		ExecCfg: ExecutionConfig(c), SampleEvery: c.Estimator.Interval,

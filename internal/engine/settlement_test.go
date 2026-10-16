@@ -359,6 +359,39 @@ func TestCapEngagedBandTransitions(t *testing.T) {
 	}
 }
 
+func TestCapEngagedOversizedBandReleasesAtFlat(t *testing.T) {
+	a := settlementActor(t)
+	a.cfg.Params = strategy.Params{MaxSteps: 2, CapBand: 9, StepQty: 1, DepthMult: 1}
+	for i := 0; i < 2; i++ {
+		l, r := strategy.DirLS.LegSides()
+		act := strategy.Action{Kind: strategy.Open, Dir: strategy.DirLS, Qty: 1,
+			L: strategy.Leg{Side: l, Price: 100}, R: strategy.Leg{Side: r, Price: 110}}
+		n := float64(i + 1)
+		if err := a.accountExecution(act, spread.Quote{}, n-1, -(n - 1), fillResult(1, 100, 1, 110, n, -n)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !a.capEngaged {
+		t.Fatal("cap not engaged at max steps")
+	}
+	closeAct := func(id int64) strategy.Action {
+		return strategy.Action{Kind: strategy.Close, Dir: strategy.DirLS, StepID: id, Qty: 1,
+			L: strategy.Leg{Side: domain.Sell, Price: 101}, R: strategy.Leg{Side: domain.Buy, Price: 110}}
+	}
+	if err := a.accountExecution(closeAct(1), spread.Quote{}, 2, -2, fillResult(1, 101, 1, 110, 1, -1)); err != nil {
+		t.Fatal(err)
+	}
+	if !a.capEngaged {
+		t.Fatal("oversized band should stay engaged while holding")
+	}
+	if err := a.accountExecution(closeAct(2), spread.Quote{}, 1, -1, fillResult(1, 101, 1, 110, 0, 0)); err != nil {
+		t.Fatal(err)
+	}
+	if a.capEngaged {
+		t.Fatal("oversized band never released at flat")
+	}
+}
+
 func TestSettlementCheckpointSurvivesEmptyLedgerRestart(t *testing.T) {
 	a := settlementActor(t)
 	a.checkpoint = true

@@ -295,6 +295,12 @@ func (Arbitrage) Decide(p Params, s State, q spread.Quote, mu float64, muReady b
 	}
 	need := p.StepQty * p.DepthMult
 	cnt := s.Counter()
+	// A band at or beyond the capacity itself must degrade to "release at
+	// flat" instead of a negative unlock threshold that never clears.
+	band := p.CapBand
+	if band > p.MaxSteps {
+		band = p.MaxSteps
+	}
 
 	// 1) close first, but never below the inventory floor
 	if abs(cnt) > p.MinInventory {
@@ -361,14 +367,14 @@ func (Arbitrage) Decide(p Params, s State, q spread.Quote, mu float64, muReady b
 		// The top CapBand steps are the most expensive re-churn: price the
 		// marginal open there with one extra sigma so a close-then-reopen at
 		// the capacity line requires a genuinely stronger signal.
-		if p.CapBand > 0 && p.CapHysteresisSigma > 0 && abs(cnt) >= p.MaxSteps-p.CapBand {
+		if band > 0 && p.CapHysteresisSigma > 0 && abs(cnt) >= p.MaxSteps-band {
 			needDev += p.CapHysteresisSigma * vol
 		}
 		// Capacity band: once the count touched MaxSteps, holds open until it
 		// falls to MaxSteps-CapBand or below. This breaks the 15->14->15
 		// close-one/open-one cycle at the capacity line.
-		if p.CapBand > 0 && s.CapEngaged && abs(cnt) > p.MaxSteps-p.CapBand {
-			return Action{Reason: fmt.Sprintf("%s signal %.2fbps but capacity band engaged (reopen below %d steps)", d, dev, p.MaxSteps-p.CapBand)}, true
+		if band > 0 && s.CapEngaged && abs(cnt) > p.MaxSteps-band {
+			return Action{Reason: fmt.Sprintf("%s signal %.2fbps but capacity band engaged (reopen below %d steps)", d, dev, p.MaxSteps-band)}, true
 		}
 		if dev < needDev {
 			return Action{}, false

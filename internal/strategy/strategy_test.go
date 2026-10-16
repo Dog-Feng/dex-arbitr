@@ -123,6 +123,8 @@ func TestCapacityBandAndHysteresis(t *testing.T) {
 		{"below band unaffected", false, 2, 2, 1, 0.4, true, ""},
 		{"band disabled blocks nothing", false, 4, 0, 1, 0.4, true, ""},
 		{"cap sigma disabled adds no buffer", false, 4, 2, 0, 0.4, true, ""},
+		{"oversized band blocks while holding", true, 2, 9, 1, 5, false, "capacity band"},
+		{"oversized band releases at flat", true, 0, 9, 1, 0.6, true, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			p := Params{StepQty: .01, MaxSteps: 5, OpenBps: 0, CloseBps: 0, DepthMult: 1, VolK: 0,

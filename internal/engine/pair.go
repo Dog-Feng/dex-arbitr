@@ -167,10 +167,14 @@ func (a *PairActor) addSettled(volumeUSD, pnlUSD float64) {
 func (a *PairActor) syncCapEngaged() {
 	p := a.cfg.Params
 	n := absCounter(a.state.Counter())
+	band := p.CapBand
+	if band > p.MaxSteps {
+		band = p.MaxSteps
+	}
 	if p.MaxSteps > 0 && n >= p.MaxSteps {
 		a.capEngaged = true
 	}
-	if p.CapBand > 0 && n <= p.MaxSteps-p.CapBand {
+	if band > 0 && n <= p.MaxSteps-band {
 		a.capEngaged = false
 	}
 }
