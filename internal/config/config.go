@@ -67,16 +67,17 @@ type Config struct {
 		MaxNotional        float64       `yaml:"max_notional"`         // per-venue aggregate notional cap (USD); 0 = unlimited
 	} `yaml:"risk"`
 	Strategy struct {
-		Kind          string        `yaml:"kind"`           // arbitrage | volume (registered strategies)
-		PairSelection string        `yaml:"pair_selection"` // manual | auto
-		OpenBps       float64       `yaml:"open_bps"`
-		CloseBps      float64       `yaml:"close_bps"`
-		DepthMult     float64       `yaml:"depth_mult"`
-		CloseOrder    string        `yaml:"close_order"`
-		VolK          float64       `yaml:"vol_k"` // one-sided sigma buffer on top of open_bps
-		IntervalMin   time.Duration `yaml:"interval_min"`
-		IntervalMax   time.Duration `yaml:"interval_max"`
-		MaxBookAge    time.Duration `yaml:"max_book_age"`
+		Kind                string        `yaml:"kind"`           // arbitrage | volume (registered strategies)
+		PairSelection       string        `yaml:"pair_selection"` // manual | auto
+		OpenBps             float64       `yaml:"open_bps"`
+		CloseBps            float64       `yaml:"close_bps"`
+		DepthMult           float64       `yaml:"depth_mult"`
+		CloseOrder          string        `yaml:"close_order"`
+		VolK                float64       `yaml:"vol_k"`                 // one-sided sigma buffer on top of open_bps
+		FlipHysteresisSigma float64       `yaml:"flip_hysteresis_sigma"` // extra sigma before reversing direction
+		IntervalMin         time.Duration `yaml:"interval_min"`
+		IntervalMax         time.Duration `yaml:"interval_max"`
+		MaxBookAge          time.Duration `yaml:"max_book_age"`
 	} `yaml:"strategy"`
 	Volume struct {
 		MinInventory      int     `yaml:"min_inventory"`       // floor steps held while churning
@@ -148,6 +149,7 @@ func Load(path string) (*Config, error) {
 	// Seed before decoding so an explicit 0 remains distinct from an omitted value.
 	c.defaults()
 	c.Execution.PriceTicks = 30
+	c.Strategy.FlipHysteresisSigma = 1.0
 	d := yaml.NewDecoder(bytes.NewBufferString(os.ExpandEnv(string(raw))))
 	d.KnownFields(true)
 	if err := d.Decode(&c); err != nil {
@@ -486,6 +488,9 @@ func (c *Config) validate() error {
 	}
 	if c.Strategy.VolK < 0 {
 		return fmt.Errorf("strategy.vol_k must be >= 0")
+	}
+	if c.Strategy.FlipHysteresisSigma < 0 {
+		return fmt.Errorf("strategy.flip_hysteresis_sigma must be >= 0")
 	}
 	if c.Volume.MinInventory < 0 {
 		return fmt.Errorf("volume.min_inventory must be >= 0")

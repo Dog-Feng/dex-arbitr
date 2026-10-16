@@ -159,6 +159,8 @@ WARMUP --(μ 就绪)--> RUNNING <-> REDUCE_ONLY
 
 **σ 就绪准入闸**：σ 未攒满增量时，策略的 Open 与 Close 都被拦截（30s 节流告警 `trading blocked until short-horizon volatility is ready`）；仅救援、drain 与应急清仓等安全退出路径不受影响。
 
+**方向反转滞回**：从空仓反向再开仓时，门槛额外加上 `flip_hysteresis_sigma × σ`（默认 `1.0`，即反转需要比正常开仓多一个 σ 的偏离，配 `0` 关闭）。该缓冲只作用于「上次方向相反且当前空仓」的反转开仓，同方向续仓不受影响；上次方向仅保存在内存（重启后视为未知、不再加缓冲）。每次满足条件的反转成交会发 `flip` 事件并计入 monitor 的全局与 per-pair `flips` 计数。该状态由引擎维护，`Decide` 本身仍是纯函数（`State.LastDir` 由调用方传入）。
+
 注：`volume` 策略自己将额外 `open_bps/close_bps` 固定为 `0 / 0`，扫描器与 actor 共用该参数规则；手续费、`vol_k`、深度和预算仍生效。显式 `vol_k: 0` 可关闭波动过滤，不跳过均值预热。旧兼容字段 `volume.loss_tolerance_bps` 在 volume 模式下必须为零，避免把零门槛改成负门槛。四种组合详见 [策略与选币完整链路](strategy-selection-flow.md)。
 
 ### 7.4 一次执行（Executor）
@@ -292,8 +294,8 @@ price = max(左腿 ask1, 右腿 ask1)   // 任一腿都可能成为买腿，按�
 
 职责：盯系统自己的交易数据（仓位、成交量、成功/失败率、盈亏、延迟、保证金、补救/应急/错误）。
 
-- 引擎在关键点发类型化事件（step_opened/step_closed/executed/rescue/status/emergency/error），picker 另发 pair_promoted/pair_demoted/pair_health/pair_warmup；monitor.Monitor.Record 按 pair 归集指标并告警。
-- 双视图：`/metrics` 顶层是全局汇总（跨对合计），新增 `pairs` 字段是每个交易对的明细（状态、步数、成交量、盈亏、μ/σ、tick_k、失败率、churn score 分量、预热覆盖度、是否活跃）。
+- 引擎在关键点发类型化事件（step_opened/step_closed/flip/executed/rescue/status/emergency/error），picker 另发 pair_promoted/pair_demoted/pair_health/pair_warmup；monitor.Monitor.Record 按 pair 归集指标并告警。
+- 双视图：`/metrics` 顶层是全局汇总（跨对合计，含 `flips` 反转计数），新增 `pairs` 字段是每个交易对的明细（状态、步数、成交量、盈亏、flips、μ/σ、tick_k、失败率、churn score 分量、预热覆盖度、是否活跃）。
 - 滚动失败率：actor 独立维护失败滚动窗口（`FailRate()`，atomic），picker 通过 candidate 读取做硬剔除；`/metrics` 同时给出 `fail_rate`（终身）与 `rolling_fail_rate`（最近窗口）。
 - 可选 HTTP：monitor.addr 非空时 arbd 内起服务，GET /metrics 返回 JSON；monitor.token 非空时要求 Authorization: Bearer <token> 或 ?token=（常量时间比较，401 拒绝）。
 - 只读、不 import engine。
@@ -306,7 +308,7 @@ price = max(左腿 ask1, 右腿 ask1)   // 任一腿都可能成为买腿，按�
 
 ### 9.3 scan（套利检测）
 
-- scan.Eval 委托 strategy.OpeningMargins：net = dev - fee_bps - vol_k*σ - open_bps，>0 即机会（与交易策略口径一致，含 per-leg 费率）。
+- scan.Eval 委托 strategy.OpeningMargins：net = dev - fee_bps - vol_k*σ - open_bps，>0 即机会（与交易策略口径一致，含 per-leg 费率）。扫描器无持仓历史，不施加 `flip_hysteresis_sigma` 反转缓冲。
 - scan.Watch 订阅两腿盘口（只读 WS），按配置 cadence 维护 μ/σ，按四层条件（可交易/数据新鲜/统计就绪/净机会>0）发机会。
 - scan.HealthTracker 是刷量健康度打分器（σ_bps / 反转频率 / 深度质量 / tick 质量 / 稳定性），供 auto picker 使用；纯统计、不碰引擎。
 - 命令：go run ./cmd/scanner -config <file> 用只读 venue 扫描所有匹配对，去重后打日志；不 import engine。
@@ -347,6 +349,7 @@ strategy:
   depth_mult: 2
   close_order: best
   vol_k: 1.28
+  flip_hysteresis_sigma: 1.0  # 反转需比正常开仓多出的 σ 缓冲（0 = 关闭）
   interval_min: 7s
   interval_max: 10s
   max_book_age: 10s

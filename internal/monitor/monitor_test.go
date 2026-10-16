@@ -217,3 +217,13 @@ func TestConcurrentRecordingAndSnapshots(t *testing.T) {
 		t.Fatalf("lost concurrent events: %+v", g)
 	}
 }
+
+func TestFlipCounter(t *testing.T) {
+	m := New(nil)
+	m.Record(Event{Pair: "A", Kind: KindFlip, Dir: "SHORT_L/LONG_R"})
+	m.Record(Event{Pair: "B", Kind: KindFlip, Dir: "LONG_L/SHORT_R"})
+	g := m.Metrics()
+	if g.Flips != 2 || g.Pairs["A"].Flips != 1 || g.Pairs["B"].Flips != 1 {
+		t.Fatalf("flip counters wrong: %+v", g)
+	}
+}

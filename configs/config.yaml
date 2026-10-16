@@ -51,6 +51,7 @@ strategy:
   depth_mult: 2        # top-of-book qty >= step_qty * 2 on both legs
   close_order: best    # best | lifo | fifo
   vol_k: 0.5          # one-sided sigma buffer added to open_bps 1.28
+  flip_hysteresis_sigma: 1.0  # extra sigma of deviation required before reversing direction (0 = off)
   interval_min: 1s
   interval_max: 2s
   max_book_age: 10s

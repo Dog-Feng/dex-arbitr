@@ -9,11 +9,43 @@ import (
 
 	"github.com/Dog-Feng/dex-arbitr/internal/domain"
 	"github.com/Dog-Feng/dex-arbitr/internal/execution"
+	"github.com/Dog-Feng/dex-arbitr/internal/monitor"
 	"github.com/Dog-Feng/dex-arbitr/internal/spread"
 	"github.com/Dog-Feng/dex-arbitr/internal/store"
 	"github.com/Dog-Feng/dex-arbitr/internal/strategy"
 	"github.com/Dog-Feng/dex-arbitr/internal/symbols"
 )
+
+func TestDirectionFlipRecordedInMonitor(t *testing.T) {
+	mon := monitor.New(nil)
+	a := settlementActor(t)
+	a.cfg.Monitor = mon
+	openAccounting(t, a, strategy.DirLS, 100, 110)
+	if a.lastDir != strategy.DirLS {
+		t.Fatalf("open did not set lastDir: %v", a.lastDir)
+	}
+	if got := mon.Metrics().Flips; got != 0 {
+		t.Fatalf("open from flat recorded a flip: %d", got)
+	}
+	// Close the DirLS step; the direction memory must survive the flat state.
+	closeAct := strategy.Action{Kind: strategy.Close, Dir: strategy.DirLS, StepID: 1, Qty: 1,
+		L: strategy.Leg{Side: domain.Sell, Price: 101}, R: strategy.Leg{Side: domain.Buy, Price: 110}}
+	if err := a.accountExecution(closeAct, spread.Quote{}, 1, -1, fillResult(1, 101, 1, 110, 0, 0)); err != nil {
+		t.Fatal(err)
+	}
+	if a.lastDir != strategy.DirLS {
+		t.Fatalf("close lost the direction memory: %v", a.lastDir)
+	}
+	// Opening the opposite direction is a flip and must be counted.
+	openAct := strategy.Action{Kind: strategy.Open, Dir: strategy.DirSL, Qty: 1,
+		L: strategy.Leg{Side: domain.Sell, Price: 110}, R: strategy.Leg{Side: domain.Buy, Price: 101}}
+	if err := a.accountExecution(openAct, spread.Quote{}, 0, 0, fillResult(1, 110, 1, 101, -1, 1)); err != nil {
+		t.Fatal(err)
+	}
+	if a.lastDir != strategy.DirSL || mon.Metrics().Flips != 1 {
+		t.Fatalf("flip not recorded: lastDir=%v flips=%d", a.lastDir, mon.Metrics().Flips)
+	}
+}
 
 func settlementActor(t *testing.T) *PairActor {
 	t.Helper()

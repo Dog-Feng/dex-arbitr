@@ -78,6 +78,10 @@ type Params struct {
 	TakerFeeL    float64 // per-fill fee rates; close fees use actual entry and exit notionals
 	TakerFeeR    float64
 	MinInventory int // minimum steps to hold (volume churn floor); 0 = none
+	// FlipHysteresisSigma is the extra deviation, in units of the current
+	// spread volatility, required before opening the opposite direction after
+	// a flat position. Same-direction additions are unaffected.
+	FlipHysteresisSigma float64
 }
 
 // Strategy decides an action from the pair state and market view.
@@ -112,8 +116,9 @@ func (v Volume) Decide(p Params, s State, q spread.Quote, mu float64, muReady bo
 
 // State is the pair state the strategy needs.
 type State struct {
-	Mode  Mode
-	Steps []Step // all same direction (single signed counter)
+	Mode    Mode
+	Steps   []Step // all same direction (single signed counter)
+	LastDir Dir    // direction last traded; 0 = unknown (e.g. after restart)
 }
 
 // Counter is the signed step count (negative = long left / short right).
@@ -276,7 +281,7 @@ func (Arbitrage) Decide(p Params, s State, q spread.Quote, mu float64, muReady b
 	if _, ok := spread.Compute(q.L, q.R); !ok || !validPrice(q.RefMid) || !finite(q.LS) || !finite(q.SL) || !finite(q.Mid) {
 		return Action{Reason: "invalid quote"}
 	}
-	if s.Mode < ModeWarmup || s.Mode > ModePaused || !validPrice(p.StepQty) || p.MaxSteps <= 0 || !validPrice(p.DepthMult) || !finite(p.OpenBps) || !finite(p.CloseBps) || !finite(p.VolK) || p.VolK < 0 || !finite(p.FeeBps) || p.FeeBps < 0 || !finite(p.TakerFeeL) || p.TakerFeeL < 0 || !finite(p.TakerFeeR) || p.TakerFeeR < 0 || p.MinInventory < 0 {
+	if s.Mode < ModeWarmup || s.Mode > ModePaused || !validPrice(p.StepQty) || p.MaxSteps <= 0 || !validPrice(p.DepthMult) || !finite(p.OpenBps) || !finite(p.CloseBps) || !finite(p.VolK) || p.VolK < 0 || !finite(p.FeeBps) || p.FeeBps < 0 || !finite(p.TakerFeeL) || p.TakerFeeL < 0 || !finite(p.TakerFeeR) || p.TakerFeeR < 0 || p.MinInventory < 0 || !finite(p.FlipHysteresisSigma) || p.FlipHysteresisSigma < 0 {
 		return Action{Reason: "invalid strategy parameters"}
 	}
 	need := p.StepQty * p.DepthMult
@@ -337,6 +342,12 @@ func (Arbitrage) Decide(p Params, s State, q spread.Quote, mu float64, muReady b
 		needDev := openingThreshold(p, q, d, vol)
 		if math.IsNaN(dev) || math.IsInf(dev, 0) || math.IsNaN(needDev) || math.IsInf(needDev, 0) {
 			return Action{Reason: "invalid threshold"}, true
+		}
+		// A reversal after a flat position needs one extra sigma of deviation
+		// so marginal noise around the mean cannot flip the book back and
+		// forth. Same-direction continuation is never taxed.
+		if cnt == 0 && s.LastDir != 0 && s.LastDir != d && p.FlipHysteresisSigma > 0 {
+			needDev += p.FlipHysteresisSigma * vol
 		}
 		if dev < needDev {
 			return Action{}, false

@@ -21,6 +21,7 @@ const (
 	KindPnL          Kind = "pnl"
 	KindStepOpened   Kind = "step_opened"
 	KindStepClosed   Kind = "step_closed"
+	KindFlip         Kind = "flip"
 	KindExecuted     Kind = "executed"
 	KindRescue       Kind = "rescue"
 	KindMargin       Kind = "margin"
@@ -71,6 +72,7 @@ type Metrics struct {
 	UptimeSec   float64 `json:"uptime_sec"`
 	Opens       uint64  `json:"opens"`
 	Closes      uint64  `json:"closes"`
+	Flips       uint64  `json:"flips"`
 	Executions  uint64  `json:"executions"`
 	OneLegFails uint64  `json:"one_leg_fails"`
 	Rescues     uint64  `json:"rescues"`
@@ -101,6 +103,7 @@ type PairMetrics struct {
 	Mode            string  `json:"mode"`
 	Opens           uint64  `json:"opens"`
 	Closes          uint64  `json:"closes"`
+	Flips           uint64  `json:"flips"`
 	Executions      uint64  `json:"executions"`
 	OneLegFails     uint64  `json:"one_leg_fails"`
 	Rescues         uint64  `json:"rescues"`
@@ -129,29 +132,29 @@ type Monitor struct {
 	start time.Time
 	alert AlertFunc
 
-	opens, closes, executions, oneLeg, rescues, emergencies, errors uint64
-	openSteps                                                       int
-	volumeUSD, realizedUSD                                          float64
-	latN, latSum, latMax                                            float64
-	muBps, sigmaBps, tickK, failRate                                float64
-	alerts                                                          []string
-	pairs                                                           map[string]*pairAcc
+	opens, closes, flips, executions, oneLeg, rescues, emergencies, errors uint64
+	openSteps                                                              int
+	volumeUSD, realizedUSD                                                 float64
+	latN, latSum, latMax                                                   float64
+	muBps, sigmaBps, tickK, failRate                                       float64
+	alerts                                                                 []string
+	pairs                                                                  map[string]*pairAcc
 }
 
 // pairAcc is one pair's rolling counters and latest gauges.
 type pairAcc struct {
-	base                                               string
-	active                                             bool
-	mode                                               string
-	opens, closes, executions, oneLeg, rescues, errors uint64
-	openSteps                                          int
-	volumeUSD, realizedUSD                             float64
-	muBps, sigmaBps, tickK                             float64
-	failRate                                           float64
-	score, depthQ, tickQ, stability, reverts           float64
-	coverage                                           float64
-	samples                                            int
-	ready                                              bool
+	base                                                      string
+	active                                                    bool
+	mode                                                      string
+	opens, closes, flips, executions, oneLeg, rescues, errors uint64
+	openSteps                                                 int
+	volumeUSD, realizedUSD                                    float64
+	muBps, sigmaBps, tickK                                    float64
+	failRate                                                  float64
+	score, depthQ, tickQ, stability, reverts                  float64
+	coverage                                                  float64
+	samples                                                   int
+	ready                                                     bool
 }
 
 // New builds a monitor; alert may be nil.
@@ -196,6 +199,9 @@ func (m *Monitor) Record(e Event) {
 		if a.openSteps > 0 {
 			a.openSteps--
 		}
+	case KindFlip:
+		m.flips++
+		m.acc(e.Pair).flips++
 	case KindExecuted:
 		m.executions++
 		m.volumeUSD += e.USD
@@ -285,7 +291,7 @@ func (m *Monitor) Metrics() Metrics {
 		}
 		pairs[key] = PairMetrics{
 			Base: a.base, Active: a.active, Mode: a.mode,
-			Opens: a.opens, Closes: a.closes, Executions: a.executions,
+			Opens: a.opens, Closes: a.closes, Flips: a.flips, Executions: a.executions,
 			OneLegFails: a.oneLeg, Rescues: a.rescues, Errors: a.errors,
 			OpenSteps: a.openSteps, VolumeUSD: a.volumeUSD, RealizedUSD: a.realizedUSD,
 			MuBps: a.muBps, SigmaBps: a.sigmaBps, TickK: a.tickK, FailRate: pfail,
@@ -298,6 +304,7 @@ func (m *Monitor) Metrics() Metrics {
 		UptimeSec:    time.Since(m.start).Seconds(),
 		Opens:        m.opens,
 		Closes:       m.closes,
+		Flips:        m.flips,
 		Executions:   m.executions,
 		OneLegFails:  m.oneLeg,
 		Rescues:      m.rescues,

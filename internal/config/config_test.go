@@ -193,6 +193,23 @@ func TestLoadVolumeLossTolerance(t *testing.T) {
 	}
 }
 
+func TestLoadFlipHysteresisDefaultAndZero(t *testing.T) {
+	c, err := loadTestConfig(t, "dry_run: true\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Strategy.FlipHysteresisSigma != 1.0 {
+		t.Fatalf("default flip_hysteresis_sigma=%v, want 1", c.Strategy.FlipHysteresisSigma)
+	}
+	c, err = loadTestConfig(t, "strategy:\n  flip_hysteresis_sigma: 0\n")
+	if err != nil || c.Strategy.FlipHysteresisSigma != 0 {
+		t.Fatalf("explicit zero should disable the hysteresis: %v %v", c, err)
+	}
+	if _, err := loadTestConfig(t, "strategy:\n  flip_hysteresis_sigma: -1\n"); err == nil || !strings.Contains(err.Error(), "flip_hysteresis_sigma") {
+		t.Fatalf("negative flip_hysteresis_sigma accepted: %v", err)
+	}
+}
+
 func TestLoadPairSelection(t *testing.T) {
 	cases := []struct {
 		name    string

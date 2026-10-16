@@ -60,6 +60,37 @@ func TestCloseFallsBackToNextBestWhenTopStepLacksDepth(t *testing.T) {
 	}
 }
 
+func TestFlipHysteresisGatesMarginalReversal(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		last     Dir
+		sigma    float64
+		slBps    float64
+		wantOpen bool
+	}{
+		{"marginal reversal blocked", DirLS, 1, 0.4, false},
+		{"decisive reversal allowed", DirLS, 1, 0.6, true},
+		{"same direction continuation", DirSL, 1, 0.4, true},
+		{"unknown history", 0, 1, 0.4, true},
+		{"hysteresis disabled", DirLS, 0, 0.4, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			lb := 100 + tc.slBps*100/1e4
+			l := domain.Book{Bids: []domain.Level{{Price: lb, Size: 1}}, Asks: []domain.Level{{Price: lb + 0.01, Size: 1}}}
+			r := domain.Book{Bids: []domain.Level{{Price: 99.99, Size: 1}}, Asks: []domain.Level{{Price: 100, Size: 1}}}
+			q, ok := spread.Compute(l, r)
+			if !ok {
+				t.Fatal("invalid quote")
+			}
+			p := Params{StepQty: .01, MaxSteps: 3, OpenBps: 0, CloseBps: 0, DepthMult: 1, VolK: 0, FlipHysteresisSigma: tc.sigma}
+			a := (Arbitrage{}).Decide(p, State{Mode: ModeRunning, LastDir: tc.last}, q, 0, true, 0.5)
+			if tc.wantOpen != (a.Kind == Open) || (tc.wantOpen && a.Dir != DirSL) {
+				t.Fatalf("got %+v, wantOpen=%v", a, tc.wantOpen)
+			}
+		})
+	}
+}
+
 func TestNoOpenWhenMeanAbsorbsSpread(t *testing.T) {
 	q, _ := spread.Compute(book(999.9, 1000, 1), book(1001, 1001.1, 1))    // LS ~ 10bps
 	a := (Arbitrage{}).Decide(P, State{Mode: ModeRunning}, q, 10, true, 0) // mean already 10bps

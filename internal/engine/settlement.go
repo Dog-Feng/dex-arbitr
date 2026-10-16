@@ -321,6 +321,9 @@ func (a *PairActor) finishIntervention(res execution.Result, interrupted ...exec
 	}
 	fees := nl*a.cfg.Pair.Left.TakerFee + nr*a.cfg.Pair.Right.TakerFee
 	closed := len(a.state.Steps)
+	if closed > 0 {
+		a.lastDir = a.state.Steps[0].Dir
+	}
 	a.state.Steps = nil
 	a.posL, a.posR = res.PosL, res.PosR
 	a.syncCounter()
@@ -565,10 +568,16 @@ func (a *PairActor) accountExecution(act strategy.Action, q spread.Quote, before
 	a.syncCounter()
 	a.syncPositionState()
 	if opened != nil {
+		if a.lastDir != 0 && a.lastDir != act.Dir {
+			a.record(monitor.KindFlip, func(e *monitor.Event) { e.Dir = act.Dir.String() })
+			a.log.Info("direction flip", "from", a.lastDir.String(), "to", act.Dir.String())
+		}
+		a.lastDir = act.Dir
 		a.next++
 		a.record(monitor.KindStepOpened, func(e *monitor.Event) { e.Dir = act.Dir.String(); e.Qty = opened.Qty })
 	}
 	if removed != nil {
+		a.lastDir = act.Dir
 		a.record(monitor.KindStepClosed, func(e *monitor.Event) { e.Dir = act.Dir.String(); e.Qty = clampedQty(act.Qty) })
 	}
 	// Budgets use the UTC day on which settlement is confirmed, including
@@ -729,6 +738,9 @@ func (a *PairActor) finishUnwind(res execution.Result) error {
 		}
 	}
 	closed := len(a.state.Steps)
+	if closed > 0 {
+		a.lastDir = a.state.Steps[0].Dir
+	}
 	a.state.Steps = nil
 	a.posL, a.posR = res.PosL, res.PosR
 	a.syncCounter()

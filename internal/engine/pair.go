@@ -124,6 +124,7 @@ type PairActor struct {
 	latL                *latencySeries
 	latR                *latencySeries
 	winUpdatedAt        time.Time
+	lastDir             strategy.Dir
 }
 
 // volumeAcc accumulates daily traded volume and realized PnL for the volume
@@ -608,7 +609,9 @@ func (a *PairActor) Run(ctx context.Context) (retErr error) {
 			}
 			canSize := a.refreshSizing()
 			mu, ready := a.mean()
-			act := a.cfg.Strategy.Decide(a.cfg.Params, a.state, q, mu, ready, a.volBps())
+			st := a.state
+			st.LastDir = a.lastDir
+			act := a.cfg.Strategy.Decide(a.cfg.Params, st, q, mu, ready, a.volBps())
 			if act.Kind == strategy.None {
 				continue
 			}

@@ -108,7 +108,8 @@ func (rt *runtime) buildActor(pair symbols.Pair, qty float64, maxSteps int, l, r
 		Monitor: rt.mon,
 		Params: strategy.Parameters(strat, strategy.Params{StepQty: qty, MaxSteps: maxSteps, OpenBps: c.Strategy.OpenBps, CloseBps: c.Strategy.CloseBps,
 			DepthMult: c.Strategy.DepthMult, CloseOrder: c.Strategy.CloseOrder, VolK: c.Strategy.VolK, FeeBps: feeBps,
-			MinInventory: minInv, TakerFeeL: pair.Left.TakerFee, TakerFeeR: pair.Right.TakerFee}),
+			MinInventory: minInv, TakerFeeL: pair.Left.TakerFee, TakerFeeR: pair.Right.TakerFee,
+			FlipHysteresisSigma: c.Strategy.FlipHysteresisSigma}),
 	})
 }
 
