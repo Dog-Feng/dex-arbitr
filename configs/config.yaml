@@ -48,9 +48,9 @@ strategy:
   pair_selection: manual # manual | auto (auto = picker-driven top-Y from shared stats)
   open_bps: 0          # arbitrage: extra edge above fees/volatility; volume always uses 0
   close_bps: 0         # arbitrage: extra net return target; volume always uses 0
-  depth_mult: 2        # top-of-book qty >= step_qty * 2 on both legs
+  depth_mult: 3        # top-of-book qty >= step_qty * 2 on both legs
   close_order: best    # best | lifo | fifo
-  vol_k: 0.5          # one-sided sigma buffer added to open_bps 1.28
+  vol_k: 1          # one-sided sigma buffer added to open_bps 1.28
   flip_hysteresis_sigma: 1.0  # extra sigma of deviation required before reversing direction (0 = off)
   cap_band: 2                # after touching max_steps, opens unlock below max_steps-cap_band (0 = off)
   cap_hysteresis_sigma: 1.0  # extra sigma to open inside the top cap_band steps (0 = off)
@@ -98,7 +98,7 @@ adaptive:
   up_factor: 1.3
   down_factor: 0.95
   min_k: 0.5
-  max_k: 5
+  max_k: 3
 
 monitor:
   addr: ":8080"            # HTTP metrics endpoint; empty = disabled
@@ -106,11 +106,6 @@ monitor:
 
 pairs:
   - base: SPY
-    left: lighter
-    right: rhlighter
-    step_qty: 0.02
-    max_steps: 15
-  - base: QQQ
     left: lighter
     right: rhlighter
     step_qty: 0.02
