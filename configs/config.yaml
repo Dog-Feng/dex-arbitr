@@ -81,7 +81,7 @@ execution:
   depth_min_mult: 5    # depth multiple below which the allowance widens
   depth_max_scale: 4   # max multiplier on thin books
   adaptive_latency:    # volatility window follows measured leg latency
-    enabled: false     # false = fixed volatility.horizon
+    enabled: true     # false = fixed volatility.horizon
     min_samples: 8     # cold start: fixed window below this count
     window_min: 200ms  # lower clamp for the latency-derived window
     window_max: 3s     # upper clamp, also the estimator ring capacity
@@ -96,7 +96,7 @@ adaptive:
   up_factor: 1.3
   down_factor: 0.95
   min_k: 0.5
-  max_k: 10
+  max_k: 5
 
 monitor:
   addr: ":8080"            # HTTP metrics endpoint; empty = disabled
