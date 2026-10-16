@@ -95,6 +95,8 @@ type PairActor struct {
 	lat                 latencyStat
 	margin              marginMonitor
 	volAcc              volumeAcc
+	procVolumeUSD       float64 // process-lifetime settled volume (status log)
+	procPnlUSD          float64 // process-lifetime settled PnL (status log)
 	adaptive            *adaptive.K
 	cnt                 atomic.Int64 // signed step counter, readable by the picker
 	busy                atomic.Bool
@@ -144,6 +146,18 @@ func (a *PairActor) resetVolumeIfNewDay(now time.Time) {
 	// An uncertainty marker from a recovered or estimated execution must
 	// survive the UTC day rollover; the daily budget only resets the counters.
 	a.volAcc = volumeAcc{day: today, pnlUncertain: a.volAcc.pnlUncertain}
+}
+
+// addSettled books confirmed settlement into both the daily budget accumulator
+// and the process-lifetime counters shown in the status log. The daily budget
+// still rolls over at UTC midnight; the process counters never reset and are
+// deliberately not persisted (a restart starts them at zero).
+func (a *PairActor) addSettled(volumeUSD, pnlUSD float64) {
+	a.resetVolumeIfNewDay(time.Now())
+	a.volAcc.volumeUSD += volumeUSD
+	a.volAcc.pnlUSD += pnlUSD
+	a.procVolumeUSD += volumeUSD
+	a.procPnlUSD += pnlUSD
 }
 
 // canOpenVolume reports whether the daily volume/cost budget allows another open.
@@ -560,8 +574,8 @@ func (a *PairActor) Run(ctx context.Context) (retErr error) {
 				e.Mode = a.state.Mode.String()
 				e.MuBps, e.SigmaBps, e.TickK, e.FailRate = st.Mean, a.volBps(), a.tickK(), a.FailRate()
 			})
-			a.log.Info("status", "mode", a.state.Mode, "steps", a.state.Counter(), "day_volume_usd", a.volAcc.volumeUSD,
-				"day_pnl_usd", a.volAcc.pnlUSD, "fail_rate", a.FailRate(), "sigma_bps", round4(a.volBps()), "vol_ready", a.volReady(time.Now()))
+			a.log.Info("status", "mode", a.state.Mode, "steps", a.state.Counter(), "volume_usd", a.procVolumeUSD,
+				"pnl_usd", a.procPnlUSD, "fail_rate", a.FailRate(), "sigma_bps", round4(a.volBps()), "vol_ready", a.volReady(time.Now()))
 			a.lat.reset()
 		case <-decide.C:
 			now := time.Now()

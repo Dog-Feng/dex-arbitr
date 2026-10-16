@@ -329,9 +329,7 @@ func (a *PairActor) finishIntervention(res execution.Result, interrupted ...exec
 	a.syncCounter()
 	a.syncPositionState()
 	a.state.Mode = strategy.ModePaused
-	a.resetVolumeIfNewDay(time.Now())
-	a.volAcc.volumeUSD += nl + nr
-	a.volAcc.pnlUSD -= fees
+	a.addSettled(nl+nr, -fees)
 	a.volAcc.pnlUncertain = true
 	for i := 0; i < closed; i++ {
 		a.record(monitor.KindStepClosed, nil)
@@ -582,9 +580,7 @@ func (a *PairActor) accountExecution(act strategy.Action, q spread.Quote, before
 	}
 	// Budgets use the UTC day on which settlement is confirmed, including
 	// executions recovered after midnight.
-	a.resetVolumeIfNewDay(time.Now())
-	a.volAcc.volumeUSD += nl + nr
-	a.volAcc.pnlUSD += deltaPnL
+	a.addSettled(nl+nr, deltaPnL)
 	oneLeg := math.Abs(res.L.Filled-res.R.Filled) >= eps || res.RescueOrders > 0
 	a.observeFailure(oneLeg)
 	a.lat.add(res.L.Latency)
@@ -746,9 +742,7 @@ func (a *PairActor) finishUnwind(res execution.Result) error {
 	a.syncCounter()
 	a.syncPositionState()
 	a.state.Mode = strategy.ModePaused
-	a.resetVolumeIfNewDay(time.Now())
-	a.volAcc.volumeUSD += nl + nr
-	a.volAcc.pnlUSD += delta
+	a.addSettled(nl+nr, delta)
 	if uncertain {
 		a.volAcc.pnlUncertain = true
 	}

@@ -303,6 +303,23 @@ func TestSettlementCompletesAgainstCurrentUTCDay(t *testing.T) {
 	nearSettlement(t, "unwind current day delta", a.volAcc.pnlUSD, .789)
 }
 
+func TestProcessLifetimeVolumeAccumulatesAcrossDays(t *testing.T) {
+	a := settlementActor(t)
+	a.volAcc = volumeAcc{day: time.Now().Add(-24 * time.Hour).UTC().Format("2006-01-02"), volumeUSD: 999, pnlUSD: -999}
+	openAccounting(t, a, strategy.DirLS, 100, 110)
+	nearSettlement(t, "process volume after open", a.procVolumeUSD, 210)
+	nearSettlement(t, "process pnl after open", a.procPnlUSD, -.21)
+	// A settlement confirmed on the next UTC day resets the daily budget but
+	// the process-lifetime counters keep accumulating.
+	a.volAcc.day = time.Now().Add(-24 * time.Hour).UTC().Format("2006-01-02")
+	if err := a.finishUnwind(fillResult(1, 101, 1, 110, 0, 0)); err != nil {
+		t.Fatal(err)
+	}
+	nearSettlement(t, "day budget reset to new day", a.volAcc.volumeUSD, 211)
+	nearSettlement(t, "process volume cumulative", a.procVolumeUSD, 421)
+	nearSettlement(t, "process pnl cumulative", a.procPnlUSD, .579)
+}
+
 func TestSettlementCheckpointSurvivesEmptyLedgerRestart(t *testing.T) {
 	a := settlementActor(t)
 	a.checkpoint = true

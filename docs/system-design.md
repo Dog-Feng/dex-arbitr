@@ -189,7 +189,7 @@ ticks = clamp( ticks, min_ticks, max_ticks )            // max_ticks=0 表示不
 
 - 开仓：对冲量 h=min(fillL,fillR)，h<半单位则放弃；记 Step（EntryBps 用成交时 mid，OpenL/OpenR 存成交价）。
 - 平仓：平仓量由确认后的两腿仓位差推导（cl=|beforeL|-|posL|），逐腿按实际成交量（含补救成交）加权计价，零成交腿不参与计价；已实现盈亏按 USD 现金流计算、以入场名义折算 bps 累计进 Step.Realized；Qty 归零则移除。
-- 统一量记账：volume_usd += (fillL + fillR + rescue_qty) * mid（失败开仓的单腿成交+补救也计入）；补救滑点 rescue_cost_usd 从 day_pnl_usd 扣除。
+- 统一量记账：结算确认后按两腿名义累加成交量（失败开仓的单腿成交+补救也计入）；补救滑点 rescue_cost_usd 从当日预算 PnL 扣除。status 日志的 `volume_usd` / `pnl_usd` 是同口径的**进程级累计**（不按日清零、重启归零）；每日预算闸内部另维护按 UTC 日滚动、持久化的预算计数。
 - 每日预算闸：刷量模式下 daily_volume_target / daily_cost_budget 达限停止开仓，跨天清零计数；`pnl_uncertain` 粘性保留，不随日切或步骤全部退出自动解除。
 - 账本一致性：每次结算后校验确认仓位与更新后的步账本一致，漂移即 PAUSED。
 - persist：步状态 JSON 原子写（state_dir/<pair_key>.json）。
@@ -412,6 +412,8 @@ pairs:
 
 ## 12. 日志与排查
 
+arbd 的运行日志时间戳显示为东八区（UTC+8，RFC3339 带 `+08:00` 偏移），方便按北京时间排查；进程内所有时间仍以 UTC 存储与计算，仅展示时转换。
+
 关键日志行（msg=）：
 
 | 消息 | 含义 / 排查 |
@@ -426,7 +428,7 @@ pairs:
 | pair actor started | 启动参数 |
 | positions / position reconciliation passed | 启动仓位核对；失败即 PAUSED |
 | mean ready -> RUNNING | μ 采样满 60m 就绪 |
-| status | 每分钟：mode/steps/day_volume/day_pnl/fail_rate/sigma_bps/vol_ready；μ/σ/价差/tick_k 经 monitor status 事件到 /metrics |
+| status | 每分钟：mode/steps/volume_usd/pnl_usd（进程级累计，重启归零）/fail_rate/sigma_bps/vol_ready；μ/σ/价差/tick_k 经 monitor status 事件到 /metrics |
 | action | 决策：kind/dir/qty/两腿价/expected_bps/reason |
 | executed | 成交：fill/px/status/rescue/rescue_cost_usd/pos/took/latency |
 | step opened / step pnl / step closed | 步账本与已实现盈亏 |
@@ -452,7 +454,7 @@ pairs:
 
 ## 13. 当前边界（已知简化）
 
-- 门槛为净成本：open_bps/close_bps 已扣 fee_bps；补救滑点计入 day_pnl_usd，但应急平仓亏损未记 step 级盈亏（直接体现账户余额）。
+- 门槛为净成本：open_bps/close_bps 已扣 fee_bps；补救滑点计入当日预算 PnL（也计入 status 的进程级 `pnl_usd`），但应急平仓亏损未记 step 级盈亏（直接体现账户余额）。
 - mark 用 book mid 近似：更准可用 WS 的 market_stats.mark_price。
 - liq 为 15s REST 缓存：单币单仓近似稳定；多仓共担保证金需提高刷新频率。
 - 步数上限不等于名义仓位上限：max_steps 限步数，部分平仓可能残留碎步。
