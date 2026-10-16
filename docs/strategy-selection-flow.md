@@ -5,9 +5,9 @@
 | 组合 | 交易对来源 | 统计与决策 |
 |---|---|---|
 | arbitrage + manual | `pairs` 指定的 base、左右 venue、step_qty、max_steps | 对指定合约匹配、对齐精度，每对维护统计；预热后按配置的套利条件交易。 |
-| volume + manual | 同上 | 使用同一统计与执行链路，额外开平阈值固定为 `0/0`，附加 volume 库存/每日预算。 |
+| volume + manual | 同上 | 使用同一统计与执行链路，额外开平阈值固定为 `0/0`，附加 volume 库存地板。 |
 | arbitrage + auto | 扫描模块发现的匹配候选，经健康评分、白名单、TopY、dwell、额度及市场排他检查选出 | 候选持续采样和预热，晋升 actor 共享该统计，执行 arbitrage。 |
-| volume + auto | 同上 | 共用自动选币流程，晋升 actor 执行 volume 的 `0/0` 阈值及预算规则。 |
+| volume + auto | 同上 | 共用自动选币流程，晋升 actor 执行 volume 的 `0/0` 阈值及库存地板规则。 |
 
 ## 从配置到成交
 
@@ -24,7 +24,7 @@ flowchart TD
   R --> K{strategy.kind}
   K -->|arbitrage| AR[配置的额外开平阈值]
   K -->|volume| V[额外开平阈值固定为 0]
-  AR --> G[手续费 深度 波动 库存 预算 风控检查]
+  AR --> G[手续费 深度 波动 库存 风控检查]
   V --> G
   G --> E[双腿 IOC 执行 补救 确认与结算]
 ```
@@ -67,7 +67,7 @@ arbitrage 使用 `strategy.open_bps/close_bps`；volume 的注册实现自己固
 
 零额外门槛仍需覆盖手续费、满足盘口深度、持仓方向和步数约束，且 σ 必须就绪。`vol_k` 默认 1.28；显式配置 `0` 可关闭波动过滤（σ 仍须就绪，因让价依赖腿价 σ），均值预热仍必须完成。扫描器会保留实际波动是否就绪的状态，过滤关闭时无需等待无用的波动就绪。
 
-volume 额外使用 `min_inventory`、`daily_volume_target`、`daily_cost_budget`。这些设置不改变交易对来源和均值配置。旧 `loss_tolerance_bps` 字段仅保留零值兼容，active volume 配成非零会立即报错，不能把额外开仓门槛变成负数。未知 `strategy.kind` 也在加载时即报错，无须等 auto 晋升才发现。
+volume 额外使用 `min_inventory` 库存地板。原 `daily_volume_target` / `daily_cost_budget` 每日预算已移除（量/盈亏记账仅作 state 审计痕迹）。这些设置不改变交易对来源和均值配置。旧 `loss_tolerance_bps` 字段仅保留零值兼容，active volume 配成非零会立即报错，不能把额外开仓门槛变成负数。未知 `strategy.kind` 也在加载时即报错，无须等 auto 晋升才发现。
 
 scanner 使用配置的行情端点、链和盘口深度，移除交易凭证。多个 venue 组合即使 base 相同也各自保留，面板显示左右 venue，避免同名覆盖。
 

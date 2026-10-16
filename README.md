@@ -11,7 +11,7 @@ Currently integrated venues: **Lighter mainnet** (`kind: lighter`, chain 304) an
 
 - 同一状态目录只允许一个写入进程；停止信号保存状态，不承诺自动平仓。
 - 尽量在订单和补救均已确认后升级。未决 checkpoint 即使步骤为空，重启仍保持 `PAUSED`，需核实交易所订单和两边仓位后再处理恢复。
-- 旧状态缺少入场价格会暂停普通交易；历史费用或成交价格不确定时，volume 策略启用每日亏损预算会阻止新开仓，减仓与应急退出仍受确认条件保护。
+- 旧状态缺少入场价格会暂停普通交易；历史费用或成交价格不确定时，会把 state 文件里的 `pnl_uncertain` 标记置位（仅作审计痕迹，不再作为开仓闸门），减仓与应急退出仍受确认条件保护。
 
 ## Layout
 
@@ -207,7 +207,7 @@ mv /opt/dex-arbitr/bin/arbd.new /opt/dex-arbitr/bin/arbd
 systemctl restart arbd && journalctl -u arbd -f
 ```
 
-- 已结算步骤与每日预算保存在 `/opt/dex-arbitr/state`，重启后加载并核对两边实际仓位。`Unresolved=true` 的状态不会自动恢复下单，需先核实交易所订单终态及持仓；详见 [恢复边界](docs/trading-safety-fixes.md#重启升级和持仓恢复边界)。
+- 已结算步骤与按 UTC 日滚动的量/盈亏审计记账保存在 `/opt/dex-arbitr/state`，重启后加载并核对两边实际仓位。`Unresolved=true` 的状态不会自动恢复下单，需先核实交易所订单终态及持仓；详见 [恢复边界](docs/trading-safety-fixes.md#重启升级和持仓恢复边界)。
 - 建议确认全部订单和补救已结算后更新；仅日志暂时没有 `rescue order` 不足以证明不存在未决订单。
 
 **回滚：**

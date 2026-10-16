@@ -161,7 +161,7 @@ WARMUP --(μ 就绪)--> RUNNING <-> REDUCE_ONLY
 
 **方向反转滞回**：从空仓反向再开仓时，门槛额外加上 `flip_hysteresis_sigma × σ`（默认 `1.0`，即反转需要比正常开仓多一个 σ 的偏离，配 `0` 关闭）。该缓冲只作用于「上次方向相反且当前空仓」的反转开仓，同方向续仓不受影响；上次方向仅保存在内存（重启后视为未知、不再加缓冲）。每次满足条件的反转成交会发 `flip` 事件并计入 monitor 的全局与 per-pair `flips` 计数。该状态由引擎维护，`Decide` 本身仍是纯函数（`State.LastDir` 由调用方传入）。
 
-注：`volume` 策略自己将额外 `open_bps/close_bps` 固定为 `0 / 0`，扫描器与 actor 共用该参数规则；手续费、`vol_k`、深度和预算仍生效。显式 `vol_k: 0` 可关闭波动过滤，不跳过均值预热。旧兼容字段 `volume.loss_tolerance_bps` 在 volume 模式下必须为零，避免把零门槛改成负门槛。四种组合详见 [策略与选币完整链路](strategy-selection-flow.md)。
+注：`volume` 策略自己将额外 `open_bps/close_bps` 固定为 `0 / 0`，扫描器与 actor 共用该参数规则；手续费、`vol_k`、深度仍生效。显式 `vol_k: 0` 可关闭波动过滤，不跳过均值预热。旧兼容字段 `volume.loss_tolerance_bps` 在 volume 模式下必须为零，避免把零门槛改成负门槛。四种组合详见 [策略与选币完整链路](strategy-selection-flow.md)。
 
 ### 7.4 一次执行（Executor）
 
@@ -189,8 +189,8 @@ ticks = clamp( ticks, min_ticks, max_ticks )            // max_ticks=0 表示不
 
 - 开仓：对冲量 h=min(fillL,fillR)，h<半单位则放弃；记 Step（EntryBps 用成交时 mid，OpenL/OpenR 存成交价）。
 - 平仓：平仓量由确认后的两腿仓位差推导（cl=|beforeL|-|posL|），逐腿按实际成交量（含补救成交）加权计价，零成交腿不参与计价；已实现盈亏按 USD 现金流计算、以入场名义折算 bps 累计进 Step.Realized；Qty 归零则移除。
-- 统一量记账：结算确认后按两腿名义累加成交量（失败开仓的单腿成交+补救也计入）；补救滑点 rescue_cost_usd 从当日预算 PnL 扣除。status 日志的 `volume_usd` / `pnl_usd` 是同口径的**进程级累计**（不按日清零、重启归零）；每日预算闸内部另维护按 UTC 日滚动、持久化的预算计数。
-- 每日预算闸：刷量模式下 daily_volume_target / daily_cost_budget 达限停止开仓，跨天清零计数；`pnl_uncertain` 粘性保留，不随日切或步骤全部退出自动解除。
+- 统一量记账：结算确认后按两腿名义累加成交量（失败开仓的单腿成交+补救也计入）；补救滑点计入结算 PnL。status 日志的 `volume_usd` / `pnl_usd` 是**进程级累计**（不按日清零、重启归零）。
+- 审计记账：state 文件另保留按 UTC 日滚动、持久化的 volume/pnl 记账与 `pnl_uncertain` 粘性标记（不随日切或步骤全部退出自动解除），仅作事后核对，不再作为开仓闸门。原 `daily_volume_target` / `daily_cost_budget` 配置已移除。
 - 账本一致性：每次结算后校验确认仓位与更新后的步账本一致，漂移即 PAUSED。
 - persist：步状态 JSON 原子写（state_dir/<pair_key>.json）。
 
@@ -356,8 +356,6 @@ strategy:
 
 volume:
   min_inventory: 0
-  daily_volume_target: 0
-  daily_cost_budget: 0
   loss_tolerance_bps: 0
 
 auto:                      # 仅 pair_selection=auto 生效
@@ -454,7 +452,7 @@ arbd 的运行日志时间戳显示为东八区（UTC+8，RFC3339 带 `+08:00` �
 
 ## 13. 当前边界（已知简化）
 
-- 门槛为净成本：open_bps/close_bps 已扣 fee_bps；补救滑点计入当日预算 PnL（也计入 status 的进程级 `pnl_usd`），但应急平仓亏损未记 step 级盈亏（直接体现账户余额）。
+- 门槛为净成本：open_bps/close_bps 已扣 fee_bps；补救滑点计入结算 PnL（进入 status 的进程级 `pnl_usd` 与 state 文件的日滚动审计记账），但应急平仓亏损未记 step 级盈亏（直接体现账户余额）。
 - mark 用 book mid 近似：更准可用 WS 的 market_stats.mark_price。
 - liq 为 15s REST 缓存：单币单仓近似稳定；多仓共担保证金需提高刷新频率。
 - 步数上限不等于名义仓位上限：max_steps 限步数，部分平仓可能残留碎步。

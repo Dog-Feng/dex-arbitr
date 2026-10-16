@@ -2,7 +2,7 @@
 
 > 目标：以最小净成本产生最大成交额，用于赚积分/空投。本文档描述两种刷量形态（taker churn 与对冲做市），以及它们共享的地基。积分回报率暂不量化。
 
-> **当前实现状态**：方案一（taker churn）已实现（`strategy: volume`）。实现细节与本文档草案的差异以 [system-design.md](system-design.md) 为准：volume 的额外开平阈值固定为 `0/0`（`loss_tolerance_bps` 必须为 0）；开平仓受 σ 就绪准入闸约束；每日预算跨天清零计数但 `pnl_uncertain` 粘性保留。方案二（对冲做市）未实现。
+> **当前实现状态**：方案一（taker churn）已实现（`strategy: volume`）。实现细节与本文档草案的差异以 [system-design.md](system-design.md) 为准：volume 的额外开平阈值固定为 `0/0`（`loss_tolerance_bps` 必须为 0）；开平仓受 σ 就绪准入闸约束；草案中的 `daily_volume_target` / `daily_cost_budget` 每日预算闸已移除，量/盈亏记账仅作为 state 文件审计痕迹（`pnl_uncertain` 粘性保留）。方案二（对冲做市）未实现。
 
 > 本文包含早期方案与未实现的草案。当前实现以 [策略与选币完整链路](strategy-selection-flow.md) 为准：volume 也需 2 小时滚动窗口、1 小时预热，额外开平阈值固定为零，手续费与配置的过滤条件仍生效；未实现定时无条件交易或 maker 路径。
 
@@ -41,7 +41,7 @@ close 条件：毛利 ≥ 已存入场费 + 预计退出费    # 额外 close_bp
 
 - 库存地板 + 边际 churn：`min_inventory`（如 8 步）保持大仓位，只对第 9 步反复开/平，实现“大仓位 + 量并存”。
 - 时间驱动兜底：当价差长期不达标时，按 `churn_interval` 固定节奏做往返（接受全额成本）以保证量目标。
-- 量/成本预算闸：`daily_volume_target`、`daily_cost_budget`，达限降频或停。
+- ~~量/成本预算闸：`daily_volume_target`、`daily_cost_budget`~~（已移除：系统不再提供每日量/亏损上限闸门）。
 - 参数放大：`step_qty`/`max_steps` 调大以放量，`interval_min/max` 压到限频允许的最小值。
 
 优点：改动最小、完全复用现有执行器与风控、量最大。缺点：每笔都付 spread，成本随量线性增长。
@@ -104,7 +104,7 @@ w = mean(Δspread) + k × σ(Δspread)
 
 1. `volume` 策略（churn + 库存地板 + 时间兜底）。
 2. `maker` 策略 / `Protector` 能力（单边 post-only 挂单 + 成交驱动对冲 + 报价管理 + 自适应 w）。
-3. 量记账器（每日量/成本/PnL）与目标/预算闸。
+3. ~~量记账器（每日量/成本/PnL）与目标/预算闸~~（已移除：仅保留审计记账）。
 4. VWAP 执行质量基准（合规友好 + 滑点度量）。
 5. 上线前数据验证：① 统计样本里“X 成交 → L 对冲”延迟内价差移动的分布（定 w）；② 目标所 maker 返佣/spread 是否 ≥ taker 对冲费 + adverse。
 
@@ -119,8 +119,6 @@ volume:
   max_steps: 20
   min_inventory: 8        # 库存地板（大仓位与量并存）
   churn_interval: 2s      # 时间兜底的固定节奏（草案，当前未实现；实际节奏由 strategy.interval_min/max 控制）
-  daily_volume_target: 1000000   # USD
-  daily_cost_budget: 100         # USD（草案示例；当前配置为 USD 绝对额）
   loss_tolerance_bps: 0    # 当前 volume 必须为 0，不能通过此项降低开仓门槛
   close_at_breakeven: true
 

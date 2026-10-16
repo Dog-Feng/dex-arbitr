@@ -58,8 +58,6 @@ strategy:
 
 volume:                     # only used when strategy.kind = volume
   min_inventory: 0          # floor steps held while churning
-  daily_volume_target: 0    # USD; 0 = unlimited
-  daily_cost_budget: 0      # USD max daily loss; 0 = unlimited
   loss_tolerance_bps: 0     # legacy compatibility field; volume requires 0
 
 auto:                       # only used when strategy.pair_selection = auto

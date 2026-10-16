@@ -16,7 +16,7 @@
 
 现状：`strategy.Decide` 中持有仓位时反方向直接返回 `holding opposite steps`（不做反手）；空仓后反手使用普通开仓门槛。缺失的是"上一平仓方向"的记忆——仓位归零后 `Steps` 为空，方向信息丢失，无法区分"同向续开"与"反手"。
 
-改动点：`strategy`（纯逻辑）+ `engine`（方向记忆）+ `config`（两个新配置）。
+改动点：`strategy`（纯逻辑）+ `engine`（方向记忆）+ `config`（一个新配置 `flip_hysteresis_sigma`）+ `monitor`（`flips` 计数）。
 
 ## 3. 设计
 
@@ -49,13 +49,13 @@ strategy:
 
 ### 3.4 交互
 
-- REDUCE_ONLY / 预算 / 深度 / 步数 / σ 准入闸全部不变，只在开仓门槛上叠加；
+- REDUCE_ONLY / 深度 / 步数 / σ 准入闸全部不变，只在开仓门槛上叠加；
 - 平仓路径不动；
 - 执行、账本、持久化不动。
 
 ## 4. 成本量化与默认值
 
-- 回测：在同一批样本上跑 `0 / 0.5 / 1.0 / 1.5`（σ 倍数）四档，统计反转次数、总往返、net_bps、平均持仓时长；
+- 回测（待执行，可选）：在同一批样本上跑 `0 / 0.5 / 1.0 / 1.5`（σ 倍数）四档，统计反转次数、总往返、net_bps、平均持仓时长；
 - 默认值建议：`flip_hysteresis_sigma: 1.0`（反转需比正常多走一个 σ），线上验证后再按回测校准；
 - 可选观测：monitor/日志增加方向切换计数（`flips`），便于对比。
 
@@ -67,9 +67,9 @@ strategy:
 | H2 | 反手信号越过带外 | 正常开仓 |
 | H3 | 同向续开 | 不受缓冲影响 |
 | H4 | LastDir 未知（重启模拟） | 不施加缓冲 |
-| H5 | 平仓方向记忆 | 平仓后 LastDir 正确更新 |
-| H6 | 系数生效 | σ 比例缓冲生效，0 关闭，负值拒绝 |
-| H7 | 配置校验 | 负值拒绝 |
+| H5 | 平仓方向记忆 | 平仓后 LastDir 正确更新（由 `engine.TestDirectionFlipRecordedInMonitor` 覆盖） |
+| H6 | 系数生效 | σ 比例缓冲生效、0 关闭（`strategy.TestFlipHysteresisGatesMarginalReversal`）、负值拒绝（`config.TestLoadFlipHysteresisDefaultAndZero`） |
+| H7 | 配置校验 | 负值拒绝（`config.TestLoadFlipHysteresisDefaultAndZero`） |
 
 ## 6. 风险与回滚
 

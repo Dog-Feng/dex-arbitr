@@ -82,10 +82,8 @@ func (rt *runtime) buildActor(pair symbols.Pair, qty float64, maxSteps int, l, r
 	}
 	feeBps := 2 * (pair.Left.TakerFee + pair.Right.TakerFee) * 1e4
 	minInv := 0
-	volTarget, volBudget := 0.0, 0.0
 	if c.Strategy.Kind == "volume" {
 		minInv = c.Volume.MinInventory
-		volTarget, volBudget = c.Volume.DailyVolumeTarget, c.Volume.DailyCostBudget
 	}
 	return NewPairActor(PairConfig{
 		Pair: pair, L: l, R: r, Strategy: strat, Est: est, DryRun: c.DryRun, Store: rt.store, Tracker: rt.tracker, IDs: rt.ids,
@@ -95,7 +93,6 @@ func (rt *runtime) buildActor(pair symbols.Pair, qty float64, maxSteps int, l, r
 		Risk: marginConfig{floor: c.Risk.MarginFloorRatio, trigger: c.Risk.MarginTriggerRatio,
 			hysteresis: c.Risk.MarginHysteresis, refresh: c.Risk.PositionRefresh, marketBps: c.Risk.EmergencyMarketBps,
 			maxNotional: c.Risk.MaxNotional},
-		VolTarget: volTarget, VolCostBudget: volBudget,
 		AdaptiveLatency: adaptiveLatencyCfg{
 			enabled: c.Execution.AdaptiveLatency.Enabled, minSamples: c.Execution.AdaptiveLatency.MinSamples,
 			ringN: c.Execution.AdaptiveLatency.RingN, windowMin: c.Execution.AdaptiveLatency.WindowMin,

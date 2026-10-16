@@ -48,8 +48,6 @@ type PairConfig struct {
 	VolMaxAge       time.Duration
 	Samples         *store.SampleSink
 	Risk            marginConfig
-	VolTarget       float64 // daily volume target (USD); 0 = unlimited
-	VolCostBudget   float64 // max daily realized loss (USD); 0 = unlimited
 	Adaptive        adaptive.Config
 	Monitor         *monitor.Monitor
 	View            PairView    // shared stats/books in auto mode; nil = actor-owned
@@ -129,8 +127,8 @@ type PairActor struct {
 	lastDir             strategy.Dir
 }
 
-// volumeAcc accumulates daily traded volume and realized PnL for the volume
-// budget gate; owned by the actor goroutine, no locking.
+// volumeAcc keeps a UTC-day-scoped volume/PnL audit trail and the sticky
+// PnL-uncertainty marker; owned by the actor goroutine, no locking.
 type volumeAcc struct {
 	day          string
 	volumeUSD    float64
@@ -144,31 +142,20 @@ func (a *PairActor) resetVolumeIfNewDay(now time.Time) {
 		return
 	}
 	// An uncertainty marker from a recovered or estimated execution must
-	// survive the UTC day rollover; the daily budget only resets the counters.
+	// survive the UTC day rollover; the day-scoped counters reset with it.
 	a.volAcc = volumeAcc{day: today, pnlUncertain: a.volAcc.pnlUncertain}
 }
 
-// addSettled books confirmed settlement into both the daily budget accumulator
-// and the process-lifetime counters shown in the status log. The daily budget
-// still rolls over at UTC midnight; the process counters never reset and are
-// deliberately not persisted (a restart starts them at zero).
+// addSettled books confirmed settlement into the day-scoped audit accumulator
+// and the process-lifetime counters shown in the status log. The day-scoped
+// counters roll over at UTC midnight and are persisted as an audit trail; the
+// process counters never reset and are deliberately not persisted.
 func (a *PairActor) addSettled(volumeUSD, pnlUSD float64) {
 	a.resetVolumeIfNewDay(time.Now())
 	a.volAcc.volumeUSD += volumeUSD
 	a.volAcc.pnlUSD += pnlUSD
 	a.procVolumeUSD += volumeUSD
 	a.procPnlUSD += pnlUSD
-}
-
-// canOpenVolume reports whether the daily volume/cost budget allows another open.
-func (a *PairActor) canOpenVolume() bool {
-	if a.cfg.VolTarget > 0 && a.volAcc.volumeUSD >= a.cfg.VolTarget {
-		return false
-	}
-	if a.cfg.VolCostBudget > 0 && (a.volAcc.pnlUncertain || a.volAcc.pnlUSD <= -a.cfg.VolCostBudget) {
-		return false
-	}
-	return true
 }
 
 // latencyStat aggregates per-leg submit-to-result latency for the status report.
@@ -640,8 +627,7 @@ func (a *PairActor) Run(ctx context.Context) (retErr error) {
 				}
 				continue
 			}
-			a.resetVolumeIfNewDay(now)
-			if act.Kind == strategy.Open && (!canSize || !a.canOpenVolume() || a.riskBlocked.Load() || a.cfg.MayOpen != nil && !a.cfg.MayOpen()) {
+			if act.Kind == strategy.Open && (!canSize || a.riskBlocked.Load() || a.cfg.MayOpen != nil && !a.cfg.MayOpen()) {
 				continue
 			}
 			a.apply(ctx, act, q)

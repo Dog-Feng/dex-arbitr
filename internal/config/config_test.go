@@ -60,7 +60,6 @@ func TestLoadStrictValidation(t *testing.T) {
 		{"duplicate YAML key", "dry_run: true\ndry_run: false\n", "already defined"},
 		{"second YAML document", "dry_run: true\n---\ndry_run: false\n", "multiple YAML documents"},
 		{"nan threshold", "strategy:\n  open_bps: .nan\n", "strategy.open_bps must be finite"},
-		{"infinite budget", "volume:\n  daily_cost_budget: .inf\n", "volume.daily_cost_budget must be finite"},
 		{"nonfinite inactive option", "auto:\n  notional_per_leg: -.inf\n", "auto.notional_per_leg must be finite"},
 		{"zero estimator interval", "estimator:\n  interval: 0s\n", "estimator.interval must be > 0"},
 		{"negative estimator window", "estimator:\n  window: -1s\n", "estimator.window must be > 0"},

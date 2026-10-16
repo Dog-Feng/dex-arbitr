@@ -61,7 +61,7 @@ func settlementActor(t *testing.T) *PairActor {
 	inst := domain.Instrument{MarketID: 1, SizeDecimals: 4, PriceDecimals: 2, TakerFee: .001}
 	a, err := NewPairActor(PairConfig{Pair: symbols.NewPair("TEST", inst, inst),
 		L: newActorTestVenue("L"), R: newActorTestVenue("R"), DryRun: true,
-		Store: s, Est: actorTestEstimator{}, MaxBookAge: time.Second, VolCostBudget: 10})
+		Store: s, Est: actorTestEstimator{}, MaxBookAge: time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -227,7 +227,7 @@ func TestSettlementDrainRequiresEachLegFlat(t *testing.T) {
 	}
 }
 
-func TestSettlementUnknownBasisAndEstimatePersistBudgetGate(t *testing.T) {
+func TestSettlementUnknownBasisAndEstimatePersistUncertainty(t *testing.T) {
 	for _, legacy := range []bool{false, true} {
 		t.Run(map[bool]string{true: "legacy entry", false: "estimated fill"}[legacy], func(t *testing.T) {
 			a := settlementActor(t)
@@ -240,8 +240,8 @@ func TestSettlementUnknownBasisAndEstimatePersistBudgetGate(t *testing.T) {
 			if err := a.finishUnwind(res); err != nil {
 				t.Fatal(err)
 			}
-			if a.canOpenVolume() || !a.volAcc.pnlUncertain {
-				t.Fatal("unknown PnL allowed another budgeted open")
+			if !a.volAcc.pnlUncertain {
+				t.Fatal("unknown PnL did not mark the audit trail uncertain")
 			}
 			if err := a.persist(); err != nil {
 				t.Fatal(err)
@@ -250,18 +250,18 @@ func TestSettlementUnknownBasisAndEstimatePersistBudgetGate(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if b.canOpenVolume() || !b.volAcc.pnlUncertain {
+			if !b.volAcc.pnlUncertain {
 				t.Fatal("actor restart forgot uncertainty")
 			}
 			b.resetVolumeIfNewDay(time.Now().Add(24 * time.Hour))
-			if b.canOpenVolume() || !b.volAcc.pnlUncertain {
-				t.Fatal("day rollover cleared the uncertainty marker and reopened the cost budget")
+			if !b.volAcc.pnlUncertain {
+				t.Fatal("day rollover cleared the uncertainty marker")
 			}
 		})
 	}
 }
 
-func TestSettlementCarriedEstimatedEntryKeepsNewDayBudgetUncertain(t *testing.T) {
+func TestSettlementCarriedEstimatedEntryKeepsNewDayUncertain(t *testing.T) {
 	for _, unwind := range []bool{false, true} {
 		t.Run(map[bool]string{false: "normal close", true: "unwind"}[unwind], func(t *testing.T) {
 			a := settlementActor(t)
@@ -279,8 +279,8 @@ func TestSettlementCarriedEstimatedEntryKeepsNewDayBudgetUncertain(t *testing.T)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if !a.volAcc.pnlUncertain || a.canOpenVolume() {
-				t.Fatal("estimated entry became exact after a day reset")
+			if !a.volAcc.pnlUncertain {
+				t.Fatal("estimated entry lost its uncertainty marker after a day reset")
 			}
 		})
 	}
