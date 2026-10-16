@@ -111,8 +111,8 @@ monitor:
 
 ## 7. 实施分期
 
-- **P1（小改动）**：monitor 加 15 分钟桶聚合（计数/量/盈亏/延迟/μ/σ）+ `/metrics.time_buckets`；engine 在 executed/close 事件补 `rescue_cost_usd`、`latency_l/r_ms`、`gross` 字段（纯事件字段，不动决策）。
-- **P2**：异常规则引擎（表驱动，阈值入 `monitor.analytics` 配置）+ alerts/anomalies 输出。
+- **P1（已实现）**：monitor 加 15 分钟桶聚合（计数/量/盈亏/延迟/μ/σ）+ `/metrics.time_buckets`；engine 在 executed/status 事件补 `rescue_cost_usd`、`latency_l/r_ms`、`gross`、`max_steps`、`oldest_step_age_s` 字段（纯事件字段，不动决策）。
+- **P2（已实现）**：异常规则引擎（阈值入 `monitor.analytics.anomalies` 配置）+ `/metrics.anomalies` 输出与 ALERT 告警；规则触发有 10 分钟冷却，非正阈值关闭对应规则。
 - **P3**：TradeSink JSONL 落盘 + 会话标签配置与展示。
 - **P4（可选）**：`cmd/analytics` 离线命令：join samples（行情侧）+ 交易 JSONL（结果侧），输出每桶/每会话报表（μ/σ、成交、盈亏、失败率、flips、持仓时长），验证"RWA 美股时段 vs 白天"的时段假设。
 - 测试：桶聚合单元测试、异常规则表驱动测试、JSON/JSONL 格式测试；全量 `-race`。

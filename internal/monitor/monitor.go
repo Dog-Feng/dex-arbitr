@@ -8,7 +8,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -33,6 +35,7 @@ const (
 	KindPairDemoted  Kind = "pair_demoted"
 	KindPairHealth   Kind = "pair_health"
 	KindPairWarmup   Kind = "pair_warmup"
+	KindRiskState    Kind = "risk_state"
 )
 
 // Event is a structured runtime event. Fields are interpreted by Kind.
@@ -63,6 +66,15 @@ type Event struct {
 	Coverage  float64
 	Samples   int
 	Ready     bool
+
+	// Observational extras consumed by the analytics layer; never used by
+	// trading decisions.
+	RescueCostUSD  float64
+	LatencyLMs     float64
+	LatencyRMs     float64
+	GrossUSD       float64
+	MaxSteps       int
+	OldestStepAgeS float64
 }
 
 // AlertFunc receives an alert message (log, webhook, ...).
@@ -75,6 +87,66 @@ type Fixed8 float64
 // MarshalJSON implements json.Marshaler with fixed 8-decimal output.
 func (f Fixed8) MarshalJSON() ([]byte, error) {
 	return []byte(strconv.FormatFloat(float64(f), 'f', 8, 64)), nil
+}
+
+// AnalyticsCfg configures time-bucketed aggregation and anomaly detection.
+// It is strictly observational: nothing here changes trading behavior.
+type AnalyticsCfg struct {
+	Bucket         time.Duration // aggregation granularity; <= 0 disables buckets
+	RetainBuckets  int           // in-memory bucket retention; <= 0 = default 672
+	MetricsBuckets int           // buckets exposed in /metrics; <= 0 = default 96
+	Cooldown       time.Duration // per-rule/pair anomaly cooldown; <= 0 = 10m
+	Anomalies      AnomalyCfg
+}
+
+// AnomalyCfg holds anomaly-rule thresholds; a non-positive threshold disables
+// the rule.
+type AnomalyCfg struct {
+	ConsecutiveFails  int
+	FlipsWindowMin    int
+	FlipsThreshold    int
+	FullLoadHeadroom  int
+	FullLoadMinutes   int
+	OldestStepMinutes int
+	LossBucketCount   int
+	LossPerBucketUSD  float64
+	RescueSlipUSD     float64
+	LatencyP95Ms      float64
+	SilentMinutes     int
+	RiskFlapsPerHour  int
+	MuJumpSigma       float64
+}
+
+// BucketMetrics is one time-bucket aggregate (global or per pair).
+type BucketMetrics struct {
+	StartUTC       string  `json:"start_utc"`
+	Pair           string  `json:"pair,omitempty"`
+	Opens          uint64  `json:"opens"`
+	Closes         uint64  `json:"closes"`
+	Flips          uint64  `json:"flips"`
+	Executions     uint64  `json:"executions"`
+	OneLegFails    uint64  `json:"one_leg_fails"`
+	Rescues        uint64  `json:"rescues"`
+	VolumeUSD      Fixed8  `json:"volume_usd"`
+	RealizedUSD    Fixed8  `json:"realized_usd"`
+	LatencyAvgMs   float64 `json:"latency_avg_ms"`
+	LatencyMaxMs   float64 `json:"latency_max_ms"`
+	LatencyP95Ms   float64 `json:"latency_p95_ms"`
+	MuBps          float64 `json:"mu_bps"`
+	SigmaBps       float64 `json:"sigma_bps"`
+	TickK          float64 `json:"tick_k"`
+	FailRate       float64 `json:"fail_rate"`
+	OpenStepsPeak  int     `json:"open_steps_peak"`
+	OldestStepAgeS float64 `json:"oldest_step_age_s"`
+}
+
+// Anomaly is one fired anomaly observation.
+type Anomaly struct {
+	Time  string `json:"time"`
+	Pair  string `json:"pair,omitempty"`
+	Rule  string `json:"rule"`
+	Level string `json:"level"`
+	Msg   string `json:"msg"`
 }
 
 // Metrics is a snapshot of the aggregated counters and gauges.
@@ -104,6 +176,10 @@ type Metrics struct {
 
 	Alerts []string               `json:"alerts"`
 	Pairs  map[string]PairMetrics `json:"pairs"`
+	// TimeBuckets are recent per-bucket aggregates; the global row has no pair.
+	TimeBuckets []BucketMetrics `json:"time_buckets"`
+	// Anomalies are the most recent fired anomaly observations.
+	Anomalies []Anomaly `json:"anomalies"`
 }
 
 // PairMetrics is the per-pair slice of the snapshot.
@@ -149,6 +225,12 @@ type Monitor struct {
 	muBps, sigmaBps, tickK, failRate                                       float64
 	alerts                                                                 []string
 	pairs                                                                  map[string]*pairAcc
+	analytics                                                              AnalyticsCfg
+	nowFn                                                                  func() time.Time
+	buckets                                                                map[string]map[int64]*bucketAcc
+	anomalies                                                              []Anomaly
+	anomalyLast                                                            map[string]time.Time
+	anomalyAlertMsg                                                        string
 }
 
 // pairAcc is one pair's rolling counters and latest gauges.
@@ -165,11 +247,50 @@ type pairAcc struct {
 	coverage                                                  float64
 	samples                                                   int
 	ready                                                     bool
+	lastExec                                                  time.Time
+	consecFails                                               int
+	fullLoadSince                                             time.Time
+	flipTimes                                                 []time.Time
+	riskTransitions                                           []time.Time
+	lossStreak                                                int
+	prevBucketMu, prevBucketSigma                             float64
+}
+
+// bucketAcc aggregates one time bucket of events.
+type bucketAcc struct {
+	opens, closes, flips, executions, oneLeg, rescues uint64
+	volumeUSD, realizedUSD                            float64
+	latN                                              uint64
+	latSum, latMax                                    float64
+	lats                                              []float64
+	muSum, sigmaSum, tickKSum                         float64
+	statusN                                           int
+	openStepsPeak                                     int
+	oldestStepAgeMax                                  float64
+	lastMu, lastSigma                                 float64
 }
 
 // New builds a monitor; alert may be nil.
 func New(alert AlertFunc) *Monitor {
-	return &Monitor{start: time.Now(), alert: alert, pairs: map[string]*pairAcc{}}
+	return &Monitor{start: time.Now(), alert: alert, pairs: map[string]*pairAcc{},
+		buckets: map[string]map[int64]*bucketAcc{}, anomalyLast: map[string]time.Time{}}
+}
+
+// ConfigureAnalytics enables time-bucketed aggregation and anomaly rules. It
+// is strictly observational and never influences trading decisions.
+func (m *Monitor) ConfigureAnalytics(cfg AnalyticsCfg) {
+	if cfg.RetainBuckets <= 0 {
+		cfg.RetainBuckets = 672
+	}
+	if cfg.MetricsBuckets <= 0 {
+		cfg.MetricsBuckets = 96
+	}
+	if cfg.Cooldown <= 0 {
+		cfg.Cooldown = 10 * time.Minute
+	}
+	m.mu.Lock()
+	m.analytics = cfg
+	m.mu.Unlock()
 }
 
 func (m *Monitor) acc(pair string) *pairAcc {
@@ -192,6 +313,9 @@ func (m *Monitor) RollingFailRate(pair string) float64 {
 // Record applies one event.
 func (m *Monitor) Record(e Event) {
 	m.mu.Lock()
+	if e.Time.IsZero() {
+		e.Time = m.now()
+	}
 	alertMsg := ""
 	switch e.Kind {
 	case KindStepOpened:
@@ -219,6 +343,7 @@ func (m *Monitor) Record(e Event) {
 			m.oneLeg++
 		}
 		a := m.acc(e.Pair)
+		a.lastExec = e.Time
 		a.executions++
 		a.volumeUSD += e.USD
 		if e.OneLeg {
@@ -234,6 +359,12 @@ func (m *Monitor) Record(e Event) {
 	case KindRescue:
 		m.rescues++
 		m.acc(e.Pair).rescues++
+	case KindRiskState:
+		a := m.acc(e.Pair)
+		a.riskTransitions = append(a.riskTransitions, e.Time)
+		if len(a.riskTransitions) > 64 {
+			a.riskTransitions = a.riskTransitions[len(a.riskTransitions)-64:]
+		}
 	case KindEmergency:
 		m.emergencies++
 		alertMsg = fmt.Sprintf("emergency unwind on %s", e.Pair)
@@ -268,6 +399,12 @@ func (m *Monitor) Record(e Event) {
 	for _, a := range m.pairs {
 		m.openSteps += a.openSteps
 	}
+	m.updateBuckets(e)
+	m.checkAnomalies(e)
+	if m.anomalyAlertMsg != "" && alertMsg == "" {
+		alertMsg = m.anomalyAlertMsg
+	}
+	m.anomalyAlertMsg = ""
 	if alertMsg != "" {
 		m.alerts = append(m.alerts, alertMsg)
 		if len(m.alerts) > 64 {
@@ -279,6 +416,276 @@ func (m *Monitor) Record(e Event) {
 	if alert != nil && alertMsg != "" {
 		alert(alertMsg)
 	}
+}
+
+func (m *Monitor) now() time.Time {
+	if m.nowFn != nil {
+		return m.nowFn()
+	}
+	return time.Now()
+}
+
+// updateBuckets routes one event into the current bucket for its pair and for
+// the global aggregate. It is observational only.
+func (m *Monitor) updateBuckets(e Event) {
+	key, ok := m.bucketKey(e.Time)
+	if !ok {
+		return
+	}
+	pairs := []string{e.Pair, ""}
+	if e.Pair == "" {
+		pairs = []string{""}
+	}
+	for _, pair := range pairs {
+		m.bucketAdd(pair, key, e)
+	}
+}
+
+func (m *Monitor) bucketKey(t time.Time) (int64, bool) {
+	size := int64(m.analytics.Bucket / time.Second)
+	if size <= 0 {
+		return 0, false
+	}
+	return t.Unix() / size * size, true
+}
+
+func (m *Monitor) bucketAdd(pair string, key int64, e Event) {
+	ring := m.buckets[pair]
+	if ring == nil {
+		ring = map[int64]*bucketAcc{}
+		m.buckets[pair] = ring
+	}
+	acc, ok := ring[key]
+	if !ok {
+		m.finalizeBucket(pair, key)
+		acc = &bucketAcc{}
+		ring[key] = acc
+		m.pruneBuckets(pair, key, ring)
+	}
+	switch e.Kind {
+	case KindStepOpened:
+		acc.opens++
+	case KindStepClosed:
+		acc.closes++
+	case KindFlip:
+		acc.flips++
+	case KindExecuted:
+		acc.executions++
+		acc.volumeUSD += e.USD
+		if e.OneLeg {
+			acc.oneLeg++
+		}
+		latencies := []float64{e.LatencyLMs, e.LatencyRMs}
+		if latencies[0] <= 0 && latencies[1] <= 0 && e.LatencyMs > 0 {
+			latencies = []float64{e.LatencyMs}
+		}
+		for _, l := range latencies {
+			if l <= 0 {
+				continue
+			}
+			acc.latN++
+			acc.latSum += l
+			if l > acc.latMax {
+				acc.latMax = l
+			}
+			acc.lats = append(acc.lats, l)
+			if len(acc.lats) > 4096 {
+				acc.lats = acc.lats[len(acc.lats)-4096:]
+			}
+		}
+	case KindRescue:
+		acc.rescues++
+	case KindPnL:
+		acc.realizedUSD += e.USD
+	case KindStatus:
+		acc.statusN++
+		acc.muSum += e.MuBps
+		acc.sigmaSum += e.SigmaBps
+		acc.tickKSum += e.TickK
+		steps := e.Steps
+		if steps < 0 {
+			steps = -steps
+		}
+		if steps > acc.openStepsPeak {
+			acc.openStepsPeak = steps
+		}
+		if e.OldestStepAgeS > acc.oldestStepAgeMax {
+			acc.oldestStepAgeMax = e.OldestStepAgeS
+		}
+		acc.lastMu, acc.lastSigma = e.MuBps, e.SigmaBps
+	}
+}
+
+func (m *Monitor) pruneBuckets(pair string, key int64, ring map[int64]*bucketAcc) {
+	if m.analytics.RetainBuckets <= 0 {
+		return
+	}
+	size := int64(m.analytics.Bucket / time.Second)
+	limit := key - size*int64(m.analytics.RetainBuckets)
+	for k := range ring {
+		if k < limit {
+			delete(ring, k)
+		}
+	}
+}
+
+// finalizeBucket runs bucket-close anomaly rules for the previous bucket once
+// a newer bucket opens.
+func (m *Monitor) finalizeBucket(pair string, key int64) {
+	ring := m.buckets[pair]
+	prevKey := int64(math.MinInt64)
+	for k := range ring {
+		if k < key && k > prevKey {
+			prevKey = k
+		}
+	}
+	if prevKey == math.MinInt64 {
+		return
+	}
+	b := ring[prevKey]
+	a := m.acc(pair)
+	ax := m.analytics.Anomalies
+	now := m.now()
+	if ax.LossBucketCount > 0 && ax.LossPerBucketUSD > 0 {
+		if b.realizedUSD < -ax.LossPerBucketUSD {
+			a.lossStreak++
+			if a.lossStreak >= ax.LossBucketCount {
+				m.fireAnomaly(pair, "loss_buckets", "WARN",
+					fmt.Sprintf("%d consecutive buckets with realized loss (latest %.6f USD)", a.lossStreak, b.realizedUSD), now)
+			}
+		} else {
+			a.lossStreak = 0
+		}
+	}
+	if ax.LatencyP95Ms > 0 {
+		if p := p95(b.lats); p > ax.LatencyP95Ms {
+			m.fireAnomaly(pair, "latency_p95", "WARN",
+				fmt.Sprintf("bucket latency p95 %.1fms above threshold %.1fms", p, ax.LatencyP95Ms), now)
+		}
+	}
+	if ax.MuJumpSigma > 0 && b.statusN > 0 && a.prevBucketSigma > 0 {
+		if math.Abs(b.lastMu-a.prevBucketMu) > ax.MuJumpSigma*a.prevBucketSigma {
+			m.fireAnomaly(pair, "mu_jump", "INFO",
+				fmt.Sprintf("mean spread moved %.3f bps vs previous bucket (sigma %.3f)", b.lastMu-a.prevBucketMu, a.prevBucketSigma), now)
+		}
+	}
+	if b.statusN > 0 {
+		a.prevBucketMu, a.prevBucketSigma = b.lastMu, b.lastSigma
+	}
+}
+
+// checkAnomalies evaluates event-driven anomaly rules. Pair-level rules need a
+// pair; bucket-close rules live in finalizeBucket.
+func (m *Monitor) checkAnomalies(e Event) {
+	if e.Pair == "" {
+		return
+	}
+	ax := m.analytics.Anomalies
+	a := m.acc(e.Pair)
+	now := e.Time
+	switch e.Kind {
+	case KindExecuted:
+		if e.OneLeg {
+			a.consecFails++
+			if ax.ConsecutiveFails > 0 && a.consecFails >= ax.ConsecutiveFails {
+				m.fireAnomaly(e.Pair, "consecutive_fails", "WARN",
+					fmt.Sprintf("%d consecutive one-leg failures", a.consecFails), now)
+			}
+		} else {
+			a.consecFails = 0
+		}
+		if ax.RescueSlipUSD > 0 && e.RescueCostUSD > ax.RescueSlipUSD {
+			m.fireAnomaly(e.Pair, "rescue_slippage", "WARN",
+				fmt.Sprintf("rescue slippage %.6f USD above threshold %.6f", e.RescueCostUSD, ax.RescueSlipUSD), now)
+		}
+	case KindFlip:
+		if ax.FlipsWindowMin > 0 && ax.FlipsThreshold > 0 {
+			cut := now.Add(-time.Duration(ax.FlipsWindowMin) * time.Minute)
+			a.flipTimes = keepAfter(append(a.flipTimes, now), cut)
+			if len(a.flipTimes) >= ax.FlipsThreshold {
+				m.fireAnomaly(e.Pair, "flip_friction", "WARN",
+					fmt.Sprintf("%d direction flips in %d minutes", len(a.flipTimes), ax.FlipsWindowMin), now)
+			}
+		}
+	case KindRiskState:
+		if ax.RiskFlapsPerHour > 0 {
+			a.riskTransitions = keepAfter(a.riskTransitions, now.Add(-time.Hour))
+			if len(a.riskTransitions) >= ax.RiskFlapsPerHour {
+				m.fireAnomaly(e.Pair, "risk_flapping", "WARN",
+					fmt.Sprintf("%d risk-state transitions in the last hour", len(a.riskTransitions)), now)
+			}
+		}
+	case KindStatus:
+		steps := e.Steps
+		if steps < 0 {
+			steps = -steps
+		}
+		if ax.FullLoadHeadroom > 0 && ax.FullLoadMinutes > 0 && e.MaxSteps > 0 && steps >= e.MaxSteps-ax.FullLoadHeadroom {
+			if a.fullLoadSince.IsZero() {
+				a.fullLoadSince = now
+			}
+			if now.Sub(a.fullLoadSince) >= time.Duration(ax.FullLoadMinutes)*time.Minute {
+				m.fireAnomaly(e.Pair, "full_load", "WARN",
+					fmt.Sprintf("open steps %d at max_steps %d for over %d minutes", steps, e.MaxSteps, ax.FullLoadMinutes), now)
+			}
+		} else {
+			a.fullLoadSince = time.Time{}
+		}
+		if ax.OldestStepMinutes > 0 && e.OldestStepAgeS > float64(ax.OldestStepMinutes)*60 {
+			m.fireAnomaly(e.Pair, "oldest_step_age", "WARN",
+				fmt.Sprintf("oldest open step age %.0fs above %d minutes", e.OldestStepAgeS, ax.OldestStepMinutes), now)
+		}
+		if ax.SilentMinutes > 0 && !a.lastExec.IsZero() &&
+			now.Sub(a.lastExec) >= time.Duration(ax.SilentMinutes)*time.Minute {
+			m.fireAnomaly(e.Pair, "silent", "INFO",
+				fmt.Sprintf("no execution for over %d minutes", ax.SilentMinutes), now)
+		}
+		if int(a.oneLeg)-int(a.rescues) > 1 {
+			m.fireAnomaly(e.Pair, "unrescued", "WARN",
+				fmt.Sprintf("%d one-leg failures not yet rescued", a.oneLeg-a.rescues), now)
+		}
+	}
+}
+
+func keepAfter(ts []time.Time, cut time.Time) []time.Time {
+	kept := ts[:0]
+	for _, t := range ts {
+		if t.After(cut) {
+			kept = append(kept, t)
+		}
+	}
+	return kept
+}
+
+func (m *Monitor) fireAnomaly(pair, rule, level, msg string, now time.Time) {
+	if m.analytics.Cooldown > 0 {
+		key := pair + "\x00" + rule
+		if last, ok := m.anomalyLast[key]; ok && now.Sub(last) < m.analytics.Cooldown {
+			return
+		}
+		m.anomalyLast[key] = now
+	}
+	m.anomalies = append(m.anomalies, Anomaly{Time: now.UTC().Format(time.RFC3339), Pair: pair, Rule: rule, Level: level, Msg: msg})
+	if len(m.anomalies) > 64 {
+		m.anomalies = m.anomalies[len(m.anomalies)-64:]
+	}
+	m.anomalyAlertMsg = fmt.Sprintf("anomaly %s on %s: %s", rule, pair, msg)
+}
+
+func p95(v []float64) float64 {
+	if len(v) == 0 {
+		return 0
+	}
+	s := append([]float64(nil), v...)
+	sort.Float64s(s)
+	rank := int(math.Ceil(0.95 * float64(len(s))))
+	if rank < 1 {
+		rank = 1
+	}
+	if rank > len(s) {
+		rank = len(s)
+	}
+	return s[rank-1]
 }
 
 // Metrics returns a snapshot.
@@ -310,6 +717,68 @@ func (m *Monitor) Metrics() Metrics {
 			Coverage:        a.coverage, Samples: a.samples, Ready: a.ready,
 		}
 	}
+	limit := m.analytics.MetricsBuckets
+	if limit <= 0 {
+		limit = 96
+	}
+	type bucketRow struct {
+		pair string
+		key  int64
+	}
+	var rows []bucketRow
+	for pair, ring := range m.buckets {
+		for k := range ring {
+			rows = append(rows, bucketRow{pair: pair, key: k})
+		}
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].key != rows[j].key {
+			return rows[i].key > rows[j].key
+		}
+		return rows[i].pair < rows[j].pair
+	})
+	timeBuckets := make([]BucketMetrics, 0, limit)
+	for _, r := range rows {
+		if len(timeBuckets) >= limit {
+			break
+		}
+		b := m.buckets[r.pair][r.key]
+		latAvg := 0.0
+		if b.latN > 0 {
+			latAvg = b.latSum / float64(b.latN)
+		}
+		mu, sigma, tickK := 0.0, 0.0, 0.0
+		if b.statusN > 0 {
+			mu = b.muSum / float64(b.statusN)
+			sigma = b.sigmaSum / float64(b.statusN)
+			tickK = b.tickKSum / float64(b.statusN)
+		}
+		failRate := 0.0
+		if b.executions > 0 {
+			failRate = float64(b.oneLeg) / float64(b.executions)
+		}
+		timeBuckets = append(timeBuckets, BucketMetrics{
+			StartUTC:       time.Unix(r.key, 0).UTC().Format(time.RFC3339),
+			Pair:           r.pair,
+			Opens:          b.opens,
+			Closes:         b.closes,
+			Flips:          b.flips,
+			Executions:     b.executions,
+			OneLegFails:    b.oneLeg,
+			Rescues:        b.rescues,
+			VolumeUSD:      Fixed8(b.volumeUSD),
+			RealizedUSD:    Fixed8(b.realizedUSD),
+			LatencyAvgMs:   latAvg,
+			LatencyMaxMs:   b.latMax,
+			LatencyP95Ms:   p95(b.lats),
+			MuBps:          mu,
+			SigmaBps:       sigma,
+			TickK:          tickK,
+			FailRate:       failRate,
+			OpenStepsPeak:  b.openStepsPeak,
+			OldestStepAgeS: b.oldestStepAgeMax,
+		})
+	}
 	return Metrics{
 		UptimeSec:    time.Since(m.start).Seconds(),
 		Opens:        m.opens,
@@ -332,6 +801,8 @@ func (m *Monitor) Metrics() Metrics {
 		FailRate:     fail,
 		Alerts:       append([]string(nil), m.alerts...),
 		Pairs:        pairs,
+		TimeBuckets:  timeBuckets,
+		Anomalies:    append([]Anomaly(nil), m.anomalies...),
 	}
 }
 

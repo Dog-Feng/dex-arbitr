@@ -143,6 +143,26 @@ func Run(ctx context.Context, c *config.Config) (runErr error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	mon := monitor.New(func(msg string) { slog.Error("ALERT", "msg", msg) })
+	an := c.Monitor.Analytics
+	mon.ConfigureAnalytics(monitor.AnalyticsCfg{
+		Bucket:        an.Bucket,
+		RetainBuckets: an.RetainBuckets,
+		Anomalies: monitor.AnomalyCfg{
+			ConsecutiveFails:  an.Anomalies.ConsecutiveFails,
+			FlipsWindowMin:    an.Anomalies.FlipsWindowMin,
+			FlipsThreshold:    an.Anomalies.FlipsThreshold,
+			FullLoadHeadroom:  an.Anomalies.FullLoadHeadroom,
+			FullLoadMinutes:   an.Anomalies.FullLoadMinutes,
+			OldestStepMinutes: an.Anomalies.OldestStepMinutes,
+			LossBucketCount:   an.Anomalies.LossBucketCount,
+			LossPerBucketUSD:  an.Anomalies.LossPerBucketUSD,
+			RescueSlipUSD:     an.Anomalies.RescueSlipUSD,
+			LatencyP95Ms:      an.Anomalies.LatencyP95Ms,
+			SilentMinutes:     an.Anomalies.SilentMinutes,
+			RiskFlapsPerHour:  an.Anomalies.RiskFlapsPerHour,
+			MuJumpSigma:       an.Anomalies.MuJumpSigma,
+		},
+	})
 	if c.Monitor.Addr != "" {
 		addr := c.Monitor.Addr
 		if !strings.Contains(addr, ":") {

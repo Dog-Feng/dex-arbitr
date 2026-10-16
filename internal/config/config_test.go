@@ -209,6 +209,30 @@ func TestLoadFlipHysteresisDefaultAndZero(t *testing.T) {
 	}
 }
 
+func TestLoadMonitorAnalyticsDefaults(t *testing.T) {
+	c, err := loadTestConfig(t, "dry_run: true\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Monitor.Analytics.Bucket != 15*time.Minute || c.Monitor.Analytics.RetainBuckets != 672 {
+		t.Fatalf("analytics defaults wrong: %+v", c.Monitor.Analytics)
+	}
+	a := c.Monitor.Analytics.Anomalies
+	if a.ConsecutiveFails != 3 || a.FlipsWindowMin != 10 || a.FlipsThreshold != 3 ||
+		a.FullLoadHeadroom != 2 || a.FullLoadMinutes != 30 || a.OldestStepMinutes != 60 ||
+		a.LossBucketCount != 3 || a.LossPerBucketUSD != 0.05 || a.RescueSlipUSD != 0.01 ||
+		a.LatencyP95Ms != 600 || a.SilentMinutes != 30 || a.RiskFlapsPerHour != 8 || a.MuJumpSigma != 3 {
+		t.Fatalf("anomaly defaults wrong: %+v", a)
+	}
+	c, err = loadTestConfig(t, "monitor:\n  analytics:\n    bucket: 1h\n    anomalies:\n      consecutive_fails: -1\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Monitor.Analytics.Bucket != time.Hour || c.Monitor.Analytics.Anomalies.ConsecutiveFails != -1 {
+		t.Fatalf("explicit analytics values not honored: %+v", c.Monitor.Analytics)
+	}
+}
+
 func TestLoadPairSelection(t *testing.T) {
 	cases := []struct {
 		name    string

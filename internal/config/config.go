@@ -103,11 +103,38 @@ type Config struct {
 		MaxK       float64 `yaml:"max_k"`
 	} `yaml:"adaptive"`
 	Monitor struct {
-		Addr  string `yaml:"addr"`  // HTTP metrics endpoint; empty = disabled
-		Token string `yaml:"token"` // bearer token; empty = no auth
+		Addr      string    `yaml:"addr"`      // HTTP metrics endpoint; empty = disabled
+		Token     string    `yaml:"token"`     // bearer token; empty = no auth
+		Analytics Analytics `yaml:"analytics"` // time-bucketed metrics and anomaly rules (observational only)
 	} `yaml:"monitor"`
 	Auto  Auto   `yaml:"auto"`
 	Pairs []Pair `yaml:"pairs"`
+}
+
+// Analytics configures the monitor's time-bucketed metrics and anomaly rules.
+// It is strictly observational: nothing here changes trading behavior.
+type Analytics struct {
+	Bucket        time.Duration `yaml:"bucket"`         // aggregation granularity; 0 = default 15m
+	RetainBuckets int           `yaml:"retain_buckets"` // in-memory retention; 0 = default 672 (7 days @ 15m)
+	Anomalies     Anomalies     `yaml:"anomalies"`
+}
+
+// Anomalies holds anomaly-rule thresholds. A rule with a non-positive
+// threshold is disabled; zero fields take the built-in default.
+type Anomalies struct {
+	ConsecutiveFails  int     `yaml:"consecutive_fails"`   // consecutive one-leg failures before warning
+	FlipsWindowMin    int     `yaml:"flips_window_min"`    // flip-friction observation window in minutes
+	FlipsThreshold    int     `yaml:"flips_threshold"`     // flips in that window before warning
+	FullLoadHeadroom  int     `yaml:"full_load_headroom"`  // steps below max_steps that counts as "full"
+	FullLoadMinutes   int     `yaml:"full_load_minutes"`   // full-load duration before warning
+	OldestStepMinutes int     `yaml:"oldest_step_minutes"` // oldest open step age before warning
+	LossBucketCount   int     `yaml:"loss_bucket_count"`   // consecutive lossy buckets before warning
+	LossPerBucketUSD  float64 `yaml:"loss_per_bucket_usd"` // per-bucket realized loss threshold
+	RescueSlipUSD     float64 `yaml:"rescue_slip_usd"`     // single-rescue slippage warning threshold
+	LatencyP95Ms      float64 `yaml:"latency_p95_ms"`      // bucket latency p95 warning threshold
+	SilentMinutes     int     `yaml:"silent_minutes"`      // no-execution warning threshold
+	RiskFlapsPerHour  int     `yaml:"risk_flaps_per_hour"` // risk gate transitions per hour warning
+	MuJumpSigma       float64 `yaml:"mu_jump_sigma"`       // mu shift vs previous bucket in sigma units
 }
 
 // AdaptiveLatency derives the volatility window from measured leg latency.
@@ -201,6 +228,53 @@ func (c *Config) defaults() {
 	}
 	if al.UpdateInterval == 0 {
 		al.UpdateInterval = time.Second
+	}
+	an := &c.Monitor.Analytics
+	if an.Bucket == 0 {
+		an.Bucket = 15 * time.Minute
+	}
+	if an.RetainBuckets == 0 {
+		an.RetainBuckets = 672
+	}
+	ax := &an.Anomalies
+	if ax.ConsecutiveFails == 0 {
+		ax.ConsecutiveFails = 3
+	}
+	if ax.FlipsWindowMin == 0 {
+		ax.FlipsWindowMin = 10
+	}
+	if ax.FlipsThreshold == 0 {
+		ax.FlipsThreshold = 3
+	}
+	if ax.FullLoadHeadroom == 0 {
+		ax.FullLoadHeadroom = 2
+	}
+	if ax.FullLoadMinutes == 0 {
+		ax.FullLoadMinutes = 30
+	}
+	if ax.OldestStepMinutes == 0 {
+		ax.OldestStepMinutes = 60
+	}
+	if ax.LossBucketCount == 0 {
+		ax.LossBucketCount = 3
+	}
+	if ax.LossPerBucketUSD == 0 {
+		ax.LossPerBucketUSD = 0.05
+	}
+	if ax.RescueSlipUSD == 0 {
+		ax.RescueSlipUSD = 0.01
+	}
+	if ax.LatencyP95Ms == 0 {
+		ax.LatencyP95Ms = 600
+	}
+	if ax.SilentMinutes == 0 {
+		ax.SilentMinutes = 30
+	}
+	if ax.RiskFlapsPerHour == 0 {
+		ax.RiskFlapsPerHour = 8
+	}
+	if ax.MuJumpSigma == 0 {
+		ax.MuJumpSigma = 3
 	}
 	a := &c.Adaptive
 	if a.FailHigh == 0 {
@@ -340,6 +414,9 @@ func (c *Config) validate() error {
 		if d.value <= 0 {
 			return fmt.Errorf("%s must be > 0", d.name)
 		}
+	}
+	if c.Monitor.Analytics.Bucket < 0 || c.Monitor.Analytics.RetainBuckets < 1 {
+		return fmt.Errorf("monitor.analytics: bucket must be >= 0 and retain_buckets >= 1")
 	}
 	if c.Estimator.MinWarmup > c.Estimator.Window || c.Estimator.Interval > c.Estimator.Window {
 		return fmt.Errorf("estimator min_warmup and interval must not exceed window")

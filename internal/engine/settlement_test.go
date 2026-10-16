@@ -320,6 +320,22 @@ func TestProcessLifetimeVolumeAccumulatesAcrossDays(t *testing.T) {
 	nearSettlement(t, "process pnl cumulative", a.procPnlUSD, .579)
 }
 
+func TestOldestStepAge(t *testing.T) {
+	a := settlementActor(t)
+	now := time.Now()
+	a.state.Steps = []strategy.Step{
+		{ID: 1, Dir: strategy.DirLS, OpenedAt: now.Add(-time.Minute)},
+		{ID: 2, Dir: strategy.DirLS, OpenedAt: now.Add(-10 * time.Second)},
+	}
+	if got := a.oldestStepAge(now); got < 59.9 || got > 60.1 {
+		t.Fatalf("oldest step age=%v, want ~60s", got)
+	}
+	a.state.Steps = nil
+	if got := a.oldestStepAge(now); got != 0 {
+		t.Fatalf("flat book age=%v, want 0", got)
+	}
+}
+
 func TestSettlementCheckpointSurvivesEmptyLedgerRestart(t *testing.T) {
 	a := settlementActor(t)
 	a.checkpoint = true
