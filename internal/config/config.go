@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Dog-Feng/dex-arbitr/internal/monitor"
 	"github.com/Dog-Feng/dex-arbitr/internal/strategy"
 	"github.com/Dog-Feng/dex-arbitr/internal/symbols"
 
@@ -114,9 +115,10 @@ type Config struct {
 // Analytics configures the monitor's time-bucketed metrics and anomaly rules.
 // It is strictly observational: nothing here changes trading behavior.
 type Analytics struct {
-	Bucket        time.Duration `yaml:"bucket"`         // aggregation granularity; 0 = default 15m
-	RetainBuckets int           `yaml:"retain_buckets"` // in-memory retention; 0 = default 672 (7 days @ 15m)
-	Anomalies     Anomalies     `yaml:"anomalies"`
+	Bucket        time.Duration     `yaml:"bucket"`         // aggregation granularity; 0 = default 15m
+	RetainBuckets int               `yaml:"retain_buckets"` // in-memory retention; 0 = default 672 (7 days @ 15m)
+	Sessions      map[string]string `yaml:"sessions"`       // name -> "HH:MM-HH:MM" Beijing wall clock; display-only
+	Anomalies     Anomalies         `yaml:"anomalies"`
 }
 
 // Anomalies holds anomaly-rule thresholds. A rule with a non-positive
@@ -417,6 +419,11 @@ func (c *Config) validate() error {
 	}
 	if c.Monitor.Analytics.Bucket < 0 || c.Monitor.Analytics.RetainBuckets < 1 {
 		return fmt.Errorf("monitor.analytics: bucket must be >= 0 and retain_buckets >= 1")
+	}
+	for name, spec := range c.Monitor.Analytics.Sessions {
+		if !monitor.ValidSessionSpec(spec) {
+			return fmt.Errorf("monitor.analytics.sessions.%s: invalid spec %q (want HH:MM-HH:MM)", name, spec)
+		}
 	}
 	if c.Estimator.MinWarmup > c.Estimator.Window || c.Estimator.Interval > c.Estimator.Window {
 		return fmt.Errorf("estimator min_warmup and interval must not exceed window")

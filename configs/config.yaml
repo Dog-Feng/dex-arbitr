@@ -104,6 +104,10 @@ monitor:
   analytics:               # observational only: time buckets + anomaly rules (never affect trading)
     bucket: 15m            # aggregation granularity; 0 = off
     retain_buckets: 672    # in-memory retention (7 days @ 15m)
+    sessions:              # display-only Beijing windows (name: HH:MM-HH:MM)
+      us_cash: "21:30-04:00"
+      us_premarket: "16:00-21:30"
+      asia_day: "09:00-16:00"
     anomalies:             # non-positive threshold disables a rule
       consecutive_fails: 3
       flips_window_min: 10

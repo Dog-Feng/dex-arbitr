@@ -40,41 +40,41 @@ const (
 
 // Event is a structured runtime event. Fields are interpreted by Kind.
 type Event struct {
-	Time      time.Time
-	Pair      string
-	Kind      Kind
-	Dir       string
-	Msg       string
-	Qty       float64
-	Bps       float64
-	USD       float64
-	LatencyMs float64
-	OneLeg    bool
-	Steps     int
+	Time      time.Time `json:"time,omitempty"`
+	Pair      string    `json:"pair,omitempty"`
+	Kind      Kind      `json:"kind"`
+	Dir       string    `json:"dir,omitempty"`
+	Msg       string    `json:"msg,omitempty"`
+	Qty       float64   `json:"qty,omitempty"`
+	Bps       float64   `json:"bps,omitempty"`
+	USD       float64   `json:"usd,omitempty"`
+	LatencyMs float64   `json:"latency_ms,omitempty"`
+	OneLeg    bool      `json:"one_leg,omitempty"`
+	Steps     int       `json:"steps,omitempty"`
 
-	MuBps    float64
-	SigmaBps float64
-	TickK    float64
-	FailRate float64
+	MuBps    float64 `json:"mu_bps,omitempty"`
+	SigmaBps float64 `json:"sigma_bps,omitempty"`
+	TickK    float64 `json:"tick_k,omitempty"`
+	FailRate float64 `json:"fail_rate,omitempty"`
 
-	Mode      string
-	Score     float64
-	DepthQ    float64
-	TickQ     float64
-	Stability float64
-	Reverts   float64
-	Coverage  float64
-	Samples   int
-	Ready     bool
+	Mode      string  `json:"mode,omitempty"`
+	Score     float64 `json:"score,omitempty"`
+	DepthQ    float64 `json:"depth_q,omitempty"`
+	TickQ     float64 `json:"tick_q,omitempty"`
+	Stability float64 `json:"stability,omitempty"`
+	Reverts   float64 `json:"reverts_per_min,omitempty"`
+	Coverage  float64 `json:"coverage,omitempty"`
+	Samples   int     `json:"samples,omitempty"`
+	Ready     bool    `json:"ready,omitempty"`
 
 	// Observational extras consumed by the analytics layer; never used by
 	// trading decisions.
-	RescueCostUSD  float64
-	LatencyLMs     float64
-	LatencyRMs     float64
-	GrossUSD       float64
-	MaxSteps       int
-	OldestStepAgeS float64
+	RescueCostUSD  float64 `json:"rescue_cost_usd,omitempty"`
+	LatencyLMs     float64 `json:"latency_l_ms,omitempty"`
+	LatencyRMs     float64 `json:"latency_r_ms,omitempty"`
+	GrossUSD       float64 `json:"gross_usd,omitempty"`
+	MaxSteps       int     `json:"max_steps,omitempty"`
+	OldestStepAgeS float64 `json:"oldest_step_age_s,omitempty"`
 }
 
 // AlertFunc receives an alert message (log, webhook, ...).
@@ -92,11 +92,17 @@ func (f Fixed8) MarshalJSON() ([]byte, error) {
 // AnalyticsCfg configures time-bucketed aggregation and anomaly detection.
 // It is strictly observational: nothing here changes trading behavior.
 type AnalyticsCfg struct {
-	Bucket         time.Duration // aggregation granularity; <= 0 disables buckets
-	RetainBuckets  int           // in-memory bucket retention; <= 0 = default 672
-	MetricsBuckets int           // buckets exposed in /metrics; <= 0 = default 96
-	Cooldown       time.Duration // per-rule/pair anomaly cooldown; <= 0 = 10m
+	Bucket         time.Duration     // aggregation granularity; <= 0 disables buckets
+	RetainBuckets  int               // in-memory bucket retention; <= 0 = default 672
+	MetricsBuckets int               // buckets exposed in /metrics; <= 0 = default 96
+	Cooldown       time.Duration     // per-rule/pair anomaly cooldown; <= 0 = 10m
+	Sessions       map[string]string // name -> "HH:MM-HH:MM" Beijing wall clock (display only)
 	Anomalies      AnomalyCfg
+}
+
+// TradeSink persists serialized trade-event lines for offline analysis.
+type TradeSink interface {
+	WriteTrade(line []byte) error
 }
 
 // AnomalyCfg holds anomaly-rule thresholds; a non-positive threshold disables
@@ -121,6 +127,7 @@ type AnomalyCfg struct {
 type BucketMetrics struct {
 	StartUTC       string  `json:"start_utc"`
 	Pair           string  `json:"pair,omitempty"`
+	Session        string  `json:"session,omitempty"`
 	Opens          uint64  `json:"opens"`
 	Closes         uint64  `json:"closes"`
 	Flips          uint64  `json:"flips"`
@@ -132,12 +139,15 @@ type BucketMetrics struct {
 	LatencyAvgMs   float64 `json:"latency_avg_ms"`
 	LatencyMaxMs   float64 `json:"latency_max_ms"`
 	LatencyP95Ms   float64 `json:"latency_p95_ms"`
+	LatencyN       uint64  `json:"latency_n,omitempty"`
 	MuBps          float64 `json:"mu_bps"`
 	SigmaBps       float64 `json:"sigma_bps"`
 	TickK          float64 `json:"tick_k"`
 	FailRate       float64 `json:"fail_rate"`
+	StatusSamples  int     `json:"status_samples,omitempty"`
 	OpenStepsPeak  int     `json:"open_steps_peak"`
 	OldestStepAgeS float64 `json:"oldest_step_age_s"`
+	RescueCostUSD  Fixed8  `json:"rescue_cost_usd,omitempty"`
 }
 
 // Anomaly is one fired anomaly observation.
@@ -231,6 +241,7 @@ type Monitor struct {
 	anomalies                                                              []Anomaly
 	anomalyLast                                                            map[string]time.Time
 	anomalyAlertMsg                                                        string
+	trades                                                                 TradeSink
 }
 
 // pairAcc is one pair's rolling counters and latest gauges.
@@ -268,6 +279,7 @@ type bucketAcc struct {
 	openStepsPeak                                     int
 	oldestStepAgeMax                                  float64
 	lastMu, lastSigma                                 float64
+	rescueCostUSD                                     float64
 }
 
 // New builds a monitor; alert may be nil.
@@ -276,9 +288,10 @@ func New(alert AlertFunc) *Monitor {
 		buckets: map[string]map[int64]*bucketAcc{}, anomalyLast: map[string]time.Time{}}
 }
 
-// ConfigureAnalytics enables time-bucketed aggregation and anomaly rules. It
-// is strictly observational and never influences trading decisions.
-func (m *Monitor) ConfigureAnalytics(cfg AnalyticsCfg) {
+// ConfigureAnalytics enables time-bucketed aggregation, anomaly rules and the
+// optional trade sink. It is strictly observational and never influences
+// trading decisions.
+func (m *Monitor) ConfigureAnalytics(cfg AnalyticsCfg, sink TradeSink) {
 	if cfg.RetainBuckets <= 0 {
 		cfg.RetainBuckets = 672
 	}
@@ -290,7 +303,70 @@ func (m *Monitor) ConfigureAnalytics(cfg AnalyticsCfg) {
 	}
 	m.mu.Lock()
 	m.analytics = cfg
+	m.trades = sink
 	m.mu.Unlock()
+}
+
+// Beijing is the fixed UTC+8 display zone used for session labels.
+var Beijing = time.FixedZone("CST", 8*3600)
+
+// ValidSessionSpec reports whether spec parses as "HH:MM-HH:MM".
+func ValidSessionSpec(spec string) bool {
+	_, _, ok := parseSessionSpec(spec)
+	return ok
+}
+
+func parseSessionSpec(spec string) (startMin, endMin int, ok bool) {
+	parts := strings.Split(spec, "-")
+	if len(parts) != 2 {
+		return 0, 0, false
+	}
+	startMin, ok = parseHHMM(parts[0])
+	if !ok {
+		return 0, 0, false
+	}
+	endMin, ok = parseHHMM(parts[1])
+	if !ok || startMin == endMin {
+		return 0, 0, false
+	}
+	return startMin, endMin, true
+}
+
+func parseHHMM(s string) (int, bool) {
+	parts := strings.Split(s, ":")
+	if len(parts) != 2 || len(parts[0]) != 2 || len(parts[1]) != 2 {
+		return 0, false
+	}
+	h, err1 := strconv.Atoi(parts[0])
+	m, err2 := strconv.Atoi(parts[1])
+	if err1 != nil || err2 != nil || h < 0 || h > 23 || m < 0 || m > 59 {
+		return 0, false
+	}
+	return h*60 + m, true
+}
+
+// SessionOf labels t by its Beijing wall clock against the configured session
+// windows (wraparound supported, e.g. "21:30-04:00"). It returns "" when the
+// time falls outside every window or no sessions are configured.
+func SessionOf(t time.Time, sessions map[string]string) string {
+	if len(sessions) == 0 {
+		return ""
+	}
+	min := t.In(Beijing).Hour()*60 + t.In(Beijing).Minute()
+	for name, spec := range sessions {
+		start, end, ok := parseSessionSpec(spec)
+		if !ok {
+			continue
+		}
+		if start < end {
+			if min >= start && min < end {
+				return name
+			}
+		} else if min >= start || min < end {
+			return name
+		}
+	}
+	return ""
 }
 
 func (m *Monitor) acc(pair string) *pairAcc {
@@ -405,6 +481,13 @@ func (m *Monitor) Record(e Event) {
 		alertMsg = m.anomalyAlertMsg
 	}
 	m.anomalyAlertMsg = ""
+	if m.trades != nil && persistableKind(e.Kind) {
+		if line, err := json.Marshal(e); err == nil {
+			if writeErr := m.trades.WriteTrade(append(line, '\n')); writeErr != nil {
+				slog.Warn("trade log write", "err", writeErr)
+			}
+		}
+	}
 	if alertMsg != "" {
 		m.alerts = append(m.alerts, alertMsg)
 		if len(m.alerts) > 64 {
@@ -416,6 +499,15 @@ func (m *Monitor) Record(e Event) {
 	if alert != nil && alertMsg != "" {
 		alert(alertMsg)
 	}
+}
+
+func persistableKind(k Kind) bool {
+	switch k {
+	case KindStepOpened, KindStepClosed, KindExecuted, KindFlip, KindRescue,
+		KindStatus, KindPnL, KindRiskState, KindError, KindEmergency:
+		return true
+	}
+	return false
 }
 
 func (m *Monitor) now() time.Time {
@@ -472,6 +564,7 @@ func (m *Monitor) bucketAdd(pair string, key int64, e Event) {
 	case KindExecuted:
 		acc.executions++
 		acc.volumeUSD += e.USD
+		acc.rescueCostUSD += e.RescueCostUSD
 		if e.OneLeg {
 			acc.oneLeg++
 		}
@@ -760,6 +853,7 @@ func (m *Monitor) Metrics() Metrics {
 		timeBuckets = append(timeBuckets, BucketMetrics{
 			StartUTC:       time.Unix(r.key, 0).UTC().Format(time.RFC3339),
 			Pair:           r.pair,
+			Session:        SessionOf(time.Unix(r.key, 0), m.analytics.Sessions),
 			Opens:          b.opens,
 			Closes:         b.closes,
 			Flips:          b.flips,
@@ -771,12 +865,15 @@ func (m *Monitor) Metrics() Metrics {
 			LatencyAvgMs:   latAvg,
 			LatencyMaxMs:   b.latMax,
 			LatencyP95Ms:   p95(b.lats),
+			LatencyN:       b.latN,
 			MuBps:          mu,
 			SigmaBps:       sigma,
 			TickK:          tickK,
 			FailRate:       failRate,
+			StatusSamples:  b.statusN,
 			OpenStepsPeak:  b.openStepsPeak,
 			OldestStepAgeS: b.oldestStepAgeMax,
+			RescueCostUSD:  Fixed8(b.rescueCostUSD),
 		})
 	}
 	return Metrics{

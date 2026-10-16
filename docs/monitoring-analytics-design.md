@@ -25,7 +25,7 @@
 - 没有生命周期指标：单步持仓时长、步龄分布、回本速度；
 - 没有分位数：延迟只有 avg/max，没有 p50/p95/p99；
 - 没有异常规则：失败率尖峰、满仓锁死、risk 抖动、连续亏损桶等只能靠人肉看日志；
-- 交易明细不可重放：step 的开/平、入场 bps、持有时间、realized 没有结构化留存（只有 samples 有行情，没有交易事件流）。
+- ~~交易明细不可重放~~（P3 已解决）：step 的开/平、入场 bps、持有时间、realized 现以结构化 JSONL 留存（`state_dir/trades/trades.jsonl`）。
 
 ## 3. 指标与"率"设计
 
@@ -103,7 +103,7 @@ monitor:
 
 ## 6. 交易明细留存（"交易的信息"）
 
-- 新增结构化交易事件 JSONL（append-only，放 `state_dir/trades/<pair>.jsonl`，由 monitor 定义 `BucketSink`/`TradeSink` 小接口，`run.go` 装配时注入 store 实现）：
+- 新增结构化交易事件 JSONL（已实现：append-only，放 `state_dir/trades/trades.jsonl` 单文件、事件内带 pair 字段，由 monitor 定义 `TradeSink` 小接口、`store.TradeLog` 实现，`run.go` 装配时注入）：
   - step_opened：id、dir、qty、entry_bps、open_l/open_r、opened_at
   - step_closed：id、held_s、entry_bps、close_prices、gross、realized_usd、one_leg
   - executed：latency_l/r、rescue_cost_usd、tick_k、σ
@@ -113,8 +113,8 @@ monitor:
 
 - **P1（已实现）**：monitor 加 15 分钟桶聚合（计数/量/盈亏/延迟/μ/σ）+ `/metrics.time_buckets`；engine 在 executed/status 事件补 `rescue_cost_usd`、`latency_l/r_ms`、`gross`、`max_steps`、`oldest_step_age_s` 字段（纯事件字段，不动决策）。
 - **P2（已实现）**：异常规则引擎（阈值入 `monitor.analytics.anomalies` 配置）+ `/metrics.anomalies` 输出与 ALERT 告警；规则触发有 10 分钟冷却，非正阈值关闭对应规则。
-- **P3**：TradeSink JSONL 落盘 + 会话标签配置与展示。
-- **P4（可选）**：`cmd/analytics` 离线命令：join samples（行情侧）+ 交易 JSONL（结果侧），输出每桶/每会话报表（μ/σ、成交、盈亏、失败率、flips、持仓时长），验证"RWA 美股时段 vs 白天"的时段假设。
+- **P3（已实现）**：交易事件 JSONL 落盘（`state_dir/trades/trades.jsonl`，单文件、事件内带 pair 字段，append-only，由 `store.TradeLog` 实现 monitor 的 `TradeSink` 接口、`run.go` 装配）+ 会话标签（`monitor.analytics.sessions`，北京时间窗口、支持跨零点，桶行带 `session` 标签）。
+- **P4（已实现）**：`cmd/analytics` 离线命令：`-trades` 读交易 JSONL、`-from/-to` 限定区间、`-bucket` 桶粒度、`-sessions` 会话窗口；内部用 `analytics.Replay` 复用 monitor 的同一套聚合代码（口径与线上 `/metrics.time_buckets` 完全一致），输出每桶明细与每会话汇总（加权均值）。行情侧 μ/σ 直接来自落盘的 status 事件；samples 原始样本的 join 留作后续扩展。
 - 测试：桶聚合单元测试、异常规则表驱动测试、JSON/JSONL 格式测试；全量 `-race`。
 
 ## 8. 与现有模块的关系

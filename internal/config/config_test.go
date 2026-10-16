@@ -60,6 +60,7 @@ func TestLoadStrictValidation(t *testing.T) {
 		{"duplicate YAML key", "dry_run: true\ndry_run: false\n", "already defined"},
 		{"second YAML document", "dry_run: true\n---\ndry_run: false\n", "multiple YAML documents"},
 		{"nan threshold", "strategy:\n  open_bps: .nan\n", "strategy.open_bps must be finite"},
+		{"bad session spec", "monitor:\n  analytics:\n    sessions:\n      x: 9:30-04:00\n", "sessions"},
 		{"nonfinite inactive option", "auto:\n  notional_per_leg: -.inf\n", "auto.notional_per_leg must be finite"},
 		{"zero estimator interval", "estimator:\n  interval: 0s\n", "estimator.interval must be > 0"},
 		{"negative estimator window", "estimator:\n  window: -1s\n", "estimator.window must be > 0"},
@@ -230,6 +231,10 @@ func TestLoadMonitorAnalyticsDefaults(t *testing.T) {
 	}
 	if c.Monitor.Analytics.Bucket != time.Hour || c.Monitor.Analytics.Anomalies.ConsecutiveFails != -1 {
 		t.Fatalf("explicit analytics values not honored: %+v", c.Monitor.Analytics)
+	}
+	c, err = loadTestConfig(t, "monitor:\n  analytics:\n    sessions:\n      us_cash: 21:30-04:00\n")
+	if err != nil || c.Monitor.Analytics.Sessions["us_cash"] != "21:30-04:00" {
+		t.Fatalf("sessions not parsed: %+v %v", c.Monitor.Analytics.Sessions, err)
 	}
 }
 

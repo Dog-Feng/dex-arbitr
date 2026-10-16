@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -381,5 +382,61 @@ func TestAnomalyRiskFlappingAndRescueSlip(t *testing.T) {
 	}
 	if !got["risk_flapping"] || !got["rescue_slippage"] {
 		t.Fatalf("expected risk_flapping/rescue_slippage, got %+v", m.Metrics().Anomalies)
+	}
+}
+
+func TestSessionSpecAndSessionOf(t *testing.T) {
+	if !ValidSessionSpec("21:30-04:00") {
+		t.Fatal("valid wrap spec rejected")
+	}
+	for _, bad := range []string{"", "25:00-04:00", "9:30-04:00", "21:30", "04:00-04:00", "21:60-04:00"} {
+		if ValidSessionSpec(bad) {
+			t.Fatalf("invalid spec %q accepted", bad)
+		}
+	}
+	sessions := map[string]string{"us_cash": "21:30-04:00"}
+	if got := SessionOf(time.Date(2026, 10, 16, 13, 30, 0, 0, time.UTC), sessions); got != "us_cash" {
+		t.Fatalf("21:30 Beijing labeled %q", got)
+	}
+	if got := SessionOf(time.Date(2026, 10, 16, 19, 59, 0, 0, time.UTC), sessions); got != "us_cash" {
+		t.Fatalf("04:00 Beijing wrap labeled %q", got)
+	}
+	if got := SessionOf(time.Date(2026, 10, 16, 6, 0, 0, 0, time.UTC), sessions); got != "" {
+		t.Fatalf("14:00 Beijing labeled %q", got)
+	}
+	if got := SessionOf(time.Now(), nil); got != "" {
+		t.Fatalf("no sessions labeled %q", got)
+	}
+}
+
+type fakeSink struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+func (f *fakeSink) WriteTrade(line []byte) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lines = append(f.lines, string(line))
+	return nil
+}
+
+func TestTradeSinkPersistsTradeKinds(t *testing.T) {
+	m := New(nil)
+	sink := &fakeSink{}
+	cfg := testAnalytics()
+	m.ConfigureAnalytics(cfg, sink)
+	t0 := time.Date(2026, 10, 16, 9, 0, 0, 0, time.UTC)
+	m.Record(Event{Time: t0, Pair: "A", Kind: KindExecuted, USD: 31, LatencyLMs: 300, LatencyRMs: 340, RescueCostUSD: 0.01})
+	m.Record(Event{Time: t0, Pair: "A", Kind: KindStatus, MuBps: 0.5, SigmaBps: 0.2, TickK: 2.5})
+	m.Record(Event{Time: t0, Pair: "A", Kind: KindPairPromoted, Score: 1})
+	if len(sink.lines) != 2 {
+		t.Fatalf("persisted %d lines, want 2: %q", len(sink.lines), sink.lines)
+	}
+	if !strings.Contains(sink.lines[0], `"pair":"A"`) || !strings.Contains(sink.lines[0], `"rescue_cost_usd":0.01`) {
+		t.Fatalf("executed line wrong: %s", sink.lines[0])
+	}
+	if !strings.Contains(sink.lines[1], `"kind":"status"`) || !strings.Contains(sink.lines[1], `"mu_bps":0.5`) {
+		t.Fatalf("status line wrong: %s", sink.lines[1])
 	}
 }
