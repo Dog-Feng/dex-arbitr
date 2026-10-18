@@ -392,6 +392,20 @@ func TestCapEngagedOversizedBandReleasesAtFlat(t *testing.T) {
 	}
 }
 
+func TestBookWakeCoalesces(t *testing.T) {
+	a := settlementActor(t)
+	a.wakeDecide()
+	a.wakeDecide()
+	if len(a.bookWake) != 1 {
+		t.Fatalf("wake channel length=%d, want 1 (coalesced)", len(a.bookWake))
+	}
+	<-a.bookWake
+	a.wakeDecide()
+	if len(a.bookWake) != 1 {
+		t.Fatalf("wake channel not reusable: len=%d", len(a.bookWake))
+	}
+}
+
 func TestOldestStepAge(t *testing.T) {
 	a := settlementActor(t)
 	now := time.Now()

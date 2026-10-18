@@ -35,6 +35,7 @@ type candidate struct {
 	mu         sync.RWMutex
 	bookL      domain.Book
 	bookR      domain.Book
+	wake       chan struct{}
 	healthLast scan.Health
 	est        estimator.Estimator
 	vol        *volatility.Estimator
@@ -74,6 +75,20 @@ func (c *candidate) Quote(now time.Time, maxAge time.Duration) (spread.Quote, bo
 		return spread.Quote{}, false
 	}
 	return spread.Compute(l, r)
+}
+
+// Updates reports (coalesced) signals whenever the shared books change; the
+// promoted actor uses it for event-driven decisions.
+func (c *candidate) Updates() <-chan struct{} { return c.wake }
+
+func (c *candidate) notify() {
+	if c.wake == nil {
+		return
+	}
+	select {
+	case c.wake <- struct{}{}:
+	default:
+	}
 }
 
 func (c *candidate) bookIdentities(l, r domain.Book) bool {
@@ -189,6 +204,7 @@ func (c *candidate) collect(ctx context.Context, sampleEvery, volEvery, volMaxAg
 			c.mu.Lock()
 			c.bookL = b
 			c.mu.Unlock()
+			c.notify()
 		case b, ok := <-chR:
 			if !ok {
 				if ctx.Err() != nil {
@@ -199,6 +215,7 @@ func (c *candidate) collect(ctx context.Context, sampleEvery, volEvery, volMaxAg
 			c.mu.Lock()
 			c.bookR = b
 			c.mu.Unlock()
+			c.notify()
 		case <-volT.C:
 			now := time.Now()
 			if q, ok := c.Quote(now, volMaxAge); ok {
@@ -306,7 +323,8 @@ func (rt *runtime) matchAll(ctx context.Context) (cands []*candidate, matchErr e
 		out = append(out, &candidate{
 			base: p.Base, key: pairKey(p.Base, l.Name(), r.Name(), rt.cfg.DryRun),
 			pair: p, l: l, r: r,
-			est: est, vol: vol, volL: volL, volR: volR,
+			wake: make(chan struct{}, 1),
+			est:  est, vol: vol, volL: volL, volR: volR,
 			health:   scan.NewHealthTracker(600),
 			notional: rt.cfg.Auto.NotionalPerLeg, depthRatio: rt.cfg.Auto.DepthUseRatio,
 			tick:       maxTick(p.Left, p.Right),
@@ -740,7 +758,7 @@ func (rt *runtime) promote(ctx context.Context, c *candidate, active map[string]
 		return fmt.Errorf("pair excluded by whitelist")
 	}
 	for _, ar := range active {
-		ac := &candidate{l: ar.actor.cfg.L, r: ar.actor.cfg.R, pair: ar.actor.cfg.Pair}
+		ac := &candidate{l: ar.actor.cfg.L, r: ar.actor.cfg.R, pair: ar.actor.cfg.Pair, wake: make(chan struct{}, 1)}
 		if candidatesOverlap(c, ac) {
 			return fmt.Errorf("market already managed by %s", ar.actor.key)
 		}

@@ -72,7 +72,7 @@ k = clamp(round(horizon_ms / interval_ms), 1, maxSlots)
 
 3.1 每次 `accountExecution` 成功后，把 `res.L.Latency / res.R.Latency` 按 1.1 的条件喂给对应腿的滚动统计（失败结算、干预、unwind 不喂）。
 
-3.2 更新时机：每个 decide tick（200ms）或每 1s 检查一次：
+3.2 更新时机：每次盘口更新触发的判定，或每 200ms 的兜底 tick 检查一次：
 
 ```text
 latency_L = EWMA 分位（冷启动回退 500ms）

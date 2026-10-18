@@ -68,7 +68,8 @@ type PairConfig struct {
 type PairView interface {
 	Book(venue string) (domain.Book, bool)
 	Quote(now time.Time, maxAge time.Duration) (spread.Quote, bool)
-	Mean() (float64, bool) // mean bps, ready
+	Updates() <-chan struct{} // signaled (coalesced) when the shared books update
+	Mean() (float64, bool)    // mean bps, ready
 	VolBps() float64
 	VolReady() bool // short-horizon volatility warm and fresh
 	LegVol(venue string) float64
@@ -91,6 +92,7 @@ type PairActor struct {
 	bookMu              sync.RWMutex
 	bookL               domain.Book
 	bookR               domain.Book
+	bookWake            chan struct{}
 	lat                 latencyStat
 	margin              marginMonitor
 	volAcc              volumeAcc
@@ -213,6 +215,7 @@ func NewPairActor(cfg PairConfig) (*PairActor, error) {
 	}
 	key := pairKey(cfg.Pair.Base, cfg.L.Name(), cfg.R.Name(), cfg.DryRun)
 	a := &PairActor{cfg: cfg, key: key, log: slog.With("pair", cfg.Pair.Base, "L", cfg.L.Name(), "R", cfg.R.Name()), drainWake: make(chan struct{}, 1)}
+	a.bookWake = make(chan struct{}, 1)
 	a.margin = marginMonitor{cfg: cfg.Risk}
 	ringN := cfg.AdaptiveLatency.ringN
 	if ringN < 2 {
@@ -352,6 +355,7 @@ func (a *PairActor) collectBooks(ctx context.Context, chL, chR <-chan domain.Boo
 			a.bookMu.Lock()
 			a.bookL = b
 			a.bookMu.Unlock()
+			a.wakeDecide()
 		case b, ok := <-chR:
 			if !ok {
 				chR = nil
@@ -359,7 +363,17 @@ func (a *PairActor) collectBooks(ctx context.Context, chL, chR <-chan domain.Boo
 			a.bookMu.Lock()
 			a.bookR = b
 			a.bookMu.Unlock()
+			a.wakeDecide()
 		}
+	}
+}
+
+// wakeDecide signals the decision loop that fresh books are available. The
+// channel is coalescing: pending updates collapse into one wake.
+func (a *PairActor) wakeDecide() {
+	select {
+	case a.bookWake <- struct{}{}:
+	default:
 	}
 }
 
@@ -538,8 +552,16 @@ func (a *PairActor) Run(ctx context.Context) (retErr error) {
 		go func() { defer close(done); a.watchRisk(ctx) }()
 		defer func() { cancel(); <-done }()
 	}
-	decide := time.NewTicker(200 * time.Millisecond)
-	defer decide.Stop()
+	// Decisions are event-driven: a book update (manual mode) or a shared-view
+	// update (auto mode) wakes the loop immediately. The ticker is only a
+	// fallback so pending/checkpoint/drain/emergency work still progresses
+	// when no updates arrive for a while.
+	housekeep := time.NewTicker(200 * time.Millisecond)
+	defer housekeep.Stop()
+	var viewUpdates <-chan struct{}
+	if a.cfg.View != nil {
+		viewUpdates = a.cfg.View.Updates()
+	}
 	report := time.NewTicker(time.Minute)
 	defer report.Stop()
 	nextAt := time.Now().Add(a.jitter())
@@ -591,77 +613,86 @@ func (a *PairActor) Run(ctx context.Context) (retErr error) {
 				"pnl_usd", strconv.FormatFloat(a.procPnlUSD, 'f', 8, 64),
 				"fail_rate", a.FailRate(), "sigma_bps", round4(a.volBps()), "vol_ready", a.volReady(time.Now()))
 			a.lat.reset()
-		case <-decide.C:
-			now := time.Now()
-			if a.pending != nil {
-				a.resolvePending(ctx)
-				continue
-			}
-			if a.checkpoint {
-				if a.checkpointExit || a.emergencyRequested.Load() || a.draining.Load() {
-					a.recoverCheckpointExit(ctx, now)
-				} else {
-					a.recoverCheckpoint(ctx, now)
-				}
-				continue
-			}
-			if a.emergencyRequested.Load() && a.reconciled {
-				a.emergency(ctx)
-				nextAt = now.Add(a.jitter())
-				continue
-			}
-			if a.draining.Load() {
-				if a.reconciled {
-					a.drain(ctx)
-				}
-				continue
-			}
-			if a.state.Mode == strategy.ModePaused {
-				continue
-			}
-			a.applyAdaptiveWindows(now)
-			if a.riskBlocked.Load() {
-				a.state.Mode = strategy.ModeReduceOnly
-			} else if a.state.Mode == strategy.ModeReduceOnly && a.meanReady() {
-				a.state.Mode = strategy.ModeRunning
-			}
-			if a.state.Mode == strategy.ModeWarmup && a.meanReady() && !a.riskBlocked.Load() {
-				a.state.Mode = strategy.ModeRunning
-			}
-			if now.Before(nextAt) {
-				continue
-			}
-			q, ok := a.quote(now)
-			if !ok {
-				continue
-			}
-			canSize := a.refreshSizing()
-			mu, ready := a.mean()
-			st := a.state
-			st.LastDir = a.lastDir
-			st.CapEngaged = a.capEngaged
-			act := a.cfg.Strategy.Decide(a.cfg.Params, st, q, mu, ready, a.volBps())
-			if act.Kind == strategy.None {
-				continue
-			}
-			if (act.Kind == strategy.Open || act.Kind == strategy.Close) && !a.volReady(now) {
-				// Volatility is the key PnL protection: without it the open
-				// threshold loses its adverse-move buffer and closes cannot be
-				// priced against a trustworthy short-horizon move, so both are
-				// blocked until the short-horizon sigma chain is warm again.
-				if time.Since(a.volBlockLoggedAt) > 30*time.Second {
-					a.log.Warn("trading blocked until short-horizon volatility is ready", "kind", act.Kind, "sigma_bps", round4(a.volBps()))
-					a.volBlockLoggedAt = time.Now()
-				}
-				continue
-			}
-			if act.Kind == strategy.Open && (!canSize || a.riskBlocked.Load() || a.cfg.MayOpen != nil && !a.cfg.MayOpen()) {
-				continue
-			}
-			a.apply(ctx, act, q)
-			nextAt = time.Now().Add(a.jitter())
+		case <-housekeep.C:
+			nextAt = a.decideOnce(ctx, time.Now(), nextAt)
+		case <-a.bookWake:
+			nextAt = a.decideOnce(ctx, time.Now(), nextAt)
+		case <-viewUpdates:
+			nextAt = a.decideOnce(ctx, time.Now(), nextAt)
 		}
 	}
+}
+
+// decideOnce runs one decision pass: housekeeping (pending/checkpoint/drain/
+// emergency/mode transitions) and the opportunity evaluation. nextAt is the
+// action-interval cooldown deadline; a non-nil action extends it.
+func (a *PairActor) decideOnce(ctx context.Context, now time.Time, nextAt time.Time) time.Time {
+	if a.pending != nil {
+		a.resolvePending(ctx)
+		return nextAt
+	}
+	if a.checkpoint {
+		if a.checkpointExit || a.emergencyRequested.Load() || a.draining.Load() {
+			a.recoverCheckpointExit(ctx, now)
+		} else {
+			a.recoverCheckpoint(ctx, now)
+		}
+		return nextAt
+	}
+	if a.emergencyRequested.Load() && a.reconciled {
+		a.emergency(ctx)
+		return now.Add(a.jitter())
+	}
+	if a.draining.Load() {
+		if a.reconciled {
+			a.drain(ctx)
+		}
+		return nextAt
+	}
+	if a.state.Mode == strategy.ModePaused {
+		return nextAt
+	}
+	a.applyAdaptiveWindows(now)
+	if a.riskBlocked.Load() {
+		a.state.Mode = strategy.ModeReduceOnly
+	} else if a.state.Mode == strategy.ModeReduceOnly && a.meanReady() {
+		a.state.Mode = strategy.ModeRunning
+	}
+	if a.state.Mode == strategy.ModeWarmup && a.meanReady() && !a.riskBlocked.Load() {
+		a.state.Mode = strategy.ModeRunning
+	}
+	if now.Before(nextAt) {
+		return nextAt
+	}
+	q, ok := a.quote(now)
+	if !ok {
+		return nextAt
+	}
+	canSize := a.refreshSizing()
+	mu, ready := a.mean()
+	st := a.state
+	st.LastDir = a.lastDir
+	st.CapEngaged = a.capEngaged
+	act := a.cfg.Strategy.Decide(a.cfg.Params, st, q, mu, ready, a.volBps())
+	if act.Kind == strategy.None {
+		return nextAt
+	}
+	if (act.Kind == strategy.Open || act.Kind == strategy.Close) && !a.volReady(now) {
+		// Volatility is the key PnL protection: without it the open
+		// threshold loses its adverse-move buffer and closes cannot be
+		// priced against a trustworthy short-horizon move, so both are
+		// blocked until the short-horizon sigma chain is warm again.
+		if time.Since(a.volBlockLoggedAt) > 30*time.Second {
+			a.log.Warn("trading blocked until short-horizon volatility is ready", "kind", act.Kind, "sigma_bps", round4(a.volBps()))
+			a.volBlockLoggedAt = time.Now()
+		}
+		return nextAt
+	}
+	if act.Kind == strategy.Open && (!canSize || a.riskBlocked.Load() || a.cfg.MayOpen != nil && !a.cfg.MayOpen()) {
+		return nextAt
+	}
+	a.apply(ctx, act, q)
+	return time.Now().Add(a.jitter())
 }
 
 func absCounter(n int) int {
