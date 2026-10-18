@@ -146,7 +146,7 @@ WARMUP --(μ 就绪)--> RUNNING <-> REDUCE_ONLY
 | 盘口 WS 推送 | 事件驱动 | collectBooks goroutine 更新 bookL/bookR 缓存 |
 | sample | 1s | 算 Mid 喂 SMA（μ）；μ 就绪则 WARMUP->RUNNING |
 | volC | 100ms | 门控后喂价差 σ、腿价 σ（VolL/VolR）+ 样本落盘 |
-| decide | 事件驱动（盘口更新即唤醒判定；200ms ticker 仅作兜底） | 到点且非 PAUSED 时 Decide -> apply；每 update_interval 重算自适应波动窗口；500ms 下单间隔冷却不变 |
+| decide | 事件驱动（盘口更新即唤醒判定；50ms ticker 仅作兜底） | 到点且非 PAUSED 时 Decide -> apply；每 update_interval 重算自适应波动窗口；500ms 下单间隔冷却不变 |
 | report | 1min | 状态日志 + 向 monitor 发 status 事件 |
 
 保证金风控运行在独立的 `watchRisk` goroutine（1s 循环），与决策循环解耦，可中断长执行并把应急请求交给恢复路径。
@@ -200,7 +200,7 @@ ticks = clamp( ticks, min_ticks, max_ticks )            // max_ticks=0 表示不
 
 1. 启动与订阅：构建 venue -> 对 pair 的左右市场 `SubscribeBook`（WS 推 `subscribed/order_book` 快照 + `update/order_book` 增量，50ms 批量）；本地维护 bookL/bookR，nonce 连续性校验、gap 自动重订阅。
 2. 采样与价差：1s sample 算第一档 `Mid` 喂 SMA（2h 窗口、60m 预热、覆盖率 80% 才 Ready）；100ms vol 门控后喂价差 σ 与腿价 σ，并落样本。
-3. 下单时机：盘口更新即触发判定（200ms ticker 兜底），到 next_action_at（默认 7-10s 抖动，可配 1-2s）且 RUNNING；μ 与 σ 均就绪、`dev >= open_bps + fee_bps + vol_k*σ`、同方向、未满 max_steps、两腿一档深度够 -> 双腿并发 IOC 开仓。
+3. 下单时机：盘口更新即触发判定（50ms ticker 兜底），到 next_action_at（默认 7-10s 抖动，可配 1-2s）且 RUNNING；μ 与 σ 均就绪、`dev >= open_bps + fee_bps + vol_k*σ`、同方向、未满 max_steps、两腿一档深度够 -> 双腿并发 IOC 开仓。
 4. 持仓：开仓后记 Step（EntryBps、OpenL/OpenR），持有对冲仓位，步数 ±1。
 5. 平仓时机：decide 循环里平仓优先；σ 就绪且 `profit = 入场基准下的净利 >= close_bps + fee_bps` 且 `|counter| > min_inventory` -> 平仓。
 6. 平账：双腿成交后 realized 累计、移除步、结算后校验确认仓位与账本一致、持久化。

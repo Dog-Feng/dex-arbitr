@@ -555,7 +555,7 @@ func (a *PairActor) Run(ctx context.Context) (retErr error) {
 	// update (auto mode) wakes the loop immediately. The ticker is only a
 	// fallback so pending/checkpoint/drain/emergency work still progresses
 	// when no updates arrive for a while.
-	housekeep := time.NewTicker(200 * time.Millisecond)
+	housekeep := time.NewTicker(50 * time.Millisecond)
 	defer housekeep.Stop()
 	var viewUpdates <-chan struct{}
 	// The shared view may additionally expose coalesced update signals; the
