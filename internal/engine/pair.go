@@ -68,8 +68,7 @@ type PairConfig struct {
 type PairView interface {
 	Book(venue string) (domain.Book, bool)
 	Quote(now time.Time, maxAge time.Duration) (spread.Quote, bool)
-	Updates() <-chan struct{} // signaled (coalesced) when the shared books update
-	Mean() (float64, bool)    // mean bps, ready
+	Mean() (float64, bool) // mean bps, ready
 	VolBps() float64
 	VolReady() bool // short-horizon volatility warm and fresh
 	LegVol(venue string) float64
@@ -559,8 +558,10 @@ func (a *PairActor) Run(ctx context.Context) (retErr error) {
 	housekeep := time.NewTicker(200 * time.Millisecond)
 	defer housekeep.Stop()
 	var viewUpdates <-chan struct{}
-	if a.cfg.View != nil {
-		viewUpdates = a.cfg.View.Updates()
+	// The shared view may additionally expose coalesced update signals; the
+	// interface stays small, so opt in with a type assertion at the call site.
+	if v, ok := a.cfg.View.(interface{ Updates() <-chan struct{} }); ok {
+		viewUpdates = v.Updates()
 	}
 	report := time.NewTicker(time.Minute)
 	defer report.Stop()
