@@ -196,6 +196,13 @@ Entropy 专有 API**。对接直接使用 Hyperliquid 标准 API/SDK（REST + WS
   行为，运营需知晓。
 - **订单终态**：filled 但成交流未回传时，适配器不下发零成交的终态，执行器按
   仓位增量推断（安全路径，不虚构成交价）。
+- **部分成交归一化**：Hyperliquid 的 IOC 部分成交后剩余自动取消，但终态仍报
+  `filled`。执行器要求 FILLED 终态等于请求量，因此适配器在所有终态发布点把
+  “FILLED 且 0<累计成交<请求量”归一化为 `Canceled`（部分成交），让执行器走
+  常规的部分成交+补救路径，避免 `invalid terminal fill ... status FILLED`
+  致命错误（2026-10-20 实盘曾因此 PAUSED 并悬置仓位 4.5 小时）。请求量来源：
+  Submit 时的取整数量、WS orderUpdates 的 `origSz`、REST orderStatus 的
+  `origSz`。注意：FILLED 但成交事实缺失（qty=0）仍保持非终态，不做归一化。
 
 ## 4. 验收标准
 

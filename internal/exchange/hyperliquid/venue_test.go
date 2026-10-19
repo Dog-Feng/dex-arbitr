@@ -154,7 +154,7 @@ func TestOnBbo(t *testing.T) {
 // the worst-acceptable price.
 func TestOrderWireTightening(t *testing.T) {
 	inst := domain.Instrument{MarketID: 200002, SizeDecimals: 4, PriceDecimals: 2}
-	_, c, price, size, err := orderWire(domain.OrderReq{
+	_, c, price, size, _, err := orderWire(domain.OrderReq{
 		ClientID: 7, Inst: inst, Side: domain.Buy, Qty: 0.123456, Price: 1356.129, ReduceOnly: true,
 	})
 	if err != nil {
@@ -166,7 +166,7 @@ func TestOrderWireTightening(t *testing.T) {
 	if size != "0.1234" {
 		t.Fatalf("size %q not floored", size)
 	}
-	_, c2, price2, _, err := orderWire(domain.OrderReq{
+	_, c2, price2, _, _, err := orderWire(domain.OrderReq{
 		ClientID: 8, Inst: inst, Side: domain.Sell, Qty: 0.1, Price: 1356.121,
 	})
 	if err != nil {
@@ -199,6 +199,30 @@ func TestSigFigTighten(t *testing.T) {
 	for _, tc := range cases {
 		if got := sigFigTighten(tc.in, tc.dec, tc.buy); got != tc.want {
 			t.Fatalf("sigFigTighten(%v,%d,buy=%v) = %v, want %v", tc.in, tc.dec, tc.buy, got, tc.want)
+		}
+	}
+}
+
+// TestPartialIOC pins the normalization of Hyperliquid partial IOC fills: a
+// FILLED terminal below the requested size becomes Canceled (partial) so the
+// executor's fill verification sees a consistent terminal state.
+func TestPartialIOC(t *testing.T) {
+	cases := []struct {
+		status domain.OrderStatus
+		filled float64
+		req    float64
+		want   domain.OrderStatus
+	}{
+		{domain.StatusFilled, 0.01, 0.01, domain.StatusFilled},
+		{domain.StatusFilled, 0.003, 0.01, domain.StatusCanceled},
+		{domain.StatusFilled, 0, 0.01, domain.StatusFilled}, // no fill facts: stay unresolved upstream
+		{domain.StatusCanceled, 0.003, 0.01, domain.StatusCanceled},
+		{domain.StatusRejected, 0, 0.01, domain.StatusRejected},
+		{domain.StatusFilled, 0.003, 0, domain.StatusFilled}, // unknown request: leave as-is
+	}
+	for _, tc := range cases {
+		if got := partialIOC(tc.status, tc.filled, tc.req); got != tc.want {
+			t.Fatalf("partialIOC(%v, %v, %v) = %v, want %v", tc.status, tc.filled, tc.req, got, tc.want)
 		}
 	}
 }

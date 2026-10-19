@@ -69,6 +69,7 @@ type Venue struct {
 	ordersOnce  sync.Once
 	orderLookup map[int64]int64 // oid -> client id, filled from submit acks and updates
 	orderFinal  map[int64]domain.OrderStatus
+	orderOrig   map[int64]float64 // oid -> requested quantity (wire size)
 	fillAgg     map[int64]fillAgg
 
 	lastNonce atomic.Int64
@@ -154,7 +155,8 @@ func NewWithConfig(cfg Config) (*Venue, error) {
 	}
 	v := &Venue{
 		cfg: cfg, assets: map[string]int{}, books: map[int]*bookState{},
-		orderLookup: map[int64]int64{}, orderFinal: map[int64]domain.OrderStatus{}, fillAgg: map[int64]fillAgg{},
+		orderLookup: map[int64]int64{}, orderFinal: map[int64]domain.OrderStatus{},
+		orderOrig: map[int64]float64{}, fillAgg: map[int64]fillAgg{},
 		sendMu: make(chan struct{}, 1), closeDone: make(chan struct{}),
 	}
 	if cfg.AgentKey != "" {
@@ -582,13 +584,30 @@ func (v *Venue) resetBooks() {
 // wsOrderUpdate is one element of the orderUpdates channel data.
 type wsOrderUpdate struct {
 	Order struct {
-		Coin  string `json:"coin"`
-		Sz    string `json:"sz"`
-		Oid   int64  `json:"oid"`
-		Cloid string `json:"cloid"`
+		Coin   string `json:"coin"`
+		Sz     string `json:"sz"`
+		OrigSz string `json:"origSz"`
+		Oid    int64  `json:"oid"`
+		Cloid  string `json:"cloid"`
 	} `json:"order"`
 	Status          string `json:"status"`
 	StatusTimestamp int64  `json:"statusTimestamp"`
+}
+
+// partialIOC normalizes a terminal FILLED report that covered only part of
+// the requested quantity. Hyperliquid auto-cancels the unfilled remainder of
+// an IOC but still reports the order as "filled"; the executor treats a
+// FILLED terminal as exactly-requested and would otherwise fail its fill
+// verification. Reporting Canceled with the partial fill routes the leg
+// through the executor's existing partial-fill + rescue handling instead.
+func partialIOC(status domain.OrderStatus, filled, requested float64) domain.OrderStatus {
+	// Only normalize when actual fill facts exist: a FILLED report with no
+	// known fills must stay unresolved instead of becoming a zero-fill
+	// Canceled terminal.
+	if status != domain.StatusFilled || requested <= 0 || filled <= 0 || filled >= requested-1e-9 {
+		return status
+	}
+	return domain.StatusCanceled
 }
 
 type wsFillsMsg struct {
@@ -618,8 +637,12 @@ func (v *Venue) onOrderUpdate(raw []byte) {
 		}
 		v.ordersMu.Lock()
 		v.orderLookup[u.Order.Oid] = cid
+		if orig, oerr := strconv.ParseFloat(u.Order.OrigSz, 64); oerr == nil && orig > 0 && !math.IsNaN(orig) {
+			v.orderOrig[u.Order.Oid] = orig
+		}
 		agg := v.fillAgg[u.Order.Oid]
 		status := mapOrderStatus(u.Status)
+		orig := v.orderOrig[u.Order.Oid]
 		if status.Terminal() {
 			v.orderFinal[u.Order.Oid] = status
 		}
@@ -629,8 +652,9 @@ func (v *Venue) onOrderUpdate(raw []byte) {
 		// zero-size terminal report would desync the executor's position
 		// accounting.
 		publishNow := status == domain.StatusRejected ||
-			(status == domain.StatusCanceled && agg.qty > 0)
+			(status.Terminal() && agg.qty > 0)
 		if publishNow {
+			status = partialIOC(status, agg.qty, v.orderOrig[u.Order.Oid])
 			v.publishOrder(domain.OrderUpdate{
 				Venue: v.cfg.Name, ClientID: cid, OrderIndex: u.Order.Oid,
 				Status: status, FilledQty: agg.qty, FilledQuote: agg.quote,
@@ -640,7 +664,7 @@ func (v *Venue) onOrderUpdate(raw []byte) {
 		v.ordersMu.Unlock()
 		if (status == domain.StatusFilled || status == domain.StatusCanceled) && agg.qty == 0 {
 			// Late fill aggregation: fetch fills once for the terminal oid.
-			go v.backfillFills(u.Order.Oid, cid, u.StatusTimestamp, status)
+			go v.backfillFills(u.Order.Oid, cid, u.StatusTimestamp, status, orig)
 		}
 	}
 }
@@ -690,6 +714,8 @@ func (v *Venue) onUserFills(raw []byte) {
 		status := v.orderFinal[f.Oid]
 		if !status.Terminal() {
 			status = domain.StatusUnknown
+		} else {
+			status = partialIOC(status, agg.qty, v.orderOrig[f.Oid])
 		}
 		v.publishOrder(domain.OrderUpdate{
 			Venue: v.cfg.Name, ClientID: cid, OrderIndex: f.Oid,
@@ -711,7 +737,9 @@ func (v *Venue) publishOrder(u domain.OrderUpdate) {
 
 // backfillFills fetches fills for a terminal order whose fills have not been
 // observed yet, then publishes the terminal update with complete fill facts.
-func (v *Venue) backfillFills(oid, cid int64, statusTs int64, status domain.OrderStatus) {
+// origQty is the requested quantity; a FILLED report below it is normalized
+// to Canceled (partial IOC).
+func (v *Venue) backfillFills(oid, cid int64, statusTs int64, status domain.OrderStatus, origQty float64) {
 	if v.cfg.Account == "" {
 		return
 	}
@@ -749,6 +777,7 @@ func (v *Venue) backfillFills(oid, cid int64, statusTs int64, status domain.Orde
 		return
 	}
 	v.fillAgg[oid] = fillAgg{qty: qty, quote: quote}
+	status = partialIOC(status, qty, origQty)
 	v.publishOrder(domain.OrderUpdate{
 		Venue: v.cfg.Name, ClientID: cid, OrderIndex: oid,
 		Status: status, FilledQty: qty, FilledQuote: quote,

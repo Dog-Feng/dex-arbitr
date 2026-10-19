@@ -48,18 +48,18 @@ func (v *Venue) lockSend(ctx context.Context) error {
 }
 
 // orderWire validates and renders the wire form of one order.
-func orderWire(r domain.OrderReq) (asset int, c string, price, size string, err error) {
+func orderWire(r domain.OrderReq) (asset int, c string, price, size string, qty float64, err error) {
 	if r.Inst.MarketID <= 0 {
-		return 0, "", "", "", fmt.Errorf("%w: invalid market id", domain.ErrRejected)
+		return 0, "", "", "", 0, fmt.Errorf("%w: invalid market id", domain.ErrRejected)
 	}
 	if r.Side != domain.Buy && r.Side != domain.Sell {
-		return 0, "", "", "", fmt.Errorf("%w: invalid order side", domain.ErrRejected)
+		return 0, "", "", "", 0, fmt.Errorf("%w: invalid order side", domain.ErrRejected)
 	}
 	if r.Qty <= 0 || math.IsNaN(r.Qty) || math.IsInf(r.Qty, 0) {
-		return 0, "", "", "", fmt.Errorf("%w: invalid order quantity", domain.ErrRejected)
+		return 0, "", "", "", 0, fmt.Errorf("%w: invalid order quantity", domain.ErrRejected)
 	}
 	if r.Price <= 0 || math.IsNaN(r.Price) || math.IsInf(r.Price, 0) {
-		return 0, "", "", "", fmt.Errorf("%w: invalid order price", domain.ErrRejected)
+		return 0, "", "", "", 0, fmt.Errorf("%w: invalid order price", domain.ErrRejected)
 	}
 	// Round to native precision in the tightening direction so the submitted
 	// bound can never be wider than the requested worst-acceptable price.
@@ -70,20 +70,20 @@ func orderWire(r domain.OrderReq) (asset int, c string, price, size string, err 
 		px = domain.Ceil(px, r.Inst.PriceDecimals)
 	}
 	if px <= 0 {
-		return 0, "", "", "", fmt.Errorf("%w: order price below native precision", domain.ErrRejected)
+		return 0, "", "", "", 0, fmt.Errorf("%w: order price below native precision", domain.ErrRejected)
 	}
 	// Perp prices carry at most 5 significant figures; round in the
 	// tightening direction so the submitted bound is never widened.
 	px = sigFigTighten(px, r.Inst.PriceDecimals, r.Side == domain.Buy)
-	qty := domain.Floor(r.Qty, r.Inst.SizeDecimals)
-	if qty <= 0 {
-		return 0, "", "", "", fmt.Errorf("%w: quantity below native precision", domain.ErrRejected)
+	qt := domain.Floor(r.Qty, r.Inst.SizeDecimals)
+	if qt <= 0 {
+		return 0, "", "", "", 0, fmt.Errorf("%w: quantity below native precision", domain.ErrRejected)
 	}
 	c, err = cloid(r.ClientID)
 	if err != nil {
-		return 0, "", "", "", fmt.Errorf("%w: %v", domain.ErrRejected, err)
+		return 0, "", "", "", 0, fmt.Errorf("%w: %v", domain.ErrRejected, err)
 	}
-	return r.Inst.MarketID, c, sigFmt(px), sigFmt(qty), nil
+	return r.Inst.MarketID, c, sigFmt(px), sigFmt(qt), qt, nil
 }
 
 // sigFigTighten rounds px to at most 5 significant figures without ever
@@ -109,7 +109,7 @@ func (v *Venue) Submit(ctx context.Context, r domain.OrderReq) (domain.SubmitAck
 	if v.signer == nil || v.cfg.Account == "" {
 		return domain.SubmitAck{}, domain.ErrNoCredentials
 	}
-	asset, c, price, size, err := orderWire(r)
+	asset, c, price, size, qty, err := orderWire(r)
 	if err != nil {
 		return domain.SubmitAck{}, err
 	}
@@ -164,6 +164,7 @@ func (v *Venue) Submit(ctx context.Context, r domain.OrderReq) (domain.SubmitAck
 	}
 	v.ordersMu.Lock()
 	v.orderLookup[oid] = r.ClientID
+	v.orderOrig[oid] = qty
 	if st.Filled != nil {
 		// An IOC that filled synchronously carries its exact fill. Publish the
 		// terminal update immediately so the executor does not wait for the
@@ -172,10 +173,10 @@ func (v *Venue) Submit(ctx context.Context, r domain.OrderReq) (domain.SubmitAck
 		avgPx, pxErr := number(st.Filled.AvgPx)
 		if qtyErr == nil && pxErr == nil && filledQty > 0 && avgPx > 0 {
 			v.fillAgg[oid] = fillAgg{qty: filledQty, quote: filledQty * avgPx}
-			v.orderFinal[oid] = domain.StatusFilled
+			v.orderFinal[oid] = partialIOC(domain.StatusFilled, filledQty, qty)
 			v.publishOrder(domain.OrderUpdate{
 				Venue: v.cfg.Name, ClientID: r.ClientID, OrderIndex: oid,
-				Status: domain.StatusFilled, FilledQty: filledQty, FilledQuote: filledQty * avgPx,
+				Status: v.orderFinal[oid], FilledQty: filledQty, FilledQuote: filledQty * avgPx,
 				Ts: time.Now(),
 			})
 		}
@@ -260,11 +261,16 @@ func (v *Venue) QueryOrder(ctx context.Context, inst domain.Instrument, clientID
 			MarketID: inst.MarketID, Status: status, Ts: time.Now(),
 		}, nil
 	}
+	orig, origErr := number(st.Order.Order.OrigSz)
+	if origErr != nil || orig <= 0 {
+		orig = 0
+	}
 	var qty, quote float64
 	ok := true
 	if status == domain.StatusFilled || status == domain.StatusCanceled {
 		qty, quote, ok = v.terminalFills(ctx, oid, st.Order.StatusTimestamp)
 	}
+	status = partialIOC(status, qty, orig)
 	if status == domain.StatusFilled && (!ok || qty <= 0) {
 		// The order is filled but the fill feed has not caught up. Report a
 		// non-terminal state; the executor infers fills from the position
@@ -333,7 +339,7 @@ func (v *Venue) SignOnly(r domain.OrderReq, nonce int64) (string, error) {
 	if v.signer == nil || v.cfg.Account == "" {
 		return "", domain.ErrNoCredentials
 	}
-	asset, c, price, size, err := orderWire(r)
+	asset, c, price, size, _, err := orderWire(r)
 	if err != nil {
 		return "", err
 	}
@@ -351,7 +357,7 @@ func (v *Venue) SignEphemeral(r domain.OrderReq, nonce int64) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("temporary signer: %w", err)
 	}
-	asset, c, price, size, err := orderWire(r)
+	asset, c, price, size, _, err := orderWire(r)
 	if err != nil {
 		return "", err
 	}
