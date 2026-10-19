@@ -22,6 +22,7 @@ import (
 	"github.com/Dog-Feng/dex-arbitr/internal/config"
 	"github.com/Dog-Feng/dex-arbitr/internal/domain"
 	"github.com/Dog-Feng/dex-arbitr/internal/exchange"
+	_ "github.com/Dog-Feng/dex-arbitr/internal/exchange/hyperliquid"
 	_ "github.com/Dog-Feng/dex-arbitr/internal/exchange/lighter"
 	"github.com/Dog-Feng/dex-arbitr/internal/scan"
 	"github.com/Dog-Feng/dex-arbitr/internal/spread/estimator"
@@ -90,6 +91,14 @@ func run(ctx context.Context, c *config.Config, refresh time.Duration, output io
 	}
 	if c.Matching.Separators != "" {
 		m.Separators = c.Matching.Separators
+	}
+	if len(c.Matching.Aliases) > 0 {
+		if m.Aliases == nil {
+			m.Aliases = map[string]string{}
+		}
+		for raw, canon := range c.Matching.Aliases {
+			m.Aliases[strings.ToUpper(strings.TrimSpace(raw))] = strings.ToUpper(strings.TrimSpace(canon))
+		}
 	}
 	pairs, err := matchAll(ctx, m, venues)
 	if err != nil {

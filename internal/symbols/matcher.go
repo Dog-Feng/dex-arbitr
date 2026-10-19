@@ -15,16 +15,33 @@ type Matcher struct {
 	Suffixes []string
 	// Separators trimmed between tokens.
 	Separators string
+	// Aliases maps a venue symbol to its canonical base before suffix
+	// stripping (case-insensitive keys, e.g. "ANTH" -> "ANTHROPIC").
+	Aliases map[string]string
+}
+
+// DefaultAliases maps common cross-venue symbol spellings to one canonical
+// base. Entries are deterministic and curated; config `matching.aliases`
+// overrides or extends them. Never auto-derive aliases at runtime: a wrong
+// mapping hedges unrelated assets.
+func DefaultAliases() map[string]string {
+	return map[string]string{
+		"ANTH": "ANTHROPIC",
+		"OAI":  "OPENAI",
+	}
 }
 
 // DefaultMatcher strips common perp / quote suffixes. USDC/USDG/USDT/USD are treated 1:1.
 func DefaultMatcher() Matcher {
-	return Matcher{Suffixes: []string{"PERP", "USDC", "USDG", "USDT", "USD"}, Separators: "-_/: ."}
+	return Matcher{Suffixes: []string{"PERP", "USDC", "USDG", "USDT", "USD"}, Separators: "-_/: .", Aliases: DefaultAliases()}
 }
 
 // Normalize returns the base asset, e.g. "BTC-USDC-PERP" -> "BTC", "SNDK" -> "SNDK".
 func (m Matcher) Normalize(sym string) string {
 	s := strings.ToUpper(strings.TrimSpace(sym))
+	if canon, ok := m.Aliases[s]; ok {
+		s = strings.ToUpper(strings.TrimSpace(canon))
+	}
 	for {
 		s = strings.TrimRight(s, m.Separators)
 		changed := false

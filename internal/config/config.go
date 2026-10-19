@@ -43,8 +43,9 @@ type Config struct {
 	SamplesDir string  `yaml:"samples_dir"`
 	Venues     []Venue `yaml:"venues"`
 	Matching   struct {
-		StripSuffixes []string `yaml:"strip_suffixes"`
-		Separators    string   `yaml:"separators"`
+		StripSuffixes []string          `yaml:"strip_suffixes"`
+		Separators    string            `yaml:"separators"`
+		Aliases       map[string]string `yaml:"aliases"`
 	} `yaml:"matching"`
 	Estimator struct {
 		Kind        string        `yaml:"kind"`
@@ -450,6 +451,17 @@ func (c *Config) validate() error {
 			return fmt.Errorf("matching.strip_suffixes must not contain an empty suffix")
 		}
 	}
+	seenAliases := map[string]string{}
+	for raw, canon := range c.Matching.Aliases {
+		raw, canon = strings.ToUpper(strings.TrimSpace(raw)), strings.ToUpper(strings.TrimSpace(canon))
+		if raw == "" || canon == "" || raw == canon {
+			return fmt.Errorf("matching.aliases entries need distinct non-empty symbols")
+		}
+		if prev, dup := seenAliases[raw]; dup && prev != canon {
+			return fmt.Errorf("matching.aliases: duplicate key %q", raw)
+		}
+		seenAliases[raw] = canon
+	}
 	if c.Execution.PriceTicks < 0 {
 		return fmt.Errorf("execution.price_ticks must be >= 0")
 	}
@@ -533,6 +545,14 @@ func (c *Config) validate() error {
 	}
 	if c.Matching.Separators != "" {
 		matcher.Separators = c.Matching.Separators
+	}
+	if len(c.Matching.Aliases) > 0 {
+		if matcher.Aliases == nil {
+			matcher.Aliases = map[string]string{}
+		}
+		for raw, canon := range c.Matching.Aliases {
+			matcher.Aliases[strings.ToUpper(strings.TrimSpace(raw))] = strings.ToUpper(strings.TrimSpace(canon))
+		}
 	}
 	for _, p := range c.Pairs {
 		if strings.TrimSpace(p.Base) == "" {

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Dog-Feng/dex-arbitr/internal/spread/estimator"
+	"github.com/Dog-Feng/dex-arbitr/internal/symbols"
 )
 
 func loadTestConfig(t *testing.T, data string) (*Config, error) {
@@ -296,6 +297,31 @@ func TestLoadPairSelection(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestLoadMatchingAliases(t *testing.T) {
+	c, err := loadTestConfig(t, "matching:\n  aliases:\n    ANTH: ANTHROPIC\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := c.Matching.Aliases["ANTH"]; got != "ANTHROPIC" {
+		t.Fatalf("alias not retained: %q", got)
+	}
+	matcher := symbols.DefaultMatcher()
+	if len(c.Matching.Aliases) > 0 {
+		matcher.Aliases = c.Matching.Aliases
+	}
+	if got := matcher.Normalize("ANTH"); got != "ANTHROPIC" {
+		t.Fatalf("alias normalization: %q", got)
+	}
+	for _, bad := range []string{
+		"matching:\n  aliases:\n    ANTH: ANTH\n",
+		"matching:\n  aliases:\n    '': X\n",
+	} {
+		if _, err := loadTestConfig(t, bad); err == nil {
+			t.Fatalf("invalid aliases accepted: %q", bad)
+		}
 	}
 }
 

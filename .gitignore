@@ -1,4 +1,5 @@
 state/
+/temp/
 *.env
 .env
 /arbd

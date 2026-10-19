@@ -12,6 +12,7 @@ import (
 
 	"github.com/Dog-Feng/dex-arbitr/internal/config"
 	"github.com/Dog-Feng/dex-arbitr/internal/engine"
+	_ "github.com/Dog-Feng/dex-arbitr/internal/exchange/hyperliquid"
 	_ "github.com/Dog-Feng/dex-arbitr/internal/exchange/lighter"
 )
 

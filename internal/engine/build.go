@@ -29,6 +29,14 @@ func Matcher(c *config.Config) symbols.Matcher {
 	if c.Matching.Separators != "" {
 		m.Separators = c.Matching.Separators
 	}
+	if len(c.Matching.Aliases) > 0 {
+		if m.Aliases == nil {
+			m.Aliases = map[string]string{}
+		}
+		for raw, canon := range c.Matching.Aliases {
+			m.Aliases[strings.ToUpper(strings.TrimSpace(raw))] = strings.ToUpper(strings.TrimSpace(canon))
+		}
+	}
 	return m
 }
 

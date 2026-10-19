@@ -4,6 +4,7 @@ go 1.23.4
 
 require (
 	github.com/elliottech/lighter-go v1.0.10
+	github.com/ethereum/go-ethereum v1.15.6
 	github.com/gorilla/websocket v1.5.3
 	gopkg.in/yaml.v3 v3.0.1
 )
@@ -17,7 +18,6 @@ require (
 	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.0.1 // indirect
 	github.com/elliottech/poseidon_crypto v0.0.15 // indirect
 	github.com/ethereum/c-kzg-4844 v1.0.0 // indirect
-	github.com/ethereum/go-ethereum v1.15.6 // indirect
 	github.com/ethereum/go-verkle v0.2.2 // indirect
 	github.com/holiman/uint256 v1.3.2 // indirect
 	github.com/mmcloughlin/addchain v0.4.0 // indirect

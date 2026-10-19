@@ -20,6 +20,7 @@ import (
 	"github.com/Dog-Feng/dex-arbitr/internal/domain"
 	"github.com/Dog-Feng/dex-arbitr/internal/engine"
 	"github.com/Dog-Feng/dex-arbitr/internal/exchange"
+	_ "github.com/Dog-Feng/dex-arbitr/internal/exchange/hyperliquid"
 	_ "github.com/Dog-Feng/dex-arbitr/internal/exchange/lighter"
 	"github.com/Dog-Feng/dex-arbitr/internal/spread"
 	"github.com/Dog-Feng/dex-arbitr/internal/spread/estimator"

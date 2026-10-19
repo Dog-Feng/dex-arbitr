@@ -146,3 +146,38 @@ func TestPrefixMustBeExact(t *testing.T) {
 		t.Fatalf("SOL must not match SOLV: %+v", ps)
 	}
 }
+func TestMatcherAliases(t *testing.T) {
+	m := DefaultMatcher()
+	m.Aliases = map[string]string{"ANTH": "ANTHROPIC"}
+	if got := m.Normalize("ANTH"); got != "ANTHROPIC" {
+		t.Fatalf("ANTH normalized to %q", got)
+	}
+	if got := m.Normalize("anth"); got != "ANTHROPIC" {
+		t.Fatalf("lowercase anth normalized to %q", got)
+	}
+	if got := m.Normalize("ANTHROPIC"); got != "ANTHROPIC" {
+		t.Fatalf("canonical side changed: %q", got)
+	}
+	// Aliased pairs match across venues.
+	left := []domain.Instrument{{Venue: "entropy", Symbol: "ANTH", MarketID: 200001}}
+	right := []domain.Instrument{{Venue: "lighter", Symbol: "ANTHROPIC", MarketID: 7}}
+	pairs := Match(m, left, right)
+	if len(pairs) != 1 || pairs[0].Base != "ANTHROPIC" {
+		t.Fatalf("aliased pair not matched: %+v", pairs)
+	}
+}
+
+func TestDefaultAliases(t *testing.T) {
+	m := DefaultMatcher()
+	if got := m.Normalize("OAI"); got != "OPENAI" {
+		t.Fatalf("OAI normalized to %q", got)
+	}
+	if got := m.Normalize("ANTH"); got != "ANTHROPIC" {
+		t.Fatalf("ANTH normalized to %q", got)
+	}
+	// Config overrides replace a built-in mapping.
+	m.Aliases["OAI"] = "SOMETHING_ELSE"
+	if got := m.Normalize("OAI"); got != "SOMETHING_ELSE" {
+		t.Fatalf("override failed: %q", got)
+	}
+}

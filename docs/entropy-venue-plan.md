@@ -1,87 +1,200 @@
-# Entropy DEX 接入方案
+# Entropy DEX 接入方案（Hyperliquid HIP-3 `io`）
 
-> 分支：`feat/entropy-venue-20261019`。状态：调研完成（外部探测），待 API 文档补全后实施。
+> 分支：`feat/entropy-venue-20261019`。状态：对接实现完成（本地未提交），待实盘账户验证。
 
-## 0. 调研结论
+## 0. 结论
 
-### 已确认
+Entropy（ticker `io`）是 Hyperliquid 上的 **HIP-3 builder-deployed perp dex**，
+不是独立交易所：撮合、保证金、清算都跑在 Hyperliquid 主网匹配引擎上，**没有
+Entropy 专有 API**。对接直接使用 Hyperliquid 标准 API/SDK（REST + WS），通过
+`dex` 参数和 `io:` 前缀的 coin 名访问 Entropy 市场。SPY 不在 Entropy universe
+中，因此无法直接配对现有 SPY 交易对；可配资产为 `io:*`（SNDK/NBIS/OAI/ANTH 等）。
 
-- **产品形态**：perp 交易平台，官网 `entropy.io`（"Trade the Frontier"），交易域 `entropy.trade`，后端 API 域名 `https://api.entropy.trade`（前端 `api` 模块中硬编码），静态资源 `assets.entropy.trade`。
-- **架构线索**（前端 bundle 模块名）：`hyperliquid-ws`、`hl-stream`、`hyperliquid-account`、`cloid-pool`、`signed-execution`、`request-deadline`、`useOrderSigner`——与 Hyperliquid 同构：链下撮合 + 签名执行 + cloid 限价单池，订单带 nonce/deadline 签名。
-- **账户体系**：Privy 嵌入式钱包 + 会话 Bearer token；统一后端返回的持仓 schema 为 `coin/size/entryPx/markPrice/liquidationPx/marginUsed/leverage`。
-- **结算链**：Arbitrum（前端经 `arb-rpc` 用 `eth_call` 读 USDC 余额，说明链上资产在 Arbitrum）。
-- **API 风格**：自定义路由（`GET /` 返回 `Cannot find any route matching ...` 的路由框架），与 Lighter 的 `/api/v1/markets` 不兼容，不能直接复用 lighter 适配器。
-- GitHub `entropyxyz` 组织是托管/门限签名项目（"Trustless and secure crypto custody"），可能是交易所的托管钱包基建，但不是交易所协议本身。
+## 0.1 已确认参数（全部经过实测或官方 SDK 0.24.0 逐字节验证）
 
-### 待确认（实现前必须补齐）
+### Dex 与资产 ID
 
-1. **完整端点清单**：行情（盘口快照/增量、成交）、下单、撤单、订单状态、账户/仓位/快照、市场元数据（tick/size/最小量/taker 费率）。可从 `/assets/usePlaceOrder-*.js`、`useOrderBook-*.js`、`hyperliquid-ws-*.js`、`useOrderSigner-*.js` 提取，或向熵方索取 API 文档。
-2. **程序化签名方案（最大阻塞点）**：前端走 Privy 嵌入式钱包，服务端不能依赖 Privy。需要确认熵方是否提供 API key / 服务端签名（EIP-712 结构、nonce、deadline）路径。若无，实盘接不了，只能做只读行情。
-3. **链上交互面**：Arbitrum 上的结算/充值合约是否需要本系统自己发交易（类比 lighter 的 CreateOrderTx），还是统一后端代签。
-4. **WS 流格式与频率**：订阅协议、nonce 连续性、断线重连语义。
+- `{"type":"perpDexs"}` 实测：`io` 的 perp dex 索引 = **10**。
+- 资产 ID 公式（官方 asset-ids 文档）：builder perp = `100000 + perp_dex_index*10000
+  + index_in_meta`。因此 `io:*` 资产 ID = `200000 + index_in_meta`。
+- 实测 `io` universe（14 个，3 个已下架）及元数据索引：
+  `io:OAI`(200000)、`io:ANTH`(200001)、`io:SNDK`(200002)、`io:IONQ`(200003)、
+  `io:NBIS`(200004)、`io:EWY`(200005)、`io:GPRO`(200006)、`io:SBE`(200007, 已下架)、
+  `io:TCNT`(200008)、`io:DRAM`(200009)、`io:PRL`(200010)、`io:XIAOMI`(200011)、
+  `io:H100`(200012, 已下架)、`io:MOONSHOT`(200013, 已下架)。
+- 默认永续 dex（`dex` 缺省）资产 ID = meta 索引本身（BTC=0），**不使用** 100000 偏移。
 
-## 0.1 已确认的 Hyperliquid API 流程（官方文档 for-developers/api）
+### 行情 / 账户 / 订单状态（`POST https://api.hyperliquid.xyz/info`）
 
-Entropy 走 Hyperliquid 的 API 体系，以下流程已从官方文档逐项核实：
-
-### 认证与签名
-
-- 账户体系支持 **API wallet（agent）**：主账户在 UI 里授权一个 API 钱包地址，服务器持有该地址私钥，用它对每个 action 做 EIP-712 签名。
-- 两种签名方案：`sign_l1_action` 与 `sign_user_signed_action`；signatureChainId 为签名链 id（Arbitrum = 42161 = 0xa4b1），`hyperliquidChain` 为 `Mainnet`。
-- 官方强烈建议参照 Python SDK 实现；常见坑：msgpack 字段顺序、数字去尾零、地址小写、签名载荷的哈希构造。
-
-### 行情 / 账户（`POST https://api.hyperliquid.xyz/info`）
-
-- `{"type":"meta"}` → `universe`（perp 币对的资产索引）、`szDecimals`、tick 等市场元数据。
-- `{"type":"allMids"}` → 全部中价（**注意有 `dex` 参数**：空串代表第一个 perp dex——多 dex 同协议，疑似 Entropy 就是其一）。
-- `{"type":"l2Book","coin":...}` → 盘口档位 `levels: [[{px,sz,n},...], [...]]`。
-- `{"type":"clearinghouseState","user":addr}` → `assetPositions`（含 `liquidationPx`）、`marginSummary`、`crossMarginSummary`、`crossMaintenanceMarginUsed`、`withdrawable`——同一快照里既有仓位/清算价又有账户权益与维持保证金，**可满足我们零清算价的同源快照保护**。
+- `{"type":"meta","dex":"io"}`：universe、`szDecimals`、`maxLeverage`(3~25)、
+  `onlyIsolated: true`（全部资产仅支持逐仓）、`marginMode: "strictIsolated"` 或
+  `"noCross"`（io:OAI）、`growthMode: "enabled"`、`deployerFeeScale: "1.0"`。
+- `{"type":"l2Book","coin":"io:SNDK"}`：实测可用，20 档/侧。
+- `{"type":"clearinghouseState","user":addr,"dex":"io"}`：`assetPositions` 含
+  `szi/entryPx/liquidationPx/positionValue/leverage.type`，`marginSummary` /
+  `crossMarginSummary` 同源返回权益与维持保证金。逐仓仓位用 `liquidationPx`
+  直接参与现有 `remainingMargin` 清算距离计算。
+- `{"type":"orderStatus","user":addr,"oid":"0x...32hex..."}`：按 oid **或 128 位
+  cloid** 查询终态（实测 `dex` 参数可带）。状态值集合见官方文档（filled/canceled/
+  rejected/marginCanceled/… 均已映射）。
+- `{"type":"userFillsByTime","user":addr,"startTime":ms,"endTime":ms}`：按 oid
+  聚合成交量和成交额，用于终态补全成交明细。
 
 ### 下单 / 撤单（`POST https://api.hyperliquid.xyz/exchange`）
 
-- 下单 body：`{action:{type:"order",orders:[{a,b,p,s,r,t,c}],grouping:"na"}, nonce(ms), signature, vaultAddress?, expiresAfter?}`，其中 `t:{limit:{tif:"Alo"|"Ioc"|"Gtc"}}`、`r=reduceOnly`、`c=cloid`（128 位 hex，可作我们的 ClientID）。
-- **支持 IOC、reduce-only、cloid** —— 与我们执行器的假设完全兼容。
-- 响应 `statuses`：`resting{oid}` / `filled{totalSz,avgPx,oid}` / `error`；用 oid 或 cloid 跟踪终态。
-- 撤单：`{"type":"cancel","cancels":[{a,o}],"f":fast}` 与 `cancelByCloid`；另有 **scheduleCancel（dead man's switch，每天最多 10 次）**——可作风险兜底。
+- 下单 body：`{action:{type:"order",orders:[{a,b,p,s,r,t,c}],grouping:"na"},
+  nonce(ms), signature, vaultAddress?, expiresAfter?}`。`t:{limit:{tif:"Ioc"}}`、
+  `r=reduceOnly`、`c=cloid`。
+- **cloid 是 128 位（0x + 32 hex）**。实测 256 位 cloid 会让服务器直接
+  `422 Failed to deserialize`。
+- 响应 `statuses`：`resting{oid}` / `filled{totalSz,avgPx,oid}` / `error`。
+- 撤单用 `cancelByCloid`（asset + cloid）。
+- WS（`wss://api.hyperliquid.xyz/ws`）：`l2Book` 订阅 `{type:"l2Book",coin:"io:SNDK"}`
+  （整本快照推送，非增量）；`orderUpdates` / `userFills` 订阅 `{type:...,user:addr}`
+  （公开流，无需签名）。`allMids` 订阅带 `dex` 参数。
 
-### 精度规则
+### 签名方案（与官方 hyperliquid-python-sdk 0.24.0 逐字节一致）
 
-- 价格最多 5 位有效数字、perp 最多 `6 - szDecimals` 位小数；数量按 `szDecimals` 取整（来自 meta）。
+- API wallet（agent）签名 = EIP-712 主类型 `"Agent"`：
+  - domain：`{name:"Exchange", version:"1", chainId:1337, verifyingContract:0x0}`；
+  - message：`{source:"a"(主网)/"b"(测试网), connectionId: bytes32}`；
+  - `connectionId = keccak(msgpack(action) || nonce_be64 || 0x00)`（0x00 为无
+    vault 标记；有 `expiresAfter` 时再追加 `0x00 || expires_be64`）。
+- msgpack 字段顺序固定：order 为 `type,orders,grouping`，order wire 为
+  `a,b,p,s,r,t[,c]`，`t:{limit:{tif}}`；cancelByCloid 为 `type,cancels`，
+  cancel wire 为 `asset,cloid`。数值用最小长度编码，`p/s` 为 `%.8f` 去尾零
+  字符串（SDK `float_to_wire`）。
+- 签名返回 `{r,s,v}`，v ∈ {27,28}，r/s 为 0x 开头、无前导零填充的 hex。
+- **已实测**：Go 实现签名与 SDK 参考向量（同私钥/同 action/同 nonce）逐字节
+  一致；主网 `/exchange` 对 Go 签名请求的拒绝为 `User or API Wallet ... does not
+  exist`（即签名通过、仅身份未授权），而非 `Invalid signature`。
 
-### 与 Entropy 的映射点（仍需向熵方确认）
+### 费率与资金
 
-1. Entropy 的 `/info`、`/exchange`、WS 是否与 Hyperliquid 同构（host 换成 `api.entropy.trade`），还是带 `dex` 参数。
-2. 资产 universe 是否与 Hyperliquid 主网一致（SPY 是否上架、指数映射）。
-3. 费率表与 API wallet 授权流程入口。
+- 所有 `io` 资产 `onlyIsolated: true`：现有引擎按逐仓清算价计算风险，不依赖
+  全仓权益；`AccountSnapshot.CrossMargin` 只在存在 cross 仓位时返回。
+- growth mode + `deployerFeeScale=1.0`：基础档 taker **9 bps**、maker **3 bps**
+  （`0.00045 × 2 × 0.1`）。账户有更高费率档/质押折扣时实际更低，静态取基础档
+  是保守估计。
+- 抵押品是 **USDC（tokenId 0）**，且按 dex 隔离：`io` 有独立 USDC 余额。交易前
+  需把资金转入 io dex（UI 划转，或 `agentSendAsset` sourceDex="spot"/"" →
+  destinationDex="io"）。本适配器暂不自动划转。
+- 默认永续 dex 基础档 taker 4.5 bps / maker 1.5 bps（不乘 HIP-3 系数）。
+- Lighter 合约规格实测包含 ANTHROPIC（5x 杠杆，tick 0.1，min qty 0.00001）；
+  与 io 符号完全一致的可配标的还包括 SNDK / NBIS / EWY / DRAM / PRL / XIAOMI。
 
-## 1. 架构映射
+## 1. 架构映射（已实现）
 
-现有扩展点是 `internal/exchange/venue.go` 的 `exchange.Venue` 接口（`Instruments`、`SubscribeBook`、`Submit`、`Positions`），以及可选的 `AccountSnapshotter`（全仓快照，用于零清算价保护）与 `LeverageSetter`。Entropy 接入按同一模式：
+- 新包 `internal/exchange/hyperliquid`：`venue.go`（工厂/Instruments/账户）、
+  `rest.go`（info/exchange 客户端）、`ws.go`（单连接订阅+重连重订阅）、
+  `sign.go`（msgpack + EIP-712 + cloid）、`orders.go`（Submit/Cancel/Query/
+  离线签名自检）。
+- 注册两个 kind：`hyperliquid`（默认永续 dex，dex 为空）与 `entropy`
+  （preset dex=`io`）。`cmd/arbd`、`cmd/scanner`、`cmd/selfcheck` 已空白导入。
+- 复用现有 `exchange.Venue` 契约：IOC + reduce-only + cloid→ClientID、WS 订单/
+  成交流、`AccountSnapshotter`（clearinghouseState 一次请求同源返回仓位与账户
+  风险）。`QueryOrder` 走 orderStatus+userFillsByTime；filled 但成交未索引时
+  返回非终态，让执行器走仓位推断（fail-safe）。
+- 价格收紧链：executor 决策价 → PriceDecimals(=6-szDecimals) 收紧 → 5 位有效
+  数字收紧（buy floor / sell ceil），保证不会放宽最差成交价。
+- 配置示例（configs/config.yaml，注释形式）：
+  `kind: entropy`，opts：`account`(主账户地址)、`private_key`(agent 私钥)、
+  `book_depth`。
+- 依赖：`go-ethereum v1.15.6` 由 indirect 提升为 direct（EIP-712 哈希与
+  secp256k1 签名）。它本就在模块图与 go.sum 内，无新增二进制。
 
-- 新包 `internal/exchange/entropy/`：`venue.go`（实现 Venue）、`rest.go`（元数据/行情 REST）、`ws.go`（订阅）、`orders.go`（签名执行）、`account.go`（账户与快照）。
-- 通过 `Register("entropy", ...)` 注册，`cmd/arbd` 用 `_ "internal/exchange/entropy"` 空白导入，与 lighter/rhlighter 并列。
-- `ResolvePair` 的精度对齐（size_decimals、min_qty）与风控字段（清算价、维持保证金）沿用现有逻辑，只是数据源换成 Entropy 的 schema。
+## 2. 实施阶段（完成度）
 
-## 2. 实施阶段
+- **P1 只读接入**：完成。`Instruments`（meta+perpDexs→资产 ID）、`SubscribeBook`
+  （WS 整本快照）、`Positions`/`AccountSnapshot`（clearinghouseState）。主网
+  实测：io:SNDK→200002 映射正确、WS 盘口 20 档可用。
+- **P2 交易接入**：代码完成，签名已经主网验证；**实盘未验证**（需要真实账户：
+  在 Hyperliquid 主网授权 agent，并向 io dex 划入 USDC）。
+- **P3 风控兼容**：完成（逐仓清算价直通现有 remainingMargin；io 全逐仓因此
+  CrossMargin 通常为 nil，属预期降级）。`LeverageSetter` 未实现：`leverage`
+  配置不会应用到 hyperliquid 腿，需在 UI 预设逐仓杠杆，或用后续 updateLeverage
+  action 补齐。
+- **P4 实盘验证**：待办。流程：`dry_run: true` 全链路 → `selfcheck -live` →
+  小仓实盘 1~2 天 → 并入主力配置。
 
-- **P0 调研补全（0.5 天）**：从前端 bundle 提取端点和消息结构，或向熵方索取文档；确认签名路径与费率表。
-- **P1 只读接入**：`Instruments` + `SubscribeBook` + `Positions` + `AccountSnapshot`；用 `cmd/scanner` 与 `cmd/selfcheck` 验证行情、符号匹配与账户读取。
-- **P2 交易接入**：`Submit`（签名执行）、订单终态跟踪、reduce-only 兼容、rescue 兼容、分腿延迟采集。
-- **P3 风控兼容**：把 Entropy 的清算价/维持保证金/全仓权益映射进 `margin.go` 的 `CrossMarginRisk`；若没有同源快照，明确降级并在启动日志告警"零清算价保护不可用"。
-- **P4 实盘验证**：`dry_run: true` 全链路闭环 → 小仓实盘 1~2 天 → 并入主力配置。
+## 2.1 实盘前置清单（操作侧）
+
+1. **账户与 agent（已就绪）**：arb.env 的 agent 私钥经 `userRole` 实测归属主
+   账户 `0xc013...9197`（arb.env 的 ENTROPY_ACCOUNT 已修正为该地址）。主账户在
+   默认永续 dex 有约 98.33 USDC。
+2. **余额与入金（已核实，注意账户模式）**：Entropy 前端把用户在所有 perp dex
+   的余额加总展示（读了 `hyperliquid-account` 模块源码确认），因此 UI 显示的可
+   用余额包含默认永续 dex 的钱，不等于 io dex 余额。标准模式下交易 io 需先把
+   USDC 划入 io dex；`agentSendAsset` 可由 agent 签名完成划转，本适配器已实现
+   （`Venue.SendAsset` + `cmd/hltransfer`），并已实盘验证（0.0001 与 50 USDC
+   两笔成功）。**注意：账户当前处于 unifiedAccount 模式**，该模式下所有永续
+   资金集中在现货余额、随交易自动流转，io dex 余额恒为 0 属正常，无需手工入
+   金；逐仓杠杆建议在 UI 预设（适配器暂未实现 SetLeverage）。
+3. **Lighter 腿凭据（待办）**：ANTH 的另一条腿是 Lighter 的 ANTHROPIC
+   （`io` 侧叫 ANTH，经 `matching.aliases: {ANTH: ANTHROPIC}` 归一化配对）。
+   本机没有 LIGHTER_* 凭据，且 Lighter API 对本机/备份 VPS 均 403；小额实盘
+   需在部署机（AWS，可访问 Lighter）配置 `LIGHTER_ACCOUNT_INDEX` /
+   `LIGHTER_API_KEY_INDEX` / `LIGHTER_PRIVATE_KEY` 后运行
+   `configs/anth-live.yaml`。
+4. **测试配置与结果**：`configs/anth-live.yaml`（rhlighter × entropy、dry_run
+   默认 true、step_qty 0.01、max_steps 2、monitor 关闭、state_dir=state-anth）。
+   已实盘验证：`selfcheck -live` 22/22 通过——双端开仓 0.01 成交、双端平仓成交、
+   终态仓位归零、零补救单。io 腿 3 笔成交净亏 0.004524 USD（平仓 PnL -0.001 +
+   手续费 0.003524），与账户余额变化逐分核对一致；io 历史订单恰为本次 4 条。
+   注意 selfcheck 的 `-symbol` 与归一化后的 base（ANTHROPIC）一致。
+
+## 2.2 交易对组合（不局限于 Lighter）
+
+- 系统本身以 venue 名为单位任意两两配对（`pairs.left/right` 引用任意两个已配
+  置 venue），lighter/rhlighter/hyperliquid/entropy 可自由组合；跨场符号不一
+  致时用 `matching.aliases` 归一化（如 `ANTH: ANTHROPIC`）。
+- 当前 RH Lighter × Entropy 的符号交集为 3 个（ANTHROPIC/OPENAI/SNDK，
+  含内置别名），Lighter × Entropy 为 7 个
+  （ANTHROPIC/SNDK/NBIS/EWY/DRAM/PRL/XIAOMI）。
+
+### 符号配对的四层策略
+
+两个 DEX 都只提供 `symbol` 一个身份字段（实测 RH 原始元数据无 ISIN/全名等
+标识），同一标的可能以不同缩写出现（Entropy `OAI` = RH `OPENAI`）。配对按
+零假阳性原则分层：
+
+1. **精确相等**：`symbols.Match` 的默认行为。
+2. **确定性别名表**：内置 `symbols.DefaultAliases()`（当前 `ANTH→ANTHROPIC`、
+   `OAI→OPENAI`），配置 `matching.aliases` 可覆盖/扩展。这是唯一影响实盘交易
+   的层，条目人工审核，绝不运行时自动推导（配错 = 拿无关资产对冲）。
+3. **统计发现/校验（建议下一步，只读）**：计划 `cmd/pairdiscover`——对候选
+   跨场组合采样双方 mid，同标的必有收益相关系数≈1、价格比率标准差≈0；用于
+   发现未知映射，并持续校验第 2 层（比率异常 ⇒ 别名错误或标的变更，告警）。
+4. **人工启用**：工具只输出建议，确认后写入配置才生效。
+
+实测：内置别名后 RH Lighter × Entropy 从 2 对增至 3 对
+（ANTHROPIC / OPENAI / SNDK）。
+
+## 2.3 签名实现质量锚点
+
+- 与官方 hyperliquid-python-sdk 0.24.0 的参考向量逐字节一致：下单、撤单
+  （cancelByCloid）、agentSendAsset 三套签名全部固化为单测。
+- 实测发现并修复了一个 msgpack 编码 bug：uint64 曾只写低 4 字节，导致含 nonce
+  的 action（agentSendAsset）哈希错位、签名被服务器拒绝；订单签名因 nonce 不
+  进 msgpack 而幸免。修复后 agentSendAsset 已实盘成功。
 
 ## 3. 风险与决策点
 
-- **签名/托管**：无服务端签名方案则无法实盘（P0 首要结论）。
-- **签名实现依赖**：EIP-712 + keccak256 + secp256k1 需要 Go 密码库（如 go-ethereum crypto）。按项目规范需先批准依赖；替代方案是手写最小 msgpack+签名（工作量大、易错，官方文档明确警告自实现签名易错）。建议引入官方 Python SDK 仅作参考实现，Go 侧用成熟密码库实现。
+- **SPY 不在 Entropy**：现有 SPY（Lighter↔RHLighter）无法迁移。新对必须从
+  `io:*` 与 Lighter 的交叉集合中选择；Lighter 侧列表需在可访问 Lighter API
+  的服务器上确认（本机与备份 VPS 均被其反爬 403）。
 - **费率与精度**：Entropy 的 taker 费率与 tick/size 与 Lighter 不同，接入后回测参数（fee_bps、让价 tick 计算）必须重跑校准。
-- **订单类型**：需确认是否支持 IOC、reduce-only、订单终态推送；不支持 IOC 则需要改造执行器或用限价+撤销近似。
-- **跨保证金零清算价**：若 Entropy 返回 0 清算价且无同源账户快照，风控会保守地持续 REDUCE_ONLY（现有 fail-closed 行为），需提前告知运营。
+- **逐仓 + 零清算价**：io 资产若返回 0/null `liquidationPx`（如 noCross 模式），
+  现有风控按 fail-closed 判定 `position_risk_unknown` 并禁止开仓，属预期保守
+  行为，运营需知晓。
+- **订单终态**：filled 但成交流未回传时，适配器不下发零成交的终态，执行器按
+  仓位增量推断（安全路径，不虚构成交价）。
 
 ## 4. 验收标准
 
-- `cmd/scanner -config` 能列出 Entropy 全部市场并正常打分；
-- `cmd/selfcheck` 通过（只读凭证、行情新鲜度）；
+- `cmd/scanner -config` 能列出 `io:` 全部市场并正常打分（已完成实测）；
+- `cmd/selfcheck` 通过（只读凭证、行情新鲜度、离线签名自检）；
 - `dry_run` 下选定交易对完成 开仓→平仓→补救 闭环；
 - 风控字段齐全，或降级行为有明确日志与文档说明；
-- 全量 `go build` / `go vet` / `go test -race ./...` 通过。
+- 全量 `go build` / `go vet` / `go test -race ./...` 通过；
+- 签名与官方 SDK 参考向量逐字节一致（已纳入单测，`TestSignReferenceVectors`）。
