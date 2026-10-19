@@ -338,7 +338,11 @@ func (v *Venue) SubscribeBook(ctx context.Context, inst domain.Instrument) (<-ch
 	}
 	v.booksMu.Unlock()
 	if !ok {
-		v.ws.subscribe("l2Book/"+coin, map[string]any{"type": "l2Book", "coin": coin})
+		// fast:true delivers 5 levels per side per block (~0.5s) instead of
+		// the throttled 20-level feed (~5s). The bbo feed refreshes the top
+		// level even faster (~0.4s) and is merged into the same book state.
+		v.ws.subscribe("l2Book/"+coin, map[string]any{"type": "l2Book", "coin": coin, "fast": true})
+		v.ws.subscribe("bbo/"+coin, map[string]any{"type": "bbo", "coin": coin})
 	}
 	go func() {
 		select {
@@ -411,6 +415,18 @@ type wsBookMsg struct {
 	} `json:"data"`
 }
 
+type wsBboMsg struct {
+	Channel string `json:"channel"`
+	Data    struct {
+		Coin string `json:"coin"`
+		Time int64  `json:"time"`
+		Bbo  []struct {
+			Px string `json:"px"`
+			Sz string `json:"sz"`
+		} `json:"bbo"`
+	} `json:"data"`
+}
+
 type wsLevel struct {
 	Px string `json:"px"`
 	Sz string `json:"sz"`
@@ -448,6 +464,79 @@ func (v *Venue) onBook(raw []byte) {
 	v.publishBook(bs, bs.snapshot(v.cfg.Name))
 }
 
+// onBbo merges the top-of-book feed into the book state. The bbo channel
+// refreshes the best levels between full-book snapshots; deeper levels keep
+// their age until the next l2Book push.
+func (v *Venue) onBbo(raw []byte) {
+	var m wsBboMsg
+	if err := json.Unmarshal(raw, &m); err != nil || m.Data.Coin == "" || len(m.Data.Bbo) != 2 {
+		return
+	}
+	v.assetsMu.RLock()
+	id, ok := v.assets[m.Data.Coin]
+	v.assetsMu.RUnlock()
+	if !ok {
+		return
+	}
+	bid, bidErr := parseBboLevel(m.Data.Bbo[0])
+	ask, askErr := parseBboLevel(m.Data.Bbo[1])
+	if bidErr != nil && askErr != nil {
+		return
+	}
+	v.booksMu.Lock()
+	defer v.booksMu.Unlock()
+	bs := v.books[id]
+	if bs == nil || !bs.synced {
+		return // wait for the first full snapshot
+	}
+	topBid, haveBid := domain.Level{}, false
+	if len(bs.bids) > 0 {
+		topBid, haveBid = bs.bids[0], true
+	}
+	if bidErr == nil {
+		topBid, haveBid = bid, true
+	}
+	topAsk, haveAsk := domain.Level{}, false
+	if len(bs.asks) > 0 {
+		topAsk, haveAsk = bs.asks[0], true
+	}
+	if askErr == nil {
+		topAsk, haveAsk = ask, true
+	}
+	if haveBid && haveAsk && topBid.Price >= topAsk.Price {
+		return // never publish a crossed book
+	}
+	if bidErr == nil {
+		if len(bs.bids) == 0 {
+			bs.bids = []domain.Level{topBid}
+		} else {
+			bs.bids[0] = topBid
+		}
+	}
+	if askErr == nil {
+		if len(bs.asks) == 0 {
+			bs.asks = []domain.Level{topAsk}
+		} else {
+			bs.asks[0] = topAsk
+		}
+	}
+	bs.seq = m.Data.Time
+	bs.updated = time.Now()
+	v.publishBook(bs, bs.snapshot(v.cfg.Name))
+}
+
+func parseBboLevel(l struct {
+	Px string `json:"px"`
+	Sz string `json:"sz"`
+}) (domain.Level, error) {
+	p, err1 := strconv.ParseFloat(l.Px, 64)
+	s, err2 := strconv.ParseFloat(l.Sz, 64)
+	if err1 != nil || err2 != nil || math.IsNaN(p) || math.IsInf(p, 0) || p <= 0 || math.IsNaN(s) || math.IsInf(s, 0) || s < 0 {
+		return domain.Level{}, fmt.Errorf("invalid bbo level")
+	}
+	return domain.Level{Price: p, Size: s}, nil
+}
+
 func parseLevels(levels []wsLevel) ([]domain.Level, error) {
 	out := make([]domain.Level, 0, len(levels))
 	for _, l := range levels {
@@ -468,6 +557,8 @@ func (v *Venue) onWSMessage(channel string, raw []byte) {
 	switch channel {
 	case "l2Book":
 		v.onBook(raw)
+	case "bbo":
+		v.onBbo(raw)
 	case "orderUpdates":
 		v.onOrderUpdate(raw)
 	case "userFills":

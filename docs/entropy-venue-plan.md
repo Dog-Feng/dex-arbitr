@@ -52,6 +52,13 @@ Entropy 专有 API**。对接直接使用 Hyperliquid 标准 API/SDK（REST + WS
 - WS（`wss://api.hyperliquid.xyz/ws`）：`l2Book` 订阅 `{type:"l2Book",coin:"io:SNDK"}`
   （整本快照推送，非增量）；`orderUpdates` / `userFills` 订阅 `{type:...,user:addr}`
   （公开流，无需签名）。`allMids` 订阅带 `dex` 参数。
+- **盘口推送节奏（实测）**：`l2Book` 不带参数时被节流到 ~5s/帧；带 `fast:true`
+  时 ~0.54s/帧（5 档/侧）；`bbo` 频道 ~0.40s/帧（仅最优买卖一档）。适配器订阅
+  `l2Book(fast)+bbo` 并把 bbo 合并进 book state 的顶层，实测有效更新 ~0.27s/帧
+  （3.7 Hz）。订单终态事件（orderUpdates/userFills）按块即时推，不受盘口节流
+  影响。
+- **对应配置**：`volatility.max_age: 600ms`（给 0.4~0.54s 节奏留 1.1~1.5 倍
+  余量；400ms 零余量、推送抖动会打碎 σ 采样链），`strategy.max_book_age: 3s`。
 
 ### 签名方案（与官方 hyperliquid-python-sdk 0.24.0 逐字节一致）
 

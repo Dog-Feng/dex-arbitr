@@ -46,7 +46,7 @@ volatility:
   interval: 100ms       # sampling interval for the spread series
   horizon: 500ms        # increment horizon whose volatility is estimated
   half_life: 1m         # EWMA half-life of realized variance
-  max_age: 50ms         # drop samples when either book is older than this
+  max_age: 600ms        # drop samples when either book is older than this (HL fast book ~0.5s)
 
 risk:
   margin_floor_ratio: 0.2     # stop opening when any leg's remaining margin <= 20%
@@ -69,7 +69,7 @@ strategy:
   cap_hysteresis_sigma: 1.0  # extra sigma to open inside the top cap_band steps (0 = off)
   interval_min: 1s
   interval_max: 2s
-  max_book_age: 10s
+  max_book_age: 3s
 
 volume:                     # only used when strategy.kind = volume
   min_inventory: 0          # floor steps held while churning
@@ -140,11 +140,6 @@ monitor:
 
 pairs:
   - base: ANTH
-    left: rhlighter
-    right: entropy
-    step_qty: 0.01
-    max_steps: 5
-  - base: SNDK
     left: rhlighter
     right: entropy
     step_qty: 0.02

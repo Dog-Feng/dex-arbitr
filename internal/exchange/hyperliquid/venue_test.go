@@ -99,6 +99,57 @@ func TestOnBook(t *testing.T) {
 	}
 }
 
+// TestOnBbo verifies the top-of-book feed merges into a synced book state
+// without disturbing deeper levels.
+func TestOnBbo(t *testing.T) {
+	v, err := NewWithConfig(Config{
+		Name: "entropy", Dex: "io", InfoURL: "https://example.invalid/info",
+		ExchangeURL: "https://example.invalid/exchange", WSURL: "wss://example.invalid/ws", BookDepth: 5,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	v.assetsMu.Lock()
+	v.assets["io:ANTH"] = 200001
+	v.assetsMu.Unlock()
+	// Before the first full snapshot the book is not synced: bbo must be
+	// ignored instead of seeding a partial book.
+	unsynced := &bookState{marketID: 200001, depth: 5}
+	v.books[200001] = unsynced
+	v.onBbo([]byte(`{"channel":"bbo","data":{"coin":"io:ANTH","time":1754450974000,"bbo":[{"px":"1963.35","sz":"2.0"},{"px":"1963.45","sz":"0.002"}]}}`))
+	if unsynced.synced || len(unsynced.bids) != 0 || len(unsynced.asks) != 0 {
+		t.Fatalf("bbo seeded an unsynced book: %+v", unsynced)
+	}
+	bs := &bookState{
+		marketID: 200001, depth: 5, synced: true,
+		bids:    []domain.Level{{Price: 1963.3, Size: 1.336}, {Price: 1963.2, Size: 0.5}},
+		asks:    []domain.Level{{Price: 1963.4, Size: 0.001}},
+		updated: time.Now().Add(-2 * time.Second),
+	}
+	v.books[200001] = bs
+	v.onBbo([]byte(`{"channel":"bbo","data":{"coin":"io:ANTH","time":1754450974231,"bbo":[{"px":"1963.35","sz":"2.0","n":3},{"px":"1963.45","sz":"0.002","n":1}]}}`))
+	if bs.bids[0].Price != 1963.35 || bs.bids[0].Size != 2.0 || len(bs.bids) != 2 || bs.bids[1].Price != 1963.2 {
+		t.Fatalf("bids after bbo: %+v", bs.bids)
+	}
+	if bs.asks[0].Price != 1963.45 || bs.asks[0].Size != 0.002 || len(bs.asks) != 1 {
+		t.Fatalf("asks after bbo: %+v", bs.asks)
+	}
+	if bs.seq != 1754450974231 || time.Since(bs.updated) > time.Second {
+		t.Fatalf("bbo did not refresh book seq/time")
+	}
+	// A crossed bbo is discarded, leaving the previous book intact.
+	before := bs.bids[0]
+	v.onBbo([]byte(`{"channel":"bbo","data":{"coin":"io:ANTH","time":1754450974300,"bbo":[{"px":"1964.0","sz":"1.0"},{"px":"1963.0","sz":"1.0"}]}}`))
+	if bs.bids[0] != before {
+		t.Fatalf("crossed bbo applied: %+v", bs.bids[0])
+	}
+	// A null side only updates the other side.
+	v.onBbo([]byte(`{"channel":"bbo","data":{"coin":"io:ANTH","time":1754450974400,"bbo":[null,{"px":"1963.40","sz":"0.01"}]}}`))
+	if bs.asks[0].Price != 1963.40 || bs.bids[0] != before {
+		t.Fatalf("null-side bbo mishandled: bids %+v asks %+v", bs.bids[0], bs.asks[0])
+	}
+}
+
 // TestOrderWireTightening verifies the native-precision rounding never widens
 // the worst-acceptable price.
 func TestOrderWireTightening(t *testing.T) {

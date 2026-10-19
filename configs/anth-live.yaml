@@ -37,7 +37,7 @@ volatility:
   interval: 100ms
   horizon: 500ms
   half_life: 1m
-  max_age: 50ms
+  max_age: 600ms
 
 risk:
   margin_floor_ratio: 0.2
@@ -60,7 +60,7 @@ strategy:
   cap_hysteresis_sigma: 1.0
   interval_min: 1s
   interval_max: 2s
-  max_book_age: 10s
+  max_book_age: 3s
 
 volume:
   min_inventory: 0
