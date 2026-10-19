@@ -1,7 +1,7 @@
 # Cross-DEX perp spread step arbitrage. Secrets come from environment variables.
 dry_run: true            # true = paper trading (no orders). Set false for live.
 state_dir: state
-leverage: 10            # account leverage, applied to every venue (1x..10000x)
+leverage: 5            # account leverage, applied to every venue (1x..10000x)
 samples_dir: state/samples   # append 100ms spread samples for offline calibration (empty = off)
 
 venues:
@@ -21,12 +21,12 @@ venues:
   # Hyperliquid API is used with dex=io. Collateral is per-dex USDC, so fund
   # the io balance before trading. account = main address; private_key = the
   # approved API-wallet (agent) key.
-  # - name: entropy
-  #   kind: entropy
-  #   opts:
-  #     account: ${ENTROPY_ACCOUNT}
-  #     private_key: ${ENTROPY_AGENT_KEY}
-  #     book_depth: 20
+  - name: entropy
+    kind: entropy
+    opts:
+      account: ${ENTROPY_ACCOUNT}
+      private_key: ${ENTROPY_AGENT_KEY}
+      book_depth: 20
 
 matching:
   strip_suffixes: [PERP, USDC, USDG, USDT, USD]   # USDC/USDG/USDT treated 1:1
@@ -111,7 +111,7 @@ adaptive:
   up_factor: 1.3
   down_factor: 0.95
   min_k: 0.5
-  max_k: 3
+  max_k: 5
 
 monitor:
   addr: ":8080"            # HTTP metrics endpoint; empty = disabled
@@ -139,8 +139,13 @@ monitor:
       mu_jump_sigma: 3
 
 pairs:
-  - base: SPY
-    left: lighter
-    right: rhlighter
+  - base: ANTH
+    left: rhlighter
+    right: entropy
+    step_qty: 0.01
+    max_steps: 5
+  - base: SNDK
+    left: rhlighter
+    right: entropy
     step_qty: 0.02
-    max_steps: 15
+    max_steps: 5
