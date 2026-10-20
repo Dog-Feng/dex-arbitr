@@ -2,6 +2,7 @@ package execution
 
 import (
 	"context"
+	"errors"
 	"math"
 	"sync"
 	"testing"
@@ -19,6 +20,7 @@ type fakeVenue struct {
 	fillFn     func(n int, r domain.OrderReq) float64 // returns filled qty
 	n          int
 	silent     bool // never emit WS events (forces fallback)
+	reduceCap  bool // reduce-only fills are capped at the remaining position
 	reads      int
 	bumpAtRead int
 	posBump    float64
@@ -53,6 +55,9 @@ func (f *fakeVenue) Submit(_ context.Context, r domain.OrderReq) (domain.SubmitA
 	q := f.fillFn(f.n, r)
 	f.n++
 	f.orders = append(f.orders, r)
+	if f.reduceCap && r.ReduceOnly && q > math.Abs(f.pos) {
+		q = math.Abs(f.pos)
+	}
 	st := domain.StatusFilled
 	if q < r.Qty {
 		st = domain.StatusCanceled
@@ -386,8 +391,10 @@ func TestStickyResidualUnwindsWholeStep(t *testing.T) {
 	}
 }
 
-func TestSubMinPositionRequiresIntervention(t *testing.T) {
-	// The short leg itself is below the venue minimum and cannot be traded.
+func TestSubMinResidualClosesWithMinimumSizedOrder(t *testing.T) {
+	// The short leg is 0.008, below the venue minimum 0.009. A zero-target
+	// flatten rounds the reduction up to the minimum; reduce-only caps the
+	// fill at the remaining 0.008 and the account ends flat.
 	instQ := domain.Instrument{MarketID: 1, SizeDecimals: 4, PriceDecimals: 2, MinQuote: 0.9}
 	lv := newFake("L", full)
 	rv := newFake("R", func(n int, r domain.OrderReq) float64 {
@@ -396,12 +403,73 @@ func TestSubMinPositionRequiresIntervention(t *testing.T) {
 		}
 		return r.Qty
 	})
+	lv.reduceCap, rv.reduceCap = true, true
 	e := topUpExec(t, lv, rv)
 	res := e.Execute(context.Background(),
 		LegSpec{Venue: lv, Inst: instQ, Side: domain.Buy, Price: 100},
 		LegSpec{Venue: rv, Inst: instQ, Side: domain.Sell, Price: 101}, 0.012, false, 0, 0)
-	if res.Err == nil {
-		t.Fatalf("expected manual-intervention error, got %+v", res)
+	if res.Err != nil || res.PosL != 0 || res.PosR != 0 {
+		t.Fatalf("expected minimum-sized close, got %+v", res)
+	}
+	if res.RescueOrders != 2 {
+		t.Fatalf("expected two rescue orders, got %+v", res)
+	}
+}
+
+func TestOpenRollbackRestoresPreOpenPositions(t *testing.T) {
+	// An opening whose equalization would need 0.003 below the minimum rolls
+	// back to the pre-open positions instead of flattening prior steps.
+	instQ := domain.Instrument{MarketID: 1, SizeDecimals: 4, PriceDecimals: 2, MinQuote: 0.9}
+	lv := newFake("L", full)
+	rv := newFake("R", func(n int, r domain.OrderReq) float64 {
+		if n == 0 {
+			return 0.009
+		}
+		return r.Qty
+	})
+	lv.reduceCap, rv.reduceCap = true, true
+	lv.pos, rv.pos = 0.02, -0.02
+	e := topUpExec(t, lv, rv)
+	res := e.Execute(context.Background(),
+		LegSpec{Venue: lv, Inst: instQ, Side: domain.Buy, Price: 100},
+		LegSpec{Venue: rv, Inst: instQ, Side: domain.Sell, Price: 101}, 0.012, false, 0.02, -0.02)
+	if res.Err != nil {
+		t.Fatalf("rollback failed: %+v", res)
+	}
+	requireQty(t, res.PosL, 0.02)
+	requireQty(t, res.PosR, -0.02)
+}
+
+func TestResolveOutstandingRollsBackOpeningToBefore(t *testing.T) {
+	instQ := domain.Instrument{MarketID: 1, SizeDecimals: 4, PriceDecimals: 2, MinQuote: 0.9}
+	lv, rv := newFake("L", full), newFake("R", full)
+	lv.reduceCap, rv.reduceCap = true, true
+	lv.pos, rv.pos = 0.032, -0.029
+	e := testExec(t, lv, rv)
+	res := Result{PosL: 0.032, PosR: -0.029, PositionsKnown: true, SettlementKnown: true,
+		targetL: 0.029, targetR: -0.029, targetsKnown: true, opening: true}
+	out := e.ResolveOutstanding(context.Background(),
+		LegSpec{Venue: lv, Inst: instQ, Side: domain.Sell, Price: 100},
+		LegSpec{Venue: rv, Inst: instQ, Side: domain.Buy, Price: 101}, res, 0.012, 0.02, -0.02)
+	if out.Err != nil {
+		t.Fatalf("recovered rollback failed: %+v", out)
+	}
+	requireQty(t, out.PosL, 0.02)
+	requireQty(t, out.PosR, -0.02)
+}
+
+func TestFlattenSubMinAtNonZeroTargetEscalates(t *testing.T) {
+	// A hedge target that needs 0.004 below the minimum cannot be rounded up
+	// (reduce-only would overshoot), so flatten reports the escalation error.
+	instQ := domain.Instrument{MarketID: 1, SizeDecimals: 4, PriceDecimals: 2, MinQuote: 0.9}
+	lv, rv := newFake("L", full), newFake("R", full)
+	e := testExec(t, lv, rv)
+	res := Result{PosL: 0.02, PosR: -0.024, PositionsKnown: true}
+	err := e.flatten(context.Background(),
+		LegSpec{Venue: lv, Inst: instQ, Side: domain.Sell, Price: 100},
+		LegSpec{Venue: rv, Inst: instQ, Side: domain.Buy, Price: 101}, 0.02, -0.02, &res, e.cfg.Rescue)
+	if !errors.Is(err, ErrSubMinResidual) {
+		t.Fatalf("expected ErrSubMinResidual, got %v", err)
 	}
 }
 

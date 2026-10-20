@@ -187,7 +187,7 @@ func (a *PairActor) resolvePending(ctx context.Context) {
 			a.posL, a.posR = res.PosL, res.PosR
 			a.syncPositionState()
 		}
-		if errors.Is(res.Err, execution.ErrUnexpectedPosition) {
+		if errors.Is(res.Err, execution.ErrUnexpectedPosition) || errors.Is(res.Err, execution.ErrSubMinResidual) {
 			p.stalls++
 			if p.stalls >= interventionStallLimit {
 				a.recoverExternalIntervention(ctx, p, res)

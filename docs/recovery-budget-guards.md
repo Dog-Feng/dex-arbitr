@@ -55,6 +55,8 @@ sum(max(每个历史步骤左右腿名义额, 当前单步额度))
 | N10 原生价格移动一tick | `TestZeroTicksPreservesNativeDecisionPrice`；domain/lighter原生单位与离线签名回归 |
 | N11 空闲腿迟到成交卡死 | `TestFlattenRecoversLateFillOnIdleLeg`；flatten按实际仓位重新收敛 |
 | N12 干预完成后永久暂停 | `TestInterventionWaitsForUnknownOriginalBeforeFlatten`；成功后恢复WARMUP |
+| N13 低于最小额残量卡死 | `TestSubMinResidualClosesWithMinimumSizedOrder`；零目标按最小额 reduce-only 封顶清残 |
+| N14 开仓回滚破坏旧仓 | `TestOpenRollbackRestoresPreOpenPositions`；回滚目标是开仓前仓位 |
 
 验证使用内存venue、假行情、离线签名和临时时钟。测试通过不代表已经实盘验证远端延迟、撮合或所有错误码；没有调用真实交易接口。
 
@@ -71,6 +73,15 @@ HL 的订单状态可能早于真实成交落位一两个区块：一个已被�
 - 外部干预抹平成功、两腿确认归零后，模式恢复 `WARMUP`（估计器重新预热后回
   `RUNNING`），不再永久暂停；PnL 保持 uncertain。干预长期未决时每 10 次尝试输出
   一条 WARN，避免静默空转（`TestInterventionWaitsForUnknownOriginalBeforeFlatten`）。
+- 低于单腿最小可交易量（如 HL $10≈0.0051）的残量不再硬报错：目标是 0 时按最小额
+  发 reduce-only 单，由成交封顶吃掉残量（连续被拒超过 3 次才上报）；目标非 0 时返回
+  `ErrSubMinResidual`。该错误与 `ErrUnexpectedPosition` 一样累计 stall，三次后进入
+  外部干预，不再无限静默重试（`TestSubMinResidualClosesWithMinimumSizedOrder`、
+  `TestSubMinResidualStallsEscalateToIntervention`）。
+- 开仓无法补齐/对齐时，回滚目标是“本次开仓前的仓位”而不是 0，既有步骤的仓位不再
+  被一起抹掉；`ResolveOutstanding` 恢复路径同样按 `opening` 标记执行该回滚
+  （`TestOpenRollbackRestoresPreOpenPositions`、`TestResolveOutstandingRollsBackOpeningToBefore`）。
+  平仓路径保持原有零目标语义不变。
 
 ## 本次离线验证
 

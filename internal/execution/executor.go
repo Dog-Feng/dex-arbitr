@@ -98,6 +98,7 @@ type Result struct {
 	targetsKnown    bool
 	rescue          RescueParams
 	emergency       bool
+	opening         bool // retained so recovery can roll an opening back to before
 }
 
 // topUpState retains the step-completion order for recovery.
@@ -131,10 +132,20 @@ var ErrUnexpectedPosition = errors.New("unexpected position change")
 // fixed IOC price would exceed the caller's per-leg opening reservation.
 var ErrNotionalBudget = errors.New("opening notional budget exceeded")
 
+// ErrSubMinResidual means reaching a rescue target would require trading less
+// than one leg's venue minimum. The engine escalates it like an unexpected
+// position change instead of retrying silently forever.
+var ErrSubMinResidual = errors.New("residual below venue minimum")
+
 // lateFillRecoveryLimit bounds consecutive flatten re-sizes caused by late
 // fills on legs without a matching request. Persistent movement past this
 // limit is reported as an unexpected position change for the engine to handle.
 const lateFillRecoveryLimit = 3
+
+// subMinAttemptLimit bounds consecutive minimum-sized reduce-only attempts
+// used to clear a sub-minimum residual. Repeated rejections past this limit
+// surface as ErrSubMinResidual for the engine to escalate.
+const subMinAttemptLimit = 3
 
 // BookFn returns the latest book for a venue/market (for rescue pricing).
 type BookFn func(venue string, marketID int) (domain.Book, bool)
@@ -228,6 +239,7 @@ func (e *Executor) ExecuteBounded(ctx context.Context, l, r LegSpec, qty float64
 		}
 	}
 	res.RequestedQty = qty
+	res.opening = !reduceOnly
 	reqL := domain.OrderReq{ClientID: e.ids.Next(), Inst: l.Inst, Side: l.Side, Qty: qty, Price: priceL, Type: domain.Limit, ReduceOnly: reduceOnly}
 	reqR := domain.OrderReq{ClientID: e.ids.Next(), Inst: r.Inst, Side: r.Side, Qty: qty, Price: priceR, Type: domain.Limit, ReduceOnly: reduceOnly}
 	var wg sync.WaitGroup
@@ -265,13 +277,16 @@ func (e *Executor) ExecuteBounded(ctx context.Context, l, r LegSpec, qty float64
 	// Keep only a hedge representable on both markets. Reducing both legs is
 	// necessary when a fine-precision partial fill leaves dust on the coarse leg.
 	tl, tr := hedgeTargets(pl, pr, l.Inst, r.Inst)
-	if flat, ferr := e.unwindSmallResidual(l, r, tl, tr, pl, pr); ferr != nil {
-		res.Err = ferr
-		return res
-	} else if flat {
-		// The residual cannot be traded on either leg: unwind the whole step
-		// to zero, where every reduction equals a full position size.
-		tl, tr = 0, 0
+	if e.unwindSmallResidual(l, r, tl, tr, pl, pr) {
+		if reduceOnly {
+			// The residual cannot be traded on either leg: unwind the whole
+			// step to zero, where every reduction equals a full position size.
+			tl, tr = 0, 0
+		} else {
+			// The opening cannot be equalized: undo only this step back to the
+			// pre-open positions so previously recorded steps stay intact.
+			tl, tr = beforeL, beforeR
+		}
 	}
 	res.targetL, res.targetR, res.targetsKnown = tl, tr, true
 	res.Err = e.flatten(ctx, l, r, tl, tr, &res, e.cfg.Rescue)
@@ -335,6 +350,11 @@ func (e *Executor) ResolveOutstanding(ctx context.Context, l, r LegSpec, res Res
 		if !res.targetsKnown {
 			res.targetL, res.targetR = hedgeTargets(res.PosL, res.PosR, l.Inst, r.Inst)
 			res.targetsKnown = true
+		}
+		if res.opening && e.unwindSmallResidual(l, r, res.targetL, res.targetR, res.PosL, res.PosR) {
+			// The opening cannot be equalized: undo only this step back to the
+			// pre-open positions so previously recorded steps stay intact.
+			res.targetL, res.targetR = beforeL, beforeR
 		}
 		res.Err = e.flatten(ctx, l, r, res.targetL, res.targetR, &res, res.rescue)
 	}
@@ -591,34 +611,23 @@ func mergeTopUp(leg *LegResult, up LegResult) {
 
 // unwindSmallResidual reports whether reaching the aligned hedge target would
 // require a reduction below one leg's venue minimum. Such dust cannot be
-// traded: the caller unwinds the whole step to zero, where every reduction
-// equals a full position. If even a full position is below its venue minimum,
-// no order can repair the account and an explicit error is returned.
-func (e *Executor) unwindSmallResidual(l, r LegSpec, tl, tr, pl, pr float64) (bool, error) {
+// traded directly: the caller re-targets (undo the step for openings, zero for
+// closes) so every remaining reduction is tradable, or flatten closes the
+// residual with a minimum-sized reduce-only order.
+func (e *Executor) unwindSmallResidual(l, r LegSpec, tl, tr, pl, pr float64) bool {
 	legs := [2]LegSpec{l, r}
 	pos := [2]float64{pl, pr}
 	tgt := [2]float64{tl, tr}
-	stuck := false
 	for i := range legs {
 		need := pos[i] - tgt[i]
 		if math.Abs(need) < math.Pow10(-legs[i].Inst.SizeDecimals)/2 {
 			continue
 		}
 		if math.Abs(need) < legMinQty(legs[i].Inst, legs[i].Price) {
-			stuck = true
+			return true
 		}
 	}
-	if !stuck {
-		return false, nil
-	}
-	for i := range legs {
-		if math.Abs(pos[i]) >= math.Pow10(-legs[i].Inst.SizeDecimals)/2 &&
-			math.Abs(pos[i]) < legMinQty(legs[i].Inst, legs[i].Price) {
-			return false, fmt.Errorf("residual position %.8f on %s below venue minimum %.8f: manual intervention required",
-				pos[i], legs[i].Venue.Name(), legMinQty(legs[i].Inst, legs[i].Price))
-		}
-	}
-	return true, nil
+	return false
 }
 
 func pause(ctx context.Context, d time.Duration) error {
@@ -1050,6 +1059,7 @@ func (e *Executor) flatten(ctx context.Context, l, r LegSpec, targetL, targetR f
 	start := time.Now()
 	alerted := false
 	lateRecovers := 0
+	subMinTries := 0
 	epsL := math.Pow10(-l.Inst.SizeDecimals) / 2
 	epsR := math.Pow10(-r.Inst.SizeDecimals) / 2
 	for attempt := 0; ; attempt++ {
@@ -1070,6 +1080,7 @@ func (e *Executor) flatten(ctx context.Context, l, r LegSpec, targetL, targetR f
 		var reqs [2]domain.OrderReq
 		var results [2]LegResult
 		ready := true
+		roundUp := false
 		for i, leg := range legs {
 			results[i].Resolved = true // no order on this leg is already settled
 			if math.Abs(deltas[i]) < math.Pow10(-leg.Inst.SizeDecimals)/2 {
@@ -1104,9 +1115,28 @@ func (e *Executor) flatten(ctx context.Context, l, r LegSpec, targetL, targetR f
 				return fmt.Errorf("invalid rescue price on %s", leg.Venue.Name())
 			}
 			if minQ := legMinQty(leg.Inst, px); q < minQ {
-				return fmt.Errorf("rescue quantity %.8f below venue minimum %.8f on %s", q, minQ, leg.Venue.Name())
+				target := targetL
+				if i == 1 {
+					target = targetR
+				}
+				if target != 0 {
+					return fmt.Errorf("%w: rescue quantity %.8f below venue minimum %.8f on %s", ErrSubMinResidual, q, minQ, leg.Venue.Name())
+				}
+				// A zero target makes the remaining position the whole
+				// residual. Reduce-only caps the fill at that position, so a
+				// minimum-sized order still closes the dust.
+				q = domain.Ceil(minQ, leg.Inst.SizeDecimals)
+				roundUp = true
 			}
 			reqs[i] = domain.OrderReq{ClientID: e.ids.Next(), Inst: leg.Inst, Side: side, Qty: q, Price: px, Type: typ, ReduceOnly: true}
+		}
+		if roundUp {
+			subMinTries++
+			if subMinTries > subMinAttemptLimit {
+				return fmt.Errorf("%w: repeated minimum-sized reductions did not clear the residual", ErrSubMinResidual)
+			}
+		} else {
+			subMinTries = 0
 		}
 		if !ready || reqs[0].Qty == 0 && reqs[1].Qty == 0 {
 			if rescue.Immediate {

@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"testing"
 	"time"
@@ -120,6 +121,27 @@ func TestInterventionWaitsForUnknownOriginalBeforeFlatten(t *testing.T) {
 	r.mu.Unlock()
 	if actual != 0 {
 		t.Fatalf("late original left exposure %g", actual)
+	}
+}
+
+func TestSubMinResidualStallsEscalateToIntervention(t *testing.T) {
+	a, l, r := auditInterventionActor(t)
+	instQ := domain.Instrument{MarketID: 1, SizeDecimals: 4, PriceDecimals: 2, TakerFee: .001, MinQuote: .9}
+	a.cfg.Pair.Left, a.cfg.Pair.Right = instQ, instQ
+	l.pos, r.pos = .012, -.008
+	a.posL, a.posR = .012, -.008
+	l.submit = func(_ context.Context, req domain.OrderReq) (float64, error) { return req.Qty, nil }
+	r.actorTestVenue.submit = func(_ context.Context, req domain.OrderReq) (float64, error) { return req.Qty, nil }
+	a.pending = &pendingExecution{
+		action:  strategy.Action{Kind: strategy.Open, Dir: strategy.DirLS, Qty: .01},
+		beforeL: 0, beforeR: 0,
+		result: execution.Result{PosL: .012, PosR: -.008, PositionsKnown: true, SettlementKnown: true,
+			Err: fmt.Errorf("%w: rescue quantity below venue minimum", execution.ErrSubMinResidual)},
+		stalls: interventionStallLimit - 1,
+	}
+	a.resolvePending(context.Background())
+	if a.pending == nil || !a.pending.intervention || a.pending.stalls != interventionStallLimit {
+		t.Fatalf("sub-min residual did not escalate: pending=%+v", a.pending)
 	}
 }
 
