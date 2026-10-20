@@ -17,15 +17,16 @@ import (
 // pendingExecution retains the complete executor result, including outstanding
 // IOC identities and rescue batches. Recovery never resubmits an original IOC.
 type pendingExecution struct {
-	action           strategy.Action
-	quote            spread.Quote
-	beforeL, beforeR float64
-	result           execution.Result
-	unwind           bool
-	lastAttempt      time.Time
-	stalls           int
-	intervention     bool
-	interrupted      *execution.Result // settled original orders, separate from the new flatten
+	action            strategy.Action
+	quote             spread.Quote
+	beforeL, beforeR  float64
+	result            execution.Result
+	unwind            bool
+	lastAttempt       time.Time
+	stalls            int
+	intervention      bool
+	interventionTries int
+	interrupted       *execution.Result // settled original orders, separate from the new flatten
 }
 
 // interventionStallLimit is how many consecutive inconsistent settlements are
@@ -254,6 +255,7 @@ func (a *PairActor) recoverExternalIntervention(ctx context.Context, p *pendingE
 		res = a.exec.ResolveTerminals(execCtx, l, r, res, p.action.Qty)
 		p.result = res
 		if res.Err != nil || !res.PositionsKnown || !execution.OrdersTerminal(res) {
+			a.noteInterventionStall(p, res)
 			return
 		}
 		// Keep the original fills intact. The new flatten has its own order
@@ -279,6 +281,7 @@ func (a *PairActor) recoverExternalIntervention(ctx context.Context, p *pendingE
 		a.syncPositionState()
 	}
 	if res.Err != nil || !res.PositionsKnown || !res.SettlementKnown {
+		a.noteInterventionStall(p, res)
 		return
 	}
 	if err := a.finishIntervention(res, *p.interrupted); err != nil {
@@ -287,6 +290,12 @@ func (a *PairActor) recoverExternalIntervention(ctx context.Context, p *pendingE
 	}
 	a.pending = nil
 	a.completeExecutionCheckpoint()
+	// The account is confirmed flat and the ledger cleared. Resume warmup so
+	// normal trading can continue once the estimators re-warm; PnL remains
+	// uncertain. Without this the pair stays paused forever after a
+	// successful self-flatten, looking like a hang with only silent alerts.
+	a.state.Mode = strategy.ModeWarmup
+	a.log.Warn("external intervention completed; both legs confirmed flat, resuming warmup")
 	if err := a.persist(); err != nil {
 		a.log.Error("persist external intervention", "err", err)
 		return
@@ -296,6 +305,16 @@ func (a *PairActor) recoverExternalIntervention(ctx context.Context, p *pendingE
 		a.drainConfirmed.Store(true)
 	}
 	a.emergencyRequested.Store(false)
+}
+
+// noteInterventionStall keeps a long-running self-flatten visible: the
+// recovery loop retries silently by design, so surface progress on a coarse
+// cadence instead of leaving operators with only the silent anomaly.
+func (a *PairActor) noteInterventionStall(p *pendingExecution, res execution.Result) {
+	p.interventionTries++
+	if p.interventionTries%10 == 0 {
+		a.log.Warn("external intervention still unresolved", "attempts", p.interventionTries, "err", res.Err)
+	}
 }
 
 // finishIntervention clears the step ledger once both legs are confirmed flat.

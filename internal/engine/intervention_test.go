@@ -112,6 +112,9 @@ func TestInterventionWaitsForUnknownOriginalBeforeFlatten(t *testing.T) {
 	if a.pending != nil || a.checkpoint || !a.Flat() || submits != 2 || len(a.state.Steps) != 0 || !a.volAcc.pnlUncertain {
 		t.Fatalf("terminal IOC did not recover safely: pending=%+v flat=%v submits=%d", a.pending, a.Flat(), submits)
 	}
+	if a.state.Mode != strategy.ModeWarmup {
+		t.Fatalf("mode after successful intervention = %v, want warmup so trading resumes", a.state.Mode)
+	}
 	r.mu.Lock()
 	actual := r.pos
 	r.mu.Unlock()

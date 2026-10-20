@@ -53,8 +53,24 @@ sum(max(每个历史步骤左右腿名义额, 当前单步额度))
 | N8 外部零成交漏未知PnL | `TestUnwindExternalZeroFillMarksPnLUncertain` |
 | N9 单槽预热/回放校验 | `TestSingleSlotEstimatorWarmsForAllStrategySelections`；`TestReplaySingleSlotWarmupAndGap` |
 | N10 原生价格移动一tick | `TestZeroTicksPreservesNativeDecisionPrice`；domain/lighter原生单位与离线签名回归 |
+| N11 空闲腿迟到成交卡死 | `TestFlattenRecoversLateFillOnIdleLeg`；flatten按实际仓位重新收敛 |
+| N12 干预完成后永久暂停 | `TestInterventionWaitsForUnknownOriginalBeforeFlatten`；成功后恢复WARMUP |
 
 验证使用内存venue、假行情、离线签名和临时时钟。测试通过不代表已经实盘验证远端延迟、撮合或所有错误码；没有调用真实交易接口。
+
+## 迟到成交与干预收尾（2026-10-20）
+
+HL 的订单状态可能早于真实成交落位一两个区块：一个已被判定终态的旧订单，其成交可能
+稍后才体现在仓位上，使本批次“未下单的腿”（req qty=0）出现仓位变化，触发
+`ErrUnexpectedPosition` 并让整个 pair 暂停。
+
+- `flatten` 确认批次失败时，若错误是 `ErrUnexpectedPosition`、本批次所有已下单的腿
+  均已显式终态、且变动只发生在未下单的空闲腿上，则把该批次记入 `unconfirmed` 并按
+  最新仓位重新计算减仓量继续收敛，连续最多 3 次；超过仍不一致才上报引擎走外部干预。
+  已下单腿的严格校验不变，未决/未知订单永远不会被丢弃（`TestFlattenRecoversLateFillOnIdleLeg`）。
+- 外部干预抹平成功、两腿确认归零后，模式恢复 `WARMUP`（估计器重新预热后回
+  `RUNNING`），不再永久暂停；PnL 保持 uncertain。干预长期未决时每 10 次尝试输出
+  一条 WARN，避免静默空转（`TestInterventionWaitsForUnknownOriginalBeforeFlatten`）。
 
 ## 本次离线验证
 

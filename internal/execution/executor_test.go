@@ -12,14 +12,18 @@ import (
 
 // fakeVenue fills orders according to fillFn and maintains a position.
 type fakeVenue struct {
-	name   string
-	mu     sync.Mutex
-	pos    float64
-	ch     chan domain.OrderUpdate
-	fillFn func(n int, r domain.OrderReq) float64 // returns filled qty
-	n      int
-	silent bool // never emit WS events (forces fallback)
-	orders []domain.OrderReq
+	name       string
+	mu         sync.Mutex
+	pos        float64
+	ch         chan domain.OrderUpdate
+	fillFn     func(n int, r domain.OrderReq) float64 // returns filled qty
+	n          int
+	silent     bool // never emit WS events (forces fallback)
+	reads      int
+	bumpAtRead int
+	posBump    float64
+	bumped     bool
+	orders     []domain.OrderReq
 }
 
 func newFake(name string, f func(int, domain.OrderReq) float64) *fakeVenue {
@@ -49,12 +53,12 @@ func (f *fakeVenue) Submit(_ context.Context, r domain.OrderReq) (domain.SubmitA
 	q := f.fillFn(f.n, r)
 	f.n++
 	f.orders = append(f.orders, r)
-	f.pos += float64(r.Side) * q
-	f.mu.Unlock()
 	st := domain.StatusFilled
 	if q < r.Qty {
 		st = domain.StatusCanceled
 	}
+	f.pos += float64(r.Side) * q
+	f.mu.Unlock()
 	if !f.silent {
 		f.ch <- domain.OrderUpdate{Venue: f.name, ClientID: r.ClientID, Status: st, FilledQty: q, FilledQuote: q * r.Price}
 	}
@@ -70,6 +74,11 @@ func (f *fakeVenue) CancelOrder(context.Context, domain.Instrument, int64) error
 func (f *fakeVenue) Positions(context.Context) ([]domain.Position, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.reads++
+	if f.bumpAtRead > 0 && f.reads >= f.bumpAtRead && !f.bumped {
+		f.bumped = true
+		f.pos += f.posBump
+	}
 	return []domain.Position{{MarketID: 1, Qty: f.pos}}, nil
 }
 func (f *fakeVenue) CanTrade() bool { return true }
@@ -224,6 +233,32 @@ func TestCloseCompletesLaggingLeg(t *testing.T) {
 	}
 	if o := r.orders[1]; o.Side != domain.Buy || !o.ReduceOnly {
 		t.Fatalf("%+v", o)
+	}
+}
+
+func TestFlattenRecoversLateFillOnIdleLeg(t *testing.T) {
+	// The close leaves R to be rescued while L is already flat. During the
+	// rescue confirmation L moves by -0.01 (a fill from an earlier order the
+	// batch never requested). Flatten re-sizes from the fresh snapshot and
+	// reduces L instead of failing the whole execution.
+	l, r := newFake("L", full), newFake("R", func(n int, q domain.OrderReq) float64 {
+		if n == 0 {
+			return 0
+		}
+		return q.Qty
+	})
+	l.pos, r.pos = 0.01, -0.01
+	l.bumpAtRead, l.posBump = 2, -0.01
+	e := testExec(t, l, r)
+	res := e.Execute(context.Background(), LegSpec{l, inst, domain.Sell, 100}, LegSpec{r, inst, domain.Buy, 100.1}, 0.01, true, 0.01, -0.01)
+	if res.Err != nil || !res.SettlementKnown {
+		t.Fatalf("flatten should recover from the late fill: %+v", res)
+	}
+	if res.PosL != 0 || res.PosR != 0 {
+		t.Fatalf("positions not flat after recovery: %+v", res)
+	}
+	if res.RescueOrders < 2 {
+		t.Fatalf("rescue should re-size after the late fill: %+v", res)
 	}
 }
 

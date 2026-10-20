@@ -131,6 +131,11 @@ var ErrUnexpectedPosition = errors.New("unexpected position change")
 // fixed IOC price would exceed the caller's per-leg opening reservation.
 var ErrNotionalBudget = errors.New("opening notional budget exceeded")
 
+// lateFillRecoveryLimit bounds consecutive flatten re-sizes caused by late
+// fills on legs without a matching request. Persistent movement past this
+// limit is reported as an unexpected position change for the engine to handle.
+const lateFillRecoveryLimit = 3
+
 // BookFn returns the latest book for a venue/market (for rescue pricing).
 type BookFn func(venue string, marketID int) (domain.Book, bool)
 
@@ -1044,6 +1049,7 @@ func (e *Executor) FlattenToZero(ctx context.Context, l, r LegSpec) (res Result,
 func (e *Executor) flatten(ctx context.Context, l, r LegSpec, targetL, targetR float64, res *Result, rescue RescueParams) error {
 	start := time.Now()
 	alerted := false
+	lateRecovers := 0
 	epsL := math.Pow10(-l.Inst.SizeDecimals) / 2
 	epsR := math.Pow10(-r.Inst.SizeDecimals) / 2
 	for attempt := 0; ; attempt++ {
@@ -1129,8 +1135,21 @@ func (e *Executor) flatten(ctx context.Context, l, r LegSpec, targetL, targetR f
 		wg.Wait()
 		res.pending = &pendingRescue{reqs: reqs, results: results, beforeL: beforeL, beforeR: beforeR}
 		if err := e.resolveRescue(ctx, l, r, res, false); err != nil {
+			if errors.Is(err, ErrUnexpectedPosition) && res.PositionsKnown && lateRecovers < lateFillRecoveryLimit &&
+				res.pending != nil && batchTerminal(res.pending) && idleLegMoved(res.pending, res) {
+				lateRecovers++
+				// A late fill from an earlier order moved a leg beyond this
+				// batch's request while every ordered leg settled. Observed
+				// positions are authoritative: keep the settled batch for
+				// recovery and re-size from the fresh snapshot instead of
+				// failing the whole execution.
+				res.unconfirmed = append(res.unconfirmed, *res.pending)
+				res.pending = nil
+				continue
+			}
 			return err
 		}
+		lateRecovers = 0
 		if rescue.Immediate {
 			if math.Abs(res.PosL-targetL) < epsL && math.Abs(res.PosR-targetR) < epsR {
 				return nil
@@ -1141,6 +1160,23 @@ func (e *Executor) flatten(ctx context.Context, l, r LegSpec, targetL, targetR f
 			return err
 		}
 	}
+}
+
+// idleLegMoved reports whether a position moved on a leg this batch never
+// ordered. Such movement is a late fill from an earlier order; the flatten
+// loop can re-size from the fresh snapshot. Movement on an ordered leg keeps
+// the strict verification so live or unknown orders are never abandoned.
+func idleLegMoved(p *pendingRescue, res *Result) bool {
+	if p == nil {
+		return false
+	}
+	legs := [2]struct{ before, now float64 }{{p.beforeL, res.PosL}, {p.beforeR, res.PosR}}
+	for i := range p.reqs {
+		if p.reqs[i].Qty == 0 && math.Abs(legs[i].now-legs[i].before) > 1e-12 {
+			return true
+		}
+	}
+	return false
 }
 
 func (e *Executor) resolveRescue(ctx context.Context, l, r LegSpec, res *Result, query bool) error {
