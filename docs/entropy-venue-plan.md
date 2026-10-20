@@ -84,9 +84,9 @@ Entropy 专有 API**。对接直接使用 Hyperliquid 标准 API/SDK（REST + WS
 
 - 所有 `io` 资产 `onlyIsolated: true`：现有引擎按逐仓清算价计算风险，不依赖
   全仓权益；`AccountSnapshot.CrossMargin` 只在存在 cross 仓位时返回。
-- growth mode + `deployerFeeScale=1.0`：基础档 taker **0.9 bps**、maker **0.3 bps**
-  （`0.00045 × 2 × 0.1`）。账户有更高费率档/质押折扣时实际更低，静态取基础档
-  是保守估计。
+- growth mode + `deployerFeeScale=1.0`：taker **0.9 bps（0.009%）**、maker
+  **0.3 bps**（`0.00045 × 2 × 0.1`）。Entropy 当前为固定费率，**无交易量档位
+  折扣**，静态费率即实际费率；记账仍优先采用成交回报里的实际 `fee`（见 L4）。
 - 抵押品是 **USDC（tokenId 0）**，且按 dex 隔离：`io` 有独立 USDC 余额。交易前
   需把资金转入 io dex（UI 划转，或 `agentSendAsset` sourceDex="spot"/"" →
   destinationDex="io"）。本适配器暂不自动划转。

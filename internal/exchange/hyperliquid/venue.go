@@ -382,13 +382,13 @@ func (v *Venue) Instruments(ctx context.Context) ([]domain.Instrument, error) {
 	return out, nil
 }
 
-// baseFees returns per-fill fee rates at the base volume tier. Growth-mode
-// HIP-3 assets with deployerFeeScale 1.0 trade at 0.9 bps taker / 0.3 bps
-// maker (0.00045 * 2 * 0.1); a better account tier only lowers the realized
-// fee, so this estimate is conservative for decision thresholds. A
-// deployerFeeScale of "0" is treated like 1.0 (full multiplier): that is
-// conservative for fee thresholds, but keep it explicit until its meaning is
-// confirmed live.
+// baseFees returns per-fill fee rates. Entropy (HIP-3) charges flat fees with
+// no volume-tier schedule: in growth mode with deployerFeeScale 1.0 the taker
+// fee is 0.009% (0.9 bps) and the maker fee 0.03% (0.3 bps), matching
+// 0.00045 * 2 * 0.1. The rate feeds pre-trade thresholds; settled PnL prefers
+// venue-reported fees. A deployerFeeScale of "0" is treated like 1.0 (full
+// multiplier): conservative for fee thresholds, but keep it explicit until
+// its meaning is confirmed live.
 func baseFees(m metaItem, isHIP3 bool) (taker, maker float64) {
 	if !isHIP3 {
 		return 0.00045, 0.00015
