@@ -95,6 +95,7 @@ type Config struct {
 		TickMax         int             `yaml:"max_ticks"`        // cap for the dynamic allowance; 0 = no cap
 		DepthMinMult    float64         `yaml:"depth_min_mult"`   // depth multiple below which allowance widens
 		DepthMaxScale   float64         `yaml:"depth_max_scale"`  // max multiplier on thin books
+		TopUpBps        float64         `yaml:"topup_bps"`        // step-completion price allowance; 0 = disabled
 		AdaptiveLatency AdaptiveLatency `yaml:"adaptive_latency"` // volatility window follows measured leg latency
 	} `yaml:"execution"`
 	Adaptive struct {
@@ -479,6 +480,9 @@ func (c *Config) validate() error {
 	}
 	if c.Execution.DepthMaxScale < 1 {
 		return fmt.Errorf("execution.depth_max_scale must be >= 1")
+	}
+	if c.Execution.TopUpBps < 0 {
+		return fmt.Errorf("execution.topup_bps must be >= 0")
 	}
 	if c.Execution.AdaptiveLatency.Enabled {
 		al := c.Execution.AdaptiveLatency

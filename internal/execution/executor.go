@@ -37,6 +37,11 @@ type Config struct {
 	// EmergencyMarketBps bounds the protective market price of an emergency
 	// unwind (liquidation-risk flatten), wider than the normal rescue bound.
 	EmergencyMarketBps float64
+	// TopUpBps caps the price allowance of the step-completion order that
+	// restores a partially filled opening leg to the full step size. The
+	// completion is attempted once; failure falls back to shrinking the
+	// over-filled leg. 0 disables completion.
+	TopUpBps float64
 }
 
 // DefaultConfig values.
@@ -44,7 +49,7 @@ func DefaultConfig() Config {
 	return Config{AckTimeout: 3 * time.Second, QueryRetries: 3, QueryInterval: time.Second,
 		SettleDelay: 700 * time.Millisecond, RescueInterval: 400 * time.Millisecond,
 		RescueAlertAfter: 10 * time.Second, Rescue: DefaultRescue, PriceTicks: 30,
-		TickK: 2.5, TickMin: 1, DepthMinMult: 5, DepthMaxScale: 4, EmergencyMarketBps: 100}
+		TickK: 2.5, TickMin: 1, DepthMinMult: 5, DepthMaxScale: 4, EmergencyMarketBps: 100, TopUpBps: 25}
 }
 
 // LegSpec is one side of a hedged action.
@@ -87,11 +92,18 @@ type Result struct {
 	Err             error   // cancellation, unavailable positions, or an unresolved order
 	pending         *pendingRescue
 	unconfirmed     []pendingRescue // full position-inferred batches still lacking terminal reports
+	topUp           *topUpState     // step-completion order on the under-filled leg
 	targetL         float64
 	targetR         float64
 	targetsKnown    bool
 	rescue          RescueParams
 	emergency       bool
+}
+
+// topUpState retains the step-completion order for recovery.
+type topUpState struct {
+	req    domain.OrderReq
+	result LegResult
 }
 
 // pendingRescue retains a submitted batch until its terminal outcomes and
@@ -228,9 +240,34 @@ func (e *Executor) ExecuteBounded(ctx context.Context, l, r LegSpec, qty float64
 		return res
 	}
 	res.SettlementKnown = true
+	if !reduceOnly && e.cfg.TopUpBps > 0 {
+		completed, terr := e.completeStep(ctx, l, r, qty, beforeL, beforeR, pl, pr, &res)
+		if terr != nil {
+			res.Err = terr
+			return res
+		}
+		if completed {
+			// The completion changed one leg; re-read authoritative positions.
+			pl2, pr2, perr := e.positions(ctx, l, r)
+			if perr != nil {
+				res.Err = perr
+				return res
+			}
+			pl, pr = pl2, pr2
+			res.PosL, res.PosR = pl, pr
+		}
+	}
 	// Keep only a hedge representable on both markets. Reducing both legs is
 	// necessary when a fine-precision partial fill leaves dust on the coarse leg.
 	tl, tr := hedgeTargets(pl, pr, l.Inst, r.Inst)
+	if flat, ferr := e.unwindSmallResidual(l, r, tl, tr, pl, pr); ferr != nil {
+		res.Err = ferr
+		return res
+	} else if flat {
+		// The residual cannot be traded on either leg: unwind the whole step
+		// to zero, where every reduction equals a full position size.
+		tl, tr = 0, 0
+	}
 	res.targetL, res.targetR, res.targetsKnown = tl, tr, true
 	res.Err = e.flatten(ctx, l, r, tl, tr, &res, e.cfg.Rescue)
 	return res
@@ -251,6 +288,24 @@ func (e *Executor) ResolveOutstanding(ctx context.Context, l, r LegSpec, res Res
 	}
 	if res.emergency {
 		return e.ResolveFlattenToZero(ctx, l, r, res)
+	}
+	if res.topUp != nil && !res.topUp.result.Resolved {
+		leg := l
+		if res.topUp.req.Inst.MarketID == r.Inst.MarketID && res.topUp.req.Side == r.Side {
+			leg = r
+		}
+		res.topUp.result = e.queryExisting(ctx, res.topUp.req, leg.Venue, res.topUp.result)
+		if res.topUp.result.Resolved && res.topUp.result.Filled > 0 {
+			if leg.Inst.MarketID == l.Inst.MarketID && leg.Side == l.Side {
+				mergeTopUp(&res.L, res.topUp.result)
+			} else {
+				mergeTopUp(&res.R, res.topUp.result)
+			}
+		}
+	}
+	if res.topUp != nil && !res.topUp.result.Resolved {
+		res.Err = fmt.Errorf("%w: completion order %d unresolved", ErrUnresolved, res.topUp.req.ClientID)
+		return res
 	}
 	// Work on a private batch copy so an older Result remains a valid snapshot.
 	if res.pending != nil {
@@ -298,6 +353,11 @@ func OrdersTerminal(res Result) bool {
 	}
 	for i := range res.unconfirmed {
 		if !batchTerminal(&res.unconfirmed[i]) {
+			return false
+		}
+	}
+	if res.topUp != nil {
+		if !terminalOrder(res.topUp.req, res.topUp.result) {
 			return false
 		}
 	}
@@ -431,6 +491,129 @@ func hedgeTargets(pl, pr float64, a, b domain.Instrument) (float64, float64) {
 		q = -q
 	}
 	return q, -q
+}
+
+// legMinQty is the smallest tradable quantity on one leg at the given price,
+// derived from the venue's minimum base size and minimum order notional.
+func legMinQty(inst domain.Instrument, price float64) float64 {
+	m := inst.MinBase
+	if price > 0 {
+		if q := inst.MinQuote / price; q > m {
+			m = q
+		}
+	}
+	if m < 0 {
+		return 0
+	}
+	return m
+}
+
+// completeStep tops up the under-filled leg of an opening when exactly one
+// leg filled short of the requested quantity. A single IOC completes the
+// step; any failure falls back to the ordinary shrink path. The completion
+// price is the decision price widened by at most TopUpBps in the aggressive
+// direction, so chasing the book is hard-bounded.
+func (e *Executor) completeStep(ctx context.Context, l, r LegSpec, qty, beforeL, beforeR, pl, pr float64, res *Result) (bool, error) {
+	dl := float64(l.Side) * (pl - beforeL)
+	dr := float64(r.Side) * (pr - beforeR)
+	epsL := math.Pow10(-l.Inst.SizeDecimals) / 2
+	epsR := math.Pow10(-r.Inst.SizeDecimals) / 2
+	var short LegSpec
+	var s float64
+	switch {
+	case dl < qty-epsL && dr >= qty-epsR:
+		short, s = l, qty-dl
+	case dr < qty-epsR && dl >= qty-epsL:
+		short, s = r, qty-dr
+	default:
+		return false, nil // both legs full, or both short: shrink aligns them
+	}
+	if s <= 0 || s < legMinQty(short.Inst, short.Price) {
+		return false, nil // below the venue minimum: cannot complete
+	}
+	s = domain.Round(s, short.Inst.SizeDecimals)
+	if s <= 0 || s < legMinQty(short.Inst, short.Price) {
+		return false, nil
+	}
+	req := domain.OrderReq{
+		ClientID: e.ids.Next(), Inst: short.Inst, Side: short.Side, Qty: s,
+		Price: topUpPrice(short, e.cfg.TopUpBps), Type: domain.Limit, ReduceOnly: false,
+	}
+	up := e.submitAndResolve(ctx, req, short.Venue)
+	res.topUp = &topUpState{req: req, result: up}
+	if !up.Resolved {
+		res.SettlementKnown = false
+		return false, fmt.Errorf("%w: completion order %d unresolved", ErrUnresolved, req.ClientID)
+	}
+	if up.Filled <= 0 {
+		return false, nil // rejected or empty: fall back to shrinking
+	}
+	if short.Inst.MarketID == l.Inst.MarketID && short.Side == l.Side {
+		mergeTopUp(&res.L, up)
+	} else {
+		mergeTopUp(&res.R, up)
+	}
+	return true, nil
+}
+
+// topUpPrice widens the decision price by bps in the aggressive direction and
+// rounds in the tightening direction so the bound is never exceeded.
+func topUpPrice(leg LegSpec, bps float64) float64 {
+	px := leg.Price
+	if leg.Side == domain.Buy {
+		px *= 1 + bps/1e4
+		px = domain.Floor(px, leg.Inst.PriceDecimals)
+	} else {
+		px *= 1 - bps/1e4
+		px = domain.Ceil(px, leg.Inst.PriceDecimals)
+	}
+	if px <= 0 || math.IsNaN(px) || math.IsInf(px, 0) {
+		return boundPrice(leg)
+	}
+	return px
+}
+
+// mergeTopUp folds completion fills into the leg's cumulative fill facts.
+func mergeTopUp(leg *LegResult, up LegResult) {
+	if up.Filled <= 0 || up.AvgPrice <= 0 {
+		return
+	}
+	total := leg.Filled + up.Filled
+	leg.AvgPrice = (leg.AvgPrice*leg.Filled + up.AvgPrice*up.Filled) / total
+	leg.Filled = total
+	leg.PriceEstimated = leg.PriceEstimated || up.PriceEstimated
+}
+
+// unwindSmallResidual reports whether reaching the aligned hedge target would
+// require a reduction below one leg's venue minimum. Such dust cannot be
+// traded: the caller unwinds the whole step to zero, where every reduction
+// equals a full position. If even a full position is below its venue minimum,
+// no order can repair the account and an explicit error is returned.
+func (e *Executor) unwindSmallResidual(l, r LegSpec, tl, tr, pl, pr float64) (bool, error) {
+	legs := [2]LegSpec{l, r}
+	pos := [2]float64{pl, pr}
+	tgt := [2]float64{tl, tr}
+	stuck := false
+	for i := range legs {
+		need := pos[i] - tgt[i]
+		if math.Abs(need) < math.Pow10(-legs[i].Inst.SizeDecimals)/2 {
+			continue
+		}
+		if math.Abs(need) < legMinQty(legs[i].Inst, legs[i].Price) {
+			stuck = true
+		}
+	}
+	if !stuck {
+		return false, nil
+	}
+	for i := range legs {
+		if math.Abs(pos[i]) >= math.Pow10(-legs[i].Inst.SizeDecimals)/2 &&
+			math.Abs(pos[i]) < legMinQty(legs[i].Inst, legs[i].Price) {
+			return false, fmt.Errorf("residual position %.8f on %s below venue minimum %.8f: manual intervention required",
+				pos[i], legs[i].Venue.Name(), legMinQty(legs[i].Inst, legs[i].Price))
+		}
+	}
+	return true, nil
 }
 
 func pause(ctx context.Context, d time.Duration) error {
@@ -913,6 +1096,9 @@ func (e *Executor) flatten(ctx context.Context, l, r LegSpec, targetL, targetR f
 			px, typ := RescuePrice(rescue, attempt, b, side, leg.Inst.PriceDecimals)
 			if px <= 0 || math.IsNaN(px) || math.IsInf(px, 0) {
 				return fmt.Errorf("invalid rescue price on %s", leg.Venue.Name())
+			}
+			if minQ := legMinQty(leg.Inst, px); q < minQ {
+				return fmt.Errorf("rescue quantity %.8f below venue minimum %.8f on %s", q, minQ, leg.Venue.Name())
 			}
 			reqs[i] = domain.OrderReq{ClientID: e.ids.Next(), Inst: leg.Inst, Side: side, Qty: q, Price: px, Type: typ, ReduceOnly: true}
 		}

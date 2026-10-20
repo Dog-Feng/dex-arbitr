@@ -95,6 +95,7 @@ execution:
   max_ticks: 0         # 0 = no upper clamp
   depth_min_mult: 5    # depth multiple below which the allowance widens
   depth_max_scale: 4   # max multiplier on thin books
+  topup_bps: 25        # step-completion price allowance after a partial fill; 0 = disabled
   adaptive_latency:    # volatility window follows measured leg latency
     enabled: true     # false = fixed volatility.horizon
     min_samples: 8     # cold start: fixed window below this count

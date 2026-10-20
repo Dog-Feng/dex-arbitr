@@ -50,6 +50,7 @@ func ExecutionConfig(c *config.Config) execution.Config {
 	ec.TickMax = c.Execution.TickMax
 	ec.DepthMinMult = c.Execution.DepthMinMult
 	ec.DepthMaxScale = c.Execution.DepthMaxScale
+	ec.TopUpBps = c.Execution.TopUpBps
 	ec.EmergencyMarketBps = c.Risk.EmergencyMarketBps
 	return ec
 }

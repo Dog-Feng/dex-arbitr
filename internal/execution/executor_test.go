@@ -86,9 +86,17 @@ func testExec(t *testing.T, l, r *fakeVenue) *Executor {
 	}
 	t.Cleanup(tr.Close)
 	cfg := DefaultConfig()
+	cfg.TopUpBps = 0 // legacy fixtures assume the pre-completion behavior
 	cfg.AckTimeout, cfg.QueryInterval, cfg.SettleDelay, cfg.RescueInterval = 50*time.Millisecond, 10*time.Millisecond, time.Millisecond, time.Millisecond
 	bk := domain.Book{Bids: []domain.Level{{Price: 100, Size: 1}}, Asks: []domain.Level{{Price: 100.1, Size: 1}}}
 	return NewExecutor(cfg, tr, NewIDGen(), func(string, int) (domain.Book, bool) { return bk, true }, nil, nil, func(string) {})
+}
+
+// topUpExec enables step completion for tests of the completion paths.
+func topUpExec(t *testing.T, l, r *fakeVenue) *Executor {
+	e := testExec(t, l, r)
+	e.cfg.TopUpBps = 25
+	return e
 }
 
 func full(_ int, r domain.OrderReq) float64 { return r.Qty }
@@ -239,5 +247,135 @@ func TestSilentVenueInferredFromPositions(t *testing.T) {
 	res := e.Execute(context.Background(), LegSpec{l, inst, domain.Buy, 100.1}, LegSpec{r, inst, domain.Sell, 100}, 0.01, false, 0, 0)
 	if res.L.Resolved || res.L.Filled != 0.01 || res.RescueOrders != 0 {
 		t.Fatalf("%+v", res)
+	}
+}
+
+// topUpInst carries a venue minimum that allows completing a 0.007 shortfall
+// at price ~100.
+var topUpInst = domain.Instrument{MarketID: 1, SizeDecimals: 4, PriceDecimals: 2, MinQuote: 0.5}
+
+func TestTopUpCompletesPartialOpen(t *testing.T) {
+	lv := newFake("L", full)
+	rv := newFake("R", func(n int, r domain.OrderReq) float64 {
+		if n == 0 {
+			return 0.013 // first leg partially fills
+		}
+		return r.Qty // the completion order fills fully
+	})
+	e := topUpExec(t, lv, rv)
+	res := e.Execute(context.Background(),
+		LegSpec{Venue: lv, Inst: topUpInst, Side: domain.Buy, Price: 100},
+		LegSpec{Venue: rv, Inst: topUpInst, Side: domain.Sell, Price: 101}, 0.02, false, 0, 0)
+	if res.Err != nil || !res.PositionsKnown || !res.SettlementKnown {
+		t.Fatalf("unsettled: %+v", res)
+	}
+	requireQty(t, res.PosL, 0.02)
+	requireQty(t, res.PosR, -0.02)
+	if res.RescueOrders != 0 {
+		t.Fatalf("step not completed: %+v", res)
+	}
+	if res.R.Filled != 0.02 {
+		t.Fatalf("R fills not merged: %+v", res.R)
+	}
+	if len(rv.orders) != 2 || rv.orders[1].Side != domain.Sell || rv.orders[1].ReduceOnly {
+		t.Fatalf("top-up orders %+v", rv.orders)
+	}
+	requireQty(t, rv.orders[1].Qty, 0.007)
+}
+
+func TestTopUpRejectedFallsBackToShrink(t *testing.T) {
+	lv := newFake("L", full)
+	rv := newFake("R", func(n int, r domain.OrderReq) float64 {
+		if n == 0 {
+			return 0.013
+		}
+		return 0 // completion rejected
+	})
+	e := topUpExec(t, lv, rv)
+	res := e.Execute(context.Background(),
+		LegSpec{Venue: lv, Inst: topUpInst, Side: domain.Buy, Price: 100},
+		LegSpec{Venue: rv, Inst: topUpInst, Side: domain.Sell, Price: 101}, 0.02, false, 0, 0)
+	if res.Err != nil {
+		t.Fatalf("shrink fallback failed: %+v", res)
+	}
+	requireQty(t, res.PosL, 0.013)
+	requireQty(t, res.PosR, -0.013)
+	if res.RescueOrders != 1 {
+		t.Fatalf("expected one shrink order, got %+v", res)
+	}
+}
+
+func TestTopUpSkippedBelowVenueMinimumShrinks(t *testing.T) {
+	// R's minimum (0.009) blocks a 0.007 top-up, while L's minimum (0.005)
+	// still allows shrinking L by 0.007.
+	instL := domain.Instrument{MarketID: 1, SizeDecimals: 4, PriceDecimals: 2, MinQuote: 0.5}
+	instR := domain.Instrument{MarketID: 1, SizeDecimals: 4, PriceDecimals: 2, MinQuote: 0.9}
+	lv := newFake("L", full)
+	rv := newFake("R", func(n int, r domain.OrderReq) float64 {
+		if n == 0 {
+			return 0.013
+		}
+		return r.Qty
+	})
+	e := topUpExec(t, lv, rv)
+	res := e.Execute(context.Background(),
+		LegSpec{Venue: lv, Inst: instL, Side: domain.Buy, Price: 100},
+		LegSpec{Venue: rv, Inst: instR, Side: domain.Sell, Price: 101}, 0.02, false, 0, 0)
+	if res.Err != nil || res.RescueOrders != 1 {
+		t.Fatalf("expected shrink: %+v", res)
+	}
+	requireQty(t, res.PosL, 0.013)
+	requireQty(t, res.PosR, -0.013)
+}
+
+func TestStickyResidualUnwindsWholeStep(t *testing.T) {
+	// Shortfall 0.007 and shrink 0.007 both below min 0.009: neither order is
+	// possible, so the whole step unwinds to zero.
+	instQ := domain.Instrument{MarketID: 1, SizeDecimals: 4, PriceDecimals: 2, MinQuote: 0.9}
+	lv := newFake("L", full)
+	rv := newFake("R", func(n int, r domain.OrderReq) float64 {
+		if n == 0 {
+			return 0.013
+		}
+		return r.Qty
+	})
+	e := topUpExec(t, lv, rv)
+	res := e.Execute(context.Background(),
+		LegSpec{Venue: lv, Inst: instQ, Side: domain.Buy, Price: 100},
+		LegSpec{Venue: rv, Inst: instQ, Side: domain.Sell, Price: 101}, 0.02, false, 0, 0)
+	if res.Err != nil || res.PosL != 0 || res.PosR != 0 {
+		t.Fatalf("expected full unwind: %+v", res)
+	}
+	if res.RescueOrders != 2 {
+		t.Fatalf("expected two unwind orders, got %+v", res)
+	}
+}
+
+func TestSubMinPositionRequiresIntervention(t *testing.T) {
+	// The short leg itself is below the venue minimum and cannot be traded.
+	instQ := domain.Instrument{MarketID: 1, SizeDecimals: 4, PriceDecimals: 2, MinQuote: 0.9}
+	lv := newFake("L", full)
+	rv := newFake("R", func(n int, r domain.OrderReq) float64 {
+		if n == 0 {
+			return 0.008
+		}
+		return r.Qty
+	})
+	e := topUpExec(t, lv, rv)
+	res := e.Execute(context.Background(),
+		LegSpec{Venue: lv, Inst: instQ, Side: domain.Buy, Price: 100},
+		LegSpec{Venue: rv, Inst: instQ, Side: domain.Sell, Price: 101}, 0.012, false, 0, 0)
+	if res.Err == nil {
+		t.Fatalf("expected manual-intervention error, got %+v", res)
+	}
+}
+
+func TestTopUpPriceBounds(t *testing.T) {
+	i := domain.Instrument{PriceDecimals: 2}
+	if got := topUpPrice(LegSpec{Inst: i, Side: domain.Buy, Price: 100}, 25); got != 100.25 {
+		t.Fatalf("buy top-up price %v", got)
+	}
+	if got := topUpPrice(LegSpec{Inst: i, Side: domain.Sell, Price: 100}, 25); got != 99.75 {
+		t.Fatalf("sell top-up price %v", got)
 	}
 }

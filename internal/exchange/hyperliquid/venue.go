@@ -266,7 +266,7 @@ func (v *Venue) Instruments(ctx context.Context) ([]domain.Instrument, error) {
 		out = append(out, domain.Instrument{
 			Venue: v.cfg.Name, Symbol: sym, MarketID: id,
 			SizeDecimals: m.SzDecimals, PriceDecimals: priceDecimals,
-			MinBase: 0, MinQuote: 0, TakerFee: taker, MakerFee: maker,
+			MinBase: 0, MinQuote: 10, TakerFee: taker, MakerFee: maker,
 		})
 	}
 	return out, nil

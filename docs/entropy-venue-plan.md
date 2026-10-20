@@ -203,6 +203,15 @@ Entropy 专有 API**。对接直接使用 Hyperliquid 标准 API/SDK（REST + WS
   致命错误（2026-10-20 实盘曾因此 PAUSED 并悬置仓位 4.5 小时）。请求量来源：
   Submit 时的取整数量、WS orderUpdates 的 `origSz`、REST orderStatus 的
   `origSz`。注意：FILLED 但成交事实缺失（qty=0）仍保持非终态，不做归一化。
+- **部分成交后的三级处理（executor）**：开仓单腿部分成交时，
+  1) 若短差 ≥ 两腿最小可交易量且补单价在 `execution.topup_bps`（默认 25 bps）
+  硬上限内，短腿同方向补一单把整步补全（只试一次，失败回退）；
+  2) 补不了但缩腿量可交易 → 缩长腿（原有行为）；
+  3) 缩腿量也低于任一腿的最小值 → 整步强平到零（每一步减仓量=完整仓位，
+  必然可交易）；若某条腿的完整仓位本身低于最小值，返回显式错误并告警
+  （等待人工处理）。flatten 对低于 venue 最小值的减仓量直接报错，不再无限
+  重试。配套：hyperliquid Instruments 的 `MinQuote=10`（HL 最低订单额），
+  使数量校验与最小可交易量计算知道该下限。
 
 ## 4. 验收标准
 
