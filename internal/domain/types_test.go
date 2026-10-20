@@ -39,6 +39,27 @@ func TestDecimalRoundingDirections(t *testing.T) {
 	}
 }
 
+func TestInstrumentTickAt(t *testing.T) {
+	hl := Instrument{PriceDecimals: 3, SigFigs: 5}
+	for _, tc := range []struct {
+		px   float64
+		want float64
+	}{
+		{1960, 0.1},
+		{19.6, 0.001},
+		{101234.5, 1},
+		{0, 0.001},
+	} {
+		if got := hl.TickAt(tc.px); got != tc.want {
+			t.Fatalf("TickAt(%v) = %v, want %v", tc.px, got, tc.want)
+		}
+	}
+	lighter := Instrument{PriceDecimals: 2}
+	if got := lighter.TickAt(1960); got != 0.01 {
+		t.Fatalf("unconstrained venue tick = %v", got)
+	}
+}
+
 func TestDecimalRoundingFloatLimits(t *testing.T) {
 	for _, tc := range []struct {
 		name        string

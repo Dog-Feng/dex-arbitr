@@ -55,6 +55,7 @@ risk:
   position_refresh: 15s       # liquidation price refresh interval
   emergency_market_bps: 100   # protective bound of the emergency market unwind
   max_notional: 0             # per-venue aggregate notional cap (USD); 0 = unlimited
+  max_auto_resume_per_day: 1  # external-intervention auto-resumes per 24h; 0 = default (1)
 
 strategy:
   kind: volume           # arbitrage | volume (registered strategies)

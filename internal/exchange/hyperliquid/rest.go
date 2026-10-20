@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -21,11 +22,54 @@ const defaultExchangeURL = "https://api.hyperliquid.xyz/exchange"
 type restClient struct {
 	infoURL     string
 	exchangeURL string
-	client      *http.Client
+	infoClient  *http.Client
+	sendClient  *http.Client
+
+	rateMu       sync.Mutex
+	lastRateTime time.Time
 }
 
 func newRestClient(infoURL, exchangeURL string) *restClient {
-	return &restClient{infoURL: infoURL, exchangeURL: exchangeURL, client: &http.Client{Timeout: 10 * time.Second}}
+	// Info reads (meta, clearinghouse) tolerate a longer timeout; signed
+	// action sends stay short so a cancel is never queued behind a slow
+	// order for long.
+	return &restClient{
+		infoURL:     infoURL,
+		exchangeURL: exchangeURL,
+		infoClient:  &http.Client{Timeout: 10 * time.Second},
+		sendClient:  &http.Client{Timeout: 5 * time.Second},
+	}
+}
+
+// httpStatusError distinguishes HTTP-level failures from transport failures so
+// callers can classify rate limiting (429) as a definitive non-execution.
+type httpStatusError struct {
+	code int
+}
+
+func (e *httpStatusError) Error() string { return fmt.Sprintf("http %d", e.code) }
+
+func httpStatus(code int) error { return &httpStatusError{code: code} }
+
+func (r *restClient) waitRateLimit(ctx context.Context) error {
+	r.rateMu.Lock()
+	defer r.rateMu.Unlock()
+	if d := 500*time.Millisecond - time.Since(r.lastRateTime); d > 0 {
+		timer := time.NewTimer(d)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return nil
+}
+
+func (r *restClient) noteRateLimit() {
+	r.rateMu.Lock()
+	r.lastRateTime = time.Now()
+	r.rateMu.Unlock()
 }
 
 func validURL(s string, allowWS bool) bool {
@@ -50,7 +94,7 @@ func (r *restClient) postInfo(ctx context.Context, req map[string]any) (json.Raw
 		return nil, fmt.Errorf("info request: %w", err)
 	}
 	hreq.Header.Set("Content-Type", "application/json")
-	resp, err := r.client.Do(hreq)
+	resp, err := r.infoClient.Do(hreq)
 	if err != nil {
 		return nil, fmt.Errorf("info: %w", err)
 	}
@@ -60,7 +104,7 @@ func (r *restClient) postInfo(ctx context.Context, req map[string]any) (json.Raw
 		return nil, fmt.Errorf("info response: %w", err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("info: http %d", resp.StatusCode)
+		return nil, fmt.Errorf("info: %w", httpStatus(resp.StatusCode))
 	}
 	return raw, nil
 }
@@ -195,6 +239,9 @@ type userFill struct {
 	Time  int64       `json:"time"`
 	Oid   json.Number `json:"oid"`
 	Cloid string      `json:"cloid"`
+	Tid   int64       `json:"tid"`
+	Hash  string      `json:"hash"`
+	Fee   json.Number `json:"fee"`
 }
 
 // fillsByTime returns fills in the half-open window [start, end].
@@ -216,6 +263,10 @@ type exchangeRequest struct {
 	Action    map[string]any `json:"action"`
 	Nonce     uint64         `json:"nonce"`
 	Signature signature      `json:"signature"`
+	// ExpiresAfter is the ms timestamp after which the exchange rejects the
+	// action instead of executing it, giving timeout recovery a definitive
+	// conclusion. 0 = never expires (kept for actions that do not support it).
+	ExpiresAfter uint64 `json:"expiresAfter,omitempty"`
 }
 
 // orderStatusEntry is one per-order outcome in the exchange response.
@@ -258,12 +309,15 @@ func (r *restClient) send(ctx context.Context, req exchangeRequest) (exchangeRes
 	if err != nil {
 		return exchangeResponse{}, fmt.Errorf("encode action: %w", err)
 	}
+	if err := r.waitRateLimit(ctx); err != nil {
+		return exchangeResponse{}, err
+	}
 	hreq, err := http.NewRequestWithContext(ctx, http.MethodPost, r.exchangeURL, bytes.NewReader(body))
 	if err != nil {
 		return exchangeResponse{}, fmt.Errorf("exchange request: %w", err)
 	}
 	hreq.Header.Set("Content-Type", "application/json")
-	resp, err := r.client.Do(hreq)
+	resp, err := r.sendClient.Do(hreq)
 	if err != nil {
 		return exchangeResponse{}, fmt.Errorf("exchange: %w", err)
 	}
@@ -273,7 +327,10 @@ func (r *restClient) send(ctx context.Context, req exchangeRequest) (exchangeRes
 		return exchangeResponse{}, fmt.Errorf("exchange response: %w", err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return exchangeResponse{}, fmt.Errorf("exchange: http %d", resp.StatusCode)
+		if resp.StatusCode == http.StatusTooManyRequests {
+			r.noteRateLimit()
+		}
+		return exchangeResponse{}, fmt.Errorf("exchange: %w", httpStatus(resp.StatusCode))
 	}
 	var out exchangeResponse
 	if err := json.Unmarshal(raw, &out); err != nil {

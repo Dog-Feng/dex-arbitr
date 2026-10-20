@@ -10,6 +10,8 @@ Currently integrated venues: **Lighter mainnet** (`kind: lighter`, chain 304) an
 升级时请保留完整 `state_dir` 与配置，并注意：
 
 - 同一状态目录只允许一个写入进程；停止信号保存状态，不承诺自动平仓。
+- Hyperliquid 签名 nonce 由本地单调时钟生成：同一 agent key 不得被多个进程共用
+  （含测试与实盘并行），否则 nonce 冲突会让部分签名被交易所拒绝。
 - 尽量在订单和补救均已确认后升级。未决 checkpoint 即使步骤为空，重启仍保持 `PAUSED`，需核实交易所订单和两边仓位后再处理恢复。
 - 旧状态缺少入场价格会暂停普通交易；历史费用或成交价格不确定时，会把 state 文件里的 `pnl_uncertain` 标记置位（仅作审计痕迹，不再作为开仓闸门），减仓与应急退出仍受确认条件保护。
 

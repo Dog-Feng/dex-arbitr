@@ -35,6 +35,7 @@ type Instrument struct {
 	MarketID      int
 	SizeDecimals  int
 	PriceDecimals int
+	SigFigs       int // max significant figures for prices; 0 = no constraint
 	MinBase       float64
 	MinQuote      float64
 	TakerFee      float64
@@ -43,6 +44,25 @@ type Instrument struct {
 
 // Tick is the minimal price increment.
 func (i Instrument) Tick() float64 { return math.Pow10(-i.PriceDecimals) }
+
+// TickAt returns the smallest price increment actually available at price px.
+// Venues that restrict prices to SigFigs significant figures (Hyperliquid: 5)
+// trade on a coarser grid for large prices; the integer grid always remains
+// available, so the grid never exceeds 1.
+func (i Instrument) TickAt(px float64) float64 {
+	t := math.Pow10(-i.PriceDecimals)
+	if i.SigFigs <= 0 || px <= 0 || math.IsNaN(px) || math.IsInf(px, 0) {
+		return t
+	}
+	exp := int(math.Floor(math.Log10(px))) - (i.SigFigs - 1)
+	if exp > 0 {
+		exp = 0
+	}
+	if s := math.Pow10(exp); s > t {
+		t = s
+	}
+	return t
+}
 
 // Level is one price level.
 type Level struct {
@@ -116,6 +136,7 @@ type OrderUpdate struct {
 	Status      OrderStatus
 	FilledQty   float64
 	FilledQuote float64
+	Fee         float64 // exchange-reported fee of the filled portion; 0 = unknown
 	Reason      string
 	Ts          time.Time
 }

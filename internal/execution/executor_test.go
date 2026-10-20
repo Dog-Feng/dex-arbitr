@@ -21,6 +21,7 @@ type fakeVenue struct {
 	n          int
 	silent     bool // never emit WS events (forces fallback)
 	reduceCap  bool // reduce-only fills are capped at the remaining position
+	manualPos  bool // fills do not move the position; tests drive it via posBump
 	reads      int
 	bumpAtRead int
 	posBump    float64
@@ -62,7 +63,9 @@ func (f *fakeVenue) Submit(_ context.Context, r domain.OrderReq) (domain.SubmitA
 	if q < r.Qty {
 		st = domain.StatusCanceled
 	}
-	f.pos += float64(r.Side) * q
+	if !f.manualPos {
+		f.pos += float64(r.Side) * q
+	}
 	f.mu.Unlock()
 	if !f.silent {
 		f.ch <- domain.OrderUpdate{Venue: f.name, ClientID: r.ClientID, Status: st, FilledQty: q, FilledQuote: q * r.Price}
@@ -110,6 +113,14 @@ func testExec(t *testing.T, l, r *fakeVenue) *Executor {
 func topUpExec(t *testing.T, l, r *fakeVenue) *Executor {
 	e := testExec(t, l, r)
 	e.cfg.TopUpBps = 25
+	return e
+}
+
+// topUpExecBook additionally sets a completion-friendly book, since the
+// completion price now checks the current opposite side.
+func topUpExecBook(t *testing.T, l, r *fakeVenue, book domain.Book) *Executor {
+	e := topUpExec(t, l, r)
+	e.book = func(string, int) (domain.Book, bool) { return book, true }
 	return e
 }
 
@@ -170,7 +181,7 @@ func TestDepthTicks(t *testing.T) {
 func TestBothFilled(t *testing.T) {
 	l, r := newFake("L", full), newFake("R", full)
 	e := testExec(t, l, r)
-	res := e.Execute(context.Background(), LegSpec{l, inst, domain.Buy, 100.1}, LegSpec{r, inst, domain.Sell, 100}, 0.01, false, 0, 0)
+	res := e.Execute(context.Background(), LegSpec{l, inst, domain.Buy, 100.1, 0}, LegSpec{r, inst, domain.Sell, 100, 0}, 0.01, false, 0, 0)
 	if res.L.Filled != 0.01 || res.R.Filled != 0.01 || res.RescueOrders != 0 || res.PosL != 0.01 || res.PosR != -0.01 {
 		t.Fatalf("%+v", res)
 	}
@@ -180,7 +191,7 @@ func TestOneLegFailsThenFlatten(t *testing.T) {
 	l := newFake("L", full)
 	r := newFake("R", func(int, domain.OrderReq) float64 { return 0 }) // R never fills
 	e := testExec(t, l, r)
-	res := e.Execute(context.Background(), LegSpec{l, inst, domain.Buy, 100.1}, LegSpec{r, inst, domain.Sell, 100}, 0.01, false, 0, 0)
+	res := e.Execute(context.Background(), LegSpec{l, inst, domain.Buy, 100.1, 0}, LegSpec{r, inst, domain.Sell, 100, 0}, 0.01, false, 0, 0)
 	if res.RescueOrders != 1 || res.PosL != 0 || res.PosR != 0 {
 		t.Fatalf("%+v", res)
 	}
@@ -200,7 +211,7 @@ func TestRescueEscalatesPrice(t *testing.T) {
 	})
 	r := newFake("R", func(int, domain.OrderReq) float64 { return 0 })
 	e := testExec(t, l, r)
-	res := e.Execute(context.Background(), LegSpec{l, inst, domain.Buy, 100.1}, LegSpec{r, inst, domain.Sell, 100}, 0.01, false, 0, 0)
+	res := e.Execute(context.Background(), LegSpec{l, inst, domain.Buy, 100.1, 0}, LegSpec{r, inst, domain.Sell, 100, 0}, 0.01, false, 0, 0)
 	if res.PosL != 0 || res.RescueOrders != 10 {
 		t.Fatalf("%+v", res)
 	}
@@ -229,7 +240,7 @@ func TestCloseCompletesLaggingLeg(t *testing.T) {
 	})
 	l.pos, r.pos = 0.01, -0.01
 	e := testExec(t, l, r)
-	res := e.Execute(context.Background(), LegSpec{l, inst, domain.Sell, 100}, LegSpec{r, inst, domain.Buy, 100.1}, 0.01, true, 0.01, -0.01)
+	res := e.Execute(context.Background(), LegSpec{l, inst, domain.Sell, 100, 0}, LegSpec{r, inst, domain.Buy, 100.1, 0}, 0.01, true, 0.01, -0.01)
 	if res.PosL != 0 || res.PosR != 0 || res.RescueOrders != 1 {
 		t.Fatalf("%+v", res)
 	}
@@ -255,7 +266,7 @@ func TestFlattenRecoversLateFillOnIdleLeg(t *testing.T) {
 	l.pos, r.pos = 0.01, -0.01
 	l.bumpAtRead, l.posBump = 2, -0.01
 	e := testExec(t, l, r)
-	res := e.Execute(context.Background(), LegSpec{l, inst, domain.Sell, 100}, LegSpec{r, inst, domain.Buy, 100.1}, 0.01, true, 0.01, -0.01)
+	res := e.Execute(context.Background(), LegSpec{l, inst, domain.Sell, 100, 0}, LegSpec{r, inst, domain.Buy, 100.1, 0}, 0.01, true, 0.01, -0.01)
 	if res.Err != nil || !res.SettlementKnown {
 		t.Fatalf("flatten should recover from the late fill: %+v", res)
 	}
@@ -284,7 +295,7 @@ func TestSilentVenueInferredFromPositions(t *testing.T) {
 	l, r := newFake("L", full), newFake("R", full)
 	l.silent = true
 	e := testExec(t, l, r)
-	res := e.Execute(context.Background(), LegSpec{l, inst, domain.Buy, 100.1}, LegSpec{r, inst, domain.Sell, 100}, 0.01, false, 0, 0)
+	res := e.Execute(context.Background(), LegSpec{l, inst, domain.Buy, 100.1, 0}, LegSpec{r, inst, domain.Sell, 100, 0}, 0.01, false, 0, 0)
 	if res.L.Resolved || res.L.Filled != 0.01 || res.RescueOrders != 0 {
 		t.Fatalf("%+v", res)
 	}
@@ -302,7 +313,12 @@ func TestTopUpCompletesPartialOpen(t *testing.T) {
 		}
 		return r.Qty // the completion order fills fully
 	})
-	e := topUpExec(t, lv, rv)
+	// R sells the completion; the book must stay inside the decision-price
+	// allowance for the completion to be worth placing.
+	e := topUpExecBook(t, lv, rv, domain.Book{
+		Bids: []domain.Level{{Price: 100.8, Size: 1}},
+		Asks: []domain.Level{{Price: 100.9, Size: 1}},
+	})
 	res := e.Execute(context.Background(),
 		LegSpec{Venue: lv, Inst: topUpInst, Side: domain.Buy, Price: 100},
 		LegSpec{Venue: rv, Inst: topUpInst, Side: domain.Sell, Price: 101}, 0.02, false, 0, 0)
@@ -474,11 +490,82 @@ func TestFlattenSubMinAtNonZeroTargetEscalates(t *testing.T) {
 }
 
 func TestTopUpPriceBounds(t *testing.T) {
+	e := NewExecutor(Config{TopUpBps: 25}, nil, nil, nil, nil, nil, nil)
 	i := domain.Instrument{PriceDecimals: 2}
-	if got := topUpPrice(LegSpec{Inst: i, Side: domain.Buy, Price: 100}, 25); got != 100.25 {
+	if got := e.topUpPrice(LegSpec{Inst: i, Side: domain.Buy, Price: 100}); got != 100.25 {
 		t.Fatalf("buy top-up price %v", got)
 	}
-	if got := topUpPrice(LegSpec{Inst: i, Side: domain.Sell, Price: 100}, 25); got != 99.75 {
+	if got := e.topUpPrice(LegSpec{Inst: i, Side: domain.Sell, Price: 100}); got != 99.75 {
 		t.Fatalf("sell top-up price %v", got)
+	}
+}
+
+// TestFeasibleReduceTarget verifies a close that leaves an untradable dust
+// residual searches to the nearest hedge both legs can still trade instead
+// of flattening the whole account.
+func TestFeasibleReduceTarget(t *testing.T) {
+	inst := domain.Instrument{MarketID: 1, SizeDecimals: 4, PriceDecimals: 2, MinQuote: 0.51}
+	e := NewExecutor(DefaultConfig(), nil, nil, nil, nil, nil, nil)
+	l, r := LegSpec{Inst: inst, Side: domain.Sell, Price: 100}, LegSpec{Inst: inst, Side: domain.Buy, Price: 100}
+	tl, tr := e.feasibleReduceTarget(l, r, -0.01, 0.014, -0.01, 0.01)
+	requireQty(t, tl, -0.0049)
+	requireQty(t, tr, 0.0049)
+	// A target that already trades is returned unchanged.
+	tl, tr = e.feasibleReduceTarget(l, r, -0.02, 0.02, -0.01, 0.01)
+	requireQty(t, tl, -0.01)
+	requireQty(t, tr, 0.01)
+}
+
+// TestTopUpVerifiesSettledPositions simulates a completion whose position
+// only appears on the venue after a delay: the executor must retry the read
+// instead of shrinking away the fill it just placed.
+func TestTopUpVerifiesSettledPositions(t *testing.T) {
+	lv := newFake("L", full)
+	rv := newFake("R", func(n int, r domain.OrderReq) float64 {
+		if n == 0 {
+			return 0.013
+		}
+		return r.Qty // the completion order fills fully
+	})
+	rv.manualPos = true
+	rv.pos = -0.013
+	rv.bumpAtRead = 3   // the first reads return the pre-completion position
+	rv.posBump = -0.007 // the completion lands on read 3
+	e := topUpExecBook(t, lv, rv, domain.Book{
+		Bids: []domain.Level{{Price: 100.8, Size: 1}},
+		Asks: []domain.Level{{Price: 100.9, Size: 1}},
+	})
+	res := e.Execute(context.Background(),
+		LegSpec{Venue: lv, Inst: topUpInst, Side: domain.Buy, Price: 100, EdgeBps: 0},
+		LegSpec{Venue: rv, Inst: topUpInst, Side: domain.Sell, Price: 101, EdgeBps: 0}, 0.02, false, 0, 0)
+	if res.Err != nil || !res.PositionsKnown || !res.SettlementKnown {
+		t.Fatalf("unsettled: %+v", res)
+	}
+	requireQty(t, res.PosL, 0.02)
+	requireQty(t, res.PosR, -0.02)
+	if res.RescueOrders != 0 {
+		t.Fatalf("stale read shrunk the completion: %+v", res)
+	}
+}
+
+// TestRescueLadderDistinctSigFigRungs verifies significant-figure venues get
+// one real grid step per ladder rung instead of collapsing onto the top.
+func TestRescueLadderDistinctSigFigRungs(t *testing.T) {
+	b := domain.Book{
+		Bids: []domain.Level{{Price: 1960.0, Size: 1}},
+		Asks: []domain.Level{{Price: 1960.1, Size: 1}},
+	}
+	inst := domain.Instrument{PriceDecimals: 3, SigFigs: 5}
+	p := RescueParams{TopTries: 0, MaxTicks: 5, MarketBps: 30}
+	seen := map[float64]bool{}
+	for attempt := 0; attempt < 5; attempt++ {
+		px, typ := RescuePrice(p, attempt, b, domain.Buy, inst)
+		if typ != domain.Limit {
+			t.Fatalf("unexpected order type %v", typ)
+		}
+		if seen[px] {
+			t.Fatalf("ladder rungs collapsed at %.4f", px)
+		}
+		seen[px] = true
 	}
 }

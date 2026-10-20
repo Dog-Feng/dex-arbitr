@@ -2,15 +2,28 @@ package hyperliquid
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
+	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Dog-Feng/dex-arbitr/internal/domain"
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
 )
+
+// cancelNothingLeft is the exchange's reply when canceling an order that has
+// already terminated. Treating it as success makes cancels idempotent.
+const cancelNothingLeft = "Order was never placed, already canceled, or filled."
+
+// submitExpiry returns the expiresAfter timestamp (ms) attached to signed
+// actions. An action that reaches the exchange after this instant is rejected
+// instead of executed, so a later timeout can be resolved definitively.
+func submitExpiry(now time.Time) uint64 { return uint64(now.Add(30 * time.Second).UnixMilli()) }
 
 // nonce returns a strictly increasing millisecond timestamp for signing.
 func (v *Venue) nonce() uint64 {
@@ -49,7 +62,7 @@ func (v *Venue) lockSend(ctx context.Context) error {
 
 // orderWire validates and renders the wire form of one order.
 func orderWire(r domain.OrderReq) (asset int, c string, price, size string, qty float64, err error) {
-	if r.Inst.MarketID <= 0 {
+	if r.Inst.MarketID < 0 {
 		return 0, "", "", "", 0, fmt.Errorf("%w: invalid market id", domain.ErrRejected)
 	}
 	if r.Side != domain.Buy && r.Side != domain.Sell {
@@ -95,6 +108,10 @@ func sigFigTighten(px float64, priceDecimals int, buy bool) float64 {
 	}
 	digits := int(math.Floor(math.Log10(px))) + 1
 	d := 5 - digits
+	if d < 0 {
+		// Prices above 100000 always trade on the integer grid.
+		d = 0
+	}
 	if d > priceDecimals {
 		d = priceDecimals
 	}
@@ -118,7 +135,8 @@ func (v *Venue) Submit(ctx context.Context, r domain.OrderReq) (domain.SubmitAck
 	}
 	defer func() { <-v.sendMu }()
 	nonce := v.nonce()
-	sig, err := v.signer.signOrder(asset, r.Side == domain.Buy, r.ReduceOnly, price, size, c, nonce)
+	expiresAfter := submitExpiry(time.Now())
+	sig, err := v.signer.signOrder(asset, r.Side == domain.Buy, r.ReduceOnly, price, size, c, nonce, expiresAfter)
 	if err != nil {
 		return domain.SubmitAck{}, fmt.Errorf("%w: sign: %v", domain.ErrRejected, err)
 	}
@@ -132,16 +150,27 @@ func (v *Venue) Submit(ctx context.Context, r domain.OrderReq) (domain.SubmitAck
 			}},
 			"grouping": "na",
 		},
-		Nonce:     nonce,
-		Signature: sig,
+		Nonce:        nonce,
+		Signature:    sig,
+		ExpiresAfter: expiresAfter,
 	})
 	if err != nil {
+		var hs *httpStatusError
+		if errors.As(err, &hs) && hs.code == http.StatusTooManyRequests {
+			slog.Warn("order rate limited; nothing executed", "venue", v.cfg.Name, "cid", r.ClientID)
+			return domain.SubmitAck{ClientID: r.ClientID}, fmt.Errorf("%w: rate limited", domain.ErrRejected)
+		}
 		slog.Warn("order send outcome unknown", "venue", v.cfg.Name, "cid", r.ClientID, "err", err)
 		return domain.SubmitAck{ClientID: r.ClientID}, err
 	}
 	statuses := resp.orderStatuses()
-	if resp.Status != "ok" || statuses == nil {
-		return domain.SubmitAck{ClientID: r.ClientID}, fmt.Errorf("exchange status %q: outcome unknown", resp.Status)
+	if resp.Status != "ok" {
+		// An action-level rejection means the order was definitively not
+		// executed; report it as rejected so the executor can roll back.
+		return domain.SubmitAck{ClientID: r.ClientID}, fmt.Errorf("%w: %s", domain.ErrRejected, rawResponse(resp))
+	}
+	if statuses == nil {
+		return domain.SubmitAck{ClientID: r.ClientID}, fmt.Errorf("unexpected response shape: outcome unknown")
 	}
 	if len(statuses) != 1 {
 		return domain.SubmitAck{ClientID: r.ClientID}, fmt.Errorf("unexpected status count %d: outcome unknown", len(statuses))
@@ -165,18 +194,25 @@ func (v *Venue) Submit(ctx context.Context, r domain.OrderReq) (domain.SubmitAck
 	v.ordersMu.Lock()
 	v.orderLookup[oid] = r.ClientID
 	v.orderOrig[oid] = qty
+	v.orderExpires[r.ClientID] = int64(expiresAfter)
+	v.knownCIDs[r.ClientID] = time.Now()
+	v.drainPending(oid)
 	if st.Filled != nil {
 		// An IOC that filled synchronously carries its exact fill. Publish the
 		// terminal update immediately so the executor does not wait for the
-		// user stream.
+		// user stream. The fill state keeps the synchronous total separate
+		// from per-trade fills so later deliveries of the same fills can only
+		// be deduplicated, never double counted.
 		filledQty, qtyErr := number(st.Filled.TotalSz)
 		avgPx, pxErr := number(st.Filled.AvgPx)
 		if qtyErr == nil && pxErr == nil && filledQty > 0 && avgPx > 0 {
-			v.fillAgg[oid] = fillAgg{qty: filledQty, quote: filledQty * avgPx}
-			v.orderFinal[oid] = partialIOC(domain.StatusFilled, filledQty, qty)
+			fs := v.fillState(oid)
+			fs.syncQty, fs.syncQuote = filledQty, filledQty*avgPx
+			effQty, effQuote, effFee := fs.effective()
+			v.orderFinal[oid] = partialIOC(domain.StatusFilled, effQty, qty)
 			v.publishOrder(domain.OrderUpdate{
 				Venue: v.cfg.Name, ClientID: r.ClientID, OrderIndex: oid,
-				Status: v.orderFinal[oid], FilledQty: filledQty, FilledQuote: filledQty * avgPx,
+				Status: v.orderFinal[oid], FilledQty: effQty, FilledQuote: effQuote, Fee: effFee,
 				Ts: time.Now(),
 			})
 		}
@@ -190,7 +226,7 @@ func (v *Venue) CancelOrder(ctx context.Context, inst domain.Instrument, clientI
 	if v.signer == nil || v.cfg.Account == "" {
 		return domain.ErrNoCredentials
 	}
-	if inst.MarketID <= 0 {
+	if inst.MarketID < 0 {
 		return fmt.Errorf("%w: invalid market id", domain.ErrRejected)
 	}
 	c, err := cloid(clientID)
@@ -202,7 +238,8 @@ func (v *Venue) CancelOrder(ctx context.Context, inst domain.Instrument, clientI
 	}
 	defer func() { <-v.sendMu }()
 	nonce := v.nonce()
-	sig, err := v.signer.signCancelByCloid(inst.MarketID, c, nonce)
+	expiresAfter := submitExpiry(time.Now())
+	sig, err := v.signer.signCancelByCloid(inst.MarketID, c, nonce, expiresAfter)
 	if err != nil {
 		return fmt.Errorf("%w: sign: %v", domain.ErrRejected, err)
 	}
@@ -211,20 +248,35 @@ func (v *Venue) CancelOrder(ctx context.Context, inst domain.Instrument, clientI
 			"type":    "cancelByCloid",
 			"cancels": []map[string]any{{"asset": inst.MarketID, "cloid": c}},
 		},
-		Nonce:     nonce,
-		Signature: sig,
+		Nonce:        nonce,
+		Signature:    sig,
+		ExpiresAfter: expiresAfter,
 	})
 	if err != nil {
+		var hs *httpStatusError
+		if errors.As(err, &hs) && hs.code == http.StatusTooManyRequests {
+			return fmt.Errorf("%w: rate limited", domain.ErrRejected)
+		}
 		slog.Warn("cancel send outcome unknown", "venue", v.cfg.Name, "cid", clientID, "err", err)
 		return err
 	}
 	if resp.Status != "ok" {
+		// An order that already terminated has nothing left to cancel; that
+		// is a successful idempotent cancel, not an error.
+		if strings.Contains(rawResponse(resp), cancelNothingLeft) {
+			slog.Debug("cancel of already-terminal order", "venue", v.cfg.Name, "cid", clientID)
+			return nil
+		}
 		return fmt.Errorf("cancelByCloid rejected: %s", rawResponse(resp))
 	}
 	// A cancel response lists per-order statuses. An explicit per-order error
-	// is surfaced; a missing order has nothing left to cancel and is fine.
+	// is surfaced except for the idempotent "already terminal" reply.
 	for _, st := range resp.orderStatuses() {
 		if st.Error != nil {
+			if strings.Contains(*st.Error, cancelNothingLeft) {
+				slog.Debug("cancel of already-terminal order", "venue", v.cfg.Name, "cid", clientID)
+				continue
+			}
 			return fmt.Errorf("cancelByCloid rejected: %s", *st.Error)
 		}
 	}
@@ -248,6 +300,14 @@ func (v *Venue) QueryOrder(ctx context.Context, inst domain.Instrument, clientID
 		return domain.OrderUpdate{}, err
 	}
 	if st.Status != "order" || st.Order == nil {
+		// unknownOid / error: an action that is now past its expiresAfter
+		// window was definitively rejected before execution.
+		if v.expiredOrder(clientID) {
+			return domain.OrderUpdate{
+				Venue: v.cfg.Name, ClientID: clientID, MarketID: inst.MarketID,
+				Status: domain.StatusRejected, Reason: "never placed, expired", Ts: time.Now(),
+			}, nil
+		}
 		return domain.OrderUpdate{Venue: v.cfg.Name, ClientID: clientID, MarketID: inst.MarketID, Status: domain.StatusUnknown}, nil
 	}
 	oid, err := strconv.ParseInt(st.Order.Order.Oid.String(), 10, 64)
@@ -265,13 +325,33 @@ func (v *Venue) QueryOrder(ctx context.Context, inst domain.Instrument, clientID
 	if origErr != nil || orig <= 0 {
 		orig = 0
 	}
-	var qty, quote float64
+	// The exchange's own view of the executed quantity: requested minus
+	// remaining. A canceled order's fill feed may not be indexed yet, in
+	// which case the trade facts must stay unresolved instead of reporting a
+	// zero-fill terminal.
+	exFilled := 0.0
+	if orig > 0 {
+		rem, remErr := number(st.Order.Order.Sz)
+		if remErr == nil && rem >= 0 && rem <= orig+1e-9 {
+			exFilled = orig - rem
+		}
+	}
+	var qty, quote, fee float64
 	ok := true
 	if status == domain.StatusFilled || status == domain.StatusCanceled {
-		qty, quote, ok = v.terminalFills(ctx, oid, st.Order.StatusTimestamp)
+		qty, quote, fee, ok = v.mergeFills(ctx, oid, st.Order.StatusTimestamp)
 	}
 	status = partialIOC(status, qty, orig)
-	if status == domain.StatusFilled && (!ok || qty <= 0) {
+	eps := 1e-9
+	if !ok && !(status == domain.StatusCanceled && exFilled <= eps) {
+		// The fill feed could not be read; only a zero-execution cancel is
+		// certain from the order status itself.
+		return domain.OrderUpdate{
+			Venue: v.cfg.Name, ClientID: clientID, OrderIndex: oid,
+			MarketID: inst.MarketID, Status: domain.StatusUnknown, Ts: time.Now(),
+		}, nil
+	}
+	if status == domain.StatusFilled && (qty <= 0 || qty < exFilled-eps) {
 		// The order is filled but the fill feed has not caught up. Report a
 		// non-terminal state; the executor infers fills from the position
 		// delta instead of trusting a zero.
@@ -280,9 +360,9 @@ func (v *Venue) QueryOrder(ctx context.Context, inst domain.Instrument, clientID
 			MarketID: inst.MarketID, Status: domain.StatusUnknown, Ts: time.Now(),
 		}, nil
 	}
-	if status == domain.StatusCanceled && !ok {
-		// A canceled order may carry partial fills; without a confirmed fill
-		// read its fill facts are unknown.
+	if status == domain.StatusCanceled && qty < exFilled-eps {
+		// A canceled order carries partial fills that are not indexed yet;
+		// without them its fill facts are unknown.
 		return domain.OrderUpdate{
 			Venue: v.cfg.Name, ClientID: clientID, OrderIndex: oid,
 			MarketID: inst.MarketID, Status: domain.StatusUnknown, Ts: time.Now(),
@@ -290,32 +370,40 @@ func (v *Venue) QueryOrder(ctx context.Context, inst domain.Instrument, clientID
 	}
 	return domain.OrderUpdate{
 		Venue: v.cfg.Name, ClientID: clientID, OrderIndex: oid,
-		MarketID: inst.MarketID, Status: status, FilledQty: qty, FilledQuote: quote, Ts: time.Now(),
+		MarketID: inst.MarketID, Status: status, FilledQty: qty, FilledQuote: quote, Fee: fee, Ts: time.Now(),
 	}, nil
 }
 
-// terminalFills sums the fill sizes for an order id around its status time.
-// ok=false means the fill feed could not be read, which is distinct from
-// "no fills exist".
-func (v *Venue) terminalFills(ctx context.Context, oid, statusTs int64) (qty, quote float64, ok bool) {
+// mergeFills fetches the REST fill feed for an order id around its status
+// time and merges every trade into the venue's per-oid fill state. The
+// effective cumulative fill is returned. ok=false means the feed could not be
+// read, which is distinct from "no fills exist".
+func (v *Venue) mergeFills(ctx context.Context, oid, statusTs int64) (qty, quote, fee float64, ok bool) {
 	end := time.Now().UnixMilli() + 2000
 	fills, err := v.rest.fillsByTime(ctx, v.cfg.Account, statusTs-1000, end)
 	if err != nil {
-		return 0, 0, false
+		return 0, 0, 0, false
 	}
+	v.ordersMu.Lock()
+	defer v.ordersMu.Unlock()
+	fs := v.fillState(oid)
 	for _, f := range fills {
 		if f.Oid.String() != strconv.FormatInt(oid, 10) {
 			continue
 		}
 		sz, err1 := number(f.Sz)
 		px, err2 := number(f.Px)
-		if err1 != nil || err2 != nil {
+		if err1 != nil || err2 != nil || sz <= 0 || px <= 0 || math.IsNaN(sz) || math.IsNaN(px) {
 			continue
 		}
-		qty += sz
-		quote += sz * px
+		feeN, feeErr := number(f.Fee)
+		if feeErr != nil {
+			feeN = 0
+		}
+		fs.add(f.Tid, sz, px, feeN)
 	}
-	return qty, quote, true
+	q, qu, fe := fs.effective()
+	return q, qu, fe, true
 }
 
 // CheckKey verifies that the configured agent key and main account are
@@ -325,7 +413,7 @@ func (v *Venue) CheckKey(ctx context.Context) error {
 	if v.signer == nil || v.cfg.Account == "" {
 		return domain.ErrNoCredentials
 	}
-	if v.signer.address.String() == v.cfg.Account {
+	if v.signer.address == common.HexToAddress(v.cfg.Account) {
 		return fmt.Errorf("agent key derives the main account; an API wallet must be a separate approved agent")
 	}
 	if _, err := v.rest.clearinghouse(ctx, v.cfg.Account, v.cfg.Dex); err != nil {
@@ -343,7 +431,7 @@ func (v *Venue) SignOnly(r domain.OrderReq, nonce int64) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	sig, err := v.signer.signOrder(asset, r.Side == domain.Buy, r.ReduceOnly, price, size, c, uint64(nonce))
+	sig, err := v.signer.signOrder(asset, r.Side == domain.Buy, r.ReduceOnly, price, size, c, uint64(nonce), 0)
 	if err != nil {
 		return "", err
 	}
@@ -361,11 +449,71 @@ func (v *Venue) SignEphemeral(r domain.OrderReq, nonce int64) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	sig, err := key.signOrder(asset, r.Side == domain.Buy, r.ReduceOnly, price, size, c, uint64(nonce))
+	sig, err := key.signOrder(asset, r.Side == domain.Buy, r.ReduceOnly, price, size, c, uint64(nonce), 0)
 	if err != nil {
 		return "", err
 	}
 	return sig.R + sig.S + ":" + strconv.Itoa(sig.V), nil
+}
+
+// SetLeverage applies account leverage to a market via an updateLeverage
+// action. HIP-3 builder perps only support isolated margin, so isCross is
+// always false. A requested leverage above the market maximum is reported as
+// ErrLeverageRejected so the caller's downward search can proceed.
+func (v *Venue) SetLeverage(ctx context.Context, inst domain.Instrument, leverage int) error {
+	if v.signer == nil || v.cfg.Account == "" {
+		return domain.ErrNoCredentials
+	}
+	if inst.MarketID < 0 {
+		return fmt.Errorf("%w: invalid market id", domain.ErrRejected)
+	}
+	if leverage < 1 {
+		return fmt.Errorf("leverage %d out of range", leverage)
+	}
+	if cap, ok := v.maxLeverage(inst.MarketID); ok && leverage > cap {
+		return fmt.Errorf("%w: market %d maximum leverage is %d", domain.ErrLeverageRejected, inst.MarketID, cap)
+	}
+	if err := v.lockSend(ctx); err != nil {
+		return err
+	}
+	defer func() { <-v.sendMu }()
+	nonce := v.nonce()
+	expiresAfter := submitExpiry(time.Now())
+	sig, err := v.signer.signUpdateLeverage(inst.MarketID, false, leverage, nonce, expiresAfter)
+	if err != nil {
+		return fmt.Errorf("%w: sign: %v", domain.ErrRejected, err)
+	}
+	resp, err := v.rest.send(ctx, exchangeRequest{
+		Action: map[string]any{
+			"type":     "updateLeverage",
+			"asset":    inst.MarketID,
+			"isCross":  false,
+			"leverage": leverage,
+		},
+		Nonce:        nonce,
+		Signature:    sig,
+		ExpiresAfter: expiresAfter,
+	})
+	if err != nil {
+		var hs *httpStatusError
+		if errors.As(err, &hs) && hs.code == http.StatusTooManyRequests {
+			return fmt.Errorf("%w: rate limited", domain.ErrRejected)
+		}
+		return fmt.Errorf("updateLeverage: %w", err)
+	}
+	if resp.Status != "ok" {
+		return fmt.Errorf("updateLeverage rejected: %s", rawResponse(resp))
+	}
+	return nil
+}
+
+// expiredOrder reports whether the order's submission window has elapsed, so
+// an unknown oid means the action never executed.
+func (v *Venue) expiredOrder(cid int64) bool {
+	v.ordersMu.Lock()
+	defer v.ordersMu.Unlock()
+	exp, ok := v.orderExpires[cid]
+	return ok && time.Now().UnixMilli() > exp+5000
 }
 
 // randomSigner builds a throwaway API-wallet identity for offline checks.

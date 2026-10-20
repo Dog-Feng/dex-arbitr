@@ -57,6 +57,10 @@ Entropy 专有 API**。对接直接使用 Hyperliquid 标准 API/SDK（REST + WS
   `l2Book(fast)+bbo` 并把 bbo 合并进 book state 的顶层，实测有效更新 ~0.27s/帧
   （3.7 Hz）。订单终态事件（orderUpdates/userFills）按块即时推，不受盘口节流
   影响。
+- **选 fast 而不是 slow 20 档**：本项目本质是价差套利，决策要求两腿价格在同一
+  时点都可执行；slow 模式的 5s 帧会让 HL 腿在成交时仍引用早已不满足价差条件的
+  旧盘口（对侧 Lighter 盘口是 100ms 级），而单步 IOC 数量极小、5 档深度足够覆盖。
+  新鲜度优先于深度；深度不足由 `bbo` 顶档合并与 IOC 让价/滑点上限兜底。
 - **对应配置**：`volatility.max_age: 600ms`（给 0.4~0.54s 节奏留 1.1~1.5 倍
   余量；400ms 零余量、推送抖动会打碎 σ 采样链），`strategy.max_book_age: 3s`。
 
@@ -80,7 +84,7 @@ Entropy 专有 API**。对接直接使用 Hyperliquid 标准 API/SDK（REST + WS
 
 - 所有 `io` 资产 `onlyIsolated: true`：现有引擎按逐仓清算价计算风险，不依赖
   全仓权益；`AccountSnapshot.CrossMargin` 只在存在 cross 仓位时返回。
-- growth mode + `deployerFeeScale=1.0`：基础档 taker **9 bps**、maker **3 bps**
+- growth mode + `deployerFeeScale=1.0`：基础档 taker **0.9 bps**、maker **0.3 bps**
   （`0.00045 × 2 × 0.1`）。账户有更高费率档/质押折扣时实际更低，静态取基础档
   是保守估计。
 - 抵押品是 **USDC（tokenId 0）**，且按 dex 隔离：`io` 有独立 USDC 余额。交易前

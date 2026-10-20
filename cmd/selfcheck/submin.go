@@ -158,11 +158,13 @@ func subminFlow(ctx context.Context, v exchange.Venue, m symbols.Matcher, base s
 		if err := submit(dir.open, qty, false); err != nil {
 			allOK = check(dir.label+" reopen", err, "%v", err) && allOK
 		}
-		_, _ = awaitPosition(ctx, v, inst, qty*float64(dir.open), 25*time.Second)
+		pos, err = awaitPosition(ctx, v, inst, qty*float64(dir.open), 25*time.Second)
+		allOK = check(dir.label+" reopen reflected", err, "position %.8f", pos) && allOK
 		if err := submit(dir.close, reduce, true); err != nil {
 			allOK = check(dir.label+" re-reduce", err, "%v", err) && allOK
 		}
-		_, _ = awaitPosition(ctx, v, inst, leave*float64(dir.open), 25*time.Second)
+		pos, err = awaitPosition(ctx, v, inst, leave*float64(dir.open), 25*time.Second)
+		allOK = check(dir.label+" re-reduce reflected", err, "position %.8f", pos) && allOK
 		rejectErr := submit(dir.close, leave, true)
 		if errors.Is(rejectErr, domain.ErrRejected) {
 			allOK = check(dir.label+" exact residual rejected", nil, "%v", rejectErr) && allOK
@@ -197,6 +199,8 @@ func awaitPosition(ctx context.Context, v exchange.Venue, inst domain.Instrument
 	deadline := time.Now().Add(wait)
 	var pos float64
 	var err error
+	interval := time.NewTimer(1500 * time.Millisecond)
+	defer interval.Stop()
 	for {
 		pos, err = execution.MarketPosition(ctx, v, inst.MarketID)
 		if err != nil {
@@ -212,13 +216,16 @@ func awaitPosition(ctx context.Context, v exchange.Venue, inst domain.Instrument
 		select {
 		case <-ctx.Done():
 			return pos, ctx.Err()
-		case <-time.After(1500 * time.Millisecond):
+		case <-interval.C:
+			interval.Reset(1500 * time.Millisecond)
 		}
 	}
 }
 
 func flattenToZero(ctx context.Context, v exchange.Venue, inst domain.Instrument, minQty, buyPx, sellPx float64, out io.Writer) error {
 	ids := execution.NewIDGen()
+	interval := time.NewTimer(2 * time.Second)
+	defer interval.Stop()
 	for attempt := 0; attempt < 8; attempt++ {
 		pos, err := execution.MarketPosition(ctx, v, inst.MarketID)
 		if err != nil {
@@ -248,7 +255,8 @@ func flattenToZero(ctx context.Context, v exchange.Venue, inst domain.Instrument
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(2 * time.Second):
+		case <-interval.C:
+			interval.Reset(2 * time.Second)
 		}
 	}
 	return fmt.Errorf("cleanup did not flatten the account after 8 attempts")

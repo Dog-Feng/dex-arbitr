@@ -3,9 +3,13 @@ package hyperliquid
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -66,6 +70,364 @@ func TestInstrumentsMapping(t *testing.T) {
 			inst.PriceDecimals != exp.PriceDecimals || math.Abs(inst.TakerFee-exp.TakerFee) > 1e-12 {
 			t.Fatalf("instrument mismatch: %+v want %+v", inst, exp)
 		}
+	}
+}
+
+// TestFillStateDedupAndEffective verifies tid-based deduplication and the
+// synchronous-total floor from /exchange.
+func TestFillStateDedupAndEffective(t *testing.T) {
+	s := newFillState()
+	if !s.add(1, 0.01, 100, 0.01) {
+		t.Fatal("first add should be new")
+	}
+	if s.add(1, 0.01, 100, 0.01) {
+		t.Fatal("same tid must deduplicate")
+	}
+	s.syncQty, s.syncQuote = 0.02, 2.0
+	if q, qu, fee := s.effective(); q != 0.02 || qu != 2.0 || fee != 0.01 {
+		t.Fatalf("effective below sync total: %v/%v/%v", q, qu, fee)
+	}
+	if !s.add(2, 0.01, 100, 0) {
+		t.Fatal("new tid must merge")
+	}
+	if q, qu, fee := s.effective(); q != 0.02 || qu != 2.0 || fee != 0.01 {
+		t.Fatalf("effective past sync total: %v/%v/%v", q, qu, fee)
+	}
+}
+
+// TestOnUserFillsDedupAndSnapshot verifies replay/snapshot trades are merged
+// but never double counted or re-published.
+func TestOnUserFillsDedupAndSnapshot(t *testing.T) {
+	v, err := NewWithConfig(Config{
+		Name: "entropy", Dex: "io", InfoURL: "https://example.invalid/info",
+		ExchangeURL: "https://example.invalid/exchange", WSURL: "wss://example.invalid/ws", BookDepth: 5,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := v.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}()
+	ch := make(chan domain.OrderUpdate, 64)
+	v.ordersMu.Lock()
+	v.orderSubs = append(v.orderSubs, ch)
+	v.orderLookup[1] = 7
+	v.orderOrig[1] = 0.01
+	v.knownCIDs[7] = time.Now()
+	v.ordersMu.Unlock()
+	feed := func(tid int64, isSnapshot bool) {
+		raw := []byte(`{"channel":"userFills","data":{"user":"0x00","isSnapshot":` +
+			`false` +
+			`,"fills":[{"coin":"io:SNDK","px":"100","sz":"0.004","oid":1,"tid":` +
+			strconv.FormatInt(tid, 10) + `}]}}`)
+		if isSnapshot {
+			raw = []byte(`{"channel":"userFills","data":{"user":"0x00","isSnapshot":true,"fills":[{"coin":"io:SNDK","px":"100","sz":"0.004","oid":1,"tid":` +
+				strconv.FormatInt(tid, 10) + `}]}}`)
+		}
+		v.onUserFills(raw)
+	}
+	feed(1, false)
+	u := <-ch
+	if u.FilledQty != 0.004 {
+		t.Fatalf("first fill published %v", u.FilledQty)
+	}
+	feed(1, false) // duplicate delivery: nothing new
+	feed(1, true)  // snapshot replay: nothing new
+	select {
+	case u := <-ch:
+		t.Fatalf("duplicate fill re-published: %+v", u)
+	default:
+	}
+	feed(2, false)
+	u = <-ch
+	if u.FilledQty != 0.008 {
+		t.Fatalf("cumulative fill %v, want 0.008", u.FilledQty)
+	}
+}
+
+// TestOnUserFillsRegistersByCloid verifies a fill arriving before the submit
+// ack is attributed through its cloid instead of being dropped.
+func TestOnUserFillsRegistersByCloid(t *testing.T) {
+	v, err := NewWithConfig(Config{
+		Name: "entropy", Dex: "io", InfoURL: "https://example.invalid/info",
+		ExchangeURL: "https://example.invalid/exchange", WSURL: "wss://example.invalid/ws", BookDepth: 5,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := v.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}()
+	ch := make(chan domain.OrderUpdate, 64)
+	cl, err := cloid(7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v.ordersMu.Lock()
+	v.orderSubs = append(v.orderSubs, ch)
+	v.knownCIDs[7] = time.Now()
+	v.ordersMu.Unlock()
+	v.onUserFills([]byte(`{"channel":"userFills","data":{"user":"0x00","fills":[{"coin":"io:SNDK","px":"100","sz":"0.004","oid":1,"tid":1,"cloid":"` + cl + `"}]}}`))
+	u := <-ch
+	if u.ClientID != 7 || u.FilledQty != 0.004 {
+		t.Fatalf("early fill misattributed: %+v", u)
+	}
+}
+
+// tradeVenue builds a venue with trading credentials and a stub exchange
+// endpoint controlled by the handler.
+func tradeVenue(t *testing.T, handler http.HandlerFunc) *Venue {
+	t.Helper()
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+	v, err := NewWithConfig(Config{
+		Name: "entropy", Dex: "io", InfoURL: srv.URL, ExchangeURL: srv.URL,
+		WSURL: "wss://example.invalid/ws", BookDepth: 20,
+		Account:  "0xc01303fffd03b36666656b809808635d011a9197",
+		AgentKey: "0x1111111111111111111111111111111111111111111111111111111111111111",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := v.Close(); err != nil {
+			t.Fatal(err)
+		}
+	})
+	return v
+}
+
+func TestSubmitActionLevelErrorIsRejected(t *testing.T) {
+	v := tradeVenue(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, `{"status":"err","response":"Order has invalid price."}`)
+	})
+	_, err := v.Submit(context.Background(), domain.OrderReq{
+		ClientID: 1, Inst: domain.Instrument{MarketID: 200002, SizeDecimals: 4, PriceDecimals: 2},
+		Side: domain.Buy, Qty: 0.01, Price: 100, Type: domain.Limit,
+	})
+	if !errors.Is(err, domain.ErrRejected) {
+		t.Fatalf("action-level error not rejected: %v", err)
+	}
+}
+
+func TestSubmitRateLimitIsRejected(t *testing.T) {
+	v := tradeVenue(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+	})
+	_, err := v.Submit(context.Background(), domain.OrderReq{
+		ClientID: 1, Inst: domain.Instrument{MarketID: 200002, SizeDecimals: 4, PriceDecimals: 2},
+		Side: domain.Buy, Qty: 0.01, Price: 100, Type: domain.Limit,
+	})
+	if !errors.Is(err, domain.ErrRejected) {
+		t.Fatalf("429 not rejected: %v", err)
+	}
+}
+
+func TestSubmitTimeoutStaysUnknown(t *testing.T) {
+	v := tradeVenue(t, func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(200 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, `{"status":"ok"}`)
+	})
+	v.rest.sendClient.Timeout = 20 * time.Millisecond
+	_, err := v.Submit(context.Background(), domain.OrderReq{
+		ClientID: 1, Inst: domain.Instrument{MarketID: 200002, SizeDecimals: 4, PriceDecimals: 2},
+		Side: domain.Buy, Qty: 0.01, Price: 100, Type: domain.Limit,
+	})
+	if err == nil || errors.Is(err, domain.ErrRejected) {
+		t.Fatalf("timeout must stay unknown: %v", err)
+	}
+}
+
+func TestCancelAlreadyTerminalIsIdempotent(t *testing.T) {
+	v := tradeVenue(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"status":"err","response":"Order was never placed, already canceled, or filled."}`)
+	})
+	if err := v.CancelOrder(context.Background(), domain.Instrument{MarketID: 200002}, 1); err != nil {
+		t.Fatalf("idempotent cancel failed: %v", err)
+	}
+}
+
+func TestQueryOrderExpiredUnknownOidRejected(t *testing.T) {
+	v := tradeVenue(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"status":"unknownOid"}`)
+	})
+	v.ordersMu.Lock()
+	v.orderExpires[1] = time.Now().Add(-time.Minute).UnixMilli()
+	v.ordersMu.Unlock()
+	u, err := v.QueryOrder(context.Background(), domain.Instrument{MarketID: 200002}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u.Status != domain.StatusRejected {
+		t.Fatalf("expired unknown oid: %+v", u)
+	}
+}
+
+func TestQueryOrderCanceledWithPendingFillsStaysUnknown(t *testing.T) {
+	v := tradeVenue(t, func(w http.ResponseWriter, r *http.Request) {
+		var req map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode: %v", err)
+		}
+		switch req["type"] {
+		case "orderStatus":
+			fmt.Fprint(w, `{"status":"order","order":{"order":{"coin":"io:SNDK","oid":"42","sz":"0.004","origSz":"0.01"},"status":"canceled","statusTimestamp":1754450974231}}`)
+		case "userFillsByTime":
+			fmt.Fprint(w, `[]`)
+		default:
+			t.Errorf("unexpected request: %v", req["type"])
+		}
+	})
+	u, err := v.QueryOrder(context.Background(), domain.Instrument{MarketID: 200002}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u.Status != domain.StatusUnknown {
+		t.Fatalf("canceled with unindexed fills must stay unknown: %+v", u)
+	}
+}
+
+func TestQueryOrderCanceledZeroFillTerminal(t *testing.T) {
+	v := tradeVenue(t, func(w http.ResponseWriter, r *http.Request) {
+		var req map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode: %v", err)
+		}
+		switch req["type"] {
+		case "orderStatus":
+			fmt.Fprint(w, `{"status":"order","order":{"order":{"coin":"io:SNDK","oid":"42","sz":"0.01","origSz":"0.01"},"status":"canceled","statusTimestamp":1754450974231}}`)
+		case "userFillsByTime":
+			fmt.Fprint(w, `[]`)
+		default:
+			t.Errorf("unexpected request: %v", req["type"])
+		}
+	})
+	u, err := v.QueryOrder(context.Background(), domain.Instrument{MarketID: 200002}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u.Status != domain.StatusCanceled || u.FilledQty != 0 {
+		t.Fatalf("zero-fill cancel must be terminal: %+v", u)
+	}
+}
+
+func TestCheckKeyRejectsDerivedAddress(t *testing.T) {
+	s, err := newSigner("0x1111111111111111111111111111111111111111111111111111111111111111")
+	if err != nil {
+		t.Fatal(err)
+	}
+	v, err := NewWithConfig(Config{
+		Name: "entropy", Dex: "io", InfoURL: "https://example.invalid/info",
+		ExchangeURL: "https://example.invalid/exchange", WSURL: "wss://example.invalid/ws",
+		BookDepth: 20, Account: strings.ToLower(s.address.Hex()),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := v.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}()
+	v.signer = s
+	if err := v.CheckKey(context.Background()); err == nil {
+		t.Fatal("derived agent address must be rejected regardless of case")
+	}
+}
+
+// TestAccountSnapshotDelistedAndSelfSufficient verifies a delisted coin does
+// not fail the snapshot and that the snapshot resolves the universe itself
+// when Instruments was never called.
+func TestAccountSnapshotDelistedAndSelfSufficient(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode: %v", err)
+		}
+		switch req["type"] {
+		case "perpDexs":
+			fmt.Fprint(w, `[null,{"name":"xyz"},null,null,null,null,null,null,null,null,{"name":"io"}]`)
+		case "meta":
+			fmt.Fprint(w, `{"universe":[
+				{"szDecimals":4,"name":"io:SNDK","maxLeverage":15,"onlyIsolated":true,"marginMode":"strictIsolated"},
+				{"szDecimals":2,"name":"io:SBE","maxLeverage":6,"onlyIsolated":true,"isDelisted":true,"marginMode":"strictIsolated"}
+			]}`)
+		case "clearinghouseState":
+			fmt.Fprint(w, `{"assetPositions":[{"position":{"coin":"io:SBE","entryPx":"10","liquidationPx":"0","szi":"0.5","positionValue":"5","leverage":{"type":"isolated"}}}],"marginSummary":{}}`)
+		default:
+			t.Errorf("unexpected info request: %v", req["type"])
+		}
+	}))
+	defer srv.Close()
+	v, err := NewWithConfig(Config{
+		Name: "entropy", Dex: "io", InfoURL: srv.URL, ExchangeURL: srv.URL,
+		WSURL: "wss://example.invalid/ws", BookDepth: 20,
+		Account: "0xc01303fffd03b36666656b809808635d011a9197",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := v.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}()
+	// No Instruments call: the snapshot must bootstrap the universe itself.
+	snap, err := v.AccountSnapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snap.Positions) != 1 || snap.Positions[0].Symbol != "SBE" || snap.Positions[0].MarketID < 0 {
+		t.Fatalf("delisted position not surfaced: %+v", snap.Positions)
+	}
+}
+
+// TestSetLeverageWire verifies the updateLeverage action body and that a
+// request above the market maximum is rejected locally.
+func TestSetLeverageWire(t *testing.T) {
+	var gotBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Errorf("decode: %v", err)
+		}
+		fmt.Fprint(w, `{"status":"ok","response":{"type":"default"}}`)
+	}))
+	defer srv.Close()
+	v, err := NewWithConfig(Config{
+		Name: "entropy", Dex: "io", InfoURL: srv.URL, ExchangeURL: srv.URL,
+		WSURL: "wss://example.invalid/ws", BookDepth: 20,
+		Account:  "0xc01303fffd03b36666656b809808635d011a9197",
+		AgentKey: "0x1111111111111111111111111111111111111111111111111111111111111111",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := v.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}()
+	v.levMu.Lock()
+	v.maxLev[200002] = 6
+	v.levMu.Unlock()
+	if err := v.SetLeverage(context.Background(), domain.Instrument{MarketID: 200002}, 7); !errors.Is(err, domain.ErrLeverageRejected) {
+		t.Fatalf("above-max leverage must be rejected: %v", err)
+	}
+	if err := v.SetLeverage(context.Background(), domain.Instrument{MarketID: 200002}, 3); err != nil {
+		t.Fatal(err)
+	}
+	action, ok := gotBody["action"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing action: %+v", gotBody)
+	}
+	if action["type"] != "updateLeverage" || action["asset"] != float64(200002) || action["isCross"] != false || action["leverage"] != float64(3) {
+		t.Fatalf("unexpected action: %+v", action)
 	}
 }
 
@@ -195,6 +557,8 @@ func TestSigFigTighten(t *testing.T) {
 		{12.34, 2, true, 12.34},      // few sig figs: grid finer than precision
 		{0.0012345, 6, true, 0.001234},
 		{100000.0, 0, false, 100000.0},
+		{101234.5, 1, true, 101234.0}, // integer grid for six-digit prices
+		{101234.5, 1, false, 101235.0},
 	}
 	for _, tc := range cases {
 		if got := sigFigTighten(tc.in, tc.dec, tc.buy); got != tc.want {

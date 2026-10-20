@@ -9,7 +9,10 @@ import (
 	"errors"
 	"flag"
 	"log/slog"
+	"math"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Dog-Feng/dex-arbitr/internal/config"
@@ -33,6 +36,10 @@ func main() {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, nil)))
 	if *amount == "" {
 		slog.Error("flags", "err", "amount is required")
+		os.Exit(2)
+	}
+	if err := validateAmount(*amount); err != nil {
+		slog.Error("flags", "err", err)
 		os.Exit(2)
 	}
 	c, err := config.Load(*cfgPath)
@@ -78,4 +85,18 @@ func main() {
 		os.Exit(1)
 	}
 	slog.Info("transfer accepted", "from", *from, "to", *to, "amount", *amount)
+}
+
+// validateAmount requires a finite positive decimal that fits the USDC wire
+// precision (8 decimals on Hyperliquid).
+func validateAmount(s string) error {
+	f, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
+	if err != nil || math.IsNaN(f) || math.IsInf(f, 0) || f <= 0 {
+		return errors.New("amount must be a finite positive decimal")
+	}
+	parts := strings.Split(strings.TrimSpace(s), ".")
+	if len(parts) == 2 && len(parts[1]) > 8 {
+		return errors.New("amount has more than 8 decimal places")
+	}
+	return nil
 }

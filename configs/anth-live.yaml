@@ -46,6 +46,7 @@ risk:
   position_refresh: 15s
   emergency_market_bps: 100
   max_notional: 0
+  max_auto_resume_per_day: 1   # 2nd external-intervention within 24h stays paused
 
 strategy:
   kind: volume

@@ -112,8 +112,7 @@ func classify(s []sample) (common, relative float64) {
 // unwindEstimate approximates the cost of flattening the filled leg: the
 // half-spread of the venue that moved least, applied to half the recorded
 // two-leg notional. It is a bound, not a fill simulation.
-func unwindEstimate(s []sample, twoLegUSD float64) float64 {
-	_ = s
+func unwindEstimate(_ []sample, twoLegUSD float64) float64 {
 	halfBps := 0.13 // ~1 tick half-spread proxy for the unchanged venue
 	return halfBps / 1e4 * (twoLegUSD / 2)
 }

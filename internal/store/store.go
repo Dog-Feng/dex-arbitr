@@ -22,9 +22,12 @@ type PairState struct {
 	PnLUncertain   bool            `json:"pnl_uncertain,omitempty"`
 	NextID         int64           `json:"next_id"`
 	Steps          []strategy.Step `json:"steps"`
-	Day            string          `json:"day,omitempty"`
-	VolumeUSD      float64         `json:"volume_usd,omitempty"`
-	PnLUSD         float64         `json:"pnl_usd,omitempty"`
+	// Interventions records completed external-intervention recoveries, used
+	// to cap automatic re-entry into trading within a rolling window.
+	Interventions []time.Time `json:"interventions,omitempty"`
+	Day           string      `json:"day,omitempty"`
+	VolumeUSD     float64     `json:"volume_usd,omitempty"`
+	PnLUSD        float64     `json:"pnl_usd,omitempty"`
 }
 
 // Store serializes access to a directory of pair-state JSON files.

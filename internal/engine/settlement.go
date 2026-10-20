@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sort"
 	"time"
 
 	"github.com/Dog-Feng/dex-arbitr/internal/domain"
@@ -24,6 +25,7 @@ type pendingExecution struct {
 	unwind            bool
 	lastAttempt       time.Time
 	stalls            int
+	dustWarned        bool
 	intervention      bool
 	interventionTries int
 	interrupted       *execution.Result // settled original orders, separate from the new flatten
@@ -187,10 +189,22 @@ func (a *PairActor) resolvePending(ctx context.Context) {
 			a.posL, a.posR = res.PosL, res.PosR
 			a.syncPositionState()
 		}
-		if errors.Is(res.Err, execution.ErrUnexpectedPosition) || errors.Is(res.Err, execution.ErrSubMinResidual) {
+		if errors.Is(res.Err, execution.ErrUnexpectedPosition) {
 			p.stalls++
 			if p.stalls >= interventionStallLimit {
 				a.recoverExternalIntervention(ctx, p, res)
+			}
+		} else if errors.Is(res.Err, execution.ErrSubMinResidual) {
+			// An untradable dust residual is not an external intervention: the
+			// ledger stays intact, trading stays paused, and the flatten keeps
+			// retrying minimum-sized reduce-only orders. Warn once so the pair
+			// does not loop silently.
+			if !p.dustWarned {
+				p.dustWarned = true
+				a.record(monitor.KindError, func(e *monitor.Event) {
+					e.Msg = fmt.Sprintf("sub-minimum residual %.8f/%.8f cannot be traded; pair stays paused until it clears", res.PosL, res.PosR)
+				})
+				a.log.Warn("sub-minimum residual keeps pair paused", "posL", res.PosL, "posR", res.PosR, "err", res.Err)
 			}
 		} else {
 			p.stalls = 0
@@ -294,8 +308,21 @@ func (a *PairActor) recoverExternalIntervention(ctx context.Context, p *pendingE
 	// normal trading can continue once the estimators re-warm; PnL remains
 	// uncertain. Without this the pair stays paused forever after a
 	// successful self-flatten, looking like a hang with only silent alerts.
-	a.state.Mode = strategy.ModeWarmup
-	a.log.Warn("external intervention completed; both legs confirmed flat, resuming warmup")
+	// Draining, emergency, legacy ledgers, and repeated interventions within
+	// the daily window must stay paused instead.
+	now := time.Now()
+	a.interventions = append(a.interventions, now)
+	a.pruneInterventions(now)
+	if !a.draining.Load() && !a.emergencyRequested.Load() && !a.legacyPrices && a.interventionBudgetOK(now) {
+		a.state.Mode = strategy.ModeWarmup
+		a.log.Warn("external intervention completed; both legs confirmed flat, resuming warmup")
+	} else {
+		a.state.Mode = strategy.ModePaused
+		a.record(monitor.KindError, func(e *monitor.Event) {
+			e.Msg = fmt.Sprintf("external intervention completed; pair stays paused (auto-resume budget exhausted or exit mode active)")
+		})
+		a.log.Warn("external intervention completed; auto-resume suppressed", "interventions_24h", a.interventionCount(now))
+	}
 	if err := a.persist(); err != nil {
 		a.log.Error("persist external intervention", "err", err)
 		return
@@ -365,9 +392,44 @@ func (a *PairActor) finishIntervention(res execution.Result, interrupted ...exec
 	return nil
 }
 
+// pruneInterventions drops intervention timestamps outside the rolling 24h
+// window so the auto-resume budget does not accumulate forever.
+func (a *PairActor) pruneInterventions(now time.Time) {
+	kept := a.interventions[:0]
+	for _, t := range a.interventions {
+		if now.Sub(t) <= 24*time.Hour {
+			kept = append(kept, t)
+		}
+	}
+	a.interventions = kept
+}
+
+// interventionCount returns the number of intervention recoveries in the
+// rolling 24h window.
+func (a *PairActor) interventionCount(now time.Time) int {
+	n := 0
+	for _, t := range a.interventions {
+		if now.Sub(t) <= 24*time.Hour {
+			n++
+		}
+	}
+	return n
+}
+
+// interventionBudgetOK reports whether another automatic resume is allowed.
+// With the default budget of one, a second intervention within 24 hours keeps
+// the pair paused until an operator confirms the account.
+func (a *PairActor) interventionBudgetOK(now time.Time) bool {
+	max := a.cfg.Risk.maxAutoResume
+	if max < 1 {
+		max = 1
+	}
+	return a.interventionCount(now) <= max
+}
+
 func (a *PairActor) legSpecs(act strategy.Action) (execution.LegSpec, execution.LegSpec) {
-	return execution.LegSpec{Venue: a.cfg.L, Inst: a.cfg.Pair.Left, Side: act.L.Side, Price: act.L.Price},
-		execution.LegSpec{Venue: a.cfg.R, Inst: a.cfg.Pair.Right, Side: act.R.Side, Price: act.R.Price}
+	return execution.LegSpec{Venue: a.cfg.L, Inst: a.cfg.Pair.Left, Side: act.L.Side, Price: act.L.Price, EdgeBps: act.ExpectedBps},
+		execution.LegSpec{Venue: a.cfg.R, Inst: a.cfg.Pair.Right, Side: act.R.Side, Price: act.R.Price, EdgeBps: act.ExpectedBps}
 }
 
 func (a *PairActor) apply(ctx context.Context, act strategy.Action, q spread.Quote) {
@@ -542,42 +604,82 @@ func (a *PairActor) accountExecution(act strategy.Action, q spread.Quote, before
 			if err != nil {
 				return err
 			}
-			found := false
+			sel := -1
 			for i := range steps {
-				if steps[i].ID != act.StepID {
-					continue
+				if steps[i].ID == act.StepID {
+					sel = i
+					break
 				}
-				found = true
-				st := &steps[i]
+			}
+			if sel < 0 {
+				return fmt.Errorf("selected step %d not found", act.StepID)
+			}
+			// The selected step is consumed first; any spillover past its
+			// quantity consumes other steps in FIFO order, so an oversized
+			// reduction no longer forces a whole-account intervention.
+			order := []int{sel}
+			for i := range steps {
+				if i != sel {
+					order = append(order, i)
+				}
+			}
+			rest := order[1:]
+			sort.SliceStable(rest, func(a, b int) bool {
+				return steps[rest[a]].OpenedAt.Before(steps[rest[b]].OpenedAt)
+			})
+			order = append(order[:1], rest...)
+			remaining := cl
+			var spilled []int64
+			for _, idx := range order {
+				if remaining < eps {
+					break
+				}
+				st := &steps[idx]
 				uncertain = uncertain || st.PriceEstimated
-				if cl > st.Qty+eps {
-					return fmt.Errorf("close exceeds selected step")
-				}
-				gross := strategy.GrossProfitUSD(*st, lpx, rpx, cl)
-				if math.IsNaN(gross) || math.IsInf(gross, 0) {
-					return fmt.Errorf("step %d lacks a trustworthy entry basis", st.ID)
-				}
-				grossUSD = gross
-				entryFees := st.EntryFeesUSD * cl / st.Qty
-				partNet := gross - fees - entryFees
-				st.EntryFeesUSD -= entryFees
-				st.RealizedUSD += partNet
 				if st.OriginalQty <= 0 {
 					st.OriginalQty = st.Qty
 				}
+				part := math.Min(remaining, st.Qty)
+				gross := strategy.GrossProfitUSD(*st, lpx, rpx, part)
+				if math.IsNaN(gross) || math.IsInf(gross, 0) {
+					return fmt.Errorf("step %d lacks a trustworthy entry basis", st.ID)
+				}
+				feesPart := fees * part / cl
+				entryFees := st.EntryFeesUSD * part / st.Qty
+				partNet := gross - feesPart - entryFees
+				st.EntryFeesUSD -= entryFees
+				st.RealizedUSD += partNet
 				st.Realized = st.RealizedUSD / (st.OriginalQty * (st.OpenL + st.OpenR) / 2) * 1e4
 				st.PriceEstimated = st.PriceEstimated || res.L.PriceEstimated || res.R.PriceEstimated || res.L.RescuePriceEstimated || res.R.RescuePriceEstimated
-				st.Qty = domain.Round(st.Qty-cl, a.cfg.Pair.SizeDecimals)
+				st.Qty = domain.Round(st.Qty-part, a.cfg.Pair.SizeDecimals)
 				deltaPnL += gross
-				if st.Qty < eps {
-					copyStep := *st
-					removed = &copyStep
-					steps = append(steps[:i], steps[i+1:]...)
+				remaining -= part
+				if idx == sel {
+					grossUSD = gross
+				} else if st.Qty < eps {
+					spilled = append(spilled, st.ID)
 				}
-				break
 			}
-			if !found {
-				return fmt.Errorf("selected step %d not found", act.StepID)
+			if remaining >= eps {
+				return fmt.Errorf("close exceeds ledger")
+			}
+			kept := steps[:0]
+			for i := range steps {
+				if steps[i].Qty < eps {
+					if i == sel {
+						copyStep := steps[i]
+						removed = &copyStep
+					}
+					continue
+				}
+				kept = append(kept, steps[i])
+			}
+			steps = kept
+			if len(spilled) > 0 {
+				a.record(monitor.KindError, func(e *monitor.Event) {
+					e.Msg = fmt.Sprintf("close spilled into steps %v", spilled)
+				})
+				a.log.Warn("close consumed part of other steps", "spilled", spilled)
 			}
 		}
 	default:

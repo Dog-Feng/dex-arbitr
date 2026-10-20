@@ -65,7 +65,7 @@ func TestSignReferenceVectors(t *testing.T) {
 	}
 	nonce := uint64(1734398369395)
 	cloid := "0x" + strings.Repeat("0", 31) + "1"
-	sig, err := s.signOrder(200002, true, false, "1356.1", "0.1", cloid, nonce)
+	sig, err := s.signOrder(200002, true, false, "1356.1", "0.1", cloid, nonce, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,7 +77,7 @@ func TestSignReferenceVectors(t *testing.T) {
 		sig.V != 28 {
 		t.Fatalf("order signature mismatch: %+v", sig)
 	}
-	cancel, err := s.signCancelByCloid(200002, cloid, nonce+1)
+	cancel, err := s.signCancelByCloid(200002, cloid, nonce+1, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,7 +88,7 @@ func TestSignReferenceVectors(t *testing.T) {
 	}
 	// The connection id the SDK hashes is keccak(packed || nonce || 0x00).
 	packed := packOrderAction(200002, true, false, "1356.1", "0.1", cloid)
-	conn := connectionID(packed, nonce)
+	conn := connectionID(packed, nonce, 0)
 	if hex.EncodeToString(conn) != "e10fac4d79c12c50d59ae8d0c478fe3d8029795c54b00e41ff5018a8b0e9b7df" {
 		t.Fatalf("connection id mismatch: %x", conn)
 	}
@@ -120,7 +120,7 @@ func TestSignSendAssetReference(t *testing.T) {
 		"", "io", "USDC:0x6d1e7cde53ba9467b783cb7c530ce054", "0.0001",
 		1734398369395,
 	)
-	if got := connectionID(packed, 1734398369395); hex.EncodeToString(got) != "5201cf3f78e5ae4483b32741e6d2e2bbc3f117f2b54902ebc6876c7c40250618" {
+	if got := connectionID(packed, 1734398369395, 0); hex.EncodeToString(got) != "5201cf3f78e5ae4483b32741e6d2e2bbc3f117f2b54902ebc6876c7c40250618" {
 		t.Fatalf("agentSendAsset connection id mismatch: %x", got)
 	}
 }

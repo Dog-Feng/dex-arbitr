@@ -127,6 +127,7 @@ type PairActor struct {
 	latR                *latencySeries
 	winUpdatedAt        time.Time
 	lastDir             strategy.Dir
+	interventions       []time.Time
 	// capEngaged records that the step count touched MaxSteps; opens stay
 	// blocked until the count falls to MaxSteps-CapBand or below.
 	capEngaged bool
@@ -228,6 +229,7 @@ func NewPairActor(cfg PairConfig) (*PairActor, error) {
 	a.state = strategy.State{Mode: strategy.ModeWarmup, Steps: st.Steps}
 	a.next = st.NextID
 	a.volAcc = volumeAcc{day: st.Day, volumeUSD: st.VolumeUSD, pnlUSD: st.PnLUSD, pnlUncertain: st.PnLUncertain}
+	a.interventions = append(a.interventions, st.Interventions...)
 	a.checkpoint = st.Unresolved
 	a.startupRecovered.Store(!st.Unresolved)
 	a.checkpointExit = st.CheckpointExit
@@ -377,7 +379,12 @@ func (a *PairActor) wakeDecide() {
 }
 
 func (a *PairActor) persist() error {
-	err := a.cfg.Store.Save(a.key, store.PairState{NextID: a.next, Steps: a.state.Steps, Day: a.volAcc.day, VolumeUSD: a.volAcc.volumeUSD, PnLUSD: a.volAcc.pnlUSD, PnLUncertain: a.volAcc.pnlUncertain, Unresolved: a.checkpoint, CheckpointExit: a.checkpointExit})
+	err := a.cfg.Store.Save(a.key, store.PairState{
+		NextID: a.next, Steps: a.state.Steps, Day: a.volAcc.day,
+		VolumeUSD: a.volAcc.volumeUSD, PnLUSD: a.volAcc.pnlUSD,
+		PnLUncertain: a.volAcc.pnlUncertain, Unresolved: a.checkpoint,
+		CheckpointExit: a.checkpointExit, Interventions: a.interventions,
+	})
 	if err != nil {
 		a.state.Mode = strategy.ModePaused
 		a.settled.Store(false)

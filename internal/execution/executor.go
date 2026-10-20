@@ -58,6 +58,10 @@ type LegSpec struct {
 	Inst  domain.Instrument
 	Side  domain.Side
 	Price float64
+	// EdgeBps is the expected gross margin of the opening in bps (0 = unknown).
+	// The step-completion order is only worth placing when the completion
+	// allowance plus the leg fee stays inside this margin.
+	EdgeBps float64
 }
 
 // LegResult is the resolved outcome of a leg.
@@ -258,18 +262,12 @@ func (e *Executor) ExecuteBounded(ctx context.Context, l, r LegSpec, qty float64
 	}
 	res.SettlementKnown = true
 	if !reduceOnly && e.cfg.TopUpBps > 0 {
-		completed, terr := e.completeStep(ctx, l, r, qty, beforeL, beforeR, pl, pr, &res)
+		completed, pl2, pr2, terr := e.completeStep(ctx, l, r, qty, beforeL, beforeR, pl, pr, &res, maxOpenNotional)
 		if terr != nil {
 			res.Err = terr
 			return res
 		}
 		if completed {
-			// The completion changed one leg; re-read authoritative positions.
-			pl2, pr2, perr := e.positions(ctx, l, r)
-			if perr != nil {
-				res.Err = perr
-				return res
-			}
 			pl, pr = pl2, pr2
 			res.PosL, res.PosR = pl, pr
 		}
@@ -279,9 +277,10 @@ func (e *Executor) ExecuteBounded(ctx context.Context, l, r LegSpec, qty float64
 	tl, tr := hedgeTargets(pl, pr, l.Inst, r.Inst)
 	if e.unwindSmallResidual(l, r, tl, tr, pl, pr) {
 		if reduceOnly {
-			// The residual cannot be traded on either leg: unwind the whole
-			// step to zero, where every reduction equals a full position size.
-			tl, tr = 0, 0
+			// Search toward zero for the closest hedge both legs can still
+			// trade; only a fully untradable target unwinds to zero, where
+			// every reduction equals a full position size.
+			tl, tr = e.feasibleReduceTarget(l, r, pl, pr, tl, tr)
 		} else {
 			// The opening cannot be equalized: undo only this step back to the
 			// pre-open positions so previously recorded steps stay intact.
@@ -291,6 +290,29 @@ func (e *Executor) ExecuteBounded(ctx context.Context, l, r LegSpec, qty float64
 	res.targetL, res.targetR, res.targetsKnown = tl, tr, true
 	res.Err = e.flatten(ctx, l, r, tl, tr, &res, e.cfg.Rescue)
 	return res
+}
+
+// feasibleReduceTarget walks the common quantity lattice from the aligned
+// target toward zero and returns the first hedge whose required reductions
+// are either zero or at least one leg's venue minimum on both legs. It only
+// returns zero when no non-zero target is tradable.
+func (e *Executor) feasibleReduceTarget(l, r LegSpec, pl, pr, tl, tr float64) (float64, float64) {
+	if tl == 0 && tr == 0 {
+		return 0, 0
+	}
+	d := min(l.Inst.SizeDecimals, r.Inst.SizeDecimals)
+	unit := math.Pow10(-d)
+	sign := 1.0
+	if tl < 0 {
+		sign = -1
+	}
+	for k := math.Abs(tl); k > unit/2; k = domain.Round(k-unit, d) {
+		cl, cr := sign*k, -sign*k
+		if !e.unwindSmallResidual(l, r, cl, cr, pl, pr) {
+			return cl, cr
+		}
+	}
+	return 0, 0
 }
 
 // ResolveOutstanding continues a canceled execution with a live parent
@@ -351,10 +373,17 @@ func (e *Executor) ResolveOutstanding(ctx context.Context, l, r LegSpec, res Res
 			res.targetL, res.targetR = hedgeTargets(res.PosL, res.PosR, l.Inst, r.Inst)
 			res.targetsKnown = true
 		}
-		if res.opening && e.unwindSmallResidual(l, r, res.targetL, res.targetR, res.PosL, res.PosR) {
-			// The opening cannot be equalized: undo only this step back to the
-			// pre-open positions so previously recorded steps stay intact.
-			res.targetL, res.targetR = beforeL, beforeR
+		if e.unwindSmallResidual(l, r, res.targetL, res.targetR, res.PosL, res.PosR) {
+			if res.opening {
+				// The opening cannot be equalized: undo only this step back to
+				// the pre-open positions so previously recorded steps stay intact.
+				res.targetL, res.targetR = beforeL, beforeR
+			} else {
+				// Closes follow the same nearest-feasible-target search as the
+				// original execution instead of surfacing an untradable dust
+				// residual as an error.
+				res.targetL, res.targetR = e.feasibleReduceTarget(l, r, res.PosL, res.PosR, res.targetL, res.targetR)
+			}
 		}
 		res.Err = e.flatten(ctx, l, r, res.targetL, res.targetR, &res, res.rescue)
 	}
@@ -412,6 +441,22 @@ func (e *Executor) ResolveTerminals(ctx context.Context, l, r LegSpec, res Resul
 	if err := ctx.Err(); err != nil {
 		res.Err = err
 		return res
+	}
+	// The completion order participates in terminal resolution exactly like
+	// in ResolveOutstanding, so recovery never blocks on an unqueried top-up.
+	if res.topUp != nil && !res.topUp.result.Resolved {
+		leg := l
+		if res.topUp.req.Inst.MarketID == r.Inst.MarketID && res.topUp.req.Side == r.Side {
+			leg = r
+		}
+		res.topUp.result = e.queryExisting(ctx, res.topUp.req, leg.Venue, res.topUp.result)
+		if res.topUp.result.Resolved && res.topUp.result.Filled > 0 {
+			if leg.Inst.MarketID == l.Inst.MarketID && leg.Side == l.Side {
+				mergeTopUp(&res.L, res.topUp.result)
+			} else {
+				mergeTopUp(&res.R, res.topUp.result)
+			}
+		}
 	}
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -538,7 +583,7 @@ func legMinQty(inst domain.Instrument, price float64) float64 {
 // step; any failure falls back to the ordinary shrink path. The completion
 // price is the decision price widened by at most TopUpBps in the aggressive
 // direction, so chasing the book is hard-bounded.
-func (e *Executor) completeStep(ctx context.Context, l, r LegSpec, qty, beforeL, beforeR, pl, pr float64, res *Result) (bool, error) {
+func (e *Executor) completeStep(ctx context.Context, l, r LegSpec, qty, beforeL, beforeR, pl, pr float64, res *Result, maxOpenNotional float64) (bool, float64, float64, error) {
 	dl := float64(l.Side) * (pl - beforeL)
 	dr := float64(r.Side) * (pr - beforeR)
 	epsL := math.Pow10(-l.Inst.SizeDecimals) / 2
@@ -551,45 +596,105 @@ func (e *Executor) completeStep(ctx context.Context, l, r LegSpec, qty, beforeL,
 	case dr < qty-epsR && dl >= qty-epsL:
 		short, s = r, qty-dr
 	default:
-		return false, nil // both legs full, or both short: shrink aligns them
+		return false, pl, pr, nil // both legs full, or both short: shrink aligns them
 	}
 	if s <= 0 || s < legMinQty(short.Inst, short.Price) {
-		return false, nil // below the venue minimum: cannot complete
+		return false, pl, pr, nil // below the venue minimum: cannot complete
 	}
 	s = domain.Round(s, short.Inst.SizeDecimals)
 	if s <= 0 || s < legMinQty(short.Inst, short.Price) {
-		return false, nil
+		return false, pl, pr, nil
+	}
+	price := e.topUpPrice(short)
+	if price <= 0 || math.IsNaN(price) || math.IsInf(price, 0) {
+		return false, pl, pr, nil // book already beyond the completion allowance
+	}
+	if maxOpenNotional > 0 {
+		// The completion quantity must fit inside the reserved opening budget.
+		filledNotional := res.L.Filled*res.L.AvgPrice + res.R.Filled*res.R.AvgPrice
+		if filledNotional+s*price > maxOpenNotional {
+			return false, pl, pr, nil
+		}
+	}
+	if short.EdgeBps > 0 {
+		// Completing is only rational when the allowance plus the leg fee
+		// stays inside the expected opening margin.
+		if e.cfg.TopUpBps+short.Inst.TakerFee*1e4 >= short.EdgeBps {
+			return false, pl, pr, nil
+		}
 	}
 	req := domain.OrderReq{
 		ClientID: e.ids.Next(), Inst: short.Inst, Side: short.Side, Qty: s,
-		Price: topUpPrice(short, e.cfg.TopUpBps), Type: domain.Limit, ReduceOnly: false,
+		Price: price, Type: domain.Limit, ReduceOnly: false,
 	}
 	up := e.submitAndResolve(ctx, req, short.Venue)
 	res.topUp = &topUpState{req: req, result: up}
 	if !up.Resolved {
 		res.SettlementKnown = false
-		return false, fmt.Errorf("%w: completion order %d unresolved", ErrUnresolved, req.ClientID)
+		return false, pl, pr, fmt.Errorf("%w: completion order %d unresolved", ErrUnresolved, req.ClientID)
 	}
 	if up.Filled <= 0 {
-		return false, nil // rejected or empty: fall back to shrinking
+		return false, pl, pr, nil // rejected or empty: fall back to shrinking
+	}
+	// Verify the completion against the venue positions with settle delay and
+	// retries: a stale read here would shrink away the fill just placed.
+	upL, upR := LegResult{Resolved: true}, LegResult{Resolved: true}
+	qL, qR := 0.0, 0.0
+	if short.Inst.MarketID == l.Inst.MarketID && short.Side == l.Side {
+		upL, qL = up, s
+	} else {
+		upR, qR = up, s
+	}
+	pl2, pr2, _, err := e.confirmPositions(ctx, l, r, pl, pr, &upL, &upR, qL, qR, l.Side, r.Side)
+	if err != nil {
+		res.SettlementKnown = false
+		return false, pl, pr, err
 	}
 	if short.Inst.MarketID == l.Inst.MarketID && short.Side == l.Side {
 		mergeTopUp(&res.L, up)
 	} else {
 		mergeTopUp(&res.R, up)
 	}
-	return true, nil
+	return true, pl2, pr2, nil
 }
 
-// topUpPrice widens the decision price by bps in the aggressive direction and
-// rounds in the tightening direction so the bound is never exceeded.
-func topUpPrice(leg LegSpec, bps float64) float64 {
+// topUpPrice bounds the completion price: the decision price widened by at
+// most TopUpBps, or the current opposite book plus the same allowance,
+// whichever is tighter. A book already beyond the allowance yields 0 (skip).
+func (e *Executor) topUpPrice(leg LegSpec) float64 {
+	bps := e.cfg.TopUpBps
 	px := leg.Price
 	if leg.Side == domain.Buy {
 		px *= 1 + bps/1e4
-		px = domain.Floor(px, leg.Inst.PriceDecimals)
 	} else {
 		px *= 1 - bps/1e4
+	}
+	if e.book != nil && leg.Venue != nil {
+		if b, ok := e.book(leg.Venue.Name(), leg.Inst.MarketID); ok && b.Valid() {
+			slip := leg.Price * bps / 1e4
+			if leg.Side == domain.Buy {
+				// The market must sit inside the completion allowance.
+				if b.Asks[0].Price > px+1e-12 {
+					return 0
+				}
+				alt := b.Asks[0].Price + slip
+				if alt < px {
+					px = alt
+				}
+			} else {
+				if b.Bids[0].Price < px-1e-12 {
+					return 0
+				}
+				alt := b.Bids[0].Price - slip
+				if alt > px {
+					px = alt
+				}
+			}
+		}
+	}
+	if leg.Side == domain.Buy {
+		px = domain.Floor(px, leg.Inst.PriceDecimals)
+	} else {
 		px = domain.Ceil(px, leg.Inst.PriceDecimals)
 	}
 	if px <= 0 || math.IsNaN(px) || math.IsInf(px, 0) {
@@ -740,7 +845,10 @@ func (e *Executor) limitPrice(leg LegSpec, qty float64) float64 {
 	if n <= 0 {
 		return boundPrice(leg)
 	}
-	off := float64(n) * leg.Inst.Tick()
+	// Significant-figure venues (Hyperliquid) trade on a coarser grid than
+	// PriceDecimals for larger prices; offsets must use the grid at the
+	// decision price or the allowance collapses in the wire tightening.
+	off := float64(n) * leg.Inst.TickAt(leg.Price)
 	px := leg.Price + off
 	if leg.Side == domain.Sell {
 		px = leg.Price - off
@@ -789,7 +897,7 @@ func (e *Executor) allowance(leg LegSpec, qty float64) int {
 	if k <= 0 {
 		k = e.cfg.TickK
 	}
-	ticks := int(math.Ceil(k*sigma/leg.Inst.Tick()*e.depthScale(leg, qty) - 1e-9))
+	ticks := int(math.Ceil(k*sigma/leg.Inst.TickAt(leg.Price)*e.depthScale(leg, qty) - 1e-9))
 	// Cover the depth the quantity actually consumes (IOC walks past level 1).
 	if e.book != nil && leg.Venue != nil {
 		if b, ok := e.book(leg.Venue.Name(), leg.Inst.MarketID); ok {
@@ -865,7 +973,8 @@ func ticksTo(leg LegSpec, price float64) int {
 	if d <= 0 {
 		return 0
 	}
-	return int(math.Ceil(d/leg.Inst.Tick() - 1e-9))
+	tick := leg.Inst.TickAt(math.Max(price, leg.Price))
+	return int(math.Ceil(d/tick - 1e-9))
 }
 
 func (e *Executor) submitAndResolve(ctx context.Context, req domain.OrderReq, v exchange.Venue) (lr LegResult) {
@@ -964,6 +1073,8 @@ func (e *Executor) awaitOrder(ctx context.Context, req domain.OrderReq, v exchan
 		break
 	}
 	// REST fallback; unknown is never a failure.
+	queryTimer := time.NewTimer(e.cfg.QueryInterval)
+	defer queryTimer.Stop()
 	for i := 0; i < e.cfg.QueryRetries && ctx.Err() == nil; i++ {
 		u, qerr := v.QueryOrder(ctx, req.Inst, req.ClientID)
 		if qerr == nil && u.Status.Terminal() {
@@ -980,7 +1091,8 @@ func (e *Executor) awaitOrder(ctx context.Context, req domain.OrderReq, v exchan
 			}
 		case <-ctx.Done():
 			return lr
-		case <-time.After(e.cfg.QueryInterval):
+		case <-queryTimer.C:
+			queryTimer.Reset(e.cfg.QueryInterval)
 		}
 	}
 	slog.Warn("order state unresolved; will infer from positions", "venue", v.Name(), "cid", req.ClientID)
@@ -1110,7 +1222,7 @@ func (e *Executor) flatten(ctx context.Context, l, r LegSpec, targetL, targetR f
 			if deltas[i] < 0 {
 				side = domain.Buy
 			}
-			px, typ := RescuePrice(rescue, attempt, b, side, leg.Inst.PriceDecimals)
+			px, typ := RescuePrice(rescue, attempt, b, side, leg.Inst)
 			if px <= 0 || math.IsNaN(px) || math.IsInf(px, 0) {
 				return fmt.Errorf("invalid rescue price on %s", leg.Venue.Name())
 			}

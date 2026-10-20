@@ -141,7 +141,7 @@ func TestMixedPrecisionPartialReducesToCommonHedge(t *testing.T) {
 			li.SizeDecimals, ri.SizeDecimals = 2, 3
 			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 			defer cancel()
-			res := e.Execute(ctx, LegSpec{l, li, side, 100}, LegSpec{r, ri, -side, 100.1}, .01, false, 0, 0)
+			res := e.Execute(ctx, LegSpec{l, li, side, 100, 0}, LegSpec{r, ri, -side, 100.1, 0}, .01, false, 0, 0)
 			requireSettled(t, res)
 			requireQty(t, res.PosL, 0)
 			requireQty(t, res.PosR, 0)
@@ -175,7 +175,7 @@ func TestCanceledOrFailedPositionReadsNeverInventCloseFills(t *testing.T) {
 			} else {
 				lv.positionFn = func(context.Context) ([]domain.Position, error) { return nil, want }
 			}
-			res := e.Execute(ctx, LegSpec{lv, inst, domain.Sell, 100}, LegSpec{r, inst, domain.Buy, 100.1}, .01, true, .01, -.01)
+			res := e.Execute(ctx, LegSpec{lv, inst, domain.Sell, 100, 0}, LegSpec{r, inst, domain.Buy, 100.1, 0}, .01, true, .01, -.01)
 			if !errors.Is(res.Err, want) || res.PositionsKnown || res.SettlementKnown || res.L.Filled != 0 || res.R.Filled != 0 || res.RescueOrders != 0 {
 				t.Fatalf("position failure fabricated a close: %+v", res)
 			}
@@ -206,8 +206,8 @@ func TestUnknownZeroOrPartialRemainsPendingUntilTerminal(t *testing.T) {
 				}
 				return u, nil
 			}
-			ls := LegSpec{lifecycleVenue{fakeVenue: l, queryFn: query}, inst, domain.Buy, 100}
-			rs := LegSpec{lifecycleVenue{fakeVenue: r, queryFn: query}, inst, domain.Sell, 100.1}
+			ls := LegSpec{lifecycleVenue{fakeVenue: l, queryFn: query}, inst, domain.Buy, 100, 0}
+			rs := LegSpec{lifecycleVenue{fakeVenue: r, queryFn: query}, inst, domain.Sell, 100.1, 0}
 			res := e.Execute(context.Background(), ls, rs, .01, false, 0, 0)
 			for i := 0; i < 2; i++ {
 				if !errors.Is(res.Err, ErrUnresolved) || res.SettlementKnown || !res.PositionsKnown || res.RescueOrders != 0 {
@@ -253,7 +253,7 @@ func TestCanceledExecutionRecoversOriginalIOCWithParentContext(t *testing.T) {
 			},
 		}
 	}
-	ls, rs := LegSpec{wrap(l), inst, domain.Buy, 100}, LegSpec{wrap(r), inst, domain.Sell, 100.1}
+	ls, rs := LegSpec{wrap(l), inst, domain.Buy, 100, 0}, LegSpec{wrap(r), inst, domain.Sell, 100.1, 0}
 	res := e.Execute(ctx, ls, rs, .01, false, 0, 0)
 	if !errors.Is(res.Err, context.Canceled) || res.SettlementKnown || res.PositionsKnown {
 		t.Fatalf("canceled child execution was cleared: %+v", res)
@@ -286,7 +286,7 @@ func TestUnknownFullRescueIsRecordedWithEstimatedPrice(t *testing.T) {
 		}
 		return domain.OrderUpdate{ClientID: cid, Status: status}, nil
 	}}
-	res := e.Execute(context.Background(), LegSpec{l, inst, domain.Sell, 100}, LegSpec{rv, inst, domain.Buy, 100.1}, .01, true, .01, -.01)
+	res := e.Execute(context.Background(), LegSpec{l, inst, domain.Sell, 100, 0}, LegSpec{rv, inst, domain.Buy, 100.1, 0}, .01, true, .01, -.01)
 	requireSettled(t, res)
 	requireQty(t, res.PosL, 0)
 	requireQty(t, res.PosR, 0)
@@ -332,7 +332,7 @@ func TestPartialUnknownRescueRecoveryDoesNotDuplicateOrdersOrAccounting(t *testi
 		}
 		return domain.OrderUpdate{ClientID: cid, Status: domain.StatusUnknown}, nil
 	}}
-	ls, rs := LegSpec{l, inst, domain.Sell, 100}, LegSpec{rv, inst, domain.Buy, 100.1}
+	ls, rs := LegSpec{l, inst, domain.Sell, 100, 0}, LegSpec{rv, inst, domain.Buy, 100.1, 0}
 	res := e.Execute(context.Background(), ls, rs, .01, true, .01, -.01)
 	for i := 0; i < 2; i++ {
 		if !errors.Is(res.Err, ErrUnresolved) || res.SettlementKnown || res.RescueOrders != 1 || len(r.orders) != 2 {
@@ -371,7 +371,7 @@ func TestConfirmedFillWaitsForPositionSnapshot(t *testing.T) {
 				}
 				return l.Positions(ctx)
 			}}
-			res := e.Execute(context.Background(), LegSpec{lv, inst, domain.Buy, 100}, LegSpec{r, inst, domain.Sell, 100.1}, .01, false, 0, 0)
+			res := e.Execute(context.Background(), LegSpec{lv, inst, domain.Buy, 100, 0}, LegSpec{r, inst, domain.Sell, 100.1, 0}, .01, false, 0, 0)
 			if delayedForever {
 				if res.Err == nil || res.SettlementKnown || res.RescueOrders != 0 {
 					t.Fatalf("stale snapshot accepted confirmed fills: %+v", res)
@@ -474,7 +474,7 @@ func TestRescuePositionFailureRecoveryCountsTerminalFillOnce(t *testing.T) {
 		}
 		return r.Positions(ctx)
 	}}
-	ls, rs := LegSpec{l, inst, domain.Sell, 100}, LegSpec{rv, inst, domain.Buy, 100.1}
+	ls, rs := LegSpec{l, inst, domain.Sell, 100, 0}, LegSpec{rv, inst, domain.Buy, 100.1, 0}
 	res := e.Execute(context.Background(), ls, rs, .01, true, .01, -.01)
 	if !errors.Is(res.Err, want) || res.PositionsKnown || res.SettlementKnown || res.RescueOrders != 1 {
 		t.Fatalf("failed rescue snapshot reported success: %+v", res)
@@ -518,7 +518,7 @@ func TestRecoveryPriceEstimateUsesOriginalOrderBound(t *testing.T) {
 			},
 		}
 	}
-	ls, rs := LegSpec{wrap(l), inst, domain.Buy, 100}, LegSpec{wrap(r), inst, domain.Sell, 100.1}
+	ls, rs := LegSpec{wrap(l), inst, domain.Buy, 100, 0}, LegSpec{wrap(r), inst, domain.Sell, 100.1, 0}
 	res := e.Execute(ctx, ls, rs, .01, false, 0, 0)
 	if !errors.Is(res.Err, context.Canceled) {
 		t.Fatalf("child cancellation missing: %+v", res)
@@ -571,7 +571,7 @@ func TestEscalatedRecoverySettlesOldBatchAndPreservesHedgeTarget(t *testing.T) {
 		}
 		return domain.OrderUpdate{ClientID: cid, Status: domain.StatusUnknown}, nil
 	}}
-	ls, rs := LegSpec{lv, inst, domain.Buy, 100}, LegSpec{r, inst, domain.Sell, 100.1}
+	ls, rs := LegSpec{lv, inst, domain.Buy, 100, 0}, LegSpec{r, inst, domain.Sell, 100.1, 0}
 	res := e.Execute(context.Background(), ls, rs, .01, false, .02, -.02)
 	if !errors.Is(res.Err, ErrUnresolved) || res.RescueOrders != 1 {
 		t.Fatalf("normal rescue did not retain old batch: %+v", res)
@@ -607,7 +607,7 @@ func TestPositionInferredFillUsesConservativeOriginalIOCPrice(t *testing.T) {
 	l, r := newFake("L", full), newFake("R", full)
 	l.silent, r.silent = true, true
 	e := testLifecycleExec(t, l, r)
-	res := e.Execute(context.Background(), LegSpec{l, inst, domain.Buy, 100}, LegSpec{r, inst, domain.Sell, 100.1}, .01, false, 0, 0)
+	res := e.Execute(context.Background(), LegSpec{l, inst, domain.Buy, 100, 0}, LegSpec{r, inst, domain.Sell, 100.1, 0}, .01, false, 0, 0)
 	requireSettled(t, res)
 	if res.L.Resolved || res.R.Resolved || !res.L.PriceEstimated || !res.R.PriceEstimated {
 		t.Fatalf("position-inferred prices were labeled exact: %+v", res)

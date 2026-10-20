@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -36,12 +37,13 @@ type wsClient struct {
 	done   <-chan struct{}
 	dial   func(context.Context, string) (wsConn, error)
 
-	mu      sync.Mutex
-	conn    wsConn
-	subs    map[string]map[string]any
-	started bool
-	wg      sync.WaitGroup
-	writeMu sync.Mutex
+	mu       sync.Mutex
+	conn     wsConn
+	subs     map[string]map[string]any
+	started  bool
+	wg       sync.WaitGroup
+	writeMu  sync.Mutex
+	lastPong atomic.Int64
 }
 
 func newWSClient(name, url string, onMsg func(channel string, raw []byte)) *wsClient {
@@ -156,6 +158,7 @@ func (c *wsClient) loop() {
 			c.onReset()
 		}
 		conn.SetPongHandler(func(string) error { return conn.SetReadDeadline(time.Now().Add(90 * time.Second)) })
+		c.lastPong.Store(time.Now().UnixMilli())
 		for _, s := range subs {
 			c.sendSub(conn, s)
 		}
@@ -168,10 +171,24 @@ func (c *wsClient) loop() {
 			for {
 				select {
 				case <-ticker.C:
+					// Hyperliquid closes connections it has not heard from in
+					// 60 seconds; an application-level ping is what the server
+					// counts, and it answers with {"channel":"pong"}.
+					if err := c.write(conn, map[string]any{"method": "ping"}); err != nil {
+						closeConn(conn)
+						return
+					}
 					c.writeMu.Lock()
 					err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(5*time.Second))
 					c.writeMu.Unlock()
 					if err != nil {
+						closeConn(conn)
+						return
+					}
+					if time.Since(time.UnixMilli(c.lastPong.Load())) > 75*time.Second {
+						// Two consecutive pongs missed: the server stopped
+						// talking; reconnect instead of trading blind.
+						slog.Warn("ws heartbeat stale; reconnecting", "venue", c.name)
 						closeConn(conn)
 						return
 					}
@@ -229,9 +246,13 @@ func (c *wsClient) readLoop(conn wsConn) {
 		}
 		switch hdr.Channel {
 		case "ping":
+			// Defensive: reply to server-initiated pings; the venue's own
+			// heartbeat uses the application-level ping/pong pair.
 			if err := c.write(conn, map[string]any{"method": "pong"}); err != nil {
 				return
 			}
+		case "pong":
+			c.lastPong.Store(time.Now().UnixMilli())
 		case "subscriptionResponse", "error", "":
 			// acks and errors carry no book or order data
 		default:

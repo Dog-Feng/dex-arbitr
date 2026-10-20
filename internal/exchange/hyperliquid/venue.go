@@ -60,17 +60,33 @@ type Venue struct {
 	// numeric asset id used in signed orders.
 	assetsMu sync.RWMutex
 	assets   map[string]int
+	// assetsLoaded marks that the asset universe (including delisted coins)
+	// has been resolved, so AccountSnapshot no longer depends on a prior
+	// Instruments call.
+	assetsLoaded bool
+
+	// maxLev caches the per-market maximum leverage from meta.
+	levMu  sync.RWMutex
+	maxLev map[int]int
+
+	warnMu      sync.Mutex
+	warnedCoins map[string]time.Time
 
 	booksMu sync.Mutex
 	books   map[int]*bookState
 
-	ordersMu    sync.Mutex
-	orderSubs   []chan domain.OrderUpdate
-	ordersOnce  sync.Once
-	orderLookup map[int64]int64 // oid -> client id, filled from submit acks and updates
-	orderFinal  map[int64]domain.OrderStatus
-	orderOrig   map[int64]float64 // oid -> requested quantity (wire size)
-	fillAgg     map[int64]fillAgg
+	ordersMu     sync.Mutex
+	orderSubs    []chan domain.OrderUpdate
+	ordersOnce   sync.Once
+	orderLookup  map[int64]int64 // oid -> client id, filled from submit acks and updates
+	orderFinal   map[int64]domain.OrderStatus
+	orderOrig    map[int64]float64 // oid -> requested quantity (wire size)
+	fillStates   map[int64]*fillState
+	orderExpires map[int64]int64 // cid -> expiresAfter (ms)
+	knownCIDs    map[int64]time.Time
+	pendingFills map[int64][]pendingFill
+	finalTouched map[int64]time.Time
+	dropCount    atomic.Int64
 
 	lastNonce atomic.Int64
 	sendMu    chan struct{}
@@ -78,10 +94,64 @@ type Venue struct {
 	closeDone chan struct{}
 }
 
-// fillAgg accumulates per-order fill quantity and quote.
-type fillAgg struct {
-	qty   float64
-	quote float64
+// fillState accumulates the fill facts of one order. Every trade is deduped
+// by tid; the synchronous /exchange response contributes an authoritative
+// total that per-trade deliveries can only approach, never double count.
+type fillState struct {
+	tids      map[int64]struct{}
+	uniq      int64
+	qty       float64
+	quote     float64
+	fee       float64
+	syncQty   float64
+	syncQuote float64
+}
+
+func newFillState() *fillState { return &fillState{tids: map[int64]struct{}{}} }
+
+// add merges one trade identified by tid. It reports whether the trade was
+// new; a replay (WS snapshot, re-delivery, REST backfill) returns false.
+func (s *fillState) add(tid int64, sz, px, fee float64) bool {
+	key := tid
+	if key <= 0 {
+		// A fill without a tid cannot be deduplicated; count it once.
+		s.uniq++
+		key = -s.uniq
+	}
+	if _, dup := s.tids[key]; dup {
+		return false
+	}
+	s.tids[key] = struct{}{}
+	s.qty += sz
+	s.quote += sz * px
+	s.fee += fee
+	return true
+}
+
+// effective returns the published cumulative fill: the per-trade sum once it
+// covers the synchronous total, otherwise the synchronous total itself.
+func (s *fillState) effective() (qty, quote, fee float64) {
+	if s.qty >= s.syncQty-1e-12 {
+		return s.qty, s.quote, s.fee
+	}
+	return s.syncQty, s.syncQuote, s.fee
+}
+
+// fillState returns the accumulator for an oid, creating it when absent.
+// Callers must hold ordersMu.
+func (v *Venue) fillState(oid int64) *fillState {
+	fs := v.fillStates[oid]
+	if fs == nil {
+		fs = newFillState()
+		v.fillStates[oid] = fs
+	}
+	return fs
+}
+
+// pendingFill parks a fill that arrived before its oid was registered.
+type pendingFill struct {
+	fill wsFill
+	at   time.Time
 }
 
 // New builds the venue from a preset kind plus option overrides.
@@ -156,7 +226,10 @@ func NewWithConfig(cfg Config) (*Venue, error) {
 	v := &Venue{
 		cfg: cfg, assets: map[string]int{}, books: map[int]*bookState{},
 		orderLookup: map[int64]int64{}, orderFinal: map[int64]domain.OrderStatus{},
-		orderOrig: map[int64]float64{}, fillAgg: map[int64]fillAgg{},
+		orderOrig: map[int64]float64{}, fillStates: map[int64]*fillState{},
+		orderExpires: map[int64]int64{}, knownCIDs: map[int64]time.Time{},
+		pendingFills: map[int64][]pendingFill{}, finalTouched: map[int64]time.Time{},
+		maxLev: map[int]int{}, warnedCoins: map[string]time.Time{},
 		sendMu: make(chan struct{}, 1), closeDone: make(chan struct{}),
 	}
 	if cfg.AgentKey != "" {
@@ -164,11 +237,13 @@ func NewWithConfig(cfg Config) (*Venue, error) {
 		if err != nil {
 			return nil, err
 		}
+		s.mainnet = cfg.ExchangeURL == defaultExchangeURL
 		v.signer = s
 	}
 	v.rest = newRestClient(cfg.InfoURL, cfg.ExchangeURL)
 	v.ws = newWSClient(cfg.Name, cfg.WSURL, v.onWSMessage)
 	v.ws.onReset = v.resetBooks
+	go v.cleanupLoop()
 	return v, nil
 }
 
@@ -235,6 +310,22 @@ func (v *Venue) Instruments(ctx context.Context) ([]domain.Instrument, error) {
 	}
 	out := make([]domain.Instrument, 0, len(meta.Universe))
 	for i, m := range meta.Universe {
+		// Validator perps use the plain meta index as the asset id. Builder
+		// perps use 100000 + perp_dex_index*10000 + index_in_meta; perpDexs
+		// reports "io" at index 10, so io:SNDK (index 2) is asset 200002.
+		id := i
+		if v.cfg.Dex != "" {
+			id = 100000 + dexIndex*10000 + i
+		}
+		v.assetsMu.Lock()
+		v.assets[m.Name] = id
+		v.assetsLoaded = true
+		v.assetsMu.Unlock()
+		v.levMu.Lock()
+		v.maxLev[id] = m.MaxLeverage
+		v.levMu.Unlock()
+		// Delisted assets are registered so account snapshots can attribute
+		// leftover positions, but they are not tradable.
 		if m.IsDelisted {
 			continue
 		}
@@ -252,20 +343,10 @@ func (v *Venue) Instruments(ctx context.Context) ([]domain.Instrument, error) {
 		if priceDecimals < 0 {
 			priceDecimals = 0
 		}
-		// Validator perps use the plain meta index as the asset id. Builder
-		// perps use 100000 + perp_dex_index*10000 + index_in_meta; perpDexs
-		// reports "io" at index 10, so io:SNDK (index 2) is asset 200002.
-		id := i
-		if v.cfg.Dex != "" {
-			id = 100000 + dexIndex*10000 + i
-		}
-		v.assetsMu.Lock()
-		v.assets[m.Name] = id
-		v.assetsMu.Unlock()
 		taker, maker := baseFees(m, v.cfg.Dex != "")
 		out = append(out, domain.Instrument{
 			Venue: v.cfg.Name, Symbol: sym, MarketID: id,
-			SizeDecimals: m.SzDecimals, PriceDecimals: priceDecimals,
+			SizeDecimals: m.SzDecimals, PriceDecimals: priceDecimals, SigFigs: 5,
 			MinBase: 0, MinQuote: 10, TakerFee: taker, MakerFee: maker,
 		})
 	}
@@ -273,9 +354,12 @@ func (v *Venue) Instruments(ctx context.Context) ([]domain.Instrument, error) {
 }
 
 // baseFees returns per-fill fee rates at the base volume tier. Growth-mode
-// HIP-3 assets with deployerFeeScale 1.0 trade at 9 bps taker / 3 bps maker;
-// a better account tier only lowers the realized fee, so this estimate is
-// conservative for decision thresholds.
+// HIP-3 assets with deployerFeeScale 1.0 trade at 0.9 bps taker / 0.3 bps
+// maker (0.00045 * 2 * 0.1); a better account tier only lowers the realized
+// fee, so this estimate is conservative for decision thresholds. A
+// deployerFeeScale of "0" is treated like 1.0 (full multiplier): that is
+// conservative for fee thresholds, but keep it explicit until its meaning is
+// confirmed live.
 func baseFees(m metaItem, isHIP3 bool) (taker, maker float64) {
 	if !isHIP3 {
 		return 0.00045, 0.00015
@@ -316,7 +400,7 @@ func (v *Venue) SubscribeBook(ctx context.Context, inst domain.Instrument) (<-ch
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if inst.MarketID <= 0 {
+	if inst.MarketID < 0 {
 		return nil, fmt.Errorf("invalid market id %d", inst.MarketID)
 	}
 	coin, ok := v.coinFor(inst.MarketID)
@@ -340,9 +424,14 @@ func (v *Venue) SubscribeBook(ctx context.Context, inst domain.Instrument) (<-ch
 	}
 	v.booksMu.Unlock()
 	if !ok {
-		// fast:true delivers 5 levels per side per block (~0.5s) instead of
-		// the throttled 20-level feed (~5s). The bbo feed refreshes the top
-		// level even faster (~0.4s) and is merged into the same book state.
+		// This system trades the spread: a decision is only valid when both
+		// legs' prices are executable at the same instant. The fast feed
+		// delivers 5 levels per side on every block (~0.5s); the throttled
+		// 20-level feed (~5s) would price one leg against a book that has
+		// long since stopped satisfying the spread condition, and 5 levels
+		// already cover the single-step IOC quantities used here. The bbo
+		// feed refreshes the top level even faster (~0.4s) and is merged into
+		// the same book state.
 		v.ws.subscribe("l2Book/"+coin, map[string]any{"type": "l2Book", "coin": coin, "fast": true})
 		v.ws.subscribe("bbo/"+coin, map[string]any{"type": "bbo", "coin": coin})
 	}
@@ -377,14 +466,18 @@ type bookState struct {
 }
 
 func (bs *bookState) snapshot(venue string) domain.Book {
-	bids := bs.bids
-	if bs.depth > 0 && len(bids) > bs.depth {
-		bids = bids[:bs.depth]
+	// Published books must never share backing arrays with the mutable state:
+	// a later bbo merge rewrites levels in place otherwise.
+	n := len(bs.bids)
+	if bs.depth > 0 && n > bs.depth {
+		n = bs.depth
 	}
-	asks := bs.asks
-	if bs.depth > 0 && len(asks) > bs.depth {
-		asks = asks[:bs.depth]
+	bids := append([]domain.Level(nil), bs.bids[:n]...)
+	m := len(bs.asks)
+	if bs.depth > 0 && m > bs.depth {
+		m = bs.depth
 	}
+	asks := append([]domain.Level(nil), bs.asks[:m]...)
 	return domain.Book{Venue: venue, MarketID: bs.marketID, Bids: bids, Asks: asks, Seq: bs.seq, Ts: bs.updated}
 }
 
@@ -491,6 +584,9 @@ func (v *Venue) onBbo(raw []byte) {
 	if bs == nil || !bs.synced {
 		return // wait for the first full snapshot
 	}
+	if m.Data.Time < bs.seq {
+		return // a late bbo must never replace a newer full snapshot
+	}
 	topBid, haveBid := domain.Level{}, false
 	if len(bs.bids) > 0 {
 		topBid, haveBid = bs.bids[0], true
@@ -508,23 +604,52 @@ func (v *Venue) onBbo(raw []byte) {
 	if haveBid && haveAsk && topBid.Price >= topAsk.Price {
 		return // never publish a crossed book
 	}
+	bids, asks := bs.bids, bs.asks
 	if bidErr == nil {
-		if len(bs.bids) == 0 {
-			bs.bids = []domain.Level{topBid}
-		} else {
-			bs.bids[0] = topBid
-		}
+		bids = mergeTop(bids, topBid, true)
 	}
 	if askErr == nil {
-		if len(bs.asks) == 0 {
-			bs.asks = []domain.Level{topAsk}
-		} else {
-			bs.asks[0] = topAsk
-		}
+		asks = mergeTop(asks, topAsk, false)
 	}
+	if !bookOrdered(bids, true) || !bookOrdered(asks, false) {
+		// Defensive: an exchange-side anomaly produced a non-monotonic book;
+		// keep the previous state instead of publishing crossed levels.
+		slog.Warn("bbo merge rejected: non-monotonic book", "venue", v.cfg.Name, "coin", m.Data.Coin)
+		return
+	}
+	bs.bids, bs.asks = bids, asks
 	bs.seq = m.Data.Time
 	bs.updated = time.Now()
 	v.publishBook(bs, bs.snapshot(v.cfg.Name))
+}
+
+// mergeTop returns a new level list whose first level is top. The replaced
+// old top is dropped and the remaining levels are kept only when strictly
+// worse than the new top, so the book stays ordered even when the new top
+// crosses stale levels. The old backing array is never written.
+func mergeTop(levels []domain.Level, top domain.Level, bid bool) []domain.Level {
+	out := make([]domain.Level, 0, len(levels)+1)
+	out = append(out, top)
+	for i, lv := range levels {
+		if i == 0 {
+			continue // superseded by the bbo
+		}
+		if bid && lv.Price < top.Price || !bid && lv.Price > top.Price {
+			out = append(out, lv)
+		}
+	}
+	return out
+}
+
+// bookOrdered reports whether bids are strictly decreasing or asks strictly
+// increasing.
+func bookOrdered(levels []domain.Level, bid bool) bool {
+	for i := 1; i < len(levels); i++ {
+		if bid && levels[i].Price >= levels[i-1].Price || !bid && levels[i].Price <= levels[i-1].Price {
+			return false
+		}
+	}
+	return true
 }
 
 func parseBboLevel(l struct {
@@ -612,15 +737,22 @@ func partialIOC(status domain.OrderStatus, filled, requested float64) domain.Ord
 
 type wsFillsMsg struct {
 	Data struct {
-		User  string `json:"user"`
-		Fills []struct {
-			Coin string `json:"coin"`
-			Px   string `json:"px"`
-			Sz   string `json:"sz"`
-			Oid  int64  `json:"oid"`
-			Time int64  `json:"time"`
-		} `json:"fills"`
+		User       string   `json:"user"`
+		IsSnapshot bool     `json:"isSnapshot"`
+		Fills      []wsFill `json:"fills"`
 	} `json:"data"`
+}
+
+type wsFill struct {
+	Coin  string `json:"coin"`
+	Px    string `json:"px"`
+	Sz    string `json:"sz"`
+	Oid   int64  `json:"oid"`
+	Time  int64  `json:"time"`
+	Tid   int64  `json:"tid"`
+	Hash  string `json:"hash"`
+	Fee   string `json:"fee"`
+	Cloid string `json:"cloid"`
 }
 
 func (v *Venue) onOrderUpdate(raw []byte) {
@@ -640,7 +772,8 @@ func (v *Venue) onOrderUpdate(raw []byte) {
 		if orig, oerr := strconv.ParseFloat(u.Order.OrigSz, 64); oerr == nil && orig > 0 && !math.IsNaN(orig) {
 			v.orderOrig[u.Order.Oid] = orig
 		}
-		agg := v.fillAgg[u.Order.Oid]
+		v.drainPending(u.Order.Oid)
+		aggQty, aggQuote, aggFee := v.fillState(u.Order.Oid).effective()
 		status := mapOrderStatus(u.Status)
 		orig := v.orderOrig[u.Order.Oid]
 		if status.Terminal() {
@@ -650,23 +783,78 @@ func (v *Venue) onOrderUpdate(raw []byte) {
 		// A filled or partially-filled canceled order whose fills have not
 		// been observed yet must resolve through the fill backfill; a
 		// zero-size terminal report would desync the executor's position
-		// accounting.
+		// accounting. A resting order publishes so the executor can confirm
+		// acceptance early.
 		publishNow := status == domain.StatusRejected ||
-			(status.Terminal() && agg.qty > 0)
+			status == domain.StatusOpen ||
+			(status.Terminal() && aggQty > 0)
 		if publishNow {
-			status = partialIOC(status, agg.qty, v.orderOrig[u.Order.Oid])
+			status = partialIOC(status, aggQty, v.orderOrig[u.Order.Oid])
 			v.publishOrder(domain.OrderUpdate{
 				Venue: v.cfg.Name, ClientID: cid, OrderIndex: u.Order.Oid,
-				Status: status, FilledQty: agg.qty, FilledQuote: agg.quote,
+				Status: status, FilledQty: aggQty, FilledQuote: aggQuote, Fee: aggFee,
 				Ts: time.Now(),
 			})
 		}
+		if status == domain.StatusUnknown {
+			// An unmapped status string must not silently stall the order:
+			// warn once and resolve it through REST.
+			slog.Warn("unmapped order status; verifying via REST", "venue", v.cfg.Name, "oid", u.Order.Oid, "status", u.Status)
+			go v.queryUnknownStatus(u.Order.Oid, cid)
+		}
 		v.ordersMu.Unlock()
-		if (status == domain.StatusFilled || status == domain.StatusCanceled) && agg.qty == 0 {
+		if (status == domain.StatusFilled || status == domain.StatusCanceled) && aggQty == 0 {
 			// Late fill aggregation: fetch fills once for the terminal oid.
 			go v.backfillFills(u.Order.Oid, cid, u.StatusTimestamp, status, orig)
 		}
 	}
+}
+
+// queryUnknownStatus resolves a status string outside the mapping via a
+// direct orderStatus lookup and publishes the terminal outcome if the fill
+// facts are already available.
+func (v *Venue) queryUnknownStatus(oid, cid int64) {
+	if v.cfg.Account == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	st, err := v.rest.orderStatus(ctx, v.cfg.Account, v.cfg.Dex, strconv.FormatInt(oid, 10))
+	if err != nil || st.Status != "order" || st.Order == nil {
+		return
+	}
+	status := mapOrderStatus(st.Order.Status)
+	if !status.Terminal() {
+		return
+	}
+	orig, origErr := number(st.Order.Order.OrigSz)
+	if origErr != nil || orig <= 0 {
+		orig = 0
+	}
+	qty, quote, fee, ok := v.mergeFills(ctx, oid, st.Order.StatusTimestamp)
+	v.ordersMu.Lock()
+	defer v.ordersMu.Unlock()
+	v.orderLookup[oid] = cid
+	v.orderFinal[oid] = status
+	if orig > 0 {
+		v.orderOrig[oid] = orig
+	}
+	if status == domain.StatusRejected {
+		v.publishOrder(domain.OrderUpdate{
+			Venue: v.cfg.Name, ClientID: cid, OrderIndex: oid,
+			Status: status, Ts: time.Now(),
+		})
+		return
+	}
+	if !ok {
+		return // fill facts are not indexed yet; backfill may still arrive
+	}
+	status = partialIOC(status, qty, orig)
+	v.publishOrder(domain.OrderUpdate{
+		Venue: v.cfg.Name, ClientID: cid, OrderIndex: oid,
+		Status: status, FilledQty: qty, FilledQuote: quote, Fee: fee,
+		Ts: time.Now(),
+	})
 }
 
 func mapOrderStatus(s string) domain.OrderStatus {
@@ -700,28 +888,70 @@ func (v *Venue) onUserFills(raw []byte) {
 	for _, f := range m.Data.Fills {
 		cid, known := v.orderLookup[f.Oid]
 		if !known {
-			continue
+			// A fill may arrive before the submit ack or order update
+			// registered its oid. A cloid known to this process identifies it
+			// as ours; otherwise park the fill until registration.
+			if c, ok := cloidToID(f.Cloid); ok {
+				if _, ours := v.knownCIDs[c]; ours {
+					v.orderLookup[f.Oid] = c
+					cid, known = c, true
+				}
+			}
+			if !known {
+				v.pendingFills[f.Oid] = append(v.pendingFills[f.Oid], pendingFill{fill: f, at: time.Now()})
+				continue
+			}
 		}
-		sz, err1 := strconv.ParseFloat(f.Sz, 64)
-		px, err2 := strconv.ParseFloat(f.Px, 64)
-		if err1 != nil || err2 != nil || sz <= 0 || px <= 0 || math.IsNaN(sz) || math.IsNaN(px) {
-			continue
+		if !v.mergeFillLocked(f) {
+			continue // duplicate trade (replay, snapshot, or backfill overlap)
 		}
-		agg := v.fillAgg[f.Oid]
-		agg.qty += sz
-		agg.quote += sz * px
-		v.fillAgg[f.Oid] = agg
+		if m.Data.IsSnapshot {
+			continue // snapshot replays only fill gaps; they never re-publish
+		}
+		aggQty, aggQuote, aggFee := v.fillState(f.Oid).effective()
 		status := v.orderFinal[f.Oid]
 		if !status.Terminal() {
 			status = domain.StatusUnknown
 		} else {
-			status = partialIOC(status, agg.qty, v.orderOrig[f.Oid])
+			status = partialIOC(status, aggQty, v.orderOrig[f.Oid])
 		}
 		v.publishOrder(domain.OrderUpdate{
 			Venue: v.cfg.Name, ClientID: cid, OrderIndex: f.Oid,
-			Status: status, FilledQty: agg.qty, FilledQuote: agg.quote,
+			Status: status, FilledQty: aggQty, FilledQuote: aggQuote, Fee: aggFee,
 			Ts: time.Now(),
 		})
+	}
+}
+
+// mergeFillLocked merges one WS fill into the per-oid state and reports
+// whether it was a new trade. Callers must hold ordersMu.
+func (v *Venue) mergeFillLocked(f wsFill) bool {
+	sz, err1 := strconv.ParseFloat(f.Sz, 64)
+	px, err2 := strconv.ParseFloat(f.Px, 64)
+	if err1 != nil || err2 != nil || sz <= 0 || px <= 0 || math.IsNaN(sz) || math.IsNaN(px) {
+		return false
+	}
+	fee, feeErr := strconv.ParseFloat(f.Fee, 64)
+	if feeErr != nil || fee < 0 || math.IsNaN(fee) {
+		fee = 0
+	}
+	return v.fillState(f.Oid).add(f.Tid, sz, px, fee)
+}
+
+// drainPending merges fills that arrived before the oid was registered.
+// Callers must hold ordersMu.
+func (v *Venue) drainPending(oid int64) {
+	pending := v.pendingFills[oid]
+	if len(pending) == 0 {
+		return
+	}
+	delete(v.pendingFills, oid)
+	now := time.Now()
+	for _, pf := range pending {
+		if now.Sub(pf.at) > time.Minute {
+			continue
+		}
+		v.mergeFillLocked(pf.fill)
 	}
 }
 
@@ -730,8 +960,11 @@ func (v *Venue) publishOrder(u domain.OrderUpdate) {
 		select {
 		case c <- u:
 		default:
-			slog.Warn("order update dropped (slow consumer)", "venue", v.cfg.Name, "cid", u.ClientID)
+			slog.Warn("order update dropped (slow consumer)", "venue", v.cfg.Name, "cid", u.ClientID, "dropped_total", v.dropCount.Add(1))
 		}
+	}
+	if u.Status.Terminal() && u.OrderIndex > 0 {
+		v.finalTouched[u.OrderIndex] = time.Now()
 	}
 }
 
@@ -753,7 +986,7 @@ func (v *Venue) backfillFills(oid, cid int64, statusTs int64, status domain.Orde
 	}
 	v.ordersMu.Lock()
 	defer v.ordersMu.Unlock()
-	var qty, quote float64
+	added := false
 	for _, f := range fills {
 		if f.Oid.String() != strconv.FormatInt(oid, 10) {
 			continue
@@ -763,9 +996,15 @@ func (v *Venue) backfillFills(oid, cid int64, statusTs int64, status domain.Orde
 		if err1 != nil || err2 != nil {
 			continue
 		}
-		qty += sz
-		quote += sz * px
+		fee, feeErr := number(f.Fee)
+		if feeErr != nil || fee < 0 {
+			fee = 0
+		}
+		if v.fillState(oid).add(f.Tid, sz, px, fee) {
+			added = true
+		}
 	}
+	qty, quote, fee := v.fillState(oid).effective()
 	if qty <= 0 {
 		// A canceled order may genuinely have no fills.
 		if status == domain.StatusCanceled {
@@ -776,11 +1015,15 @@ func (v *Venue) backfillFills(oid, cid int64, statusTs int64, status domain.Orde
 		}
 		return
 	}
-	v.fillAgg[oid] = fillAgg{qty: qty, quote: quote}
+	if !added {
+		// Every trade was already merged through another source; the
+		// published terminal update is still current.
+		return
+	}
 	status = partialIOC(status, qty, origQty)
 	v.publishOrder(domain.OrderUpdate{
 		Venue: v.cfg.Name, ClientID: cid, OrderIndex: oid,
-		Status: status, FilledQty: qty, FilledQuote: quote,
+		Status: status, FilledQty: qty, FilledQuote: quote, Fee: fee,
 		Ts: time.Now(),
 	})
 }
@@ -823,8 +1066,7 @@ func (v *Venue) SubscribeOrders(ctx context.Context) (<-chan domain.OrderUpdate,
 	return ch, nil
 }
 
-// Position returns the pair's position on marketID and the venue's total
-// notional aggregated across all markets.
+// Positions returns every non-zero position on the account.
 func (v *Venue) Positions(ctx context.Context) ([]domain.Position, error) {
 	snapshot, err := v.AccountSnapshot(ctx)
 	if err != nil {
@@ -837,6 +1079,9 @@ func (v *Venue) Positions(ctx context.Context) ([]domain.Position, error) {
 func (v *Venue) AccountSnapshot(ctx context.Context) (domain.AccountSnapshot, error) {
 	if v.cfg.Account == "" {
 		return domain.AccountSnapshot{}, domain.ErrNoCredentials
+	}
+	if err := v.ensureAssets(ctx); err != nil {
+		return domain.AccountSnapshot{}, err
 	}
 	ch, err := v.rest.clearinghouse(ctx, v.cfg.Account, v.cfg.Dex)
 	if err != nil {
@@ -852,7 +1097,11 @@ func (v *Venue) AccountSnapshot(ctx context.Context) (domain.AccountSnapshot, er
 		seen[coin] = true
 		id, ok := v.assetForCoin(coin)
 		if !ok {
-			return domain.AccountSnapshot{}, fmt.Errorf("position coin %q not in universe", coin)
+			// A delisted or otherwise unknown coin still contributes to the
+			// account exposure. Attribute it with a reserved negative id so
+			// monitoring and reconciliation can see it without failing.
+			id = -1
+			v.warnCoinOnce(coin)
 		}
 		qty, err := number(ap.Position.Szi)
 		if err != nil || math.IsNaN(qty) {
@@ -863,11 +1112,17 @@ func (v *Venue) AccountSnapshot(ctx context.Context) (domain.AccountSnapshot, er
 		}
 		entry, err := number(ap.Position.EntryPx)
 		if err != nil || entry <= 0 {
-			return domain.AccountSnapshot{}, fmt.Errorf("coin %q: invalid entry price", coin)
+			if id >= 0 {
+				return domain.AccountSnapshot{}, fmt.Errorf("coin %q: invalid entry price", coin)
+			}
+			entry = 0
 		}
 		liq, err := number(ap.Position.LiquidationPx)
 		if err != nil || liq < 0 {
-			return domain.AccountSnapshot{}, fmt.Errorf("coin %q: invalid liquidation price", coin)
+			if id >= 0 {
+				return domain.AccountSnapshot{}, fmt.Errorf("coin %q: invalid liquidation price", coin)
+			}
+			liq = 0
 		}
 		notional, err := number(ap.Position.PositionValue)
 		if err != nil || notional < 0 {
@@ -906,4 +1161,120 @@ func (v *Venue) assetForCoin(coin string) (int, bool) {
 	defer v.assetsMu.RUnlock()
 	id, ok := v.assets[coin]
 	return id, ok
+}
+
+// ensureAssets resolves the asset universe once, so AccountSnapshot no longer
+// depends on Instruments having been called first.
+func (v *Venue) ensureAssets(ctx context.Context) error {
+	v.assetsMu.RLock()
+	loaded := v.assetsLoaded
+	v.assetsMu.RUnlock()
+	if loaded {
+		return nil
+	}
+	v.assetsMu.Lock()
+	defer v.assetsMu.Unlock()
+	if v.assetsLoaded {
+		return nil
+	}
+	meta, err := v.rest.meta(ctx, v.cfg.Dex)
+	if err != nil {
+		return fmt.Errorf("asset universe: %w", err)
+	}
+	dexIndex, err := v.rest.dexIndex(ctx, v.cfg.Dex)
+	if err != nil {
+		return fmt.Errorf("perp dex index: %w", err)
+	}
+	for i, m := range meta.Universe {
+		id := i
+		if v.cfg.Dex != "" {
+			id = 100000 + dexIndex*10000 + i
+		}
+		v.assets[m.Name] = id
+		v.maxLev[id] = m.MaxLeverage
+	}
+	v.assetsLoaded = true
+	return nil
+}
+
+// maxLeverage returns the market's maximum leverage from meta when known.
+func (v *Venue) maxLeverage(asset int) (int, bool) {
+	v.levMu.RLock()
+	defer v.levMu.RUnlock()
+	cap, ok := v.maxLev[asset]
+	return cap, ok
+}
+
+// warnCoinOnce logs an unknown-position-coin warning at most once a minute
+// per coin so a delisted leftover cannot spam the log.
+func (v *Venue) warnCoinOnce(coin string) {
+	now := time.Now()
+	v.warnMu.Lock()
+	defer v.warnMu.Unlock()
+	if last, ok := v.warnedCoins[coin]; ok && now.Sub(last) < time.Minute {
+		return
+	}
+	v.warnedCoins[coin] = now
+	slog.Warn("position coin not in universe", "venue", v.cfg.Name, "coin", coin)
+}
+
+// cleanupLoop periodically drops per-order state once a terminal outcome has
+// been published long enough to cover every query and recovery window.
+func (v *Venue) cleanupLoop() {
+	t := time.NewTicker(time.Minute)
+	defer t.Stop()
+	for {
+		select {
+		case <-v.closeDone:
+			return
+		case <-t.C:
+			v.cleanupOrders()
+		}
+	}
+}
+
+func (v *Venue) cleanupOrders() {
+	now := time.Now()
+	finalCutoff := now.Add(-10 * time.Minute)
+	cidCutoff := now.Add(-time.Hour)
+	v.ordersMu.Lock()
+	for oid, st := range v.orderFinal {
+		if !st.Terminal() {
+			continue
+		}
+		if touched, ok := v.finalTouched[oid]; ok && touched.After(finalCutoff) {
+			continue
+		}
+		delete(v.orderLookup, oid)
+		delete(v.orderFinal, oid)
+		delete(v.orderOrig, oid)
+		delete(v.fillStates, oid)
+		delete(v.finalTouched, oid)
+	}
+	for oid, pending := range v.pendingFills {
+		kept := pending[:0]
+		for _, pf := range pending {
+			if now.Sub(pf.at) <= time.Minute {
+				kept = append(kept, pf)
+			}
+		}
+		if len(kept) == 0 {
+			delete(v.pendingFills, oid)
+		} else {
+			v.pendingFills[oid] = kept
+		}
+	}
+	for cid, at := range v.knownCIDs {
+		if at.Before(cidCutoff) {
+			delete(v.knownCIDs, cid)
+		}
+	}
+	for cid, exp := range v.orderExpires {
+		// Keep the expiry long after it elapsed: the elapsed marker is what
+		// turns a late unknownOid into a definitive rejection.
+		if exp < now.UnixMilli()-time.Hour.Milliseconds() {
+			delete(v.orderExpires, cid)
+		}
+	}
+	v.ordersMu.Unlock()
 }

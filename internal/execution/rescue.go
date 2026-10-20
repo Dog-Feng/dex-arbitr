@@ -18,11 +18,13 @@ type RescueParams struct {
 var DefaultRescue = RescueParams{TopTries: 3, MaxTicks: 5, MarketBps: 30}
 
 // RescuePrice returns the price and order type for a rescue attempt (0-based).
-func RescuePrice(p RescueParams, attempt int, b domain.Book, side domain.Side, priceDecimals int) (float64, domain.OrderType) {
+// Ladder steps use the instrument's effective tick at the top of book, so
+// significant-figure venues (Hyperliquid) get one real grid step per rung
+// instead of collapsing onto the top.
+func RescuePrice(p RescueParams, attempt int, b domain.Book, side domain.Side, inst domain.Instrument) (float64, domain.OrderType) {
 	if p.Immediate {
-		return marketPrice(p.MarketBps, b, side, priceDecimals), domain.Market
+		return marketPrice(p.MarketBps, b, side, inst), domain.Market
 	}
-	tick := math.Pow10(-priceDecimals)
 	top := func() float64 {
 		if side == domain.Buy {
 			return b.Asks[0].Price
@@ -32,23 +34,30 @@ func RescuePrice(p RescueParams, attempt int, b domain.Book, side domain.Side, p
 	dir := float64(side) // buy => pay up (+), sell => sell lower (-)
 	switch {
 	case attempt < p.TopTries:
-		return domain.Round(top(), priceDecimals), domain.Limit
+		return domain.Round(top(), inst.PriceDecimals), domain.Limit
 	case attempt < p.TopTries+p.MaxTicks:
 		n := float64(attempt - p.TopTries + 1)
-		return domain.Round(top()+dir*n*tick, priceDecimals), domain.Limit
+		tick := inst.TickAt(top())
+		px := domain.Round(top()+dir*n*tick, inst.PriceDecimals)
+		prev := domain.Round(top()+dir*(n-1)*tick, inst.PriceDecimals)
+		for px == prev {
+			// Adjacent rungs must stay distinct on the venue's real grid.
+			px = domain.Round(px+dir*tick, inst.PriceDecimals)
+		}
+		return px, domain.Limit
 	default:
-		return marketPrice(p.MarketBps, b, side, priceDecimals), domain.Market
+		return marketPrice(p.MarketBps, b, side, inst), domain.Market
 	}
 }
 
 // marketPrice returns a protective market price at mid ± bps, rounded to a tick.
-func marketPrice(bps float64, b domain.Book, side domain.Side, priceDecimals int) float64 {
-	tick := math.Pow10(-priceDecimals)
+func marketPrice(bps float64, b domain.Book, side domain.Side, inst domain.Instrument) float64 {
+	tick := inst.TickAt(b.Mid())
 	px := b.Mid() * (1 + float64(side)*bps/1e4)
 	if side == domain.Buy {
 		px = math.Ceil(px/tick-1e-9) * tick
 	} else {
 		px = math.Floor(px/tick+1e-9) * tick
 	}
-	return domain.Round(px, priceDecimals)
+	return domain.Round(px, inst.PriceDecimals)
 }
