@@ -3,6 +3,7 @@
 //	go run ./cmd/selfcheck                    # read-only checks (no keys needed)
 //	go run ./cmd/selfcheck -live              # real open/close round trip on flat markets
 //	go run ./cmd/selfcheck -live -rescue      # local one-leg rejection -> real rescue flatten
+//	go run ./cmd/selfcheck -submin            # live sub-minimum residual round-up check on one venue
 package main
 
 import (
@@ -34,6 +35,8 @@ type options struct {
 	watch  time.Duration
 	live   bool
 	rescue bool
+	submin bool
+	venue  string
 }
 
 type checks struct {
@@ -59,9 +62,11 @@ func main() {
 	watch := flag.Duration("watch", 15*time.Second, "order book watch duration")
 	live := flag.Bool("live", false, "place real orders (round trip; both markets must be flat)")
 	rescue := flag.Bool("rescue", false, "with -live: reject the right order locally and verify real rescue flatten")
+	submin := flag.Bool("submin", false, "live: verify sub-minimum residual handling on one venue (must be flat first)")
+	venue := flag.String("venue", "entropy", "venue used by -submin")
 	flag.Parse()
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn})))
-	os.Exit(runMain(*cfgPath, options{base: *base, qty: *qty, watch: *watch, live: *live, rescue: *rescue}))
+	os.Exit(runMain(*cfgPath, options{base: *base, qty: *qty, watch: *watch, live: *live, rescue: *rescue, submin: *submin, venue: *venue}))
 }
 
 func runMain(path string, opts options) int {
@@ -69,6 +74,9 @@ func runMain(path string, opts options) int {
 	if err != nil {
 		fmt.Println("config:", err)
 		return 1
+	}
+	if opts.submin {
+		return runSubmin(cfg, opts)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
@@ -78,6 +86,40 @@ func runMain(path string, opts options) int {
 		return 1
 	}
 	return runChecks(ctx, cfg, opts, venues, os.Stdout)
+}
+
+// runSubmin builds only the target venue so missing credentials for other
+// configured venues cannot block the check.
+func runSubmin(cfg *config.Config, opts options) int {
+	var vc *config.Venue
+	for i := range cfg.Venues {
+		if cfg.Venues[i].Name == opts.venue {
+			vc = &cfg.Venues[i]
+			break
+		}
+	}
+	if vc == nil {
+		fmt.Printf("venue %q not configured\n", opts.venue)
+		return 1
+	}
+	v, err := exchange.New(vc.Kind, vc.Name, vc.Opts)
+	if err != nil {
+		fmt.Println("venue:", err)
+		return 1
+	}
+	defer func() {
+		if err := v.Close(); err != nil {
+			fmt.Println("venue close:", err)
+		}
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	if err := subminFlow(ctx, v, engine.Matcher(cfg), opts.base, opts.qty, os.Stdout); err != nil {
+		fmt.Println("submin:", err)
+		return 1
+	}
+	fmt.Println("\nRESULT: sub-min verification passed")
+	return 0
 }
 
 func selectPair(cfg *config.Config, venues map[string]exchange.Venue) (config.Pair, exchange.Venue, exchange.Venue, error) {
