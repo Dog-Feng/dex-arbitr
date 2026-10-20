@@ -92,6 +92,13 @@ func TestSignReferenceVectors(t *testing.T) {
 	if hex.EncodeToString(conn) != "e10fac4d79c12c50d59ae8d0c478fe3d8029795c54b00e41ff5018a8b0e9b7df" {
 		t.Fatalf("connection id mismatch: %x", conn)
 	}
+	// With expiresAfter the SDK appends 0x00 || expires_be64 after the vault
+	// marker (signing.py action_hash); this vector was computed with that
+	// exact algorithm for the same action and nonce.
+	conn = connectionID(packed, nonce, 1734398399395)
+	if hex.EncodeToString(conn) != "0faa14378017a449e9e3f34b6e05b56281309777bdc937c988402a3b4dd06fd5" {
+		t.Fatalf("expiring connection id mismatch: %x", conn)
+	}
 }
 
 // TestSignSendAssetReference pins the agentSendAsset L1 signature to values

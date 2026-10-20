@@ -27,6 +27,7 @@ type fakeVenue struct {
 	posBump    float64
 	bumped     bool
 	orders     []domain.OrderReq
+	feeRate    float64 // reported fee per unit of notional; 0 = venue reports none
 }
 
 func newFake(name string, f func(int, domain.OrderReq) float64) *fakeVenue {
@@ -68,7 +69,7 @@ func (f *fakeVenue) Submit(_ context.Context, r domain.OrderReq) (domain.SubmitA
 	}
 	f.mu.Unlock()
 	if !f.silent {
-		f.ch <- domain.OrderUpdate{Venue: f.name, ClientID: r.ClientID, Status: st, FilledQty: q, FilledQuote: q * r.Price}
+		f.ch <- domain.OrderUpdate{Venue: f.name, ClientID: r.ClientID, Status: st, FilledQty: q, FilledQuote: q * r.Price, Fee: q * r.Price * f.feeRate}
 	}
 	return domain.SubmitAck{ClientID: r.ClientID}, nil
 }

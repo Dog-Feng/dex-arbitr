@@ -159,11 +159,20 @@ func (a *PairActor) failSettlement(p *pendingExecution) {
 	}
 }
 
+// subMinRetryInterval spaces recovery retries once a sub-minimum residual has
+// been reported. Emergency and drain requests keep the normal interval.
+const subMinRetryInterval = 30 * time.Second
+
 func (a *PairActor) resolvePending(ctx context.Context) {
 	p := a.pending
 	interval := a.cfg.ExecCfg.QueryInterval
 	if interval <= 0 {
 		interval = time.Second
+	}
+	if p.dustWarned && interval < subMinRetryInterval && !a.emergencyRequested.Load() && !a.draining.Load() {
+		// A sub-minimum residual will not clear on the next tick; retrying
+		// every query interval only spams rejected minimum-sized orders.
+		interval = subMinRetryInterval
 	}
 	if time.Since(p.lastAttempt) < interval {
 		return
@@ -196,9 +205,10 @@ func (a *PairActor) resolvePending(ctx context.Context) {
 			}
 		} else if errors.Is(res.Err, execution.ErrSubMinResidual) {
 			// An untradable dust residual is not an external intervention: the
-			// ledger stays intact, trading stays paused, and the flatten keeps
-			// retrying minimum-sized reduce-only orders. Warn once so the pair
-			// does not loop silently.
+			// ledger stays intact and trading stays paused. Openings first try
+			// a forward completion inside the executor; what remains here is
+			// retried at subMinRetryInterval. Warn once so the pair does not
+			// loop silently.
 			if !p.dustWarned {
 				p.dustWarned = true
 				a.record(monitor.KindError, func(e *monitor.Event) {
@@ -359,6 +369,7 @@ func (a *PairActor) finishIntervention(res execution.Result, interrupted ...exec
 	if err != nil {
 		return err
 	}
+	fees := legFees(res.L, a.cfg.Pair.Left.TakerFee) + legFees(res.R, a.cfg.Pair.Right.TakerFee)
 	for _, original := range interrupted {
 		left, err := legNotional(original.L)
 		if err != nil {
@@ -370,8 +381,8 @@ func (a *PairActor) finishIntervention(res execution.Result, interrupted ...exec
 		}
 		nl += left
 		nr += right
+		fees += legFees(original.L, a.cfg.Pair.Left.TakerFee) + legFees(original.R, a.cfg.Pair.Right.TakerFee)
 	}
-	fees := nl*a.cfg.Pair.Left.TakerFee + nr*a.cfg.Pair.Right.TakerFee
 	closed := len(a.state.Steps)
 	if closed > 0 {
 		a.lastDir = a.state.Steps[0].Dir
@@ -524,6 +535,38 @@ func legNotional(lr execution.LegResult) (float64, error) {
 	return sum, nil
 }
 
+// legFees returns a leg's fees in USD. Each component (the leg's own and
+// completion fills, then rescue fills) uses the venue-reported fee when every
+// fill in it carried one, otherwise the static taker estimate. A venue that
+// never reports fees therefore keeps the previous estimate exactly.
+func legFees(lr execution.LegResult, taker float64) float64 {
+	fee := lr.Fee
+	if lr.Filled > 0 && (lr.FeeUnknown || !finitePositive(lr.Fee)) {
+		fee = lr.Filled * lr.AvgPrice * taker
+	}
+	if lr.Filled <= 0 {
+		fee = 0
+	}
+	rescue := lr.RescueFee
+	if lr.RescueFilled > 0 && (lr.RescueFeeUnknown || !finitePositive(lr.RescueFee)) {
+		rescue = lr.RescueFilled * lr.RescuePrice * taker
+	}
+	if lr.RescueFilled <= 0 {
+		rescue = 0
+	}
+	return fee + rescue
+}
+
+// openFeeRate is the effective fee per unit of notional for the leg's own
+// fills: the reported fee over its notional when known, else the taker rate.
+func openFeeRate(lr execution.LegResult, taker float64) float64 {
+	n := lr.Filled * lr.AvgPrice
+	if lr.Filled <= 0 || !finitePositive(n) || lr.FeeUnknown || !finitePositive(lr.Fee) {
+		return taker
+	}
+	return lr.Fee / n
+}
+
 func closePrice(lr execution.LegResult, qty float64) (float64, error) {
 	n, err := legNotional(lr)
 	if err != nil {
@@ -542,6 +585,8 @@ func (a *PairActor) accountExecution(act strategy.Action, q spread.Quote, before
 	if res.Err != nil || !res.PositionsKnown || !res.SettlementKnown {
 		return execution.ErrUnresolved
 	}
+	// Forward-completion fills extend the opening at the same side; they are
+	// part of each leg's entry price and fees.
 	nl, err := legNotional(res.L)
 	if err != nil {
 		return err
@@ -550,8 +595,11 @@ func (a *PairActor) accountExecution(act strategy.Action, q spread.Quote, before
 	if err != nil {
 		return err
 	}
-	feeL, feeR := a.cfg.Pair.Left.TakerFee, a.cfg.Pair.Right.TakerFee
-	fees := nl*feeL + nr*feeR
+	// Venue-reported fees replace the static taker estimate wherever every
+	// fill of a leg component carried one.
+	fees := legFees(res.L, a.cfg.Pair.Left.TakerFee) + legFees(res.R, a.cfg.Pair.Right.TakerFee)
+	feeL := openFeeRate(res.L, a.cfg.Pair.Left.TakerFee)
+	feeR := openFeeRate(res.R, a.cfg.Pair.Right.TakerFee)
 	deltaPnL := -fees
 	uncertain := res.L.PriceEstimated || res.R.PriceEstimated || res.L.RescuePriceEstimated || res.R.RescuePriceEstimated
 	eps := math.Pow10(-a.cfg.Pair.SizeDecimals) / 2
@@ -832,7 +880,7 @@ func (a *PairActor) finishUnwind(res execution.Result) error {
 	if err != nil {
 		return err
 	}
-	fees := nl*a.cfg.Pair.Left.TakerFee + nr*a.cfg.Pair.Right.TakerFee
+	fees := legFees(res.L, a.cfg.Pair.Left.TakerFee) + legFees(res.R, a.cfg.Pair.Right.TakerFee)
 	delta := -fees
 	uncertain := res.L.PriceEstimated || res.R.PriceEstimated || res.L.RescuePriceEstimated || res.R.RescuePriceEstimated
 	qty := math.Abs(a.expectedL())

@@ -84,7 +84,9 @@ func TestFillStateDedupAndEffective(t *testing.T) {
 		t.Fatal("same tid must deduplicate")
 	}
 	s.syncQty, s.syncQuote = 0.02, 2.0
-	if q, qu, fee := s.effective(); q != 0.02 || qu != 2.0 || fee != 0.01 {
+	// Below the sync total only part of the trades (and fees) are known, so
+	// the fee is reported as unknown rather than understated.
+	if q, qu, fee := s.effective(); q != 0.02 || qu != 2.0 || fee != 0 {
 		t.Fatalf("effective below sync total: %v/%v/%v", q, qu, fee)
 	}
 	if !s.add(2, 0.01, 100, 0) {

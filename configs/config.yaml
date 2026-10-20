@@ -20,7 +20,8 @@ venues:
   # Entropy (io) is a HIP-3 builder dex on Hyperliquid: the standard
   # Hyperliquid API is used with dex=io. Collateral is per-dex USDC, so fund
   # the io balance before trading. account = main address; private_key = the
-  # approved API-wallet (agent) key.
+  # approved API-wallet (agent) key. Optional network: mainnet|testnet selects
+  # the signing source; empty infers it from the exchange URL host.
   - name: entropy
     kind: entropy
     opts:

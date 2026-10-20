@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -47,6 +48,10 @@ type Config struct {
 	Account     string // main account address; required to trade or read positions
 	AgentKey    string // API-wallet (agent) private key; empty = read-only
 	BookDepth   int
+	// Network selects the L1 signing source: "mainnet" or "testnet". Empty
+	// infers it from the exchange URL host (testnet only when the host names
+	// testnet), so proxies and trailing slashes keep mainnet signatures.
+	Network string
 }
 
 // Venue is the Hyperliquid adapter, including HIP-3 dexs such as Entropy.
@@ -86,7 +91,11 @@ type Venue struct {
 	knownCIDs    map[int64]time.Time
 	pendingFills map[int64][]pendingFill
 	finalTouched map[int64]time.Time
-	dropCount    atomic.Int64
+	// staleSeen records when cleanup first saw an oid without a terminal
+	// state (a never-reported order, or a fill state rebuilt by a REST query
+	// after the oid was cleaned) so such entries age out instead of leaking.
+	staleSeen map[int64]time.Time
+	dropCount atomic.Int64
 
 	lastNonce atomic.Int64
 	sendMu    chan struct{}
@@ -129,12 +138,14 @@ func (s *fillState) add(tid int64, sz, px, fee float64) bool {
 }
 
 // effective returns the published cumulative fill: the per-trade sum once it
-// covers the synchronous total, otherwise the synchronous total itself.
+// covers the synchronous total, otherwise the synchronous total itself. The
+// fee is only reported with the per-trade sum: fees of a partial subset of
+// trades would understate the order's fee, so it is reported as 0 (unknown).
 func (s *fillState) effective() (qty, quote, fee float64) {
 	if s.qty >= s.syncQty-1e-12 {
 		return s.qty, s.quote, s.fee
 	}
-	return s.syncQty, s.syncQuote, s.fee
+	return s.syncQty, s.syncQuote, 0
 }
 
 // fillState returns the accumulator for an oid, creating it when absent.
@@ -156,7 +167,7 @@ type pendingFill struct {
 
 // New builds the venue from a preset kind plus option overrides.
 // Recognized opts: dex, info_url, exchange_url, ws_url, account, private_key,
-// book_depth.
+// book_depth, network.
 func New(name, kind string, opts map[string]string) (*Venue, error) {
 	p, ok := presets[kind]
 	if !ok {
@@ -181,6 +192,7 @@ func New(name, kind string, opts map[string]string) (*Venue, error) {
 	}
 	cfg.Account = strings.ToLower(strings.TrimSpace(opts["account"]))
 	cfg.AgentKey = strings.TrimSpace(opts["private_key"])
+	cfg.Network = strings.TrimSpace(opts["network"])
 	if v := strings.TrimSpace(opts["book_depth"]); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil || n <= 0 {
@@ -210,6 +222,10 @@ func NewWithConfig(cfg Config) (*Venue, error) {
 	}
 	cfg.Account = strings.ToLower(strings.TrimSpace(cfg.Account))
 	cfg.AgentKey = strings.TrimSpace(cfg.AgentKey)
+	mainnet, err := signingMainnet(cfg.Network, cfg.ExchangeURL)
+	if err != nil {
+		return nil, err
+	}
 	if cfg.Account != "" {
 		if len(cfg.Account) == 40 {
 			cfg.Account = "0x" + cfg.Account
@@ -229,7 +245,8 @@ func NewWithConfig(cfg Config) (*Venue, error) {
 		orderOrig: map[int64]float64{}, fillStates: map[int64]*fillState{},
 		orderExpires: map[int64]int64{}, knownCIDs: map[int64]time.Time{},
 		pendingFills: map[int64][]pendingFill{}, finalTouched: map[int64]time.Time{},
-		maxLev: map[int]int{}, warnedCoins: map[string]time.Time{},
+		staleSeen: map[int64]time.Time{},
+		maxLev:    map[int]int{}, warnedCoins: map[string]time.Time{},
 		sendMu: make(chan struct{}, 1), closeDone: make(chan struct{}),
 	}
 	if cfg.AgentKey != "" {
@@ -237,7 +254,7 @@ func NewWithConfig(cfg Config) (*Venue, error) {
 		if err != nil {
 			return nil, err
 		}
-		s.mainnet = cfg.ExchangeURL == defaultExchangeURL
+		s.mainnet = mainnet
 		v.signer = s
 	}
 	v.rest = newRestClient(cfg.InfoURL, cfg.ExchangeURL)
@@ -245,6 +262,27 @@ func NewWithConfig(cfg Config) (*Venue, error) {
 	v.ws.onReset = v.resetBooks
 	go v.cleanupLoop()
 	return v, nil
+}
+
+// signingMainnet resolves the L1 signing network. An explicit network wins;
+// otherwise only an exchange host naming testnet signs as testnet. Exact URL
+// equality is not used: a trailing slash or a mainnet proxy must not silently
+// switch every signature to the testnet source.
+func signingMainnet(network, exchangeURL string) (bool, error) {
+	switch strings.ToLower(strings.TrimSpace(network)) {
+	case "mainnet":
+		return true, nil
+	case "testnet":
+		return false, nil
+	case "":
+	default:
+		return false, fmt.Errorf("network must be mainnet or testnet, got %q", network)
+	}
+	u, err := url.Parse(strings.TrimSpace(exchangeURL))
+	if err != nil {
+		return false, fmt.Errorf("invalid exchange URL: %w", err)
+	}
+	return !strings.Contains(strings.ToLower(u.Hostname()), "testnet"), nil
 }
 
 func (v *Venue) Name() string   { return v.cfg.Name }
@@ -308,22 +346,13 @@ func (v *Venue) Instruments(ctx context.Context) ([]domain.Instrument, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Register the whole universe (including delisted coins) before
+	// validating tradable markets, so a concurrent snapshot never observes a
+	// half-built asset table marked as loaded.
+	v.registerAssets(meta.Universe, dexIndex)
 	out := make([]domain.Instrument, 0, len(meta.Universe))
 	for i, m := range meta.Universe {
-		// Validator perps use the plain meta index as the asset id. Builder
-		// perps use 100000 + perp_dex_index*10000 + index_in_meta; perpDexs
-		// reports "io" at index 10, so io:SNDK (index 2) is asset 200002.
-		id := i
-		if v.cfg.Dex != "" {
-			id = 100000 + dexIndex*10000 + i
-		}
-		v.assetsMu.Lock()
-		v.assets[m.Name] = id
-		v.assetsLoaded = true
-		v.assetsMu.Unlock()
-		v.levMu.Lock()
-		v.maxLev[id] = m.MaxLeverage
-		v.levMu.Unlock()
+		id := v.assetID(dexIndex, i)
 		// Delisted assets are registered so account snapshots can attribute
 		// leftover positions, but they are not tradable.
 		if m.IsDelisted {
@@ -777,7 +806,7 @@ func (v *Venue) onOrderUpdate(raw []byte) {
 		status := mapOrderStatus(u.Status)
 		orig := v.orderOrig[u.Order.Oid]
 		if status.Terminal() {
-			v.orderFinal[u.Order.Oid] = status
+			v.markFinal(u.Order.Oid, status)
 		}
 		// Only publish a terminal report that already carries its fill facts.
 		// A filled or partially-filled canceled order whose fills have not
@@ -835,7 +864,7 @@ func (v *Venue) queryUnknownStatus(oid, cid int64) {
 	v.ordersMu.Lock()
 	defer v.ordersMu.Unlock()
 	v.orderLookup[oid] = cid
-	v.orderFinal[oid] = status
+	v.markFinal(oid, status)
 	if orig > 0 {
 		v.orderOrig[oid] = orig
 	}
@@ -966,6 +995,15 @@ func (v *Venue) publishOrder(u domain.OrderUpdate) {
 	if u.Status.Terminal() && u.OrderIndex > 0 {
 		v.finalTouched[u.OrderIndex] = time.Now()
 	}
+}
+
+// markFinal records a terminal status and starts its retention window. A
+// terminal order still awaiting its fill backfill has not been published
+// yet, so the window must start here, not at publication, or cleanup would
+// drop the oid before its fills arrive. Callers must hold ordersMu.
+func (v *Venue) markFinal(oid int64, status domain.OrderStatus) {
+	v.orderFinal[oid] = status
+	v.finalTouched[oid] = time.Now()
 }
 
 // backfillFills fetches fills for a terminal order whose fills have not been
@@ -1172,11 +1210,9 @@ func (v *Venue) ensureAssets(ctx context.Context) error {
 	if loaded {
 		return nil
 	}
-	v.assetsMu.Lock()
-	defer v.assetsMu.Unlock()
-	if v.assetsLoaded {
-		return nil
-	}
+	// Fetch without holding assetsMu: the book path reads the asset table
+	// and must not block behind network I/O. A concurrent duplicate fetch
+	// registers identical ids and is harmless.
 	meta, err := v.rest.meta(ctx, v.cfg.Dex)
 	if err != nil {
 		return fmt.Errorf("asset universe: %w", err)
@@ -1185,16 +1221,35 @@ func (v *Venue) ensureAssets(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("perp dex index: %w", err)
 	}
-	for i, m := range meta.Universe {
-		id := i
-		if v.cfg.Dex != "" {
-			id = 100000 + dexIndex*10000 + i
-		}
-		v.assets[m.Name] = id
-		v.maxLev[id] = m.MaxLeverage
+	v.registerAssets(meta.Universe, dexIndex)
+	return nil
+}
+
+// assetID maps a meta index to the signed asset id. Validator perps use the
+// plain meta index. Builder perps use 100000 + perp_dex_index*10000 +
+// index_in_meta; perpDexs reports "io" at index 10, so io:SNDK (index 2) is
+// asset 200002.
+func (v *Venue) assetID(dexIndex, i int) int {
+	if v.cfg.Dex != "" {
+		return 100000 + dexIndex*10000 + i
+	}
+	return i
+}
+
+// registerAssets records every coin's asset id and max leverage, then marks
+// the universe loaded. Each map is written under its own lock.
+func (v *Venue) registerAssets(universe []metaItem, dexIndex int) {
+	v.levMu.Lock()
+	for i, m := range universe {
+		v.maxLev[v.assetID(dexIndex, i)] = m.MaxLeverage
+	}
+	v.levMu.Unlock()
+	v.assetsMu.Lock()
+	for i, m := range universe {
+		v.assets[m.Name] = v.assetID(dexIndex, i)
 	}
 	v.assetsLoaded = true
-	return nil
+	v.assetsMu.Unlock()
 }
 
 // maxLeverage returns the market's maximum leverage from meta when known.
@@ -1238,18 +1293,58 @@ func (v *Venue) cleanupOrders() {
 	finalCutoff := now.Add(-10 * time.Minute)
 	cidCutoff := now.Add(-time.Hour)
 	v.ordersMu.Lock()
-	for oid, st := range v.orderFinal {
-		if !st.Terminal() {
-			continue
-		}
-		if touched, ok := v.finalTouched[oid]; ok && touched.After(finalCutoff) {
-			continue
-		}
+	drop := func(oid int64) {
 		delete(v.orderLookup, oid)
 		delete(v.orderFinal, oid)
 		delete(v.orderOrig, oid)
 		delete(v.fillStates, oid)
 		delete(v.finalTouched, oid)
+		delete(v.staleSeen, oid)
+	}
+	for oid, st := range v.orderFinal {
+		if !st.Terminal() {
+			continue
+		}
+		// An entry without a touch time is treated as just touched: its
+		// retention window starts now rather than expiring immediately.
+		touched, ok := v.finalTouched[oid]
+		if !ok {
+			v.finalTouched[oid] = now
+			continue
+		}
+		if touched.After(finalCutoff) {
+			continue
+		}
+		drop(oid)
+	}
+	// Entries never reaching a terminal state age out an hour after cleanup
+	// first notices them.
+	stale := func(oid int64) {
+		if _, final := v.orderFinal[oid]; final {
+			delete(v.staleSeen, oid)
+			return
+		}
+		first, ok := v.staleSeen[oid]
+		if !ok {
+			v.staleSeen[oid] = now
+			return
+		}
+		if first.Before(cidCutoff) {
+			drop(oid)
+		}
+	}
+	for oid := range v.orderLookup {
+		stale(oid)
+	}
+	for oid := range v.fillStates {
+		stale(oid)
+	}
+	for oid := range v.staleSeen {
+		if _, lookup := v.orderLookup[oid]; !lookup {
+			if _, fs := v.fillStates[oid]; !fs {
+				delete(v.staleSeen, oid)
+			}
+		}
 	}
 	for oid, pending := range v.pendingFills {
 		kept := pending[:0]

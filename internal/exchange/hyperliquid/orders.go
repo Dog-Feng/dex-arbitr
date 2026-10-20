@@ -140,6 +140,13 @@ func (v *Venue) Submit(ctx context.Context, r domain.OrderReq) (domain.SubmitAck
 	if err != nil {
 		return domain.SubmitAck{}, fmt.Errorf("%w: sign: %v", domain.ErrRejected, err)
 	}
+	// Record the identity and expiry before sending: a transport error or
+	// timeout returns before any oid is known, and only the recorded expiry
+	// lets a later unknownOid resolve as a definitive rejection.
+	v.ordersMu.Lock()
+	v.orderExpires[r.ClientID] = int64(expiresAfter)
+	v.knownCIDs[r.ClientID] = time.Now()
+	v.ordersMu.Unlock()
 	resp, err := v.rest.send(ctx, exchangeRequest{
 		Action: map[string]any{
 			"type": "order",
@@ -194,8 +201,6 @@ func (v *Venue) Submit(ctx context.Context, r domain.OrderReq) (domain.SubmitAck
 	v.ordersMu.Lock()
 	v.orderLookup[oid] = r.ClientID
 	v.orderOrig[oid] = qty
-	v.orderExpires[r.ClientID] = int64(expiresAfter)
-	v.knownCIDs[r.ClientID] = time.Now()
 	v.drainPending(oid)
 	if st.Filled != nil {
 		// An IOC that filled synchronously carries its exact fill. Publish the
@@ -209,7 +214,7 @@ func (v *Venue) Submit(ctx context.Context, r domain.OrderReq) (domain.SubmitAck
 			fs := v.fillState(oid)
 			fs.syncQty, fs.syncQuote = filledQty, filledQty*avgPx
 			effQty, effQuote, effFee := fs.effective()
-			v.orderFinal[oid] = partialIOC(domain.StatusFilled, effQty, qty)
+			v.markFinal(oid, partialIOC(domain.StatusFilled, effQty, qty))
 			v.publishOrder(domain.OrderUpdate{
 				Venue: v.cfg.Name, ClientID: r.ClientID, OrderIndex: oid,
 				Status: v.orderFinal[oid], FilledQty: effQty, FilledQuote: effQuote, Fee: effFee,

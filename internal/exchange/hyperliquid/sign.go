@@ -122,9 +122,10 @@ func (s *signer) signTyped(data apitypes.TypedData) (signature, error) {
 // connectionID builds the bytes32 hashed over the signed action, matching the
 // official SDK: keccak(msgpack(action) || nonce_be64 || vault_marker). The
 // vault marker is 0x00 when no vault address is configured. When expiresAfter
-// is set, its big-endian uint64 timestamp follows the vault marker.
+// is set, the SDK appends another 0x00 marker followed by its big-endian
+// uint64 timestamp.
 func connectionID(packed []byte, nonce, expiresAfter uint64) []byte {
-	data := make([]byte, 0, len(packed)+17)
+	data := make([]byte, 0, len(packed)+18)
 	data = append(data, packed...)
 	data = append(data,
 		byte(nonce>>56), byte(nonce>>48), byte(nonce>>40), byte(nonce>>32),
@@ -132,7 +133,8 @@ func connectionID(packed []byte, nonce, expiresAfter uint64) []byte {
 		0x00,
 	)
 	if expiresAfter != 0 {
-		data = append(data,
+		// The SDK prefixes the timestamp with its own 0x00 marker byte.
+		data = append(data, 0x00,
 			byte(expiresAfter>>56), byte(expiresAfter>>48), byte(expiresAfter>>40), byte(expiresAfter>>32),
 			byte(expiresAfter>>24), byte(expiresAfter>>16), byte(expiresAfter>>8), byte(expiresAfter),
 		)

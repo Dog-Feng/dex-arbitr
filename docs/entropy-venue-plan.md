@@ -110,7 +110,8 @@ Entropy 专有 API**。对接直接使用 Hyperliquid 标准 API/SDK（REST + WS
   数字收紧（buy floor / sell ceil），保证不会放宽最差成交价。
 - 配置示例（configs/config.yaml，注释形式）：
   `kind: entropy`，opts：`account`(主账户地址)、`private_key`(agent 私钥)、
-  `book_depth`。
+  `book_depth`、`network`（`mainnet`/`testnet`，可选；留空时按 exchange URL
+  的主机名推断，只有主机名含 testnet 才按测试网签名）。
 - 依赖：`go-ethereum v1.15.6` 由 indirect 提升为 direct（EIP-712 哈希与
   secp256k1 签名）。它本就在模块图与 go.sum 内，无新增二进制。
 
