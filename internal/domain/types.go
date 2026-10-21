@@ -116,6 +116,7 @@ type OrderUpdate struct {
 	Status      OrderStatus
 	FilledQty   float64
 	FilledQuote float64
+	Fee         float64 // exchange-reported fee of the filled portion; 0 = unknown
 	Reason      string
 	Ts          time.Time
 }

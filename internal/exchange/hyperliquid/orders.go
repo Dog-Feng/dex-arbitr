@@ -165,18 +165,24 @@ func (v *Venue) Submit(ctx context.Context, r domain.OrderReq) (domain.SubmitAck
 	v.ordersMu.Lock()
 	v.orderLookup[oid] = r.ClientID
 	v.orderOrig[oid] = qty
+	v.knownCIDs[r.ClientID] = time.Now()
+	v.drainPending(oid)
 	if st.Filled != nil {
 		// An IOC that filled synchronously carries its exact fill. Publish the
 		// terminal update immediately so the executor does not wait for the
-		// user stream.
+		// user stream. The fill state keeps the synchronous total separate
+		// from per-trade fills so later deliveries of the same fills can only
+		// be deduplicated, never double counted.
 		filledQty, qtyErr := number(st.Filled.TotalSz)
 		avgPx, pxErr := number(st.Filled.AvgPx)
 		if qtyErr == nil && pxErr == nil && filledQty > 0 && avgPx > 0 {
-			v.fillAgg[oid] = fillAgg{qty: filledQty, quote: filledQty * avgPx}
-			v.orderFinal[oid] = partialIOC(domain.StatusFilled, filledQty, qty)
+			fs := v.fillState(oid)
+			fs.syncQty, fs.syncQuote = filledQty, filledQty*avgPx
+			effQty, effQuote, effFee := fs.effective()
+			v.orderFinal[oid] = partialIOC(domain.StatusFilled, effQty, qty)
 			v.publishOrder(domain.OrderUpdate{
 				Venue: v.cfg.Name, ClientID: r.ClientID, OrderIndex: oid,
-				Status: v.orderFinal[oid], FilledQty: filledQty, FilledQuote: filledQty * avgPx,
+				Status: v.orderFinal[oid], FilledQty: effQty, FilledQuote: effQuote, Fee: effFee,
 				Ts: time.Now(),
 			})
 		}
@@ -265,10 +271,10 @@ func (v *Venue) QueryOrder(ctx context.Context, inst domain.Instrument, clientID
 	if origErr != nil || orig <= 0 {
 		orig = 0
 	}
-	var qty, quote float64
+	var qty, quote, fee float64
 	ok := true
 	if status == domain.StatusFilled || status == domain.StatusCanceled {
-		qty, quote, ok = v.terminalFills(ctx, oid, st.Order.StatusTimestamp)
+		qty, quote, fee, ok = v.mergeFills(ctx, oid, st.Order.StatusTimestamp)
 	}
 	status = partialIOC(status, qty, orig)
 	if status == domain.StatusFilled && (!ok || qty <= 0) {
@@ -290,32 +296,40 @@ func (v *Venue) QueryOrder(ctx context.Context, inst domain.Instrument, clientID
 	}
 	return domain.OrderUpdate{
 		Venue: v.cfg.Name, ClientID: clientID, OrderIndex: oid,
-		MarketID: inst.MarketID, Status: status, FilledQty: qty, FilledQuote: quote, Ts: time.Now(),
+		MarketID: inst.MarketID, Status: status, FilledQty: qty, FilledQuote: quote, Fee: fee, Ts: time.Now(),
 	}, nil
 }
 
-// terminalFills sums the fill sizes for an order id around its status time.
-// ok=false means the fill feed could not be read, which is distinct from
-// "no fills exist".
-func (v *Venue) terminalFills(ctx context.Context, oid, statusTs int64) (qty, quote float64, ok bool) {
+// mergeFills fetches the REST fill feed for an order id around its status
+// time and merges every trade into the venue's per-oid fill state. The
+// effective cumulative fill is returned. ok=false means the feed could not be
+// read, which is distinct from "no fills exist".
+func (v *Venue) mergeFills(ctx context.Context, oid, statusTs int64) (qty, quote, fee float64, ok bool) {
 	end := time.Now().UnixMilli() + 2000
 	fills, err := v.rest.fillsByTime(ctx, v.cfg.Account, statusTs-1000, end)
 	if err != nil {
-		return 0, 0, false
+		return 0, 0, 0, false
 	}
+	v.ordersMu.Lock()
+	defer v.ordersMu.Unlock()
+	fs := v.fillState(oid)
 	for _, f := range fills {
 		if f.Oid.String() != strconv.FormatInt(oid, 10) {
 			continue
 		}
 		sz, err1 := number(f.Sz)
 		px, err2 := number(f.Px)
-		if err1 != nil || err2 != nil {
+		if err1 != nil || err2 != nil || sz <= 0 || px <= 0 || math.IsNaN(sz) || math.IsNaN(px) {
 			continue
 		}
-		qty += sz
-		quote += sz * px
+		feeN, feeErr := number(f.Fee)
+		if feeErr != nil {
+			feeN = 0
+		}
+		fs.add(f.Tid, sz, px, feeN)
 	}
-	return qty, quote, true
+	q, qu, fe := fs.effective()
+	return q, qu, fe, true
 }
 
 // CheckKey verifies that the configured agent key and main account are

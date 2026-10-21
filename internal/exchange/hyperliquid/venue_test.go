@@ -6,6 +6,7 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 	"time"
 
@@ -310,3 +311,109 @@ func queryStubVenue(t *testing.T, responses map[string]string) *Venue {
 }
 
 const testAccount = "0xc01303fffd03b36666656b809808635d011a9197"
+
+// TestFillStateDedupAndEffective verifies tid-based deduplication and the
+// synchronous-total floor from /exchange.
+func TestFillStateDedupAndEffective(t *testing.T) {
+	s := newFillState()
+	if !s.add(1, 0.01, 100, 0.01) {
+		t.Fatal("first add should be new")
+	}
+	if s.add(1, 0.01, 100, 0.01) {
+		t.Fatal("same tid must deduplicate")
+	}
+	s.syncQty, s.syncQuote = 0.02, 2.0
+	// Below the sync total the fee is unknown (reported as 0), matching the
+	// production semantics of a partial subset of trades.
+	if q, qu, fee := s.effective(); q != 0.02 || qu != 2.0 || fee != 0 {
+		t.Fatalf("effective below sync total: %v/%v/%v", q, qu, fee)
+	}
+	if !s.add(2, 0.01, 100, 0) {
+		t.Fatal("new tid must merge")
+	}
+	if q, qu, fee := s.effective(); q != 0.02 || qu != 2.0 || fee != 0.01 {
+		t.Fatalf("effective past sync total: %v/%v/%v", q, qu, fee)
+	}
+}
+
+// TestOnUserFillsDedupAndSnapshot verifies replay/snapshot trades are merged
+// but never double counted or re-published.
+func TestOnUserFillsDedupAndSnapshot(t *testing.T) {
+	v, err := NewWithConfig(Config{
+		Name: "entropy", Dex: "io", InfoURL: "https://example.invalid/info",
+		ExchangeURL: "https://example.invalid/exchange", WSURL: "wss://example.invalid/ws", BookDepth: 5,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := v.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}()
+	ch := make(chan domain.OrderUpdate, 64)
+	v.ordersMu.Lock()
+	v.orderSubs = append(v.orderSubs, ch)
+	v.orderLookup[1] = 7
+	v.orderOrig[1] = 0.01
+	v.knownCIDs[7] = time.Now()
+	v.ordersMu.Unlock()
+	feed := func(tid int64, isSnapshot bool) {
+		snap := "false"
+		if isSnapshot {
+			snap = "true"
+		}
+		raw := []byte(`{"channel":"userFills","data":{"user":"0x00","isSnapshot":` + snap +
+			`,"fills":[{"coin":"io:SNDK","px":"100","sz":"0.004","oid":1,"tid":` +
+			strconv.FormatInt(tid, 10) + `}]}}`)
+		v.onUserFills(raw)
+	}
+	feed(1, false)
+	u := <-ch
+	if u.FilledQty != 0.004 {
+		t.Fatalf("first fill published %v", u.FilledQty)
+	}
+	feed(1, false) // duplicate delivery: nothing new
+	feed(1, true)  // snapshot replay: nothing new
+	select {
+	case u := <-ch:
+		t.Fatalf("duplicate fill re-published: %+v", u)
+	default:
+	}
+	feed(2, false)
+	u = <-ch
+	if u.FilledQty != 0.008 {
+		t.Fatalf("cumulative fill %v, want 0.008", u.FilledQty)
+	}
+}
+
+// TestOnUserFillsRegistersByCloid verifies a fill arriving before the submit
+// ack is attributed through its cloid instead of being dropped.
+func TestOnUserFillsRegistersByCloid(t *testing.T) {
+	v, err := NewWithConfig(Config{
+		Name: "entropy", Dex: "io", InfoURL: "https://example.invalid/info",
+		ExchangeURL: "https://example.invalid/exchange", WSURL: "wss://example.invalid/ws", BookDepth: 5,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := v.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}()
+	ch := make(chan domain.OrderUpdate, 64)
+	cl, err := cloid(7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v.ordersMu.Lock()
+	v.orderSubs = append(v.orderSubs, ch)
+	v.knownCIDs[7] = time.Now()
+	v.ordersMu.Unlock()
+	v.onUserFills([]byte(`{"channel":"userFills","data":{"user":"0x00","fills":[{"coin":"io:SNDK","px":"100","sz":"0.004","oid":1,"tid":1,"cloid":"` + cl + `"}]}}`))
+	u := <-ch
+	if u.ClientID != 7 || u.FilledQty != 0.004 {
+		t.Fatalf("early fill misattributed: %+v", u)
+	}
+}

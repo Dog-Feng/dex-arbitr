@@ -124,7 +124,7 @@ func TestInterventionWaitsForUnknownOriginalBeforeFlatten(t *testing.T) {
 	}
 }
 
-func TestSubMinResidualStallsEscalateToIntervention(t *testing.T) {
+func TestSubMinResidualStaysPausedWithoutIntervention(t *testing.T) {
 	a, l, r := auditInterventionActor(t)
 	instQ := domain.Instrument{MarketID: 1, SizeDecimals: 4, PriceDecimals: 2, TakerFee: .001, MinQuote: .9}
 	a.cfg.Pair.Left, a.cfg.Pair.Right = instQ, instQ
@@ -137,11 +137,14 @@ func TestSubMinResidualStallsEscalateToIntervention(t *testing.T) {
 		beforeL: 0, beforeR: 0,
 		result: execution.Result{PosL: .012, PosR: -.008, PositionsKnown: true, SettlementKnown: true,
 			Err: fmt.Errorf("%w: rescue quantity below venue minimum", execution.ErrSubMinResidual)},
-		stalls: interventionStallLimit - 1,
 	}
 	a.resolvePending(context.Background())
-	if a.pending == nil || !a.pending.intervention || a.pending.stalls != interventionStallLimit {
-		t.Fatalf("sub-min residual did not escalate: pending=%+v", a.pending)
+	// A dust residual is not an external intervention: the pending execution
+	// stays retained, the stall counter is untouched, and a warning is
+	// emitted exactly once so the pair keeps retrying without clearing the
+	// ledger or flattening the whole account.
+	if a.pending == nil || a.pending.intervention || a.pending.stalls != 0 || !a.pending.dustWarned {
+		t.Fatalf("sub-min residual misclassified: pending=%+v", a.pending)
 	}
 }
 

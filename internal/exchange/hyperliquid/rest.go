@@ -195,6 +195,9 @@ type userFill struct {
 	Time  int64       `json:"time"`
 	Oid   json.Number `json:"oid"`
 	Cloid string      `json:"cloid"`
+	Tid   int64       `json:"tid"`
+	Hash  string      `json:"hash"`
+	Fee   json.Number `json:"fee"`
 }
 
 // fillsByTime returns fills in the half-open window [start, end].

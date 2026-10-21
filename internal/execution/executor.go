@@ -77,6 +77,49 @@ type LegResult struct {
 	RescuePrice          float64
 	RescuePriceEstimated bool
 	request              domain.OrderReq
+	// extra holds same-side completion fills merged into Filled, so a
+	// re-query of the original order can restore them and terminal checks
+	// can verify the original order alone.
+	extra extraFills
+}
+
+// extraFills accumulates completion fills merged into a leg.
+type extraFills struct {
+	qty, quote float64
+	estimate   bool
+}
+
+// original returns the leg as reported by its own order, without merged
+// completion fills.
+func (lr LegResult) original() LegResult {
+	if lr.extra.qty <= 0 {
+		return lr
+	}
+	o := lr
+	o.Filled = lr.Filled - lr.extra.qty
+	if o.Filled < 0 {
+		o.Filled = 0
+	}
+	o.AvgPrice = 0
+	if o.Filled > 0 {
+		o.AvgPrice = (lr.Filled*lr.AvgPrice - lr.extra.quote) / o.Filled
+	}
+	o.extra = extraFills{}
+	return o
+}
+
+// withExtra re-applies merged completion fills on top of the leg's own
+// order outcome.
+func (lr LegResult) withExtra(x extraFills) LegResult {
+	lr.extra = x
+	if x.qty <= 0 {
+		return lr
+	}
+	total := lr.Filled + x.qty
+	lr.AvgPrice = (lr.Filled*lr.AvgPrice + x.quote) / total
+	lr.Filled = total
+	lr.PriceEstimated = lr.PriceEstimated || x.estimate
+	return lr
 }
 
 // Result of a two-leg execution.
@@ -93,6 +136,7 @@ type Result struct {
 	pending         *pendingRescue
 	unconfirmed     []pendingRescue // full position-inferred batches still lacking terminal reports
 	topUp           *topUpState     // step-completion order on the under-filled leg
+	forward         *forwardState   // same-side orders extending an untradable opening
 	targetL         float64
 	targetR         float64
 	targetsKnown    bool
@@ -105,6 +149,16 @@ type Result struct {
 type topUpState struct {
 	req    domain.OrderReq
 	result LegResult
+	leg    int // 0 = left leg, 1 = right leg
+}
+
+// forwardState retains a forward completion: same-side orders extending an
+// opening that could neither be equalized nor rolled back with tradable
+// orders. beforeL/beforeR are the confirmed positions the orders started from.
+type forwardState struct {
+	beforeL, beforeR float64
+	orders           []topUpState
+	confirmed        bool
 }
 
 // pendingRescue retains a submitted batch until its terminal outcomes and
@@ -279,18 +333,212 @@ func (e *Executor) ExecuteBounded(ctx context.Context, l, r LegSpec, qty float64
 	tl, tr := hedgeTargets(pl, pr, l.Inst, r.Inst)
 	if e.unwindSmallResidual(l, r, tl, tr, pl, pr) {
 		if reduceOnly {
-			// The residual cannot be traded on either leg: unwind the whole
-			// step to zero, where every reduction equals a full position size.
-			tl, tr = 0, 0
+			// Search toward zero for the closest hedge both legs can still
+			// trade; only a fully untradable target unwinds to zero, where
+			// every reduction equals a full position size.
+			tl, tr = e.feasibleReduceTarget(l, r, pl, pr, tl, tr)
 		} else {
 			// The opening cannot be equalized: undo only this step back to the
 			// pre-open positions so previously recorded steps stay intact.
 			tl, tr = beforeL, beforeR
+			if e.subMinReduction(l, r, tl, tr, pl, pr, true) {
+				// Neither equalizing nor undoing is tradable (a zero target
+				// is still closable with a capped minimum-sized reduce-only
+				// order): extend both legs forward to the nearest hedge
+				// they can both reach.
+				done, pl2, pr2, ferr := e.forwardComplete(ctx, l, r, qty, beforeL, beforeR, pl, pr, &res, maxOpenNotional)
+				if ferr != nil {
+					res.Err = ferr
+					return res
+				}
+				if done {
+					pl, pr = pl2, pr2
+					tl, tr = e.openingTarget(l, r, beforeL, beforeR, pl, pr)
+				}
+			}
 		}
 	}
 	res.targetL, res.targetR, res.targetsKnown = tl, tr, true
 	res.Err = e.flatten(ctx, l, r, tl, tr, &res, e.cfg.Rescue)
 	return res
+}
+
+// openingTarget is the aligned hedge of an opening, or its pre-open
+// positions when the aligned hedge is not tradable.
+func (e *Executor) openingTarget(l, r LegSpec, beforeL, beforeR, pl, pr float64) (float64, float64) {
+	tl, tr := hedgeTargets(pl, pr, l.Inst, r.Inst)
+	if e.unwindSmallResidual(l, r, tl, tr, pl, pr) {
+		return beforeL, beforeR
+	}
+	return tl, tr
+}
+
+// forwardTarget finds the smallest common hedge h at or above the larger
+// opened leg such that each leg's addition is zero or at least its venue
+// minimum, searching at most one minimum beyond the larger leg.
+func (e *Executor) forwardTarget(l, r LegSpec, dl, dr, minL, minR float64) (h, addL, addR float64, ok bool) {
+	d := min(l.Inst.SizeDecimals, r.Inst.SizeDecimals)
+	unit := math.Pow10(-d)
+	epsL, epsR := math.Pow10(-l.Inst.SizeDecimals)/2, math.Pow10(-r.Inst.SizeDecimals)/2
+	hi := math.Max(dl, dr)
+	limit := hi + math.Max(minL, minR) + unit
+	for h = domain.Ceil(domain.Round(hi, max(l.Inst.SizeDecimals, r.Inst.SizeDecimals)), d); h <= limit+unit/2; h = domain.Round(h+unit, d) {
+		addL = domain.Round(h-dl, l.Inst.SizeDecimals)
+		addR = domain.Round(h-dr, r.Inst.SizeDecimals)
+		if addL < -epsL || addR < -epsR {
+			continue
+		}
+		okL := addL < epsL || addL >= minL
+		okR := addR < epsR || addR >= minR
+		if okL && okR && (addL >= epsL || addR >= epsR) {
+			if addL < epsL {
+				addL = 0
+			}
+			if addR < epsR {
+				addR = 0
+			}
+			return h, addL, addR, true
+		}
+	}
+	return 0, 0, 0, false
+}
+
+// forwardComplete extends an opening that can neither be equalized nor
+// rolled back with tradable orders. Instead of leaving untradable dust that
+// pauses the pair, it adds same-side IOCs on one or both legs so the opening
+// reaches the nearest hedge every addition can trade. The opening may exceed
+// maxOpenNotional by at most one venue-minimum order; anything larger is
+// refused and the caller keeps the original sub-minimum error path.
+func (e *Executor) forwardComplete(ctx context.Context, l, r LegSpec, qty, beforeL, beforeR, pl, pr float64, res *Result, maxOpenNotional float64) (bool, float64, float64, error) {
+	if res.forward != nil || res.L.RescueFilled > 0 || res.R.RescueFilled > 0 {
+		return false, pl, pr, nil // at most one forward completion, never after a rollback
+	}
+	dl := float64(l.Side) * (pl - beforeL)
+	dr := float64(r.Side) * (pr - beforeR)
+	if dl < -math.Pow10(-l.Inst.SizeDecimals)/2 || dr < -math.Pow10(-r.Inst.SizeDecimals)/2 {
+		return false, pl, pr, nil
+	}
+	legs := [2]LegSpec{l, r}
+	var mins [2]float64
+	for i, leg := range legs {
+		// The venue minimum notional is checked at the order's own price;
+		// size it at the less favourable of decision and limit price.
+		px := leg.Price
+		if lp := e.limitPrice(leg, qty); lp > 0 && lp < px {
+			px = lp
+		}
+		mins[i] = legMinQty(leg.Inst, px)
+	}
+	h, addL, addR, ok := e.forwardTarget(l, r, dl, dr, mins[0], mins[1])
+	if !ok {
+		return false, pl, pr, nil
+	}
+	if maxOpenNotional > 0 {
+		slack := 0.0
+		for i, leg := range legs {
+			slack = math.Max(slack, mins[i]*leg.Price)
+		}
+		if h*math.Max(l.Price, r.Price) > maxOpenNotional+slack {
+			return false, pl, pr, nil
+		}
+	}
+	f := &forwardState{beforeL: pl, beforeR: pr}
+	adds := [2]float64{addL, addR}
+	for i, leg := range legs {
+		if adds[i] <= 0 {
+			continue
+		}
+		f.orders = append(f.orders, topUpState{leg: i, req: domain.OrderReq{
+			ClientID: e.ids.Next(), Inst: leg.Inst, Side: leg.Side, Qty: adds[i],
+			Price: e.limitPrice(leg, adds[i]), Type: domain.Limit, ReduceOnly: false,
+		}})
+	}
+	slog.Info("opening cannot be equalized or undone with tradable sizes; completing forward",
+		"hedge", h, "add_l", addL, "add_r", addR)
+	var wg sync.WaitGroup
+	for i := range f.orders {
+		wg.Add(1)
+		go func(o *topUpState) {
+			defer wg.Done()
+			o.result = e.submitAndResolve(ctx, o.req, legs[o.leg].Venue)
+		}(&f.orders[i])
+	}
+	wg.Wait()
+	res.forward = f
+	if err := e.resolveForward(ctx, l, r, res, false); err != nil {
+		return false, pl, pr, err
+	}
+	return true, res.PosL, res.PosR, nil
+}
+
+// resolveForward settles a forward completion: it queries unresolved orders
+// (query=true), confirms both positions against the orders' fills from the
+// positions they started at, and merges the fills into each leg. Until it
+// succeeds the execution is not settled.
+func (e *Executor) resolveForward(ctx context.Context, l, r LegSpec, res *Result, query bool) error {
+	if res.forward == nil || res.forward.confirmed {
+		return nil
+	}
+	f := *res.forward
+	f.orders = append([]topUpState(nil), f.orders...)
+	res.forward = &f
+	legs := [2]LegSpec{l, r}
+	for i := range f.orders {
+		o := &f.orders[i]
+		if query && !o.result.Resolved {
+			o.result = e.queryExisting(ctx, o.req, legs[o.leg].Venue, o.result)
+		}
+		if !o.result.Resolved {
+			res.SettlementKnown = false
+			return fmt.Errorf("%w: forward completion order %d unresolved", ErrUnresolved, o.req.ClientID)
+		}
+	}
+	fills := [2]LegResult{{Resolved: true}, {Resolved: true}}
+	var qtys [2]float64
+	for _, o := range f.orders {
+		fills[o.leg], qtys[o.leg] = o.result, o.req.Qty
+	}
+	pl, pr, known, err := e.confirmPositions(ctx, l, r, f.beforeL, f.beforeR, &fills[0], &fills[1], qtys[0], qtys[1], l.Side, r.Side)
+	if known {
+		res.PosL, res.PosR, res.PositionsKnown = pl, pr, true
+	}
+	if err != nil {
+		res.SettlementKnown = false
+		return err
+	}
+	for _, o := range f.orders {
+		if o.leg == 0 {
+			mergeTopUp(&res.L, o.result)
+		} else {
+			mergeTopUp(&res.R, o.result)
+		}
+	}
+	f.confirmed = true
+	res.SettlementKnown = true
+	return nil
+}
+
+// feasibleReduceTarget walks the common quantity lattice from the aligned
+// target toward zero and returns the first hedge whose required reductions
+// are either zero or at least one leg's venue minimum on both legs. It only
+// returns zero when no non-zero target is tradable.
+func (e *Executor) feasibleReduceTarget(l, r LegSpec, pl, pr, tl, tr float64) (float64, float64) {
+	if tl == 0 && tr == 0 {
+		return 0, 0
+	}
+	d := min(l.Inst.SizeDecimals, r.Inst.SizeDecimals)
+	unit := math.Pow10(-d)
+	sign := 1.0
+	if tl < 0 {
+		sign = -1
+	}
+	for k := math.Abs(tl); k > unit/2; k = domain.Round(k-unit, d) {
+		cl, cr := sign*k, -sign*k
+		if !e.unwindSmallResidual(l, r, cl, cr, pl, pr) {
+			return cl, cr
+		}
+	}
+	return 0, 0
 }
 
 // ResolveOutstanding continues a canceled execution with a live parent
@@ -301,6 +549,7 @@ func (e *Executor) ExecuteBounded(ctx context.Context, l, r LegSpec, qty float64
 func (e *Executor) ResolveOutstanding(ctx context.Context, l, r LegSpec, res Result, qty, beforeL, beforeR float64) Result {
 	start := time.Now()
 	previousDuration := res.Duration
+	prevErr := res.Err
 	res.Err = nil
 	if err := ctx.Err(); err != nil {
 		res.Err = err
@@ -327,6 +576,11 @@ func (e *Executor) ResolveOutstanding(ctx context.Context, l, r LegSpec, res Res
 		res.Err = fmt.Errorf("%w: completion order %d unresolved", ErrUnresolved, res.topUp.req.ClientID)
 		return res
 	}
+	if err := e.resolveForward(ctx, l, r, &res, true); err != nil {
+		res.Err = err
+		res.Duration = previousDuration + time.Since(start)
+		return res
+	}
 	// Work on a private batch copy so an older Result remains a valid snapshot.
 	if res.pending != nil {
 		batch := *res.pending
@@ -351,10 +605,32 @@ func (e *Executor) ResolveOutstanding(ctx context.Context, l, r LegSpec, res Res
 			res.targetL, res.targetR = hedgeTargets(res.PosL, res.PosR, l.Inst, r.Inst)
 			res.targetsKnown = true
 		}
-		if res.opening && e.unwindSmallResidual(l, r, res.targetL, res.targetR, res.PosL, res.PosR) {
-			// The opening cannot be equalized: undo only this step back to the
-			// pre-open positions so previously recorded steps stay intact.
-			res.targetL, res.targetR = beforeL, beforeR
+		if e.unwindSmallResidual(l, r, res.targetL, res.targetR, res.PosL, res.PosR) {
+			if res.opening {
+				// The opening cannot be equalized: undo only this step back to
+				// the pre-open positions so previously recorded steps stay intact.
+				res.targetL, res.targetR = beforeL, beforeR
+				if e.subMinReduction(l, r, beforeL, beforeR, res.PosL, res.PosR, !errors.Is(prevErr, ErrSubMinResidual)) {
+					// Neither is tradable: complete forward as the original
+					// execution would, bounded by one venue minimum. A zero
+					// target only qualifies after minimum-sized reduce-only
+					// orders already failed to clear it.
+					done, pl, pr, ferr := e.forwardComplete(ctx, l, r, qty, beforeL, beforeR, res.PosL, res.PosR, &res, 0)
+					if ferr != nil {
+						res.Err = ferr
+						res.Duration = previousDuration + time.Since(start)
+						return res
+					}
+					if done {
+						res.targetL, res.targetR = e.openingTarget(l, r, beforeL, beforeR, pl, pr)
+					}
+				}
+			} else {
+				// Closes follow the same nearest-feasible-target search as the
+				// original execution instead of surfacing an untradable dust
+				// residual as an error.
+				res.targetL, res.targetR = e.feasibleReduceTarget(l, r, res.PosL, res.PosR, res.targetL, res.targetR)
+			}
 		}
 		res.Err = e.flatten(ctx, l, r, res.targetL, res.targetR, &res, res.rescue)
 	}
@@ -386,6 +662,13 @@ func OrdersTerminal(res Result) bool {
 			return false
 		}
 	}
+	if res.forward != nil {
+		for _, t := range res.forward.orders {
+			if !terminalOrder(t.req, t.result) {
+				return false
+			}
+		}
+	}
 	return true
 }
 
@@ -399,6 +682,7 @@ func batchTerminal(p *pendingRescue) bool {
 }
 
 func terminalOrder(req domain.OrderReq, lr LegResult) bool {
+	lr = lr.original()
 	return lr.Resolved && lr.Status.Terminal() && verifyDelta(&lr, lr.Filled, req.Qty, req.Inst) == nil
 }
 
@@ -412,6 +696,32 @@ func (e *Executor) ResolveTerminals(ctx context.Context, l, r LegSpec, res Resul
 	if err := ctx.Err(); err != nil {
 		res.Err = err
 		return res
+	}
+	// A forward completion participates in terminal resolution exactly like
+	// in ResolveOutstanding, so recovery never blocks on unqueried orders.
+	if res.forward != nil && !res.forward.confirmed {
+		f := *res.forward
+		f.orders = append([]topUpState(nil), f.orders...)
+		res.forward = &f
+		legs := [2]LegSpec{l, r}
+		all := true
+		for i := range f.orders {
+			o := &f.orders[i]
+			o.result = e.queryExisting(ctx, o.req, legs[o.leg].Venue, o.result)
+			all = all && o.result.Resolved
+		}
+		if all {
+			// Positions are read independently below; the fills are merged
+			// once so accounting still sees the forward entry.
+			for _, o := range f.orders {
+				if o.leg == 0 {
+					mergeTopUp(&res.L, o.result)
+				} else {
+					mergeTopUp(&res.R, o.result)
+				}
+			}
+			f.confirmed = true
+		}
 	}
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -484,7 +794,14 @@ func inferLeg(lr *LegResult, delta, px, qty float64) {
 	if lr.Resolved {
 		return
 	}
+	x := lr.extra
 	lr.Filled = math.Abs(delta)
+	if x.qty > 0 {
+		// delta spans merged completion fills; infer only the original part.
+		lr.Filled = math.Max(0, lr.Filled-x.qty)
+		defer func() { *lr = lr.withExtra(x) }()
+		lr.extra = extraFills{}
+	}
 	if lr.Filled > 0 {
 		// For an IOC with no execution quote, use its original price bound:
 		// buy costs are bounded above and sell proceeds below. A top-of-book
@@ -603,10 +920,11 @@ func mergeTopUp(leg *LegResult, up LegResult) {
 	if up.Filled <= 0 || up.AvgPrice <= 0 {
 		return
 	}
-	total := leg.Filled + up.Filled
-	leg.AvgPrice = (leg.AvgPrice*leg.Filled + up.AvgPrice*up.Filled) / total
-	leg.Filled = total
-	leg.PriceEstimated = leg.PriceEstimated || up.PriceEstimated
+	x := leg.extra
+	x.qty += up.Filled
+	x.quote += up.Filled * up.AvgPrice
+	x.estimate = x.estimate || up.PriceEstimated
+	*leg = leg.original().withExtra(x)
 }
 
 // unwindSmallResidual reports whether reaching the aligned hedge target would
@@ -615,12 +933,20 @@ func mergeTopUp(leg *LegResult, up LegResult) {
 // closes) so every remaining reduction is tradable, or flatten closes the
 // residual with a minimum-sized reduce-only order.
 func (e *Executor) unwindSmallResidual(l, r LegSpec, tl, tr, pl, pr float64) bool {
+	return e.subMinReduction(l, r, tl, tr, pl, pr, false)
+}
+
+// subMinReduction reports a reduction below the venue minimum on either leg.
+// With nonZeroOnly it ignores legs whose target is zero: flatten closes those
+// with a minimum-sized reduce-only order capped at the position.
+func (e *Executor) subMinReduction(l, r LegSpec, tl, tr, pl, pr float64, nonZeroOnly bool) bool {
 	legs := [2]LegSpec{l, r}
 	pos := [2]float64{pl, pr}
 	tgt := [2]float64{tl, tr}
 	for i := range legs {
+		eps := math.Pow10(-legs[i].Inst.SizeDecimals) / 2
 		need := pos[i] - tgt[i]
-		if math.Abs(need) < math.Pow10(-legs[i].Inst.SizeDecimals)/2 {
+		if math.Abs(need) < eps || nonZeroOnly && math.Abs(tgt[i]) < eps {
 			continue
 		}
 		if math.Abs(need) < legMinQty(legs[i].Inst, legs[i].Price) {
@@ -990,13 +1316,15 @@ func (e *Executor) awaitOrder(ctx context.Context, req domain.OrderReq, v exchan
 }
 
 func fill(lr LegResult, u domain.OrderUpdate, start time.Time, estimate float64) LegResult {
+	x := lr.extra
 	lr.Status, lr.Filled, lr.AvgPrice, lr.Resolved = u.Status, u.FilledQty, u.AvgPrice(), true
 	lr.PriceEstimated = false
 	if lr.Filled > 0 && (lr.AvgPrice <= 0 || math.IsNaN(lr.AvgPrice) || math.IsInf(lr.AvgPrice, 0)) {
 		lr.AvgPrice, lr.PriceEstimated = estimate, true
 	}
 	lr.Latency = time.Since(start)
-	return lr
+	// Completion fills merged earlier survive a re-query of the original.
+	return lr.withExtra(x)
 }
 
 // EmergencyFlatten reduces both market positions to zero and reports an error

@@ -64,13 +64,15 @@ type Venue struct {
 	booksMu sync.Mutex
 	books   map[int]*bookState
 
-	ordersMu    sync.Mutex
-	orderSubs   []chan domain.OrderUpdate
-	ordersOnce  sync.Once
-	orderLookup map[int64]int64 // oid -> client id, filled from submit acks and updates
-	orderFinal  map[int64]domain.OrderStatus
-	orderOrig   map[int64]float64 // oid -> requested quantity (wire size)
-	fillAgg     map[int64]fillAgg
+	ordersMu     sync.Mutex
+	orderSubs    []chan domain.OrderUpdate
+	ordersOnce   sync.Once
+	orderLookup  map[int64]int64 // oid -> client id, filled from submit acks and updates
+	orderFinal   map[int64]domain.OrderStatus
+	orderOrig    map[int64]float64 // oid -> requested quantity (wire size)
+	fillStates   map[int64]*fillState
+	knownCIDs    map[int64]time.Time
+	pendingFills map[int64][]pendingFill
 
 	lastNonce atomic.Int64
 	sendMu    chan struct{}
@@ -78,10 +80,66 @@ type Venue struct {
 	closeDone chan struct{}
 }
 
-// fillAgg accumulates per-order fill quantity and quote.
-type fillAgg struct {
-	qty   float64
-	quote float64
+// fillState accumulates the fill facts of one order. Every trade is deduped
+// by tid; the synchronous /exchange response contributes an authoritative
+// total that per-trade deliveries can only approach, never double count.
+type fillState struct {
+	tids      map[int64]struct{}
+	uniq      int64
+	qty       float64
+	quote     float64
+	fee       float64
+	syncQty   float64
+	syncQuote float64
+}
+
+func newFillState() *fillState { return &fillState{tids: map[int64]struct{}{}} }
+
+// add merges one trade identified by tid. It reports whether the trade was
+// new; a replay (WS snapshot, re-delivery, REST backfill) returns false.
+func (s *fillState) add(tid int64, sz, px, fee float64) bool {
+	key := tid
+	if key <= 0 {
+		// A fill without a tid cannot be deduplicated; count it once.
+		s.uniq++
+		key = -s.uniq
+	}
+	if _, dup := s.tids[key]; dup {
+		return false
+	}
+	s.tids[key] = struct{}{}
+	s.qty += sz
+	s.quote += sz * px
+	s.fee += fee
+	return true
+}
+
+// effective returns the published cumulative fill: the per-trade sum once it
+// covers the synchronous total, otherwise the synchronous total itself. The
+// fee is only reported with the per-trade sum: fees of a partial subset of
+// trades would understate the order's fee, so it is reported as 0 (unknown).
+func (s *fillState) effective() (qty, quote, fee float64) {
+	if s.qty >= s.syncQty-1e-12 {
+		return s.qty, s.quote, s.fee
+	}
+	return s.syncQty, s.syncQuote, 0
+}
+
+// fillState returns the accumulator for an oid, creating it when absent.
+// Callers must hold ordersMu.
+func (v *Venue) fillState(oid int64) *fillState {
+	fs := v.fillStates[oid]
+	if fs == nil {
+		fs = newFillState()
+		v.fillStates[oid] = fs
+	}
+	return fs
+}
+
+// pendingFill parks a fill that arrived before its oid was registered.
+type pendingFill struct {
+	fill wsFill
+	at   time.Time
 }
 
 // New builds the venue from a preset kind plus option overrides.
@@ -156,7 +214,8 @@ func NewWithConfig(cfg Config) (*Venue, error) {
 	v := &Venue{
 		cfg: cfg, assets: map[string]int{}, books: map[int]*bookState{},
 		orderLookup: map[int64]int64{}, orderFinal: map[int64]domain.OrderStatus{},
-		orderOrig: map[int64]float64{}, fillAgg: map[int64]fillAgg{},
+		orderOrig: map[int64]float64{}, fillStates: map[int64]*fillState{},
+		knownCIDs: map[int64]time.Time{}, pendingFills: map[int64][]pendingFill{},
 		sendMu: make(chan struct{}, 1), closeDone: make(chan struct{}),
 	}
 	if cfg.AgentKey != "" {
@@ -612,15 +671,22 @@ func partialIOC(status domain.OrderStatus, filled, requested float64) domain.Ord
 
 type wsFillsMsg struct {
 	Data struct {
-		User  string `json:"user"`
-		Fills []struct {
-			Coin string `json:"coin"`
-			Px   string `json:"px"`
-			Sz   string `json:"sz"`
-			Oid  int64  `json:"oid"`
-			Time int64  `json:"time"`
-		} `json:"fills"`
+		User       string   `json:"user"`
+		IsSnapshot bool     `json:"isSnapshot"`
+		Fills      []wsFill `json:"fills"`
 	} `json:"data"`
+}
+
+type wsFill struct {
+	Coin  string `json:"coin"`
+	Px    string `json:"px"`
+	Sz    string `json:"sz"`
+	Oid   int64  `json:"oid"`
+	Time  int64  `json:"time"`
+	Tid   int64  `json:"tid"`
+	Hash  string `json:"hash"`
+	Fee   string `json:"fee"`
+	Cloid string `json:"cloid"`
 }
 
 func (v *Venue) onOrderUpdate(raw []byte) {
@@ -640,7 +706,8 @@ func (v *Venue) onOrderUpdate(raw []byte) {
 		if orig, oerr := strconv.ParseFloat(u.Order.OrigSz, 64); oerr == nil && orig > 0 && !math.IsNaN(orig) {
 			v.orderOrig[u.Order.Oid] = orig
 		}
-		agg := v.fillAgg[u.Order.Oid]
+		v.drainPending(u.Order.Oid)
+		aggQty, aggQuote, aggFee := v.fillState(u.Order.Oid).effective()
 		status := mapOrderStatus(u.Status)
 		orig := v.orderOrig[u.Order.Oid]
 		if status.Terminal() {
@@ -652,17 +719,17 @@ func (v *Venue) onOrderUpdate(raw []byte) {
 		// zero-size terminal report would desync the executor's position
 		// accounting.
 		publishNow := status == domain.StatusRejected ||
-			(status.Terminal() && agg.qty > 0)
+			(status.Terminal() && aggQty > 0)
 		if publishNow {
-			status = partialIOC(status, agg.qty, v.orderOrig[u.Order.Oid])
+			status = partialIOC(status, aggQty, v.orderOrig[u.Order.Oid])
 			v.publishOrder(domain.OrderUpdate{
 				Venue: v.cfg.Name, ClientID: cid, OrderIndex: u.Order.Oid,
-				Status: status, FilledQty: agg.qty, FilledQuote: agg.quote,
+				Status: status, FilledQty: aggQty, FilledQuote: aggQuote, Fee: aggFee,
 				Ts: time.Now(),
 			})
 		}
 		v.ordersMu.Unlock()
-		if (status == domain.StatusFilled || status == domain.StatusCanceled) && agg.qty == 0 {
+		if (status == domain.StatusFilled || status == domain.StatusCanceled) && aggQty == 0 {
 			// Late fill aggregation: fetch fills once for the terminal oid.
 			go v.backfillFills(u.Order.Oid, cid, u.StatusTimestamp, status, orig)
 		}
@@ -700,28 +767,70 @@ func (v *Venue) onUserFills(raw []byte) {
 	for _, f := range m.Data.Fills {
 		cid, known := v.orderLookup[f.Oid]
 		if !known {
-			continue
+			// A fill may arrive before the submit ack or order update
+			// registered its oid. A cloid known to this process identifies it
+			// as ours; otherwise park the fill until registration.
+			if c, ok := cloidToID(f.Cloid); ok {
+				if _, ours := v.knownCIDs[c]; ours {
+					v.orderLookup[f.Oid] = c
+					cid, known = c, true
+				}
+			}
+			if !known {
+				v.pendingFills[f.Oid] = append(v.pendingFills[f.Oid], pendingFill{fill: f, at: time.Now()})
+				continue
+			}
 		}
-		sz, err1 := strconv.ParseFloat(f.Sz, 64)
-		px, err2 := strconv.ParseFloat(f.Px, 64)
-		if err1 != nil || err2 != nil || sz <= 0 || px <= 0 || math.IsNaN(sz) || math.IsNaN(px) {
-			continue
+		if !v.mergeFillLocked(f) {
+			continue // duplicate trade (replay, snapshot, or backfill overlap)
 		}
-		agg := v.fillAgg[f.Oid]
-		agg.qty += sz
-		agg.quote += sz * px
-		v.fillAgg[f.Oid] = agg
+		if m.Data.IsSnapshot {
+			continue // snapshot replays only fill gaps; they never re-publish
+		}
+		aggQty, aggQuote, aggFee := v.fillState(f.Oid).effective()
 		status := v.orderFinal[f.Oid]
 		if !status.Terminal() {
 			status = domain.StatusUnknown
 		} else {
-			status = partialIOC(status, agg.qty, v.orderOrig[f.Oid])
+			status = partialIOC(status, aggQty, v.orderOrig[f.Oid])
 		}
 		v.publishOrder(domain.OrderUpdate{
 			Venue: v.cfg.Name, ClientID: cid, OrderIndex: f.Oid,
-			Status: status, FilledQty: agg.qty, FilledQuote: agg.quote,
+			Status: status, FilledQty: aggQty, FilledQuote: aggQuote, Fee: aggFee,
 			Ts: time.Now(),
 		})
+	}
+}
+
+// mergeFillLocked merges one WS fill into the per-oid state and reports
+// whether it was a new trade. Callers must hold ordersMu.
+func (v *Venue) mergeFillLocked(f wsFill) bool {
+	sz, err1 := strconv.ParseFloat(f.Sz, 64)
+	px, err2 := strconv.ParseFloat(f.Px, 64)
+	if err1 != nil || err2 != nil || sz <= 0 || px <= 0 || math.IsNaN(sz) || math.IsNaN(px) {
+		return false
+	}
+	fee, feeErr := strconv.ParseFloat(f.Fee, 64)
+	if feeErr != nil || fee < 0 || math.IsNaN(fee) {
+		fee = 0
+	}
+	return v.fillState(f.Oid).add(f.Tid, sz, px, fee)
+}
+
+// drainPending merges fills that arrived before the oid was registered.
+// Callers must hold ordersMu.
+func (v *Venue) drainPending(oid int64) {
+	pending := v.pendingFills[oid]
+	if len(pending) == 0 {
+		return
+	}
+	delete(v.pendingFills, oid)
+	now := time.Now()
+	for _, pf := range pending {
+		if now.Sub(pf.at) > time.Minute {
+			continue
+		}
+		v.mergeFillLocked(pf.fill)
 	}
 }
 
@@ -753,7 +862,7 @@ func (v *Venue) backfillFills(oid, cid int64, statusTs int64, status domain.Orde
 	}
 	v.ordersMu.Lock()
 	defer v.ordersMu.Unlock()
-	var qty, quote float64
+	added := false
 	for _, f := range fills {
 		if f.Oid.String() != strconv.FormatInt(oid, 10) {
 			continue
@@ -763,9 +872,15 @@ func (v *Venue) backfillFills(oid, cid int64, statusTs int64, status domain.Orde
 		if err1 != nil || err2 != nil {
 			continue
 		}
-		qty += sz
-		quote += sz * px
+		fee, feeErr := number(f.Fee)
+		if feeErr != nil || fee < 0 {
+			fee = 0
+		}
+		if v.fillState(oid).add(f.Tid, sz, px, fee) {
+			added = true
+		}
 	}
+	qty, quote, fee := v.fillState(oid).effective()
 	if qty <= 0 {
 		// A canceled order may genuinely have no fills.
 		if status == domain.StatusCanceled {
@@ -776,11 +891,15 @@ func (v *Venue) backfillFills(oid, cid int64, statusTs int64, status domain.Orde
 		}
 		return
 	}
-	v.fillAgg[oid] = fillAgg{qty: qty, quote: quote}
+	if !added {
+		// Every trade was already merged through another source; the
+		// published terminal update is still current.
+		return
+	}
 	status = partialIOC(status, qty, origQty)
 	v.publishOrder(domain.OrderUpdate{
 		Venue: v.cfg.Name, ClientID: cid, OrderIndex: oid,
-		Status: status, FilledQty: qty, FilledQuote: quote,
+		Status: status, FilledQty: qty, FilledQuote: quote, Fee: fee,
 		Ts: time.Now(),
 	})
 }

@@ -359,6 +359,33 @@ func TestCapEngagedBandTransitions(t *testing.T) {
 	}
 }
 
+// TestCloseSpillsIntoOtherStepsFIFO verifies an oversized step close consumes
+// the selected step first and the overflow from the remaining steps in
+// opening order, instead of failing with "close exceeds selected step".
+func TestCloseSpillsIntoOtherStepsFIFO(t *testing.T) {
+	a := settlementActor(t)
+	openAccounting(t, a, strategy.DirLS, 100, 110)
+	a.next++
+	a.state.Steps = append(a.state.Steps, strategy.Step{
+		ID: 2, Dir: strategy.DirLS, Qty: 0.01, OriginalQty: 0.01,
+		OpenL: 100, OpenR: 110, EntryBps: strategy.EntryBps(strategy.DirLS, 100, 110),
+		EntryFeesUSD: 0.01 * (100*0.001 + 110*0.001), OpenedAt: time.Now().Add(time.Minute),
+	})
+	a.state.Steps[0].Qty, a.state.Steps[0].OriginalQty = 0.01, 0.01
+	a.state.Steps[0].EntryFeesUSD = 0.01 * (100*0.001 + 110*0.001)
+	a.posL, a.posR = 0.02, -0.02
+	act := strategy.Action{Kind: strategy.Close, Dir: strategy.DirLS, StepID: 1, Qty: 0.01,
+		L: strategy.Leg{Side: domain.Sell, Price: 101}, R: strategy.Leg{Side: domain.Buy, Price: 110.5}}
+	if err := a.accountExecution(act, spread.Quote{}, 0.02, -0.02, fillResult(0.014, 101, 0.014, 110.5, 0.006, -0.006)); err != nil {
+		t.Fatal(err)
+	}
+	if len(a.state.Steps) != 1 || a.state.Steps[0].ID != 2 {
+		t.Fatalf("spill did not consume FIFO: %+v", a.state.Steps)
+	}
+	nearSettlement(t, "remaining step quantity", a.state.Steps[0].Qty, 0.006)
+	nearSettlement(t, "remaining entry fees", a.state.Steps[0].EntryFeesUSD, 0.0021*0.006/0.01)
+}
+
 func TestCapEngagedOversizedBandReleasesAtFlat(t *testing.T) {
 	a := settlementActor(t)
 	a.cfg.Params = strategy.Params{MaxSteps: 2, CapBand: 9, StepQty: 1, DepthMult: 1}
