@@ -48,11 +48,14 @@ type Config struct {
 		Aliases       map[string]string `yaml:"aliases"`
 	} `yaml:"matching"`
 	Estimator struct {
-		Kind        string        `yaml:"kind"`
-		Window      time.Duration `yaml:"window"`
-		MinWarmup   time.Duration `yaml:"min_warmup"`
-		MinCoverage float64       `yaml:"min_coverage"`
-		Interval    time.Duration `yaml:"interval"`
+		Kind          string        `yaml:"kind"`
+		Window        time.Duration `yaml:"window"`
+		MinWarmup     time.Duration `yaml:"min_warmup"`
+		MinCoverage   float64       `yaml:"min_coverage"`
+		Interval      time.Duration `yaml:"interval"`
+		MuHalfLife    time.Duration `yaml:"mu_half_life"`    // zscore: mean EMA half-life
+		SigmaHalfLife time.Duration `yaml:"sigma_half_life"` // zscore: dispersion EWMA half-life
+		SigmaFloor    float64       `yaml:"sigma_floor"`     // zscore: dispersion floor (bps)
 	} `yaml:"estimator"`
 	Volatility struct {
 		Interval time.Duration `yaml:"interval"`  // sampling interval
@@ -79,6 +82,8 @@ type Config struct {
 		FlipHysteresisSigma float64       `yaml:"flip_hysteresis_sigma"` // extra sigma before reversing direction
 		CapBand             int           `yaml:"cap_band"`              // steps below max_steps that unlock opens after hitting the cap
 		CapHysteresisSigma  float64       `yaml:"cap_hysteresis_sigma"`  // extra sigma to open inside the top cap_band steps
+		ZOpen               float64       `yaml:"z_open"`                // zscore: z threshold for opens (0 = default 2)
+		StepZ               float64       `yaml:"step_z"`                // zscore: z-unit ladder spacing per open step (0 = off)
 		IntervalMin         time.Duration `yaml:"interval_min"`
 		IntervalMax         time.Duration `yaml:"interval_max"`
 		MaxBookAge          time.Duration `yaml:"max_book_age"`
@@ -198,6 +203,19 @@ func Load(path string) (*Config, error) {
 			return nil, fmt.Errorf("parse %s: %w", path, err)
 		}
 		return nil, fmt.Errorf("parse %s: multiple YAML documents", path)
+	}
+	// Kind-dependent defaults are applied after decoding so a zscore switch
+	// in the file activates them.
+	if c.Estimator.Kind == "zscore" {
+		if c.Estimator.MuHalfLife == 0 {
+			c.Estimator.MuHalfLife = 15 * time.Minute
+		}
+		if c.Estimator.SigmaHalfLife == 0 {
+			c.Estimator.SigmaHalfLife = 3 * time.Hour
+		}
+		if c.Estimator.SigmaFloor == 0 {
+			c.Estimator.SigmaFloor = 0.5
+		}
 	}
 	return &c, c.validate()
 }
@@ -414,6 +432,9 @@ func (c *Config) validate() error {
 	if _, err := strategy.New(c.Strategy.Kind); err != nil {
 		return fmt.Errorf("strategy.kind: %w", err)
 	}
+	if c.Strategy.Kind == "zscore" && c.Estimator.Kind != "zscore" {
+		return fmt.Errorf("strategy.kind zscore requires estimator.kind zscore")
+	}
 	for _, d := range []struct {
 		name  string
 		value time.Duration
@@ -443,6 +464,20 @@ func (c *Config) validate() error {
 	}
 	if c.Estimator.MinCoverage <= 0 || c.Estimator.MinCoverage > 1 {
 		return fmt.Errorf("estimator.min_coverage must be in (0, 1]")
+	}
+	if c.Estimator.Kind == "zscore" {
+		if c.Estimator.MuHalfLife <= 0 || c.Estimator.SigmaHalfLife <= 0 {
+			return fmt.Errorf("estimator.mu_half_life and sigma_half_life must be > 0 for the zscore estimator")
+		}
+		if c.Estimator.SigmaFloor < 0 {
+			return fmt.Errorf("estimator.sigma_floor must be >= 0")
+		}
+	}
+	if c.Strategy.ZOpen < 0 {
+		return fmt.Errorf("strategy.z_open must be >= 0")
+	}
+	if c.Strategy.StepZ < 0 {
+		return fmt.Errorf("strategy.step_z must be >= 0")
 	}
 	if c.Strategy.DepthMult <= 0 {
 		return fmt.Errorf("strategy.depth_mult must be > 0")

@@ -48,6 +48,17 @@ type Params struct {
 	MinWarmup   time.Duration
 	MinCoverage float64
 	Interval    time.Duration // sampling interval (1s)
+	// Z-score estimator only: mean and dispersion half-lives plus a floor on
+	// the dispersion so a perfectly quiet market cannot inflate z.
+	MuHalfLife    time.Duration
+	SigmaHalfLife time.Duration
+	SigmaFloor    float64
+}
+
+// LongVol exposes the long-horizon spread dispersion used by z-score
+// strategies. The short-horizon volatility chain is a different quantity.
+type LongVol interface {
+	LongVol() float64
 }
 
 // Factory builds an estimator.

@@ -36,9 +36,13 @@ matching:
   aliases: {}
 
 estimator:
-  kind: sma
+  kind: sma              # sma | zscore (zscore: EMA mean + long-horizon dispersion gate)
   window: 2h
   min_warmup: 60m
+  # z-score estimator options (used when kind: zscore):
+  # mu_half_life: 15m        # mean EMA half-life
+  # sigma_half_life: 3h      # dispersion EWMA half-life
+  # sigma_floor: 0.5         # dispersion floor in bps
   min_coverage: 0.8
   interval: 1s
 
@@ -67,6 +71,8 @@ strategy:
   flip_hysteresis_sigma: 1.0  # extra sigma of deviation required before reversing direction (0 = off)
   cap_band: 2                # after touching max_steps, opens unlock below max_steps-cap_band (0 = off)
   cap_hysteresis_sigma: 1.0  # extra sigma to open inside the top cap_band steps (0 = off)
+  # z_open: 2                 # z-score open threshold (used when kind: zscore; 0 = default 2)
+  # step_z: 0.5               # z-score ladder: each step needs +0.5 sigma (0 = off)
   interval_min: 1s
   interval_max: 2s
   max_book_age: 3s

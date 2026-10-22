@@ -62,6 +62,8 @@ func (rt *runtime) newStats() (estimator.Estimator, *volatility.Estimator, *vola
 	est, err := estimator.New(c.Estimator.Kind, estimator.Params{
 		Window: c.Estimator.Window, MinWarmup: c.Estimator.MinWarmup,
 		MinCoverage: c.Estimator.MinCoverage, Interval: c.Estimator.Interval,
+		MuHalfLife: c.Estimator.MuHalfLife, SigmaHalfLife: c.Estimator.SigmaHalfLife,
+		SigmaFloor: c.Estimator.SigmaFloor,
 	})
 	if err != nil {
 		return nil, nil, nil, nil, err
@@ -116,7 +118,8 @@ func (rt *runtime) buildActor(pair symbols.Pair, qty float64, maxSteps int, l, r
 			DepthMult: c.Strategy.DepthMult, CloseOrder: c.Strategy.CloseOrder, VolK: c.Strategy.VolK, FeeBps: feeBps,
 			MinInventory: minInv, TakerFeeL: pair.Left.TakerFee, TakerFeeR: pair.Right.TakerFee,
 			FlipHysteresisSigma: c.Strategy.FlipHysteresisSigma,
-			CapBand:             c.Strategy.CapBand, CapHysteresisSigma: c.Strategy.CapHysteresisSigma}),
+			CapBand:             c.Strategy.CapBand, CapHysteresisSigma: c.Strategy.CapHysteresisSigma,
+			ZOpen: c.Strategy.ZOpen, StepZ: c.Strategy.StepZ}),
 	})
 }
 

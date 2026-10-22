@@ -674,7 +674,15 @@ func (a *PairActor) decideOnce(ctx context.Context, now time.Time, nextAt time.T
 	st := a.state
 	st.LastDir = a.lastDir
 	st.CapEngaged = a.capEngaged
-	act := a.cfg.Strategy.Decide(a.cfg.Params, st, q, mu, ready, a.volBps())
+	vol := a.volBps()
+	if _, zk := a.cfg.Strategy.(strategy.ZScore); zk {
+		// The z-score strategy normalizes by the long-horizon dispersion of
+		// the estimator, not the short-horizon volatility chain.
+		if lv, ok := a.cfg.Est.(estimator.LongVol); ok {
+			vol = lv.LongVol()
+		}
+	}
+	act := a.cfg.Strategy.Decide(a.cfg.Params, st, q, mu, ready, vol)
 	if act.Kind == strategy.None {
 		return nextAt
 	}

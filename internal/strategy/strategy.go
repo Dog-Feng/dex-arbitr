@@ -90,6 +90,14 @@ type Params struct {
 	// spread volatility, required to open inside the top CapBand steps. It
 	// prices the marginal cost of re-churning near the capacity line.
 	CapHysteresisSigma float64
+	// ZOpen is the z-score threshold (units of the long-horizon dispersion)
+	// used by the zscore strategy instead of OpenBps/VolK. 0 applies the
+	// default of 2.
+	ZOpen float64
+	// StepZ is the z-unit ladder spacing for the zscore strategy: each open
+	// step requires z >= ZOpen + StepZ*|cnt| so steps spread over the
+	// deviation band instead of stacking at one level. 0 disables the ladder.
+	StepZ float64
 }
 
 // Strategy decides an action from the pair state and market view.
@@ -279,19 +287,75 @@ func legs(q spread.Quote, l, r domain.Side) (Leg, Leg) {
 	return Leg{l, px(q.L, l)}, Leg{r, px(q.R, r)}
 }
 
+// gate validates the preconditions every strategy variant shares. ok=false
+// returns a blocking action.
+func gate(p Params, s State, q spread.Quote) (Action, bool) {
+	if s.Mode == ModePaused {
+		return Action{Reason: "paused"}, false
+	}
+	if _, ok := spread.Compute(q.L, q.R); !ok || !validPrice(q.RefMid) || !finite(q.LS) || !finite(q.SL) || !finite(q.Mid) {
+		return Action{Reason: "invalid quote"}, false
+	}
+	if s.Mode < ModeWarmup || s.Mode > ModePaused || !validPrice(p.StepQty) || p.MaxSteps <= 0 || !validPrice(p.DepthMult) || !finite(p.OpenBps) || !finite(p.CloseBps) || !finite(p.VolK) || p.VolK < 0 || !finite(p.FeeBps) || p.FeeBps < 0 || !finite(p.TakerFeeL) || p.TakerFeeL < 0 || !finite(p.TakerFeeR) || p.TakerFeeR < 0 || p.MinInventory < 0 || !finite(p.FlipHysteresisSigma) || p.FlipHysteresisSigma < 0 || p.CapBand < 0 || !finite(p.CapHysteresisSigma) || p.CapHysteresisSigma < 0 || !finite(p.ZOpen) || p.ZOpen < 0 || !finite(p.StepZ) || p.StepZ < 0 {
+		return Action{Reason: "invalid strategy parameters"}, false
+	}
+	return Action{}, true
+}
+
+// decideClose evaluates the close-first rule shared by every strategy. ok
+// reports that the close path produced either a close or a blocking reason.
+func decideClose(p Params, s State, q spread.Quote) (Action, bool) {
+	cnt := s.Counter()
+	if abs(cnt) <= p.MinInventory {
+		return Action{}, false
+	}
+	type cand struct {
+		st Step
+		pf float64
+		ix int
+	}
+	var cs []cand
+	for i, st := range s.Steps {
+		if pf := profit(st, q); pf >= p.CloseBps+closeFeeBps(p, st, q) {
+			cs = append(cs, cand{st, pf, i})
+		}
+	}
+	if len(cs) == 0 {
+		return Action{}, false
+	}
+	switch p.CloseOrder {
+	case "lifo":
+		sort.Slice(cs, func(i, j int) bool { return cs[i].ix > cs[j].ix })
+	case "fifo":
+		sort.Slice(cs, func(i, j int) bool { return cs[i].ix < cs[j].ix })
+	default: // best
+		sort.SliceStable(cs, func(i, j int) bool { return cs[i].pf > cs[j].pf })
+	}
+	// Try candidates in order so a depth-starved large step cannot
+	// block a smaller, profitable step that has enough liquidity.
+	for _, c := range cs {
+		ol, or := c.st.Dir.LegSides()
+		l, r := ol.Opposite(), or.Opposite()
+		if !depthOK(q, l, r, c.st.Qty*p.DepthMult) {
+			continue
+		}
+		la, ra := legs(q, l, r)
+		return Action{Kind: Close, Dir: c.st.Dir, StepID: c.st.ID, Qty: c.st.Qty, L: la, R: ra, ExpectedBps: c.pf,
+			Reason: fmt.Sprintf("close step %d profit %.2fbps >= %.2f+%.2f (net)", c.st.ID, c.pf, p.CloseBps, closeFeeBps(p, c.st, q))}, true
+	}
+	return Action{Reason: fmt.Sprintf("%d profitable close candidate(s) but none has top-of-book depth for its size", len(cs))}, true
+}
+
 // Decide is pure: same inputs => same action. mu is the spread mean in bps
 // (only used for opening; muReady=false blocks opens). vol is the short-horizon
 // spread volatility in bps; openings require the deviation to exceed
 // OpenBps + VolK*vol so the expected 500ms adverse move is pre-reserved.
 func (Arbitrage) Decide(p Params, s State, q spread.Quote, mu float64, muReady bool, vol float64) Action {
-	if s.Mode == ModePaused {
-		return Action{Reason: "paused"}
+	if act, ok := gate(p, s, q); !ok {
+		return act
 	}
-	if _, ok := spread.Compute(q.L, q.R); !ok || !validPrice(q.RefMid) || !finite(q.LS) || !finite(q.SL) || !finite(q.Mid) {
-		return Action{Reason: "invalid quote"}
-	}
-	if s.Mode < ModeWarmup || s.Mode > ModePaused || !validPrice(p.StepQty) || p.MaxSteps <= 0 || !validPrice(p.DepthMult) || !finite(p.OpenBps) || !finite(p.CloseBps) || !finite(p.VolK) || p.VolK < 0 || !finite(p.FeeBps) || p.FeeBps < 0 || !finite(p.TakerFeeL) || p.TakerFeeL < 0 || !finite(p.TakerFeeR) || p.TakerFeeR < 0 || p.MinInventory < 0 || !finite(p.FlipHysteresisSigma) || p.FlipHysteresisSigma < 0 || p.CapBand < 0 || !finite(p.CapHysteresisSigma) || p.CapHysteresisSigma < 0 {
-		return Action{Reason: "invalid strategy parameters"}
+	if act, ok := decideClose(p, s, q); ok {
+		return act
 	}
 	need := p.StepQty * p.DepthMult
 	cnt := s.Counter()
@@ -302,45 +366,7 @@ func (Arbitrage) Decide(p Params, s State, q spread.Quote, mu float64, muReady b
 		band = p.MaxSteps
 	}
 
-	// 1) close first, but never below the inventory floor
-	if abs(cnt) > p.MinInventory {
-		type cand struct {
-			st Step
-			pf float64
-			ix int
-		}
-		var cs []cand
-		for i, st := range s.Steps {
-			if pf := profit(st, q); pf >= p.CloseBps+closeFeeBps(p, st, q) {
-				cs = append(cs, cand{st, pf, i})
-			}
-		}
-		if len(cs) > 0 {
-			switch p.CloseOrder {
-			case "lifo":
-				sort.Slice(cs, func(i, j int) bool { return cs[i].ix > cs[j].ix })
-			case "fifo":
-				sort.Slice(cs, func(i, j int) bool { return cs[i].ix < cs[j].ix })
-			default: // best
-				sort.SliceStable(cs, func(i, j int) bool { return cs[i].pf > cs[j].pf })
-			}
-			// Try candidates in order so a depth-starved large step cannot
-			// block a smaller, profitable step that has enough liquidity.
-			for _, c := range cs {
-				ol, or := c.st.Dir.LegSides()
-				l, r := ol.Opposite(), or.Opposite()
-				if !depthOK(q, l, r, c.st.Qty*p.DepthMult) {
-					continue
-				}
-				la, ra := legs(q, l, r)
-				return Action{Kind: Close, Dir: c.st.Dir, StepID: c.st.ID, Qty: c.st.Qty, L: la, R: ra, ExpectedBps: c.pf,
-					Reason: fmt.Sprintf("close step %d profit %.2fbps >= %.2f+%.2f (net)", c.st.ID, c.pf, p.CloseBps, closeFeeBps(p, c.st, q))}
-			}
-			return Action{Reason: fmt.Sprintf("%d profitable close candidate(s) but none has top-of-book depth for its size", len(cs))}
-		}
-	}
-
-	// 2) open
+	// open
 	if s.Mode != ModeRunning {
 		return Action{Reason: "mode " + s.Mode.String() + ": no opens"}
 	}
@@ -411,6 +437,109 @@ func (Arbitrage) Decide(p Params, s State, q spread.Quote, mu float64, muReady b
 	return Action{Reason: fmt.Sprintf("no signal: LS dev %.2f, SL dev %.2f (mu %.2f)", devLS, devSL, mu)}
 }
 
+// ZScore is the mean-reversion strategy whose opening gate is the spread's
+// long-horizon z-score instead of a fixed bps deviation. Closing is unchanged.
+type ZScore struct{}
+
+// Parameters applies the z-score defaults.
+func (ZScore) Parameters(p Params) Params {
+	if p.ZOpen <= 0 {
+		p.ZOpen = 2
+	}
+	return p
+}
+
+// Decide opens when the long-horizon z-score exceeds ZOpen in one direction
+// and the deviation still covers the round-trip fees. mu is the fast mean,
+// vol is the long-horizon dispersion. Closing uses the same rule as
+// Arbitrage: gross profit must cover the entry-fee amortization plus exit
+// fees. Forced reduction is deliberately not implemented here.
+func (ZScore) Decide(p Params, s State, q spread.Quote, mu float64, muReady bool, vol float64) Action {
+	p = (ZScore{}).Parameters(p)
+	if act, ok := gate(p, s, q); !ok {
+		return act
+	}
+	if act, ok := decideClose(p, s, q); ok {
+		return act
+	}
+	need := p.StepQty * p.DepthMult
+	cnt := s.Counter()
+	band := p.CapBand
+	if band > p.MaxSteps {
+		band = p.MaxSteps
+	}
+	if s.Mode != ModeRunning {
+		return Action{Reason: "mode " + s.Mode.String() + ": no opens"}
+	}
+	if !muReady {
+		return Action{Reason: "mean not ready"}
+	}
+	if math.IsNaN(mu) || math.IsInf(mu, 0) || math.IsNaN(vol) || math.IsInf(vol, 0) || vol <= 0 {
+		return Action{Reason: "invalid statistics"}
+	}
+	zLS := (q.LS - mu) / vol
+	zSL := (q.SL + mu) / vol
+	try := func(d Dir, z, dev float64) (Action, bool) {
+		if math.IsNaN(z) || math.IsInf(z, 0) {
+			return Action{Reason: "invalid z"}, true
+		}
+		needZ := p.ZOpen
+		feeBps := openFeeBps(p, q, d)
+		// A reversal after a flat position needs one extra sigma of z.
+		if cnt == 0 && s.LastDir != 0 && s.LastDir != d && p.FlipHysteresisSigma > 0 {
+			needZ += p.FlipHysteresisSigma
+		}
+		// The top CapBand steps price one extra sigma of z.
+		if band > 0 && p.CapHysteresisSigma > 0 && abs(cnt) >= p.MaxSteps-band {
+			needZ += p.CapHysteresisSigma
+		}
+		// The ladder prices each additional step one StepZ of dispersion
+		// higher, spreading entries over the deviation band.
+		needZ += p.StepZ * float64(abs(cnt))
+		if band > 0 && s.CapEngaged && abs(cnt) > p.MaxSteps-band {
+			return Action{Reason: fmt.Sprintf("%s z %.2f but capacity band engaged (reopen below %d steps)", d, z, p.MaxSteps-band)}, true
+		}
+		if z < needZ || dev < feeBps {
+			return Action{}, false
+		}
+		if cnt != 0 && Dir(sign(cnt)) != d {
+			return Action{Reason: fmt.Sprintf("%s z %.2f but holding opposite steps", d, z)}, true
+		}
+		if abs(cnt) >= p.MaxSteps {
+			return Action{Reason: fmt.Sprintf("%s z %.2f but max steps %d reached", d, z, p.MaxSteps)}, true
+		}
+		l, r := d.LegSides()
+		if !depthOK(q, l, r, need) {
+			return Action{Reason: fmt.Sprintf("%s z %.2f but top-of-book depth < %.4f", d, z, need)}, true
+		}
+		la, ra := legs(q, l, r)
+		return Action{Kind: Open, Dir: d, Qty: p.StepQty, L: la, R: ra, ExpectedBps: dev,
+			Reason: fmt.Sprintf("open %s z %.2f >= %.2f dev %.2fbps >= fee %.2f (mu %.2f sigma %.2f)", d, z, needZ, dev, feeBps, mu, vol)}, true
+	}
+	// prefer the larger z
+	first, second := DirLS, DirSL
+	z1, z2 := zLS, zSL
+	if zSL > zLS {
+		first, second, z1, z2 = DirSL, DirLS, zSL, zLS
+	}
+	devLS := q.LS - mu
+	devSL := q.SL + mu
+	dev1, dev2 := devLS, devSL
+	if zSL > zLS {
+		dev1, dev2 = devSL, devLS
+	}
+	if a, ok := try(first, z1, dev1); ok && a.Kind != None {
+		return a
+	} else if b, ok2 := try(second, z2, dev2); ok2 && b.Kind != None {
+		return b
+	} else if ok {
+		return a
+	} else if ok2 {
+		return b
+	}
+	return Action{Reason: fmt.Sprintf("no signal: LS z %.2f, SL z %.2f (mu %.2f sigma %.2f)", zLS, zSL, mu, vol)}
+}
+
 // EntryBps computes the executed spread (bps) of a leg pair in direction d,
 // referencing the fill-time mid (lPx+rPx)/2.
 func EntryBps(d Dir, lPx, rPx float64) float64 {
@@ -469,4 +598,5 @@ func New(name string) (Strategy, error) {
 func init() {
 	Register("arbitrage", func() Strategy { return Arbitrage{} })
 	Register("volume", func() Strategy { return Volume{} })
+	Register("zscore", func() Strategy { return ZScore{} })
 }

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Dog-Feng/dex-arbitr/internal/spread/estimator"
+	"github.com/Dog-Feng/dex-arbitr/internal/strategy"
 	"github.com/Dog-Feng/dex-arbitr/internal/symbols"
 )
 
@@ -191,6 +192,40 @@ func TestLoadVolumeLossTolerance(t *testing.T) {
 	}
 	if _, err := Load(bad); err == nil || !strings.Contains(err.Error(), "loss_tolerance_bps") {
 		t.Fatalf("expected loss_tolerance_bps validation error, got %v", err)
+	}
+}
+
+func TestLoadZScoreSwitch(t *testing.T) {
+	c, err := loadTestConfig(t, "estimator:\n  kind: zscore\n  window: 2h\n  min_warmup: 15m\n  interval: 1s\n  min_coverage: 0.8\nstrategy:\n  kind: zscore\n  z_open: 2.5\n  step_z: 0.5\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Estimator.MuHalfLife != 15*time.Minute || c.Estimator.SigmaHalfLife != 3*time.Hour || c.Estimator.SigmaFloor != 0.5 {
+		t.Fatalf("zscore estimator defaults not applied: %+v", c.Estimator)
+	}
+	if c.Strategy.ZOpen != 2.5 {
+		t.Fatalf("z_open = %v, want 2.5", c.Strategy.ZOpen)
+	}
+	if c.Strategy.StepZ != 0.5 {
+		t.Fatalf("step_z = %v, want 0.5", c.Strategy.StepZ)
+	}
+	if _, err := strategy.New(c.Strategy.Kind); err != nil {
+		t.Fatalf("zscore strategy not registered: %v", err)
+	}
+}
+
+func TestLoadZScoreValidation(t *testing.T) {
+	for _, tc := range []struct{ name, data, want string }{
+		{"negative floor", "estimator:\n  kind: zscore\n  sigma_floor: -1\n", "sigma_floor"},
+		{"negative z open", "estimator:\n  kind: zscore\nstrategy:\n  kind: zscore\n  z_open: -1\n", "z_open"},
+		{"negative step z", "estimator:\n  kind: zscore\nstrategy:\n  kind: zscore\n  step_z: -0.5\n", "step_z"},
+		{"zscore strategy with sma estimator", "strategy:\n  kind: zscore\n", "requires estimator.kind zscore"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := loadTestConfig(t, tc.data); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Load error=%v, want %q", err, tc.want)
+			}
+		})
 	}
 }
 
