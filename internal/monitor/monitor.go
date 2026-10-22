@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"math"
 	"net/http"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -300,6 +301,14 @@ func (m *Monitor) ConfigureAnalytics(cfg AnalyticsCfg, sink TradeSink) {
 	}
 	if cfg.Cooldown <= 0 {
 		cfg.Cooldown = 10 * time.Minute
+	}
+	// A typed nil (e.g. a nil *store.TradeLog passed through an interface)
+	// must normalize to a nil sink or Record would dereference it.
+	if sink != nil {
+		v := reflect.ValueOf(sink)
+		if v.Kind() == reflect.Ptr && v.IsNil() {
+			sink = nil
+		}
 	}
 	m.mu.Lock()
 	m.analytics = cfg

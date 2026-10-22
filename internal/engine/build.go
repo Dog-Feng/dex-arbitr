@@ -167,6 +167,10 @@ func Run(ctx context.Context, c *config.Config) (runErr error) {
 			}
 		}()
 	}
+	var sink monitor.TradeSink
+	if tradeLog != nil {
+		sink = tradeLog
+	}
 	mon.ConfigureAnalytics(monitor.AnalyticsCfg{
 		Bucket:        an.Bucket,
 		RetainBuckets: an.RetainBuckets,
@@ -186,7 +190,7 @@ func Run(ctx context.Context, c *config.Config) (runErr error) {
 			RiskFlapsPerHour:  an.Anomalies.RiskFlapsPerHour,
 			MuJumpSigma:       an.Anomalies.MuJumpSigma,
 		},
-	}, tradeLog)
+	}, sink)
 	if c.Monitor.Addr != "" {
 		addr := c.Monitor.Addr
 		if !strings.Contains(addr, ":") {

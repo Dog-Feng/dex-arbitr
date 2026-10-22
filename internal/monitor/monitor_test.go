@@ -421,6 +421,18 @@ func (f *fakeSink) WriteTrade(line []byte) error {
 	return nil
 }
 
+// TestConfigureAnalyticsTypedNilSink pins the engine-side contract: passing a
+// typed nil (nil *TradeLog) through the interface must not leave a non-nil
+// sink that Record would dereference. Reproduces the startup panic where the
+// first persisted event segfaulted in TradeLog.WriteTrade.
+func TestConfigureAnalyticsTypedNilSink(t *testing.T) {
+	m := New(nil)
+	var typedNil *fakeSink
+	m.ConfigureAnalytics(AnalyticsCfg{Bucket: time.Minute}, typedNil)
+	m.Record(Event{Kind: KindRiskState, Pair: "A"})
+	m.Record(Event{Kind: KindStatus, Pair: "A"})
+}
+
 func TestTradeSinkPersistsTradeKinds(t *testing.T) {
 	m := New(nil)
 	sink := &fakeSink{}
