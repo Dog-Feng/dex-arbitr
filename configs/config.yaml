@@ -36,13 +36,13 @@ matching:
   aliases: {}
 
 estimator:
-  kind: sma              # sma | zscore (zscore: EMA mean + long-horizon dispersion gate)
+  kind: zscore              # sma | zscore (zscore: EMA mean + long-horizon dispersion gate)
   window: 2h
-  min_warmup: 60m
+  min_warmup: 15m
   # z-score estimator options (used when kind: zscore):
-  # mu_half_life: 15m        # mean EMA half-life
-  # sigma_half_life: 3h      # dispersion EWMA half-life
-  # sigma_floor: 0.5         # dispersion floor in bps
+  mu_half_life: 15m        # mean EMA half-life
+  sigma_half_life: 3h      # dispersion EWMA half-life
+  sigma_floor: 0.5         # dispersion floor in bps
   min_coverage: 0.8
   interval: 1s
 
@@ -61,7 +61,14 @@ risk:
   max_notional: 0             # per-venue aggregate notional cap (USD); 0 = unlimited
 
 strategy:
-  kind: volume           # arbitrage | volume (registered strategies)
+  # kind: zscore 与 arbitrage/volume 的区别：
+  #   开仓门槛不再用固定 bps（open_bps + vol_k×σ），而是用长期价差离散度归一化：
+  #     z = (当前价差 - 快速均值) / σ_long
+  #   当 |z| >= z_open 且偏离仍覆盖往返手续费时才开仓；step_z 阶梯让每一步
+  #   比前一步多要求 step_z 个 σ，把步数铺在偏离带上（0 = 关闭阶梯）。
+  #   平仓规则与 arbitrage 完全相同（毛利 >= close_bps + 入场费摊销 + 出场费）。
+  #   必须搭配 estimator.kind: zscore；open_bps / vol_k 在 zscore 下失效。
+  kind: zscore           # arbitrage | volume | zscore
   pair_selection: manual # manual | auto (auto = picker-driven top-Y from shared stats)
   open_bps: 0          # arbitrage: extra edge above fees/volatility; volume always uses 0
   close_bps: 0         # arbitrage: extra net return target; volume always uses 0
@@ -71,8 +78,8 @@ strategy:
   flip_hysteresis_sigma: 1.0  # extra sigma of deviation required before reversing direction (0 = off)
   cap_band: 2                # after touching max_steps, opens unlock below max_steps-cap_band (0 = off)
   cap_hysteresis_sigma: 1.0  # extra sigma to open inside the top cap_band steps (0 = off)
-  # z_open: 2                 # z-score open threshold (used when kind: zscore; 0 = default 2)
-  # step_z: 0.5               # z-score ladder: each step needs +0.5 sigma (0 = off)
+  z_open: 2                 # z-score open threshold (used when kind: zscore; 0 = default 2)
+  step_z: 0.5               # z-score ladder: each step needs +0.5 sigma (0 = off)
   interval_min: 1s
   interval_max: 2s
   max_book_age: 3s
@@ -149,5 +156,5 @@ pairs:
   - base: ANTH
     left: rhlighter
     right: entropy
-    step_qty: 0.02
-    max_steps: 5
+    step_qty: 0.01
+    max_steps: 50

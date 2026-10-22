@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -47,6 +48,7 @@ type sim struct {
 	noOpenUntil time.Time
 	coolReset   bool
 	forced      int
+	entryGaps   []float64
 }
 
 func (s *sim) counter() int {
@@ -78,6 +80,7 @@ func (s *sim) apply(act strategy.Action, t time.Time, feeL, feeR float64) {
 	case strategy.Open:
 		entryFees := act.Qty * (act.L.Price*feeL + act.R.Price*feeR)
 		s.volume += act.Qty * (act.L.Price + act.R.Price)
+		s.entryGaps = append(s.entryGaps, act.L.Price-act.R.Price)
 		s.nextID++
 		s.steps = append(s.steps, strategy.Step{
 			ID: s.nextID, Dir: act.Dir, Qty: act.Qty, OriginalQty: act.Qty,
@@ -253,6 +256,7 @@ func main() {
 	sigmaFloor := flag.Float64("sigmafloor", 0.5, "zscore dispersion floor (bps)")
 	interval := flag.Duration("interval", time.Second, "decision cadence")
 	stats := flag.Bool("stats", false, "print multi-window statistics instead of a backtest")
+	dump := flag.Bool("dump", false, "print every held step's entry spread in USD")
 	flag.Parse()
 	if *samples == "" {
 		fmt.Fprintln(os.Stderr, "-samples is required")
@@ -489,5 +493,27 @@ func main() {
 		}
 		fmt.Printf("frozen_entries: n=%d span=%.2f bps (%.2f..%.2f) unrealized_end=%.3f usd\n",
 			len(s.steps), maxB-minB, minB, maxB, unrealized)
+	}
+	if *dump && len(s.steps) > 0 {
+		sorted := append([]strategy.Step(nil), s.steps...)
+		sort.Slice(sorted, func(i, j int) bool { return sorted[i].EntryBps < sorted[j].EntryBps })
+		for i, st := range sorted {
+			fmt.Printf("step=%02d dir=%d entry_bps=%.2f open_l=%.2f open_r=%.2f gap_usd=%.2f\n",
+				i+1, st.Dir, st.EntryBps, st.OpenL, st.OpenR, st.OpenL-st.OpenR)
+		}
+	}
+	if *dump && len(s.entryGaps) > 0 {
+		minG, maxG, sumG := math.Inf(1), math.Inf(-1), 0.0
+		for _, g := range s.entryGaps {
+			sumG += g
+			if g < minG {
+				minG = g
+			}
+			if g > maxG {
+				maxG = g
+			}
+		}
+		fmt.Printf("all_entries: n=%d gap_usd min=%.2f max=%.2f avg=%.2f\n",
+			len(s.entryGaps), minG, maxG, sumG/float64(len(s.entryGaps)))
 	}
 }
