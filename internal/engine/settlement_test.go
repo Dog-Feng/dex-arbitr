@@ -47,6 +47,31 @@ func TestDirectionFlipRecordedInMonitor(t *testing.T) {
 	}
 }
 
+func TestCloseSpillRecordsClosedEventForEveryConsumedStep(t *testing.T) {
+	mon := monitor.New(nil)
+	a := settlementActor(t)
+	a.cfg.Monitor = mon
+	a.state.Steps = []strategy.Step{
+		{ID: 1, Dir: strategy.DirLS, Qty: 1, OriginalQty: 1, OpenL: 100, OpenR: 110},
+		{ID: 2, Dir: strategy.DirLS, Qty: 1, OriginalQty: 1, OpenL: 100, OpenR: 110},
+	}
+	a.next = 3
+	a.posL, a.posR = 2, -2
+	a.syncCounter()
+	// Closing 2 units through step 1 (which holds 1) consumes step 2 too.
+	act := strategy.Action{Kind: strategy.Close, Dir: strategy.DirLS, StepID: 1, Qty: 2,
+		L: strategy.Leg{Side: domain.Sell, Price: 110}, R: strategy.Leg{Side: domain.Buy, Price: 100}}
+	if err := a.accountExecution(act, spread.Quote{}, 2, -2, fillResult(2, 110, 2, 100, 0, 0)); err != nil {
+		t.Fatal(err)
+	}
+	if len(a.state.Steps) != 0 {
+		t.Fatalf("steps not cleared after spill: %+v", a.state.Steps)
+	}
+	if got := mon.Metrics().Closes; got != 2 {
+		t.Fatalf("close events = %d, want one per consumed step", got)
+	}
+}
+
 func settlementActor(t *testing.T) *PairActor {
 	t.Helper()
 	s, err := store.New(t.TempDir())

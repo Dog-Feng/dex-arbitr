@@ -564,7 +564,7 @@ func (a *PairActor) accountExecution(act strategy.Action, q spread.Quote, before
 	eps := math.Pow10(-a.cfg.Pair.SizeDecimals) / 2
 	steps := append([]strategy.Step(nil), a.state.Steps...)
 	var opened *strategy.Step
-	var removed *strategy.Step
+	var removed []float64 // consumed quantities of every fully closed step
 	var rescueCost, grossUSD float64
 	switch act.Kind {
 	case strategy.Open:
@@ -647,6 +647,12 @@ func (a *PairActor) accountExecution(act strategy.Action, q spread.Quote, before
 					st.OriginalQty = st.Qty
 				}
 				part := math.Min(remaining, st.Qty)
+				if st.Qty-part < eps {
+					if idx != sel {
+						spilled = append(spilled, st.ID)
+					}
+					removed = append(removed, part)
+				}
 				gross := strategy.GrossProfitUSD(*st, lpx, rpx, part)
 				if math.IsNaN(gross) || math.IsInf(gross, 0) {
 					return fmt.Errorf("step %d lacks a trustworthy entry basis", st.ID)
@@ -663,8 +669,6 @@ func (a *PairActor) accountExecution(act strategy.Action, q spread.Quote, before
 				remaining -= part
 				if idx == sel {
 					grossUSD = gross
-				} else if st.Qty < eps {
-					spilled = append(spilled, st.ID)
 				}
 			}
 			if remaining >= eps {
@@ -673,10 +677,6 @@ func (a *PairActor) accountExecution(act strategy.Action, q spread.Quote, before
 			kept := steps[:0]
 			for i := range steps {
 				if steps[i].Qty < eps {
-					if i == sel {
-						copyStep := steps[i]
-						removed = &copyStep
-					}
 					continue
 				}
 				kept = append(kept, steps[i])
@@ -714,9 +714,11 @@ func (a *PairActor) accountExecution(act strategy.Action, q spread.Quote, before
 		a.next++
 		a.record(monitor.KindStepOpened, func(e *monitor.Event) { e.Dir = act.Dir.String(); e.Qty = opened.Qty })
 	}
-	if removed != nil {
+	if len(removed) > 0 {
 		a.lastDir = act.Dir
-		a.record(monitor.KindStepClosed, func(e *monitor.Event) { e.Dir = act.Dir.String(); e.Qty = clampedQty(act.Qty) })
+		for _, qty := range removed {
+			a.record(monitor.KindStepClosed, func(e *monitor.Event) { e.Dir = act.Dir.String(); e.Qty = clampedQty(qty) })
+		}
 	}
 	// Budgets use the UTC day on which settlement is confirmed, including
 	// executions recovered after midnight.

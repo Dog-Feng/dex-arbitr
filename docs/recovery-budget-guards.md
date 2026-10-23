@@ -83,6 +83,20 @@ HL 的订单状态可能早于真实成交落位一两个区块：一个已被�
   （`TestOpenRollbackRestoresPreOpenPositions`、`TestResolveOutstandingRollsBackOpeningToBefore`）。
   平仓路径保持原有零目标语义不变。
 
+## 平仓越界与监控修正（2026-10-23）
+
+- 平仓成交溢出选中步骤、按 FIFO 顺延消费其他步骤时，每个被整步清掉的步骤都发一条
+  `step_closed` 事件，`closes` 计数与账本实际清掉的步骤数一致
+  （`TestCloseSpillRecordsClosedEventForEveryConsumedStep`）。顺延仍然记录一条 error
+  作为账本偏离的预警，不改变 FIFO 消化语义。
+- 低于最小额残量的策略以 review 修复（405c371）为准：`ErrSubMinResidual` 保持
+  PAUSED、告警一次并按 `subMinRetryInterval` 退避重试，不再升级为外部干预，也
+  不在非零目标上尝试精确量下单；应急/退出请求绕过退避
+  （`TestSubMinResidualStaysPausedWithoutIntervention`、`TestSubMinResidualRetryBackoff`）。
+- 监控层：全局聚合桶在关闭时不再执行 pair 级规则，消除 metrics 里的空 pair
+  幽灵条目和重复告警（`TestAggregateBucketDoesNotCreatePhantomPair`）；
+  `latency_p95_ms` 阈值 600 → 1200，适配 HL 腿 750-870ms 的常态延迟。
+
 ## 本次离线验证
 
 2026-10-15：`go test -race -count=1 -p4 ./...` 全部通过，19个有测试包、284个顶层测试，含子用例720项；没有失败或跳过测试用例，另2个包无测试文件。`go vet -p4 ./...`、五个命令的 `go build -p4 ./cmd/...`、gofmt和git diff空白检查均通过。没有执行应用main或实际交易。

@@ -368,6 +368,24 @@ func TestAnomalyLossBucketsAndMuJump(t *testing.T) {
 	}
 }
 
+func TestAggregateBucketDoesNotCreatePhantomPair(t *testing.T) {
+	m := New(nil)
+	m.analytics = testAnalytics()
+	t0 := time.Date(2026, 10, 16, 9, 0, 0, 0, time.UTC)
+	m.Record(Event{Time: t0, Pair: "A", Kind: KindStatus, MuBps: 1, SigmaBps: 1})
+	// A later bucket closes the first one, including its aggregate mirror.
+	m.Record(Event{Time: t0.Add(16 * time.Minute), Pair: "A", Kind: KindStatus, MuBps: 2, SigmaBps: 1})
+	metrics := m.Metrics()
+	if _, ok := metrics.Pairs[""]; ok {
+		t.Fatalf("aggregate bucket created a phantom empty pair: %+v", metrics.Pairs)
+	}
+	for _, a := range metrics.Anomalies {
+		if a.Pair == "" {
+			t.Fatalf("aggregate bucket fired an empty-pair anomaly: %+v", a)
+		}
+	}
+}
+
 func TestAnomalyRiskFlappingAndRescueSlip(t *testing.T) {
 	m := New(nil)
 	m.analytics = testAnalytics()

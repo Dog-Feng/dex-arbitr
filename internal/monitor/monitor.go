@@ -634,6 +634,11 @@ func (m *Monitor) pruneBuckets(pair string, key int64, ring map[int64]*bucketAcc
 // finalizeBucket runs bucket-close anomaly rules for the previous bucket once
 // a newer bucket opens.
 func (m *Monitor) finalizeBucket(pair string, key int64) {
+	if pair == "" {
+		// The aggregate bucket mirrors the same data its pair buckets carry;
+		// closing it must not run pair-level rules or create a phantom pair.
+		return
+	}
 	ring := m.buckets[pair]
 	prevKey := int64(math.MinInt64)
 	for k := range ring {
