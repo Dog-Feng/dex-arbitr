@@ -32,6 +32,9 @@ type signature struct {
 type signer struct {
 	key     *ecdsa.PrivateKey
 	address common.Address
+	// mainnet selects the EIP-712 "source" field ("a" mainnet, "b" testnet),
+	// matching the official SDK's base_url == MAINNET_API_URL check.
+	mainnet bool
 }
 
 // newSigner parses a 32-byte hex private key (optional 0x prefix).
@@ -40,7 +43,9 @@ func newSigner(hexKey string) (*signer, error) {
 	if err != nil {
 		return nil, fmt.Errorf("invalid agent private key: %w", err)
 	}
-	return &signer{key: key, address: crypto.PubkeyToAddress(key.PublicKey)}, nil
+	// Mainnet is the default; NewWithConfig overrides it when the exchange
+	// URL points elsewhere.
+	return &signer{key: key, address: crypto.PubkeyToAddress(key.PublicKey), mainnet: true}, nil
 }
 
 // cloid encodes the client order id as a 128-bit hex string with 0x prefix.
@@ -67,16 +72,17 @@ func cloidToID(s string) (int64, bool) {
 // signOrder signs an order action with the standard API-wallet scheme
 // (sign_l1_action). The connection id is the keccak hash of the msgpack
 // encoding of the action followed by the big-endian nonce and the vault
-// marker, exactly as the official Python SDK computes it.
-func (s *signer) signOrder(asset int, isBuy, reduceOnly bool, price, size, c string, nonce uint64) (signature, error) {
+// marker, exactly as the official Python SDK computes it. expiresAfter is
+// folded into the connection id when set.
+func (s *signer) signOrder(asset int, isBuy, reduceOnly bool, price, size, c string, nonce, expiresAfter uint64) (signature, error) {
 	packed := packOrderAction(asset, isBuy, reduceOnly, price, size, c)
-	return s.signTyped(agentPayload(connectionID(packed, nonce), true))
+	return s.signTyped(agentPayload(connectionID(packed, nonce, expiresAfter), s.mainnet))
 }
 
 // signCancelByCloid signs a cancelByCloid action.
-func (s *signer) signCancelByCloid(asset int, c string, nonce uint64) (signature, error) {
+func (s *signer) signCancelByCloid(asset int, c string, nonce, expiresAfter uint64) (signature, error) {
 	packed := packCancelByCloidAction(asset, c)
-	return s.signTyped(agentPayload(connectionID(packed, nonce), true))
+	return s.signTyped(agentPayload(connectionID(packed, nonce, expiresAfter), s.mainnet))
 }
 
 // signSendAsset signs an agentSendAsset action: the agent moves its own
@@ -85,7 +91,14 @@ func (s *signer) signSendAsset(account, sourceDex, destDex, token, amount string
 	// agentSendAsset is an L1 action: the agent signs the phantom Agent
 	// struct over connectionId = keccak(msgpack(action) ‖ nonce ‖ 0x00).
 	packed := packAgentSendAsset(account, sourceDex, destDex, token, amount, nonce)
-	return s.signTyped(agentPayload(connectionID(packed, nonce), true))
+	return s.signTyped(agentPayload(connectionID(packed, nonce, 0), s.mainnet))
+}
+
+// signUpdateLeverage signs an updateLeverage action. expiresAfter is supported
+// on L1 actions and folded into the connection id.
+func (s *signer) signUpdateLeverage(asset int, isCross bool, leverage int, nonce, expiresAfter uint64) (signature, error) {
+	packed := packUpdateLeverageAction(asset, isCross, leverage)
+	return s.signTyped(agentPayload(connectionID(packed, nonce, expiresAfter), s.mainnet))
 }
 
 func (s *signer) signTyped(data apitypes.TypedData) (signature, error) {
@@ -108,15 +121,24 @@ func (s *signer) signTyped(data apitypes.TypedData) (signature, error) {
 
 // connectionID builds the bytes32 hashed over the signed action, matching the
 // official SDK: keccak(msgpack(action) || nonce_be64 || vault_marker). The
-// vault marker is 0x00 when no vault address is configured.
-func connectionID(packed []byte, nonce uint64) []byte {
-	data := make([]byte, 0, len(packed)+9)
+// vault marker is 0x00 when no vault address is configured. When expiresAfter
+// is set, the SDK appends another 0x00 marker followed by its big-endian
+// uint64 timestamp.
+func connectionID(packed []byte, nonce, expiresAfter uint64) []byte {
+	data := make([]byte, 0, len(packed)+18)
 	data = append(data, packed...)
 	data = append(data,
 		byte(nonce>>56), byte(nonce>>48), byte(nonce>>40), byte(nonce>>32),
 		byte(nonce>>24), byte(nonce>>16), byte(nonce>>8), byte(nonce),
 		0x00,
 	)
+	if expiresAfter != 0 {
+		// The SDK prefixes the timestamp with its own 0x00 marker byte.
+		data = append(data, 0x00,
+			byte(expiresAfter>>56), byte(expiresAfter>>48), byte(expiresAfter>>40), byte(expiresAfter>>32),
+			byte(expiresAfter>>24), byte(expiresAfter>>16), byte(expiresAfter>>8), byte(expiresAfter),
+		)
+	}
 	return crypto.Keccak256(data)
 }
 
@@ -254,6 +276,22 @@ func packCancelByCloidAction(asset int, c string) []byte {
 	m.uint(uint64(asset))
 	m.str("cloid")
 	m.str(c)
+	return m.b
+}
+
+// packUpdateLeverageAction encodes {"type":"updateLeverage","asset":a,
+// "isCross":b,"leverage":n}.
+func packUpdateLeverageAction(asset int, isCross bool, leverage int) []byte {
+	var m msgpack
+	m.mapHeader(4)
+	m.str("type")
+	m.str("updateLeverage")
+	m.str("asset")
+	m.uint(uint64(asset))
+	m.str("isCross")
+	m.boolean(isCross)
+	m.str("leverage")
+	m.uint(uint64(leverage))
 	return m.b
 }
 

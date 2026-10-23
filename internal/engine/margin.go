@@ -19,6 +19,9 @@ type marginConfig struct {
 	refresh     time.Duration
 	marketBps   float64
 	maxNotional float64
+	// maxAutoResume caps how many external-intervention recoveries may
+	// auto-resume trading per 24h window before the pair stays paused.
+	maxAutoResume int
 }
 
 // marginAction is the decision the monitor asks the actor to apply.

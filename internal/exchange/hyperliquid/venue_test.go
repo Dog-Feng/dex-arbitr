@@ -417,3 +417,35 @@ func TestOnUserFillsRegistersByCloid(t *testing.T) {
 		t.Fatalf("early fill misattributed: %+v", u)
 	}
 }
+
+// TestSigningMainnet verifies the L1 signing source selection: an explicit
+// network wins, an empty network infers from the exchange host, and an
+// unknown network is rejected.
+func TestSigningMainnet(t *testing.T) {
+	tests := []struct {
+		name        string
+		network     string
+		exchangeURL string
+		want        bool
+		wantErr     bool
+	}{
+		{"explicit mainnet", "mainnet", "https://api.hyperliquid.xyz/exchange", true, false},
+		{"explicit testnet", "testnet", "https://api.hyperliquid.xyz/exchange", false, false},
+		{"infer mainnet", "", "https://api.hyperliquid.xyz/exchange", true, false},
+		{"infer testnet host", "", "https://api.hyperliquid-testnet.xyz/exchange", false, false},
+		{"trailing slash keeps mainnet", "", "https://api.hyperliquid.xyz/", true, false},
+		{"unknown network rejected", "devnet", "https://api.hyperliquid.xyz/exchange", false, true},
+		{"bad url rejected", "", "://bad", false, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := signingMainnet(tc.network, tc.exchangeURL)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("signingMainnet(%q, %q) err=%v, wantErr=%v", tc.network, tc.exchangeURL, err, tc.wantErr)
+			}
+			if err == nil && got != tc.want {
+				t.Fatalf("signingMainnet(%q, %q) = %v, want %v", tc.network, tc.exchangeURL, got, tc.want)
+			}
+		})
+	}
+}

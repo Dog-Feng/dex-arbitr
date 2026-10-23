@@ -46,6 +46,8 @@ type Config struct {
 		StripSuffixes []string          `yaml:"strip_suffixes"`
 		Separators    string            `yaml:"separators"`
 		Aliases       map[string]string `yaml:"aliases"`
+		// AliasesBuiltin disables the built-in alias table when false.
+		AliasesBuiltin *bool `yaml:"aliases_builtin"`
 	} `yaml:"matching"`
 	Estimator struct {
 		Kind          string        `yaml:"kind"`
@@ -70,6 +72,9 @@ type Config struct {
 		PositionRefresh    time.Duration `yaml:"position_refresh"`     // liquidation price refresh interval
 		EmergencyMarketBps float64       `yaml:"emergency_market_bps"` // protective bound of the emergency unwind
 		MaxNotional        float64       `yaml:"max_notional"`         // per-venue aggregate notional cap (USD); 0 = unlimited
+		// MaxAutoResumePerDay caps external-intervention auto-resumes per
+		// rolling 24h window; 0 falls back to the built-in default.
+		MaxAutoResumePerDay int `yaml:"max_auto_resume_per_day"`
 	} `yaml:"risk"`
 	Strategy struct {
 		Kind                string        `yaml:"kind"`           // arbitrage | volume (registered strategies)
@@ -456,14 +461,18 @@ func (c *Config) validate() error {
 			return fmt.Errorf("monitor.analytics.sessions.%s: invalid spec %q (want HH:MM-HH:MM)", name, spec)
 		}
 	}
-	if c.Estimator.MinWarmup > c.Estimator.Window || c.Estimator.Interval > c.Estimator.Window {
-		return fmt.Errorf("estimator min_warmup and interval must not exceed window")
-	}
-	if maxSpan := (c.Estimator.Window / c.Estimator.Interval) * c.Estimator.Interval; c.Estimator.MinWarmup > maxSpan {
-		return fmt.Errorf("estimator.min_warmup (%s) is unreachable: a %s window sampled every %s can span at most %s", c.Estimator.MinWarmup, c.Estimator.Window, c.Estimator.Interval, maxSpan)
-	}
-	if c.Estimator.MinCoverage <= 0 || c.Estimator.MinCoverage > 1 {
-		return fmt.Errorf("estimator.min_coverage must be in (0, 1]")
+	// The window and coverage constraints only make sense for the bucketed
+	// SMA estimator; the zscore estimator does not use them.
+	if c.Estimator.Kind != "zscore" {
+		if c.Estimator.MinWarmup > c.Estimator.Window || c.Estimator.Interval > c.Estimator.Window {
+			return fmt.Errorf("estimator min_warmup and interval must not exceed window")
+		}
+		if maxSpan := (c.Estimator.Window / c.Estimator.Interval) * c.Estimator.Interval; c.Estimator.MinWarmup > maxSpan {
+			return fmt.Errorf("estimator.min_warmup (%s) is unreachable: a %s window sampled every %s can span at most %s", c.Estimator.MinWarmup, c.Estimator.Window, c.Estimator.Interval, maxSpan)
+		}
+		if c.Estimator.MinCoverage <= 0 || c.Estimator.MinCoverage > 1 {
+			return fmt.Errorf("estimator.min_coverage must be in (0, 1]")
+		}
 	}
 	if c.Estimator.Kind == "zscore" {
 		if c.Estimator.MuHalfLife <= 0 || c.Estimator.SigmaHalfLife <= 0 {
@@ -490,8 +499,10 @@ func (c *Config) validate() error {
 	seenAliases := map[string]string{}
 	for raw, canon := range c.Matching.Aliases {
 		raw, canon = strings.ToUpper(strings.TrimSpace(raw)), strings.ToUpper(strings.TrimSpace(canon))
-		if raw == "" || canon == "" || raw == canon {
-			return fmt.Errorf("matching.aliases entries need distinct non-empty symbols")
+		// An empty canonical value deletes a built-in alias; otherwise both
+		// symbols must be present and distinct.
+		if raw == "" || canon == raw {
+			return fmt.Errorf("matching.aliases entries need non-empty, distinct symbols")
 		}
 		if prev, dup := seenAliases[raw]; dup && prev != canon {
 			return fmt.Errorf("matching.aliases: duplicate key %q", raw)
@@ -578,21 +589,7 @@ func (c *Config) validate() error {
 	}
 	pairs := map[string]bool{}
 	markets := map[string]bool{}
-	matcher := symbols.DefaultMatcher()
-	if len(c.Matching.StripSuffixes) > 0 {
-		matcher.Suffixes = c.Matching.StripSuffixes
-	}
-	if c.Matching.Separators != "" {
-		matcher.Separators = c.Matching.Separators
-	}
-	if len(c.Matching.Aliases) > 0 {
-		if matcher.Aliases == nil {
-			matcher.Aliases = map[string]string{}
-		}
-		for raw, canon := range c.Matching.Aliases {
-			matcher.Aliases[strings.ToUpper(strings.TrimSpace(raw))] = strings.ToUpper(strings.TrimSpace(canon))
-		}
-	}
+	matcher := c.BuildMatcher()
 	for _, p := range c.Pairs {
 		if strings.TrimSpace(p.Base) == "" {
 			return fmt.Errorf("pair base must not be empty")
@@ -701,6 +698,18 @@ func (c *Config) validate() error {
 		}
 	}
 	return nil
+}
+
+// BuildMatcher assembles the symbol matcher from the configured matching
+// section, routing every alias merge through the symbols package so the
+// engine, the scanner, and validation can never drift apart.
+func (c *Config) BuildMatcher() symbols.Matcher {
+	return symbols.MatcherFor(symbols.Config{
+		StripSuffixes:  c.Matching.StripSuffixes,
+		Separators:     c.Matching.Separators,
+		Aliases:        c.Matching.Aliases,
+		AliasesBuiltin: c.Matching.AliasesBuiltin,
+	})
 }
 
 func finiteFields(v reflect.Value, path string) error {

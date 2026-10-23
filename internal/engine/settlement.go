@@ -314,12 +314,22 @@ func (a *PairActor) recoverExternalIntervention(ctx context.Context, p *pendingE
 	}
 	a.pending = nil
 	a.completeExecutionCheckpoint()
-	// The account is confirmed flat and the ledger cleared. Resume warmup so
-	// normal trading can continue once the estimators re-warm; PnL remains
-	// uncertain. Without this the pair stays paused forever after a
-	// successful self-flatten, looking like a hang with only silent alerts.
-	a.state.Mode = strategy.ModeWarmup
-	a.log.Warn("external intervention completed; both legs confirmed flat, resuming warmup")
+	// The account is confirmed flat and the ledger cleared. Draining,
+	// emergency, legacy ledgers, and repeated interventions within the daily
+	// window must stay paused instead of silently resuming trading.
+	now := time.Now()
+	a.interventions = append(a.interventions, now)
+	a.pruneInterventions(now)
+	if !a.draining.Load() && !a.emergencyRequested.Load() && !a.legacyPrices && a.interventionBudgetOK(now) {
+		a.state.Mode = strategy.ModeWarmup
+		a.log.Warn("external intervention completed; both legs confirmed flat, resuming warmup")
+	} else {
+		a.state.Mode = strategy.ModePaused
+		a.record(monitor.KindError, func(e *monitor.Event) {
+			e.Msg = fmt.Sprintf("external intervention completed; pair stays paused (auto-resume budget exhausted or exit mode active)")
+		})
+		a.log.Warn("external intervention completed; auto-resume suppressed", "interventions_24h", a.interventionCount(now))
+	}
 	if err := a.persist(); err != nil {
 		a.log.Error("persist external intervention", "err", err)
 		return
@@ -387,6 +397,41 @@ func (a *PairActor) finishIntervention(res execution.Result, interrupted ...exec
 	a.record(monitor.KindExecuted, func(e *monitor.Event) { e.USD = nl + nr })
 	a.record(monitor.KindPnL, func(e *monitor.Event) { e.USD = -fees })
 	return nil
+}
+
+// pruneInterventions drops intervention timestamps outside the rolling 24h
+// window so the auto-resume budget does not accumulate forever.
+func (a *PairActor) pruneInterventions(now time.Time) {
+	kept := a.interventions[:0]
+	for _, t := range a.interventions {
+		if now.Sub(t) <= 24*time.Hour {
+			kept = append(kept, t)
+		}
+	}
+	a.interventions = kept
+}
+
+// interventionCount returns the number of intervention recoveries in the
+// rolling 24h window.
+func (a *PairActor) interventionCount(now time.Time) int {
+	n := 0
+	for _, t := range a.interventions {
+		if now.Sub(t) <= 24*time.Hour {
+			n++
+		}
+	}
+	return n
+}
+
+// interventionBudgetOK reports whether another automatic resume is allowed.
+// With the default budget of one, a second intervention within 24 hours keeps
+// the pair paused until an operator confirms the account.
+func (a *PairActor) interventionBudgetOK(now time.Time) bool {
+	max := a.cfg.Risk.maxAutoResume
+	if max < 1 {
+		max = 1
+	}
+	return a.interventionCount(now) <= max
 }
 
 func (a *PairActor) legSpecs(act strategy.Action) (execution.LegSpec, execution.LegSpec) {

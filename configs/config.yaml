@@ -20,7 +20,8 @@ venues:
   # Entropy (io) is a HIP-3 builder dex on Hyperliquid: the standard
   # Hyperliquid API is used with dex=io. Collateral is per-dex USDC, so fund
   # the io balance before trading. account = main address; private_key = the
-  # approved API-wallet (agent) key.
+  # approved API-wallet (agent) key. Optional network: mainnet|testnet selects
+  # the signing source; empty infers it from the exchange URL host.
   - name: entropy
     kind: entropy
     opts:
@@ -37,13 +38,13 @@ matching:
 
 estimator:
   kind: zscore              # sma | zscore (zscore: EMA mean + long-horizon dispersion gate)
-  window: 2h
+  window: 2h                # zscore 下不生效（仅 sma 使用，可留作切换回退）
   min_warmup: 15m
   # z-score estimator options (used when kind: zscore):
   mu_half_life: 15m        # mean EMA half-life
   sigma_half_life: 3h      # dispersion EWMA half-life
   sigma_floor: 0.5         # dispersion floor in bps
-  min_coverage: 0.8
+  min_coverage: 0.8         # zscore 下不生效（仅 sma 使用）
   interval: 1s
 
 volatility:
@@ -59,6 +60,7 @@ risk:
   position_refresh: 15s       # liquidation price refresh interval
   emergency_market_bps: 100   # protective bound of the emergency market unwind
   max_notional: 0             # per-venue aggregate notional cap (USD); 0 = unlimited
+  max_auto_resume_per_day: 1  # external-intervention auto-resumes per 24h; 0 = default (1)
 
 strategy:
   # kind: zscore 与 arbitrage/volume 的区别：

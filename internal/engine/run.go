@@ -103,7 +103,7 @@ func (rt *runtime) buildActor(pair symbols.Pair, qty float64, maxSteps int, l, r
 		Vol: vol, VolL: volL, VolR: volR, VolEvery: c.Volatility.Interval, VolMaxAge: c.Volatility.MaxAge, Samples: samples,
 		Risk: marginConfig{floor: c.Risk.MarginFloorRatio, trigger: c.Risk.MarginTriggerRatio,
 			hysteresis: c.Risk.MarginHysteresis, refresh: c.Risk.PositionRefresh, marketBps: c.Risk.EmergencyMarketBps,
-			maxNotional: c.Risk.MaxNotional},
+			maxNotional: c.Risk.MaxNotional, maxAutoResume: c.Risk.MaxAutoResumePerDay},
 		AdaptiveLatency: adaptiveLatencyCfg{
 			enabled: c.Execution.AdaptiveLatency.Enabled, minSamples: c.Execution.AdaptiveLatency.MinSamples,
 			ringN: c.Execution.AdaptiveLatency.RingN, windowMin: c.Execution.AdaptiveLatency.WindowMin,

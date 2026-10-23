@@ -36,12 +36,72 @@ func DefaultMatcher() Matcher {
 	return Matcher{Suffixes: []string{"PERP", "USDC", "USDG", "USDT", "USD"}, Separators: "-_/: .", Aliases: DefaultAliases()}
 }
 
-// Normalize returns the base asset, e.g. "BTC-USDC-PERP" -> "BTC", "SNDK" -> "SNDK".
+// Config holds user-supplied matching overrides.
+type Config struct {
+	StripSuffixes []string
+	Separators    string
+	Aliases       map[string]string
+	// AliasesBuiltin drops the built-in alias table when false (nil keeps it).
+	AliasesBuiltin *bool
+}
+
+// MatcherFor builds a matcher from optional configuration. All call sites
+// (config validation, the engine, and the scanner) use this single merge path
+// so alias handling can never drift.
+func MatcherFor(c Config) Matcher {
+	m := DefaultMatcher()
+	if len(c.StripSuffixes) > 0 {
+		m.Suffixes = c.StripSuffixes
+	}
+	if c.Separators != "" {
+		m.Separators = c.Separators
+	}
+	builtin := true
+	if c.AliasesBuiltin != nil {
+		builtin = *c.AliasesBuiltin
+	}
+	m.Aliases = MergeAliases(c.Aliases, builtin)
+	return m
+}
+
+// MergeAliases combines the built-in alias table with configured aliases.
+// Configured entries override built-ins; an empty canonical value deletes a
+// built-in alias; builtin=false drops all built-in aliases.
+func MergeAliases(configured map[string]string, builtin bool) map[string]string {
+	aliases := map[string]string{}
+	if builtin {
+		for raw, canon := range DefaultAliases() {
+			aliases[strings.ToUpper(strings.TrimSpace(raw))] = strings.ToUpper(strings.TrimSpace(canon))
+		}
+	}
+	for raw, canon := range configured {
+		key := strings.ToUpper(strings.TrimSpace(raw))
+		if key == "" {
+			continue
+		}
+		val := strings.ToUpper(strings.TrimSpace(canon))
+		if val == "" {
+			delete(aliases, key)
+			continue
+		}
+		aliases[key] = val
+	}
+	return aliases
+}
+
+// Normalize returns the base asset, e.g. "BTC-USDC-PERP" -> "BTC", "SNDK" ->
+// "SNDK". Suffixes are stripped first, then the remaining token resolves
+// through aliases, and the result is stripped and trimmed again.
 func (m Matcher) Normalize(sym string) string {
 	s := strings.ToUpper(strings.TrimSpace(sym))
-	if canon, ok := m.Aliases[s]; ok {
-		s = strings.ToUpper(strings.TrimSpace(canon))
-	}
+	s = m.stripSuffixes(s)
+	s = m.resolveAlias(s)
+	s = m.stripSuffixes(s)
+	return strings.Trim(s, m.Separators)
+}
+
+// stripSuffixes repeatedly removes known suffixes and separator tails.
+func (m Matcher) stripSuffixes(s string) string {
 	for {
 		s = strings.TrimRight(s, m.Separators)
 		changed := false
@@ -57,7 +117,26 @@ func (m Matcher) Normalize(sym string) string {
 			break
 		}
 	}
-	return strings.Trim(s, m.Separators)
+	return s
+}
+
+// resolveAlias follows chained aliases up to a small hop limit with a cycle
+// guard so a self-referential mapping cannot loop.
+func (m Matcher) resolveAlias(s string) string {
+	seen := map[string]bool{}
+	for hops := 0; hops < 10; hops++ {
+		canon, ok := m.Aliases[s]
+		if !ok || seen[s] {
+			return s
+		}
+		canon = strings.ToUpper(strings.TrimSpace(canon))
+		if canon == "" || canon == s {
+			return s
+		}
+		seen[s] = true
+		s = canon
+	}
+	return s
 }
 
 // Pair is a matched instrument pair with aligned trading precision.

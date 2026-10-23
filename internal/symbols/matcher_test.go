@@ -181,3 +181,46 @@ func TestDefaultAliases(t *testing.T) {
 		t.Fatalf("override failed: %q", got)
 	}
 }
+
+// TestNormalizeSuffixThenAlias verifies suffix stripping happens before the
+// alias lookup, so "ANTH-PERP" resolves through the ANTH alias.
+func TestNormalizeSuffixThenAlias(t *testing.T) {
+	m := DefaultMatcher()
+	if got := m.Normalize("ANTH-PERP"); got != "ANTHROPIC" {
+		t.Fatalf("suffixed alias normalized to %q", got)
+	}
+}
+
+// TestChainedAliasesResolveWithCycleGuard follows chained mappings and stops
+// at self-references.
+func TestChainedAliasesResolveWithCycleGuard(t *testing.T) {
+	m := DefaultMatcher()
+	m.Aliases = map[string]string{"A": "B", "B": "C"}
+	if got := m.Normalize("A"); got != "C" {
+		t.Fatalf("chained alias normalized to %q", got)
+	}
+	m.Aliases["C"] = "B"
+	if got := m.Normalize("A"); got != "B" {
+		t.Fatalf("cycle must terminate, got %q", got)
+	}
+}
+
+// TestMergeAliases verifies config aliases override built-ins, an empty
+// canonical value deletes a built-in, and builtin=false drops the table.
+func TestMergeAliases(t *testing.T) {
+	aliases := MergeAliases(map[string]string{"ANTH": "CUSTOM"}, true)
+	if aliases["ANTH"] != "CUSTOM" || aliases["OAI"] != "OPENAI" {
+		t.Fatalf("override/merge failed: %+v", aliases)
+	}
+	aliases = MergeAliases(map[string]string{"OAI": ""}, true)
+	if _, ok := aliases["OAI"]; ok {
+		t.Fatal("empty canonical must delete the built-in alias")
+	}
+	if aliases["ANTH"] != "ANTHROPIC" {
+		t.Fatal("unrelated built-in alias lost")
+	}
+	aliases = MergeAliases(nil, false)
+	if len(aliases) != 0 {
+		t.Fatalf("builtins not disabled: %+v", aliases)
+	}
+}

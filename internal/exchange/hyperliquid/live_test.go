@@ -35,7 +35,7 @@ func TestLiveSignatureAcceptedByExchange(t *testing.T) {
 	const asset = 200002 // io:SNDK
 	c := "0x" + strings.Repeat("0", 31) + "1"
 	nonce := uint64(time.Now().UnixMilli())
-	sig, err := s.signOrder(asset, true, false, "1.0", "0.01", c, nonce)
+	sig, err := s.signOrder(asset, true, false, "1.0", "0.01", c, nonce, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -22,22 +22,7 @@ import (
 
 // Matcher from config.
 func Matcher(c *config.Config) symbols.Matcher {
-	m := symbols.DefaultMatcher()
-	if len(c.Matching.StripSuffixes) > 0 {
-		m.Suffixes = c.Matching.StripSuffixes
-	}
-	if c.Matching.Separators != "" {
-		m.Separators = c.Matching.Separators
-	}
-	if len(c.Matching.Aliases) > 0 {
-		if m.Aliases == nil {
-			m.Aliases = map[string]string{}
-		}
-		for raw, canon := range c.Matching.Aliases {
-			m.Aliases[strings.ToUpper(strings.TrimSpace(raw))] = strings.ToUpper(strings.TrimSpace(canon))
-		}
-	}
-	return m
+	return c.BuildMatcher()
 }
 
 // ExecutionConfig combines executor defaults with configured normal-order pricing.

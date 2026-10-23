@@ -229,6 +229,16 @@ func TestLoadZScoreValidation(t *testing.T) {
 	}
 }
 
+func TestLoadZScoreWarmupIndependentOfWindow(t *testing.T) {
+	c, err := loadTestConfig(t, "estimator:\n  kind: zscore\n  window: 2h\n  min_warmup: 24h\n  interval: 1s\nstrategy:\n  kind: zscore\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Estimator.MinWarmup != 24*time.Hour {
+		t.Fatalf("min_warmup = %s, want 24h", c.Estimator.MinWarmup)
+	}
+}
+
 func TestLoadFlipHysteresisDefaultAndZero(t *testing.T) {
 	c, err := loadTestConfig(t, "dry_run: true\n")
 	if err != nil {
