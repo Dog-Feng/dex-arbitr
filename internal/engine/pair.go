@@ -128,6 +128,8 @@ type PairActor struct {
 	winUpdatedAt        time.Time
 	lastDir             strategy.Dir
 	forcedCloseAt       time.Time // last forced-exit close; feeds the reopen cooldown
+	reconLast           reconBaseline
+	reconInit           bool
 	interventions       []time.Time
 	// capEngaged records that the step count touched MaxSteps; opens stay
 	// blocked until the count falls to MaxSteps-CapBand or below.
@@ -622,6 +624,7 @@ func (a *PairActor) Run(ctx context.Context) (retErr error) {
 				"pnl_usd", strconv.FormatFloat(a.procPnlUSD, 'f', 8, 64),
 				"fail_rate", a.FailRate(), "sigma_bps", round4(a.volBps()), "vol_ready", a.volReady(time.Now()))
 			a.lat.reset()
+			a.logAccountRecon()
 		case <-housekeep.C:
 			nextAt = a.decideOnce(ctx, time.Now(), nextAt)
 		case <-a.bookWake:
@@ -886,6 +889,32 @@ func (a *PairActor) record(kind monitor.Kind, fill func(*monitor.Event)) {
 		fill(&e)
 	}
 	a.cfg.Monitor.Record(e)
+}
+
+// logAccountRecon prints the per-minute account reconciliation line: both
+// venues' total asset value, positions, unrealized PnL, the ledger's realized
+// PnL, and the funding residual. It is observational only.
+func (a *PairActor) logAccountRecon() {
+	snap := a.margin.reconAccount()
+	markL, markR, _ := a.riskMarks()
+	unrealL, unrealR, total, deltaTotal, deltaUnreal, deltaRealized, funding, next :=
+		computeRecon(snap, markL, markR, a.volAcc.pnlUSD, a.reconLast, a.reconInit)
+	a.reconLast, a.reconInit = next, true
+	a.log.Info("account_recon",
+		"pair", a.key, "L", a.cfg.L.Name(), "R", a.cfg.R.Name(),
+		"qty_l", strconv.FormatFloat(snap.QtyL, 'f', 8, 64),
+		"qty_r", strconv.FormatFloat(snap.QtyR, 'f', 8, 64),
+		"equity_l", strconv.FormatFloat(snap.EquityL, 'f', 4, 64),
+		"equity_r", strconv.FormatFloat(snap.EquityR, 'f', 4, 64),
+		"total_equity", strconv.FormatFloat(total, 'f', 4, 64),
+		"unreal_l", strconv.FormatFloat(unrealL, 'f', 4, 64),
+		"unreal_r", strconv.FormatFloat(unrealR, 'f', 4, 64),
+		"unreal_total", strconv.FormatFloat(unrealL+unrealR, 'f', 4, 64),
+		"ledger_realized", strconv.FormatFloat(a.volAcc.pnlUSD, 'f', 4, 64),
+		"delta_total", strconv.FormatFloat(deltaTotal, 'f', 4, 64),
+		"delta_unreal", strconv.FormatFloat(deltaUnreal, 'f', 4, 64),
+		"delta_realized", strconv.FormatFloat(deltaRealized, 'f', 4, 64),
+		"funding_est", strconv.FormatFloat(funding, 'f', 4, 64))
 }
 
 // legVol is the short-horizon leg-price volatility (price units) of a venue.

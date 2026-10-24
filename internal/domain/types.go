@@ -166,6 +166,9 @@ type CrossMarginRisk struct {
 type AccountSnapshot struct {
 	Positions   []Position
 	CrossMargin *CrossMarginRisk // nil means unavailable or invalid
+	// AccountValue is the account-wide total asset value (0 = unavailable).
+	// It feeds the per-minute reconciliation log and nothing else.
+	AccountValue float64
 }
 
 var (

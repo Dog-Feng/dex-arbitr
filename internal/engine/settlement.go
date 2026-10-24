@@ -62,7 +62,7 @@ func (a *PairActor) executionContext(parent context.Context) (context.Context, f
 // watchRisk owns its margin monitor independently of the trading loop. It can
 // interrupt a long ordinary rescue; settlement is then recovered before unwind.
 func (a *PairActor) watchRisk(ctx context.Context) {
-	m := a.margin
+	m := &a.margin
 	t := time.NewTicker(time.Second)
 	defer t.Stop()
 	var reported, lastBlocked bool
@@ -84,7 +84,7 @@ func (a *PairActor) watchRisk(ctx context.Context) {
 			reason = "book_unavailable"
 		}
 		if !reported || blocked != lastBlocked || blocked && reason != lastReason {
-			a.logRiskState(assessedAt, m, ml, mr, blocked, reason)
+		a.logRiskState(assessedAt, m, ml, mr, blocked, reason)
 			reported, lastBlocked, lastReason = true, blocked, reason
 		}
 		if action == marginTrigger && a.emergencyRequested.CompareAndSwap(false, true) {
@@ -104,7 +104,7 @@ func (a *PairActor) watchRisk(ctx context.Context) {
 
 // logRiskState records transitions rather than repeating the same reason each
 // second. These inputs explain a block without logging account identifiers.
-func (a *PairActor) logRiskState(now time.Time, m marginMonitor, markL, markR float64, blocked bool, reason string) {
+func (a *PairActor) logRiskState(now time.Time, m *marginMonitor, markL, markR float64, blocked bool, reason string) {
 	// Observational only: feed the monitor's risk-flapping anomaly rule. This
 	// is called from the risk watcher goroutine, so it bypasses a.record to
 	// avoid touching actor-owned state (a.state.Mode) from another goroutine.

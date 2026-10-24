@@ -147,7 +147,7 @@ WARMUP --(μ 就绪)--> RUNNING <-> REDUCE_ONLY
 | sample | 1s | 算 Mid 喂 SMA（μ）；μ 就绪则 WARMUP->RUNNING |
 | volC | 100ms | 门控后喂价差 σ、腿价 σ（VolL/VolR）+ 样本落盘 |
 | decide | 事件驱动（盘口更新即唤醒判定；50ms ticker 仅作兜底） | 到点且非 PAUSED 时 Decide -> apply；每 update_interval 重算自适应波动窗口；500ms 下单间隔冷却不变 |
-| report | 1min | 状态日志 + 向 monitor 发 status 事件 |
+| report | 1min | 状态日志 + account_recon 对账日志 + 向 monitor 发 status 事件 |
 
 保证金风控运行在独立的 `watchRisk` goroutine（1s 循环），与决策循环解耦，可中断长执行并把应急请求交给恢复路径。
 
@@ -435,6 +435,7 @@ arbd 的运行日志时间戳显示为东八区（UTC+8，RFC3339 带 `+08:00` �
 | positions / position reconciliation passed | 启动仓位核对；失败即 PAUSED |
 | mean ready -> RUNNING | μ 采样满 60m 就绪 |
 | status | 每分钟：mode/steps/volume_usd/pnl_usd（进程级累计，重启归零）/fail_rate/sigma_bps/vol_ready；μ/σ/价差/tick_k 经 monitor status 事件到 /metrics |
+| account_recon | 每分钟：两腿仓位 `qty_l/qty_r`、各腿账户总资产 `equity_l/equity_r` 与 `total_equity`、未实现盈亏 `unreal_l/r/total`、账本累计已实现 `ledger_realized`，以及相对上一分钟的 `delta_total/delta_unreal/delta_realized` 与 `funding_est`（资金费等残差）；纯观察，用于账户对账 |
 | action | 决策：kind/dir/qty/两腿价/expected_bps/reason |
 | executed | 成交：fill/px/status/rescue/rescue_cost_usd/pos/took/latency |
 | step opened / step pnl / step closed | 步账本与已实现盈亏 |

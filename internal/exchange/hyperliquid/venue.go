@@ -1092,6 +1092,14 @@ func (v *Venue) AccountSnapshot(ctx context.Context) (domain.AccountSnapshot, er
 			break
 		}
 	}
+	// The per-dex account value feeds the minute reconciliation log. Use the
+	// margin summary first and the cross summary as a fallback for dexes that
+	// report account value only there.
+	if v, err := number(ch.MarginSummary.AccountValue); err == nil && v > 0 {
+		snapshot.AccountValue = v
+	} else if v, err := number(ch.CrossMarginSummary.AccountValue); err == nil && v > 0 {
+		snapshot.AccountValue = v
+	}
 	return snapshot, nil
 }
 

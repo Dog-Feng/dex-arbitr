@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"sync"
 	"time"
 
 	"github.com/Dog-Feng/dex-arbitr/internal/domain"
@@ -40,6 +41,7 @@ const (
 type marginMonitor struct {
 	cfg          marginConfig
 	armed        bool
+	mu           sync.Mutex // guards fields copied by the reconciliation log
 	lastRefresh  time.Time
 	lastL, lastR time.Time
 
@@ -47,6 +49,8 @@ type marginMonitor struct {
 	liqL, liqR           float64
 	entryL, entryR       float64
 	qtyL, qtyR           float64
+	accountValueL        float64
+	accountValueR        float64
 	aggL, aggR           float64
 	modeL, modeR         domain.MarginMode
 	notionalL, notionalR float64
@@ -58,23 +62,74 @@ type marginMonitor struct {
 // discard liquidation data that was successfully read from the other venue.
 func (m *marginMonitor) refresh(ctx context.Context, l, r exchange.Venue, leftID, rightID int) {
 	m.lastRefresh = time.Now()
-	pl, aggL, crossL, errL := venueMarginSnapshot(ctx, l, leftID)
+	pl, aggL, crossL, avL, errL := venueMarginSnapshot(ctx, l, leftID)
+	pr, aggR, crossR, avR, errR := venueMarginSnapshot(ctx, r, rightID)
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if errL == nil {
 		m.liqL, m.entryL, m.qtyL, m.aggL = pl.LiquidationPrice, pl.AvgEntry, pl.Qty, aggL
 		m.modeL, m.notionalL, m.crossL = pl.MarginMode, pl.Notional, crossL
+		m.accountValueL = avL
+		if m.accountValueL <= 0 && crossL != nil {
+			m.accountValueL = crossL.Equity
+		}
 		m.lastL = time.Now()
 	} else {
 		slog.Warn("margin positions refresh", "venue", l.Name(), "err", errL)
 	}
-	pr, aggR, crossR, errR := venueMarginSnapshot(ctx, r, rightID)
 	if errR == nil {
 		m.liqR, m.entryR, m.qtyR, m.aggR = pr.LiquidationPrice, pr.AvgEntry, pr.Qty, aggR
 		m.modeR, m.notionalR, m.crossR = pr.MarginMode, pr.Notional, crossR
+		m.accountValueR = avR
+		if m.accountValueR <= 0 && crossR != nil {
+			m.accountValueR = crossR.Equity
+		}
 		m.lastR = time.Now()
 	} else {
 		slog.Warn("margin positions refresh", "venue", r.Name(), "err", errR)
 	}
 	m.have = !m.lastL.IsZero() || !m.lastR.IsZero()
+}
+
+// reconAccount is the read-only account view the per-minute reconciliation
+// log copies. It is safe to call from the actor loop while watchRisk refreshes.
+type reconAccount struct {
+	QtyL, QtyR       float64
+	EntryL, EntryR   float64
+	EquityL, EquityR float64
+}
+
+func (m *marginMonitor) reconAccount() reconAccount {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return reconAccount{QtyL: m.qtyL, QtyR: m.qtyR, EntryL: m.entryL, EntryR: m.entryR,
+		EquityL: m.accountValueL, EquityR: m.accountValueR}
+}
+
+// reconBaseline is the previous minute's reconciliation snapshot.
+type reconBaseline struct {
+	total, unreal, realized float64
+}
+
+// computeRecon derives the per-minute reconciliation numbers. funding is the
+// residual account-value change not explained by ledger-realized or
+// unrealized moves (funding payments, fee rebates, and the unexplained rest).
+func computeRecon(snap reconAccount, markL, markR, realized float64, prev reconBaseline, initialized bool) (unrealL, unrealR, total, deltaTotal, deltaUnreal, deltaRealized, funding float64, next reconBaseline) {
+	if snap.QtyL != 0 && snap.EntryL > 0 && markL > 0 {
+		unrealL = snap.QtyL * (markL - snap.EntryL)
+	}
+	if snap.QtyR != 0 && snap.EntryR > 0 && markR > 0 {
+		unrealR = snap.QtyR * (markR - snap.EntryR)
+	}
+	unreal := unrealL + unrealR
+	total = snap.EquityL + snap.EquityR
+	if initialized {
+		deltaTotal = total - prev.total
+		deltaUnreal = unreal - prev.unreal
+		deltaRealized = realized - prev.realized
+	}
+	funding = deltaTotal - deltaRealized - deltaUnreal
+	return unrealL, unrealR, total, deltaTotal, deltaUnreal, deltaRealized, funding, reconBaseline{total: total, unreal: unreal, realized: realized}
 }
 
 // assess decides the action from the current mark prices; fresh=false means
@@ -242,21 +297,23 @@ func remainingMargin(qty, entry, liq, mark float64) (float64, bool) {
 // venuePositions returns the pair's position on marketID and the venue's total
 // notional aggregated across all markets (the account-level exposure).
 func venuePositions(ctx context.Context, v exchange.Venue, marketID int) (domain.Position, float64, error) {
-	pos, agg, _, err := venueMarginSnapshot(ctx, v, marketID)
+	pos, agg, _, _, err := venueMarginSnapshot(ctx, v, marketID)
 	return pos, agg, err
 }
 
 // venueMarginSnapshot obtains positions and optional account evidence in one
 // request. A snapshot failure must not fall back to a separate positions read:
 // combining those responses could approve a position with stale account data.
-func venueMarginSnapshot(ctx context.Context, v exchange.Venue, marketID int) (domain.Position, float64, *domain.CrossMarginRisk, error) {
+func venueMarginSnapshot(ctx context.Context, v exchange.Venue, marketID int) (domain.Position, float64, *domain.CrossMarginRisk, float64, error) {
 	var ps []domain.Position
 	var cross *domain.CrossMarginRisk
+	var accountValue float64
 	var err error
 	if s, ok := v.(exchange.AccountSnapshotter); ok {
 		var snapshot domain.AccountSnapshot
 		snapshot, err = s.AccountSnapshot(ctx)
 		ps = snapshot.Positions
+		accountValue = snapshot.AccountValue
 		if snapshot.CrossMargin != nil {
 			copyRisk := *snapshot.CrossMargin
 			cross = &copyRisk
@@ -265,21 +322,21 @@ func venueMarginSnapshot(ctx context.Context, v exchange.Venue, marketID int) (d
 		ps, err = v.Positions(ctx)
 	}
 	if err != nil {
-		return domain.Position{}, 0, nil, err
+		return domain.Position{}, 0, nil, 0, err
 	}
 	var pos domain.Position
 	var agg float64
 	for _, p := range ps {
 		if math.IsNaN(p.Qty) || math.IsInf(p.Qty, 0) || math.IsNaN(p.AvgEntry) || math.IsInf(p.AvgEntry, 0) || p.AvgEntry < 0 || math.IsNaN(p.LiquidationPrice) || math.IsInf(p.LiquidationPrice, 0) {
-			return domain.Position{}, 0, nil, fmt.Errorf("%s market %d has invalid position data", v.Name(), p.MarketID)
+			return domain.Position{}, 0, nil, 0, fmt.Errorf("%s market %d has invalid position data", v.Name(), p.MarketID)
 		}
 		agg += math.Abs(p.Qty) * p.AvgEntry
 		if !finite(agg) {
-			return domain.Position{}, 0, nil, fmt.Errorf("%s has invalid aggregate position value", v.Name())
+			return domain.Position{}, 0, nil, 0, fmt.Errorf("%s has invalid aggregate position value", v.Name())
 		}
 		if p.MarketID == marketID {
 			pos = p
 		}
 	}
-	return pos, agg, cross, nil
+	return pos, agg, cross, accountValue, nil
 }
