@@ -107,7 +107,7 @@ func (m *marginMonitor) assessAt(now time.Time, markL, markR float64, fresh bool
 	minR := 1.0
 	considered := false
 	unknown := !validL || !validR
-	if r, ok := remainingPositionMargin(m.qtyL, m.entryL, m.liqL, markL, m.modeL, m.notionalL, m.crossL); ok && validL {
+	if r, ok := remainingPositionMargin(m.qtyL, m.entryL, m.liqL, markL, m.modeL, m.notionalL, m.crossL, m.cfg.floor); ok && validL {
 		considered = true
 		if r < minR {
 			minR = r
@@ -115,7 +115,7 @@ func (m *marginMonitor) assessAt(now time.Time, markL, markR float64, fresh bool
 	} else if validL && m.qtyL != 0 {
 		unknown = true
 	}
-	if r, ok := remainingPositionMargin(m.qtyR, m.entryR, m.liqR, markR, m.modeR, m.notionalR, m.crossR); ok && validR {
+	if r, ok := remainingPositionMargin(m.qtyR, m.entryR, m.liqR, markR, m.modeR, m.notionalR, m.crossR, m.cfg.floor); ok && validR {
 		considered = true
 		if r < minR {
 			minR = r
@@ -178,7 +178,11 @@ func (m *marginMonitor) cacheFresh(now, last time.Time) bool {
 // headroom may use zero as a conservative liquidation bound. Both headroom and
 // position value must come from the same fresh REST account snapshot: using
 // today's book value could incorrectly approve a position after a price fall.
-func remainingPositionMargin(qty, entry, liq, mark float64, mode domain.MarginMode, value float64, cross *domain.CrossMarginRisk) (float64, bool) {
+//
+// floor scales how much free equity the account must retain relative to the
+// leg's notional: headroom >= floor*value. A floor <= 0 falls back to 100%
+// coverage so an unconfigured monitor never loosens the bound.
+func remainingPositionMargin(qty, entry, liq, mark float64, mode domain.MarginMode, value float64, cross *domain.CrossMarginRisk, floor float64) (float64, bool) {
 	if r, ok := remainingMargin(qty, entry, liq, mark); ok {
 		return r, true
 	}
@@ -188,7 +192,10 @@ func remainingPositionMargin(qty, entry, liq, mark float64, mode domain.MarginMo
 		return 0, false
 	}
 	headroom := cross.Equity - cross.Maintenance
-	if !finite(headroom) || headroom < value {
+	if floor <= 0 || !finite(floor) {
+		floor = 1
+	}
+	if !finite(headroom) || cross.Equity <= cross.Maintenance || headroom < floor*value {
 		return 0, false
 	}
 	ratio := mark / entry

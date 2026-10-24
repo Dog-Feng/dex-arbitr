@@ -17,30 +17,34 @@ func TestZeroLiquidationRequiresSameSnapshotCrossEvidence(t *testing.T) {
 		mode           domain.MarginMode
 		value          float64
 		cross          *domain.CrossMarginRisk
+		floor          float64
 		ok             bool
 	}{
-		{"healthy cross long", .04, 0, 99, domain.MarginCross, 4, &domain.CrossMarginRisk{Equity: 50, Maintenance: 1}, true},
-		{"headroom exactly covers value", .04, 0, 99, domain.MarginCross, 4, &domain.CrossMarginRisk{Equity: 5, Maintenance: 1}, true},
-		{"missing account risk", .04, 0, 99, domain.MarginCross, 4, nil, false},
-		{"unknown mode", .04, 0, 99, domain.MarginUnknown, 4, &domain.CrossMarginRisk{Equity: 50}, false},
-		{"isolated", .04, 0, 99, domain.MarginIsolated, 4, &domain.CrossMarginRisk{Equity: 50}, false},
-		{"short", -.04, 0, 99, domain.MarginCross, 4, &domain.CrossMarginRisk{Equity: 50}, false},
-		{"missing snapshot value", .04, 0, 99, domain.MarginCross, 0, &domain.CrossMarginRisk{Equity: 50}, false},
-		{"negative snapshot value", .04, 0, 99, domain.MarginCross, -4, &domain.CrossMarginRisk{Equity: 50}, false},
-		{"nan snapshot value", .04, 0, 99, domain.MarginCross, math.NaN(), &domain.CrossMarginRisk{Equity: 50}, false},
-		{"infinite equity", .04, 0, 99, domain.MarginCross, 4, &domain.CrossMarginRisk{Equity: math.Inf(1)}, false},
-		{"nan maintenance", .04, 0, 99, domain.MarginCross, 4, &domain.CrossMarginRisk{Equity: 50, Maintenance: math.NaN()}, false},
-		{"negative maintenance", .04, 0, 99, domain.MarginCross, 4, &domain.CrossMarginRisk{Equity: 50, Maintenance: -1}, false},
-		{"negative equity", .04, 0, 99, domain.MarginCross, 4, &domain.CrossMarginRisk{Equity: -1}, false},
-		{"insufficient headroom", .04, 0, 99, domain.MarginCross, 4, &domain.CrossMarginRisk{Equity: 4, Maintenance: 1}, false},
+		{"healthy cross long", .04, 0, 99, domain.MarginCross, 4, &domain.CrossMarginRisk{Equity: 50, Maintenance: 1}, 1, true},
+		{"headroom exactly covers value", .04, 0, 99, domain.MarginCross, 4, &domain.CrossMarginRisk{Equity: 5, Maintenance: 1}, 1, true},
+		{"headroom covers floor fraction", .04, 0, 99, domain.MarginCross, 4, &domain.CrossMarginRisk{Equity: 1.8, Maintenance: 1}, .2, true},
+		{"headroom below floor fraction", .04, 0, 99, domain.MarginCross, 4, &domain.CrossMarginRisk{Equity: 1.7, Maintenance: 1}, .2, false},
+		{"equity not above maintenance", .04, 0, 99, domain.MarginCross, 4, &domain.CrossMarginRisk{Equity: 1, Maintenance: 1}, .2, false},
+		{"missing account risk", .04, 0, 99, domain.MarginCross, 4, nil, 1, false},
+		{"unknown mode", .04, 0, 99, domain.MarginUnknown, 4, &domain.CrossMarginRisk{Equity: 50}, 1, false},
+		{"isolated", .04, 0, 99, domain.MarginIsolated, 4, &domain.CrossMarginRisk{Equity: 50}, 1, false},
+		{"short", -.04, 0, 99, domain.MarginCross, 4, &domain.CrossMarginRisk{Equity: 50}, 1, false},
+		{"missing snapshot value", .04, 0, 99, domain.MarginCross, 0, &domain.CrossMarginRisk{Equity: 50}, 1, false},
+		{"negative snapshot value", .04, 0, 99, domain.MarginCross, -4, &domain.CrossMarginRisk{Equity: 50}, 1, false},
+		{"nan snapshot value", .04, 0, 99, domain.MarginCross, math.NaN(), &domain.CrossMarginRisk{Equity: 50}, 1, false},
+		{"infinite equity", .04, 0, 99, domain.MarginCross, 4, &domain.CrossMarginRisk{Equity: math.Inf(1)}, 1, false},
+		{"nan maintenance", .04, 0, 99, domain.MarginCross, 4, &domain.CrossMarginRisk{Equity: 50, Maintenance: math.NaN()}, 1, false},
+		{"negative maintenance", .04, 0, 99, domain.MarginCross, 4, &domain.CrossMarginRisk{Equity: 50, Maintenance: -1}, 1, false},
+		{"negative equity", .04, 0, 99, domain.MarginCross, 4, &domain.CrossMarginRisk{Equity: -1}, 1, false},
+		{"insufficient headroom", .04, 0, 99, domain.MarginCross, 4, &domain.CrossMarginRisk{Equity: 4, Maintenance: 1}, 1, false},
 		// A falling book price must not make old, insufficient equity appear
 		// sufficient: use the original value=100, not current qty*mark=40.
-		{"book fall cannot approve old snapshot", 1, 0, 40, domain.MarginCross, 100, &domain.CrossMarginRisk{Equity: 51, Maintenance: 1}, false},
-		{"invalid mark", .04, 0, math.NaN(), domain.MarginCross, 4, &domain.CrossMarginRisk{Equity: 50}, false},
-		{"negative liquidation", .04, -1, 99, domain.MarginCross, 4, &domain.CrossMarginRisk{Equity: 50}, false},
+		{"book fall cannot approve old snapshot", 1, 0, 40, domain.MarginCross, 100, &domain.CrossMarginRisk{Equity: 51, Maintenance: 1}, 1, false},
+		{"invalid mark", .04, 0, math.NaN(), domain.MarginCross, 4, &domain.CrossMarginRisk{Equity: 50}, 1, false},
+		{"negative liquidation", .04, -1, 99, domain.MarginCross, 4, &domain.CrossMarginRisk{Equity: 50}, 1, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			ratio, ok := remainingPositionMargin(tc.qty, 100, tc.liq, tc.mark, tc.mode, tc.value, tc.cross)
+			ratio, ok := remainingPositionMargin(tc.qty, 100, tc.liq, tc.mark, tc.mode, tc.value, tc.cross, tc.floor)
 			if ok != tc.ok || ok && math.Abs(ratio-tc.mark/100) > 1e-12 {
 				t.Fatalf("ratio=%v usable=%v want usable=%v", ratio, ok, tc.ok)
 			}

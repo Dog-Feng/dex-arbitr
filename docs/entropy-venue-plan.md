@@ -1,4 +1,4 @@
-# Entropy DEX 接入方案（Hyperliquid HIP-3 `io`）
+﻿# Entropy DEX 接入方案（Hyperliquid HIP-3 `io`）
 
 > 分支：`feat/entropy-venue-20261019`。状态：对接实现完成（本地未提交），待实盘账户验证。
 
@@ -58,7 +58,7 @@ Entropy 专有 API**。对接直接使用 Hyperliquid 标准 API/SDK（REST + WS
   （3.7 Hz）。订单终态事件（orderUpdates/userFills）按块即时推，不受盘口节流
   影响。
 - **对应配置**：`volatility.max_age: 600ms`（给 0.4~0.54s 节奏留 1.1~1.5 倍
-  余量；400ms 零余量、推送抖动会打碎 σ 采样链），`strategy.max_book_age: 3s`。
+  余量；400ms 零余量、推送抖动会打碎 σ 采样链），`strategy.max_book_age: 5s`。
 
 ### 签名方案（与官方 hyperliquid-python-sdk 0.24.0 逐字节一致）
 

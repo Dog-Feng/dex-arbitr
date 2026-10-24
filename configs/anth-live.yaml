@@ -60,7 +60,7 @@ strategy:
   cap_hysteresis_sigma: 1.0
   interval_min: 1s
   interval_max: 2s
-  max_book_age: 3s
+  max_book_age: 5s
 
 volume:
   min_inventory: 0
