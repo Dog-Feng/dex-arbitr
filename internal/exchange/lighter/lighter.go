@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
+	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
@@ -136,7 +137,9 @@ func NewWithConfig(cfg Config) (*Venue, error) {
 	}
 	cfg.Host = strings.TrimRight(cfg.Host, "/")
 	v := &Venue{cfg: cfg, books: map[int]*bookState{}, sendMu: make(chan struct{}, 1), closeDone: make(chan struct{})}
-	v.rest = &restClient{host: cfg.Host}
+	// One pooled client serves every REST path (queries and sendTx); the
+	// per-call client factory only remains as a test-injection fallback.
+	v.rest = &restClient{host: cfg.Host, client: &http.Client{Timeout: 10 * time.Second, Transport: exchange.NewHTTPTransport()}}
 	if cfg.PrivateKey != "" {
 		// Nonces and key checks use our contextual REST client. Supplying no SDK
 		// HTTP client also prevents an accidental implicit nonce fetch.

@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Dog-Feng/dex-arbitr/internal/spread/estimator"
 	"github.com/Dog-Feng/dex-arbitr/internal/strategy"
 )
 
@@ -28,6 +29,9 @@ type PairState struct {
 	Day           string      `json:"day,omitempty"`
 	VolumeUSD     float64     `json:"volume_usd,omitempty"`
 	PnLUSD        float64     `json:"pnl_usd,omitempty"`
+	// Estimator restores the spread-mean estimator's warmup history so a
+	// restart does not pay the full warmup window again.
+	Estimator *estimator.State `json:"estimator,omitempty"`
 }
 
 // Store serializes access to a directory of pair-state JSON files.
@@ -238,6 +242,12 @@ func validate(st PairState) error {
 	}
 	if !finite(st.VolumeUSD) || st.VolumeUSD < 0 || !finite(st.PnLUSD) {
 		return fmt.Errorf("daily budget values must be finite and volume nonnegative")
+	}
+	if e := st.Estimator; e != nil {
+		if e.Kind == "" || e.N < 1 || !finite(e.Mean) || !finite(e.MX2) || e.MX2 < 0 ||
+			e.Started.IsZero() || e.Last.IsZero() || e.Last.Before(e.Started) {
+			return fmt.Errorf("invalid estimator state")
+		}
 	}
 	ids := make(map[int64]bool)
 	var dir strategy.Dir

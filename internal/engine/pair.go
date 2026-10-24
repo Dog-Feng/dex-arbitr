@@ -236,6 +236,17 @@ func NewPairActor(cfg PairConfig) (*PairActor, error) {
 	a.checkpoint = st.Unresolved
 	a.startupRecovered.Store(!st.Unresolved)
 	a.checkpointExit = st.CheckpointExit
+	if st.Estimator != nil {
+		// Resume the mean estimator's warmup history: a restart skips the
+		// full warmup window. Freshness gates still block readiness until a
+		// new sample arrives, and the first update decays the restored mean
+		// by the real elapsed time.
+		if p, ok := cfg.Est.(estimator.Persistable); ok {
+			if err := p.Restore(*st.Estimator); err != nil {
+				a.log.Warn("estimator state unusable; cold-starting warmup", "kind", st.Estimator.Kind, "err", err)
+			}
+		}
+	}
 	if a.checkpointExit {
 		// Restart the quarantine: even an order sent just before the prior
 		// process stopped must expire before this actor can release its slot.
@@ -387,6 +398,7 @@ func (a *PairActor) persist() error {
 		VolumeUSD: a.volAcc.volumeUSD, PnLUSD: a.volAcc.pnlUSD,
 		PnLUncertain: a.volAcc.pnlUncertain, Unresolved: a.checkpoint,
 		CheckpointExit: a.checkpointExit, Interventions: a.interventions,
+		Estimator: a.estimatorSnapshot(),
 	})
 	if err != nil {
 		a.state.Mode = strategy.ModePaused
@@ -396,6 +408,34 @@ func (a *PairActor) persist() error {
 		return a.fatalErr
 	}
 	return nil
+}
+
+// estimatorSnapshot returns the mean estimator's restart state, or nil when
+// the estimator does not support persistence (SMA cold-starts by design).
+func (a *PairActor) estimatorSnapshot() *estimator.State {
+	if a.cfg.Est == nil {
+		return nil
+	}
+	if p, ok := a.cfg.Est.(estimator.Persistable); ok {
+		s := p.Save()
+		return &s
+	}
+	return nil
+}
+
+// sampleMean feeds the mean estimator from the freshest books. Event-driven
+// sampling keeps the mean within one book update of the market; the 1s
+// fallback ticker remains for quiet stretches and is a no-op for bucket-based
+// estimators (SMA dedups per bucket, z-score weights by real dt). Only the
+// actor goroutine owns the estimator, so sampling happens here, never in the
+// collector goroutine.
+func (a *PairActor) sampleMean(now time.Time) {
+	if a.cfg.View != nil || a.cfg.Est == nil {
+		return // auto mode: the shared view owns the estimator
+	}
+	if q, ok := a.quote(now); ok {
+		a.cfg.Est.Update(now, q.Mid)
+	}
 }
 
 func (a *PairActor) jitter() time.Duration {
@@ -628,9 +668,13 @@ func (a *PairActor) Run(ctx context.Context) (retErr error) {
 		case <-housekeep.C:
 			nextAt = a.decideOnce(ctx, time.Now(), nextAt)
 		case <-a.bookWake:
-			nextAt = a.decideOnce(ctx, time.Now(), nextAt)
+			now := time.Now()
+			a.sampleMean(now)
+			nextAt = a.decideOnce(ctx, now, nextAt)
 		case <-viewUpdates:
-			nextAt = a.decideOnce(ctx, time.Now(), nextAt)
+			now := time.Now()
+			a.sampleMean(now)
+			nextAt = a.decideOnce(ctx, now, nextAt)
 		}
 	}
 }

@@ -121,6 +121,24 @@ func (z *ZScore) StatsAt(now time.Time) Stats {
 	return st
 }
 
+// Save snapshots the warmup history for restart persistence. The estimator is
+// owned by one actor goroutine, so no locking is needed.
+func (z *ZScore) Save() State {
+	return State{Kind: "zscore", Mean: z.mean, MX2: z.mx2, N: z.n, Started: z.started, Last: z.last}
+}
+
+// Restore resumes a previously saved estimator. The freshness gate still
+// blocks readiness until a new sample arrives, and the first Update decays
+// the restored values by the real elapsed time, so a long stop naturally
+// discounts the old history instead of trusting it.
+func (z *ZScore) Restore(s State) error {
+	if s.Kind != "zscore" || !validState(s) {
+		return errInvalidState
+	}
+	z.mean, z.mx2, z.n, z.started, z.last = s.Mean, s.MX2, s.N, s.Started, s.Last
+	return nil
+}
+
 func (z *ZScore) ready(now time.Time) bool {
 	return z.n > 0 && now.Sub(z.started) >= z.p.MinWarmup &&
 		now.Sub(z.last) <= 2*z.p.Interval

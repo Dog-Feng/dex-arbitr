@@ -14,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Dog-Feng/dex-arbitr/internal/exchange"
 )
 
 const defaultInfoURL = "https://api.hyperliquid.xyz/info"
@@ -32,12 +34,15 @@ type restClient struct {
 func newRestClient(infoURL, exchangeURL string) *restClient {
 	// Info reads (meta, clearinghouse) tolerate a longer timeout; signed
 	// action sends stay short so a cancel is never queued behind a slow
-	// order for long.
+	// order for long. Both share one pooled transport: info and exchange
+	// live on the same host, so the periodic position polls keep the pool
+	// warm for signed actions as well.
+	transport := exchange.NewHTTPTransport()
 	return &restClient{
 		infoURL:     infoURL,
 		exchangeURL: exchangeURL,
-		infoClient:  &http.Client{Timeout: 10 * time.Second},
-		sendClient:  &http.Client{Timeout: 5 * time.Second},
+		infoClient:  &http.Client{Timeout: 10 * time.Second, Transport: transport},
+		sendClient:  &http.Client{Timeout: 5 * time.Second, Transport: transport},
 	}
 }
 
