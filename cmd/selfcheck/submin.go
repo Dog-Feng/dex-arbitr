@@ -158,11 +158,15 @@ func subminFlow(ctx context.Context, v exchange.Venue, m symbols.Matcher, base s
 		if err := submit(dir.open, qty, false); err != nil {
 			allOK = check(dir.label+" reopen", err, "%v", err) && allOK
 		}
-		_, _ = awaitPosition(ctx, v, inst, qty*float64(dir.open), 25*time.Second)
+		if _, err := awaitPosition(ctx, v, inst, qty*float64(dir.open), 25*time.Second); err != nil {
+			allOK = check(dir.label+" reopen position", err, "%v", err) && allOK
+		}
 		if err := submit(dir.close, reduce, true); err != nil {
 			allOK = check(dir.label+" re-reduce", err, "%v", err) && allOK
 		}
-		_, _ = awaitPosition(ctx, v, inst, leave*float64(dir.open), 25*time.Second)
+		if _, err := awaitPosition(ctx, v, inst, leave*float64(dir.open), 25*time.Second); err != nil {
+			allOK = check(dir.label+" re-reduce position", err, "%v", err) && allOK
+		}
 		rejectErr := submit(dir.close, leave, true)
 		if errors.Is(rejectErr, domain.ErrRejected) {
 			allOK = check(dir.label+" exact residual rejected", nil, "%v", rejectErr) && allOK
@@ -209,10 +213,12 @@ func awaitPosition(ctx context.Context, v exchange.Venue, inst domain.Instrument
 		if time.Now().After(deadline) {
 			return pos, fmt.Errorf("position %.8f did not reach %.8f within %s", pos, want, wait)
 		}
+		timer := time.NewTimer(1500 * time.Millisecond)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return pos, ctx.Err()
-		case <-time.After(1500 * time.Millisecond):
+		case <-timer.C:
 		}
 	}
 }
@@ -245,10 +251,12 @@ func flattenToZero(ctx context.Context, v exchange.Venue, inst domain.Instrument
 			return fmt.Errorf("cleanup order: %w", err)
 		}
 		fmt.Fprintf(out, "[INFO] cleanup reduce %s %.5f at %.6f\n", side, q, px)
+		timer := time.NewTimer(2 * time.Second)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return ctx.Err()
-		case <-time.After(2 * time.Second):
+		case <-timer.C:
 		}
 	}
 	return fmt.Errorf("cleanup did not flatten the account after 8 attempts")

@@ -77,11 +77,41 @@ func (s *Store) Load(key string) (PairState, error) {
 	return s.load(key)
 }
 
+// readFileWithRetry bounds transient Windows sharing violations: a reader can
+// hit the file while another process (an actor save, a virus scanner) briefly
+// holds it. ErrNotExist returns immediately to preserve empty-state semantics.
+func readFileWithRetry(path string) ([]byte, error) {
+	var b []byte
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		b, err = os.ReadFile(path)
+		if err == nil || attempt == 2 {
+			return b, err
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return b, err
+}
+
+// renameWithRetry bounds the same Windows sharing violations on the replace
+// side of an atomic save.
+func renameWithRetry(from, to string) error {
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		err = os.Rename(from, to)
+		if err == nil || attempt == 2 {
+			return err
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return err
+}
+
 func (s *Store) load(key string) (PairState, error) {
 	if err := validKey(key); err != nil {
 		return PairState{}, err
 	}
-	b, err := os.ReadFile(s.path(key))
+	b, err := readFileWithRetry(s.path(key))
 	if errors.Is(err, os.ErrNotExist) {
 		return PairState{NextID: 1}, nil
 	}
@@ -185,7 +215,7 @@ func (s *Store) write(key string, b []byte) (retErr error) {
 	if err := f.Close(); err != nil {
 		return err
 	}
-	if err := os.Rename(f.Name(), s.path(key)); err != nil {
+	if err := renameWithRetry(f.Name(), s.path(key)); err != nil {
 		return err
 	}
 	return syncDir(s.dir)

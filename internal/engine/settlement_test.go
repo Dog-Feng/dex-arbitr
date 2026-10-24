@@ -585,3 +585,30 @@ func TestSettlementRejectsWrongBookIdentityAndFutureTime(t *testing.T) {
 		t.Fatal("wrong venue quote accepted")
 	}
 }
+
+// TestSettlementUsesReportedFees locks the L4 fix: exchange-reported fees win
+// over the static rate estimate, and a missing report falls back to it.
+func TestSettlementUsesReportedFees(t *testing.T) {
+	t.Run("reported fees win", func(t *testing.T) {
+		a := settlementActor(t)
+		l, r := strategy.DirLS.LegSides()
+		act := strategy.Action{Kind: strategy.Open, Dir: strategy.DirLS, Qty: 1,
+			L: strategy.Leg{Side: l, Price: 100}, R: strategy.Leg{Side: r, Price: 110}}
+		res := fillResult(1, 100, 1, 110, float64(l), float64(r))
+		res.L.Fee, res.R.Fee = 0.05, 0.06 // reported fees, below the static 0.1% each
+		if err := a.accountExecution(act, spread.Quote{}, 0, 0, res); err != nil {
+			t.Fatal(err)
+		}
+		nearSettlement(t, "entry fees", a.state.Steps[0].EntryFeesUSD, 0.11)
+	})
+	t.Run("static fallback when unreported", func(t *testing.T) {
+		a := settlementActor(t)
+		l, r := strategy.DirLS.LegSides()
+		act := strategy.Action{Kind: strategy.Open, Dir: strategy.DirLS, Qty: 1,
+			L: strategy.Leg{Side: l, Price: 100}, R: strategy.Leg{Side: r, Price: 110}}
+		if err := a.accountExecution(act, spread.Quote{}, 0, 0, fillResult(1, 100, 1, 110, float64(l), float64(r))); err != nil {
+			t.Fatal(err)
+		}
+		nearSettlement(t, "entry fees", a.state.Steps[0].EntryFeesUSD, 100*0.001+110*0.001)
+	})
+}

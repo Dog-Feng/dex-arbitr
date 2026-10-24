@@ -149,8 +149,6 @@ func (v *Venue) onWSMessage(typ, channel string, raw []byte) {
 		v.onBook(typ, channel, raw)
 	case strings.HasPrefix(channel, "account_all_orders:"):
 		v.onOrders(raw)
-	case typ == "error" || strings.Contains(string(raw), `"error"`):
-		slog.Warn("ws error message", "venue", v.cfg.Name)
 	}
 }
 

@@ -84,7 +84,7 @@ func (a *PairActor) watchRisk(ctx context.Context) {
 			reason = "book_unavailable"
 		}
 		if !reported || blocked != lastBlocked || blocked && reason != lastReason {
-		a.logRiskState(assessedAt, m, ml, mr, blocked, reason)
+			a.logRiskState(assessedAt, m, ml, mr, blocked, reason)
 			reported, lastBlocked, lastReason = true, blocked, reason
 		}
 		if action == marginTrigger && a.emergencyRequested.CompareAndSwap(false, true) {
@@ -435,8 +435,8 @@ func (a *PairActor) interventionBudgetOK(now time.Time) bool {
 }
 
 func (a *PairActor) legSpecs(act strategy.Action) (execution.LegSpec, execution.LegSpec) {
-	return execution.LegSpec{Venue: a.cfg.L, Inst: a.cfg.Pair.Left, Side: act.L.Side, Price: act.L.Price},
-		execution.LegSpec{Venue: a.cfg.R, Inst: a.cfg.Pair.Right, Side: act.R.Side, Price: act.R.Price}
+	return execution.LegSpec{Venue: a.cfg.L, Inst: a.cfg.Pair.Left, Side: act.L.Side, Price: act.L.Price, MarginBps: act.ExpectedBps},
+		execution.LegSpec{Venue: a.cfg.R, Inst: a.cfg.Pair.Right, Side: act.R.Side, Price: act.R.Price, MarginBps: act.ExpectedBps}
 }
 
 func (a *PairActor) apply(ctx context.Context, act strategy.Action, q spread.Quote) {
@@ -548,6 +548,19 @@ func closePrice(lr execution.LegResult, qty float64) (float64, error) {
 
 // accountExecution derives ledger quantity from confirmed final positions,
 // not min/max of the original IOC fills. Fees include every direct/rescue fill.
+// executionFees returns the total fee of a settled execution: the
+// exchange-reported fees when every filled leg reported one, else the static
+// rate estimate of the executed notional.
+func (a *PairActor) executionFees(res execution.Result, nl, nr float64) float64 {
+	fees := nl*a.cfg.Pair.Left.TakerFee + nr*a.cfg.Pair.Right.TakerFee
+	if reported := res.L.Fee + res.L.RescueFee + res.R.Fee + res.R.RescueFee; reported > 0 &&
+		(res.L.Filled+res.L.RescueFilled <= 0 || res.L.Fee+res.L.RescueFee > 0) &&
+		(res.R.Filled+res.R.RescueFilled <= 0 || res.R.Fee+res.R.RescueFee > 0) {
+		return reported
+	}
+	return fees
+}
+
 func (a *PairActor) accountExecution(act strategy.Action, q spread.Quote, beforeL, beforeR float64, res execution.Result) error {
 	if res.Err != nil || !res.PositionsKnown || !res.SettlementKnown {
 		return execution.ErrUnresolved
@@ -560,8 +573,7 @@ func (a *PairActor) accountExecution(act strategy.Action, q spread.Quote, before
 	if err != nil {
 		return err
 	}
-	feeL, feeR := a.cfg.Pair.Left.TakerFee, a.cfg.Pair.Right.TakerFee
-	fees := nl*feeL + nr*feeR
+	fees := a.executionFees(res, nl, nr)
 	deltaPnL := -fees
 	uncertain := res.L.PriceEstimated || res.R.PriceEstimated || res.L.RescuePriceEstimated || res.R.RescuePriceEstimated
 	eps := math.Pow10(-a.cfg.Pair.SizeDecimals) / 2
@@ -592,6 +604,16 @@ func (a *PairActor) accountExecution(act strategy.Action, q spread.Quote, before
 		if h >= eps {
 			if !finitePositive(res.L.AvgPrice) || !finitePositive(res.R.AvgPrice) {
 				return fmt.Errorf("opening prices unknown")
+			}
+			// Split the entry fee per leg: exchange-reported rates when present,
+			// the static venue rate otherwise, so the retained step carries the
+			// actual cost of its own fills.
+			feeL, feeR := a.cfg.Pair.Left.TakerFee, a.cfg.Pair.Right.TakerFee
+			if rep := res.L.Fee + res.L.RescueFee; rep > 0 && nl > 0 {
+				feeL = rep / nl
+			}
+			if rep := res.R.Fee + res.R.RescueFee; rep > 0 && nr > 0 {
+				feeR = rep / nr
 			}
 			st := strategy.Step{ID: a.next, Dir: act.Dir, Qty: domain.Round(h, a.cfg.Pair.SizeDecimals), OriginalQty: h,
 				OpenL: res.L.AvgPrice, OpenR: res.R.AvgPrice, EntryBps: strategy.EntryBps(act.Dir, res.L.AvgPrice, res.R.AvgPrice),
@@ -844,7 +866,7 @@ func (a *PairActor) finishUnwind(res execution.Result) error {
 	if err != nil {
 		return err
 	}
-	fees := nl*a.cfg.Pair.Left.TakerFee + nr*a.cfg.Pair.Right.TakerFee
+	fees := a.executionFees(res, nl, nr)
 	delta := -fees
 	uncertain := res.L.PriceEstimated || res.R.PriceEstimated || res.L.RescuePriceEstimated || res.R.RescuePriceEstimated
 	qty := math.Abs(a.expectedL())

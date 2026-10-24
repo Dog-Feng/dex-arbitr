@@ -39,10 +39,32 @@ type Instrument struct {
 	MinQuote      float64
 	TakerFee      float64
 	MakerFee      float64
+	// SigFigs limits the price grid to N significant figures (Hyperliquid:
+	// 5, with integer prices always allowed). 0 means no limit: the tick is
+	// the full PriceDecimals unit.
+	SigFigs int
 }
 
-// Tick is the minimal price increment.
+// Tick is the minimal price increment at the instrument's full precision.
 func (i Instrument) Tick() float64 { return math.Pow10(-i.PriceDecimals) }
+
+// TickAt returns the effective minimal price increment at price px. Venues
+// with a significant-figure rule (SigFigs > 0) enforce a coarser grid that
+// widens as the price magnitude grows; integer prices stay representable.
+func (i Instrument) TickAt(px float64) float64 {
+	t := i.Tick()
+	if i.SigFigs <= 0 || px <= 0 || math.IsNaN(px) || math.IsInf(px, 0) {
+		return t
+	}
+	exp := int(math.Floor(math.Log10(px))) - (i.SigFigs - 1)
+	if exp > 0 {
+		exp = 0 // integer prices are always allowed
+	}
+	if s := math.Pow10(exp); s > t {
+		t = s
+	}
+	return t
+}
 
 // Level is one price level.
 type Level struct {
@@ -166,9 +188,15 @@ type CrossMarginRisk struct {
 type AccountSnapshot struct {
 	Positions   []Position
 	CrossMargin *CrossMarginRisk // nil means unavailable or invalid
-	// AccountValue is the account-wide total asset value (0 = unavailable).
-	// It feeds the per-minute reconciliation log and nothing else.
+	// AccountValue is the account-wide total asset value in the exchange's
+	// own (mark-price) terms; it feeds the per-minute reconciliation log as
+	// the page-consistent equity reference. 0 = unavailable.
 	AccountValue float64
+	// SpotValue is the pure spot USDC balance (0 = unavailable). Under the
+	// unified account the spot balance is the equity baseline; the engine
+	// combines it with book-mark unrealized PnL so the funding residual is
+	// not polluted by the exchange mark price lagging the order book.
+	SpotValue float64
 }
 
 var (

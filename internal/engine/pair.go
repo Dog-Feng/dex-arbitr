@@ -897,7 +897,7 @@ func (a *PairActor) record(kind monitor.Kind, fill func(*monitor.Event)) {
 func (a *PairActor) logAccountRecon() {
 	snap := a.margin.reconAccount()
 	markL, markR, _ := a.riskMarks()
-	unrealL, unrealR, total, deltaTotal, deltaUnreal, deltaRealized, funding, next :=
+	unrealL, unrealR, total, deltaTotal, deltaUnreal, deltaRealized, funding, book, deltaBook, next :=
 		computeRecon(snap, markL, markR, a.volAcc.pnlUSD, a.reconLast, a.reconInit)
 	a.reconLast, a.reconInit = next, true
 	recon := monitor.AccountRecon{
@@ -906,11 +906,13 @@ func (a *PairActor) logAccountRecon() {
 		EquityL:        monitor.Fixed4(snap.EquityL),
 		EquityR:        monitor.Fixed4(snap.EquityR),
 		TotalEquity:    monitor.Fixed4(total),
+		EquityBook:     monitor.Fixed4(book),
 		UnrealL:        monitor.Fixed4(unrealL),
 		UnrealR:        monitor.Fixed4(unrealR),
 		UnrealTotal:    monitor.Fixed4(unrealL + unrealR),
 		LedgerRealized: monitor.Fixed4(a.volAcc.pnlUSD),
 		DeltaTotal:     monitor.Fixed4(deltaTotal),
+		DeltaBook:      monitor.Fixed4(deltaBook),
 		DeltaUnreal:    monitor.Fixed4(deltaUnreal),
 		DeltaRealized:  monitor.Fixed4(deltaRealized),
 		FundingEst:     monitor.Fixed4(funding),
@@ -922,11 +924,13 @@ func (a *PairActor) logAccountRecon() {
 		"equity_l", strconv.FormatFloat(snap.EquityL, 'f', 4, 64),
 		"equity_r", strconv.FormatFloat(snap.EquityR, 'f', 4, 64),
 		"total_equity", strconv.FormatFloat(total, 'f', 4, 64),
+		"equity_book", strconv.FormatFloat(book, 'f', 4, 64),
 		"unreal_l", strconv.FormatFloat(unrealL, 'f', 4, 64),
 		"unreal_r", strconv.FormatFloat(unrealR, 'f', 4, 64),
 		"unreal_total", strconv.FormatFloat(unrealL+unrealR, 'f', 4, 64),
 		"ledger_realized", strconv.FormatFloat(a.volAcc.pnlUSD, 'f', 4, 64),
 		"delta_total", strconv.FormatFloat(deltaTotal, 'f', 4, 64),
+		"delta_book", strconv.FormatFloat(deltaBook, 'f', 4, 64),
 		"delta_unreal", strconv.FormatFloat(deltaUnreal, 'f', 4, 64),
 		"delta_realized", strconv.FormatFloat(deltaRealized, 'f', 4, 64),
 		"funding_est", strconv.FormatFloat(funding, 'f', 4, 64))

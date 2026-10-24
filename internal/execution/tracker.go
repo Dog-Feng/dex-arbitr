@@ -3,6 +3,8 @@ package execution
 
 import (
 	"context"
+	crand "crypto/rand"
+	"encoding/binary"
 	"fmt"
 	"strings"
 	"sync"
@@ -16,10 +18,20 @@ import (
 // IDGen produces unique client order indexes (< 2^48).
 type IDGen struct{ n atomic.Int64 }
 
-// NewIDGen seeds from wall clock (ms*100) so restarts don't collide.
+// idMask keeps ids below 2^48, matching the venues' client-order-index range.
+const idMask = uint64(1<<48) - 1
+
+// NewIDGen seeds from 48 bits of OS randomness so two processes started in the
+// same millisecond, or a clock rollback, cannot reuse client order ids. The
+// wall clock is only a fallback when the platform lacks an entropy source.
 func NewIDGen() *IDGen {
 	g := &IDGen{}
-	g.n.Store(time.Now().UnixMilli() * 100 % ((1 << 48) - 1))
+	var seed [8]byte
+	if _, err := crand.Read(seed[:]); err == nil {
+		g.n.Store(int64(binary.LittleEndian.Uint64(seed[:]) & idMask))
+		return g
+	}
+	g.n.Store(time.Now().UnixMilli() * 100 % int64(idMask))
 	return g
 }
 

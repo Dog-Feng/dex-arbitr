@@ -21,7 +21,7 @@ func TestResolveTerminalsRequiresExplicitOriginalOutcome(t *testing.T) {
 		}
 		return domain.OrderUpdate{ClientID: cid, Status: domain.StatusUnknown}, nil
 	}
-	ls, rs := LegSpec{lifecycleVenue{fakeVenue: l, queryFn: query}, inst, domain.Buy, 100}, LegSpec{lifecycleVenue{fakeVenue: r, queryFn: query}, inst, domain.Sell, 100}
+	ls, rs := LegSpec{lifecycleVenue{fakeVenue: l, queryFn: query}, inst, domain.Buy, 100, 0}, LegSpec{lifecycleVenue{fakeVenue: r, queryFn: query}, inst, domain.Sell, 100, 0}
 	res := e.Execute(context.Background(), ls, rs, .01, false, 0, 0)
 	requireSettled(t, res)
 	if OrdersTerminal(res) {
@@ -60,7 +60,7 @@ func TestResolveTerminalsRetainsPositionInferredRescue(t *testing.T) {
 		}
 		return domain.OrderUpdate{ClientID: cid, Status: domain.StatusUnknown}, nil
 	}}
-	ls, rs := LegSpec{l, inst, domain.Sell, 100}, LegSpec{rv, inst, domain.Buy, 100.1}
+	ls, rs := LegSpec{l, inst, domain.Sell, 100, 0}, LegSpec{rv, inst, domain.Buy, 100.1, 0}
 	res := e.Execute(context.Background(), ls, rs, .01, true, .01, -.01)
 	requireSettled(t, res)
 	if OrdersTerminal(res) || len(res.unconfirmed) != 1 {
@@ -103,7 +103,7 @@ func TestExecuteBoundedFreezesPricesAndChecksBothLegs(t *testing.T) {
 			if reject {
 				cap = .0001 // below one native quantity unit
 			}
-			res := e.ExecuteBounded(context.Background(), LegSpec{l, inst, domain.Buy, 100}, LegSpec{r, inst, domain.Sell, 100}, .01, false, 0, 0, cap)
+			res := e.ExecuteBounded(context.Background(), LegSpec{l, inst, domain.Buy, 100, 0}, LegSpec{r, inst, domain.Sell, 100, 0}, .01, false, 0, 0, cap)
 			if reject {
 				if !errors.Is(res.Err, ErrNotionalBudget) || len(l.orders) != 0 || len(r.orders) != 0 {
 					t.Fatalf("over-budget action submitted an IOC: %+v", res)
@@ -125,7 +125,7 @@ func TestExecuteBoundedDoesNotBlockCloses(t *testing.T) {
 	l, r := newFake("L", full), newFake("R", full)
 	l.pos, r.pos = .01, -.01
 	e := testLifecycleExec(t, l, r)
-	res := e.ExecuteBounded(context.Background(), LegSpec{l, inst, domain.Sell, 100}, LegSpec{r, inst, domain.Buy, 100}, .01, true, .01, -.01, .0001)
+	res := e.ExecuteBounded(context.Background(), LegSpec{l, inst, domain.Sell, 100, 0}, LegSpec{r, inst, domain.Buy, 100, 0}, .01, true, .01, -.01, .0001)
 	requireSettled(t, res)
 	if res.PosL != 0 || res.PosR != 0 {
 		t.Fatal("opening cap blocked a close")
@@ -135,7 +135,7 @@ func TestExecuteBoundedDoesNotBlockCloses(t *testing.T) {
 func TestExecuteBoundedReservesSellDecisionNotional(t *testing.T) {
 	l, r := newFake("L", full), newFake("R", full)
 	e := testLifecycleExec(t, l, r)
-	res := e.ExecuteBounded(context.Background(), LegSpec{l, inst, domain.Buy, 100}, LegSpec{r, inst, domain.Sell, 101}, .01, false, 0, 0, 1.008)
+	res := e.ExecuteBounded(context.Background(), LegSpec{l, inst, domain.Buy, 100, 0}, LegSpec{r, inst, domain.Sell, 101, 0}, .01, false, 0, 0, 1.008)
 	requireSettled(t, res)
 	if res.RequestedQty != .0099 || l.orders[0].Qty*101 > 1.008 || r.orders[0].Qty != res.RequestedQty {
 		t.Fatalf("sell decision notional did not constrain the opening quantity: %+v", res)
@@ -165,7 +165,7 @@ func TestResolveTerminalsRemovesInvalidatedRescueInference(t *testing.T) {
 		}
 		return domain.OrderUpdate{ClientID: cid, Status: domain.StatusUnknown}, nil
 	}}
-	ls, rs := LegSpec{l, inst, domain.Sell, 100}, LegSpec{rv, inst, domain.Buy, 100.1}
+	ls, rs := LegSpec{l, inst, domain.Sell, 100, 0}, LegSpec{rv, inst, domain.Buy, 100.1, 0}
 	res := e.Execute(context.Background(), ls, rs, .01, true, .01, -.01)
 	requireSettled(t, res)
 	if res.R.RescueFilled != .01 || OrdersTerminal(res) {
@@ -194,7 +194,7 @@ func TestZeroTicksPreservesNativeDecisionPrice(t *testing.T) {
 		side  domain.Side
 		price float64
 	}{{domain.Buy, 33554.401}, {domain.Sell, 33554.404}} {
-		if got := e.limitPrice(LegSpec{l, i, tc.side, tc.price}, .01); got != tc.price {
+		if got := e.limitPrice(LegSpec{l, i, tc.side, tc.price, 0}, .01); got != tc.price {
 			t.Fatalf("native decision %g became %g", tc.price, got)
 		}
 	}

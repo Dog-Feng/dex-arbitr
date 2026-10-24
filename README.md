@@ -55,7 +55,7 @@ execution:
   price_ticks: 30
 ```
 
-固定模式下，买单限价为决策价格加 N 个 tick，卖单为决策价格减 N 个 tick；tick 是各交易所的最小价格单位。设为 `0` 时使用决策价格，省略时默认 `30`，负数配置会报错。启用 `dynamic_ticks` 且波动已就绪时，改用波动、盘口深度及 min/max ticks 计算范围；未就绪时回退到 `price_ticks`。可选开启 `execution.adaptive_latency` 后，波动窗口按实测腿延迟自适应（价差窗口取两腿较大者）。普通补救使用 IOC 价格阶梯；应急退出和 drain 使用 reduce-only 保护市价单，并确认每腿分别归零。修改配置在操作者重启后生效。
+固定模式下，买单限价为决策价格加 N 个 tick，卖单为决策价格减 N 个 tick；tick 是各交易所的最小价格单位，Hyperliquid 腿按其 5 位有效数字规则在决策价格处取有效 tick（整数价格始终可表示，例如 ANTH ~1960 处 1 tick = 0.1，价格 ≥ 100000 处 1 tick = 1），救援阶梯与动态让价共用同一有效 tick。设为 `0` 时使用决策价格，省略时默认 `30`，负数配置会报错。启用 `dynamic_ticks` 且波动已就绪时，改用波动、盘口深度及 min/max ticks 计算范围；未就绪时回退到 `price_ticks`。可选开启 `execution.adaptive_latency` 后，波动窗口按实测腿延迟自适应（价差窗口取两腿较大者）。普通补救使用 IOC 价格阶梯；应急退出和 drain 使用 reduce-only 保护市价单，并确认每腿分别归零。修改配置在操作者重启后生效。
 
 开平仓均要求短周期波动率 σ 就绪（按增量计数，攒满 `volatility.horizon/interval` 个增量即 ready，断链不作废）；σ 未就绪时策略开平仓被拦截，仅救援、drain 与应急清仓可用。
 

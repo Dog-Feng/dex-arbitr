@@ -83,19 +83,23 @@ type Event struct {
 }
 
 // AccountRecon is one per-minute account reconciliation snapshot. It is
-// observational: the equity and unrealized figures reconcile the venues'
-// account value with the ledger, funding_est is the unexplained residual.
+// observational: the equity figures follow the venues' page equity (exchange
+// mark terms), equity_book is the book-consistent baseline (spot + book-mark
+// unrealized), and funding_est is the residual after removing ledger-realized
+// and book-unrealized moves.
 type AccountRecon struct {
 	QtyL           Fixed8 `json:"qty_l,omitempty"`
 	QtyR           Fixed8 `json:"qty_r,omitempty"`
 	EquityL        Fixed4 `json:"equity_l,omitempty"`
 	EquityR        Fixed4 `json:"equity_r,omitempty"`
 	TotalEquity    Fixed4 `json:"total_equity,omitempty"`
+	EquityBook     Fixed4 `json:"equity_book,omitempty"`
 	UnrealL        Fixed4 `json:"unreal_l,omitempty"`
 	UnrealR        Fixed4 `json:"unreal_r,omitempty"`
 	UnrealTotal    Fixed4 `json:"unreal_total,omitempty"`
 	LedgerRealized Fixed4 `json:"ledger_realized,omitempty"`
 	DeltaTotal     Fixed4 `json:"delta_total,omitempty"`
+	DeltaBook      Fixed4 `json:"delta_book,omitempty"`
 	DeltaUnreal    Fixed4 `json:"delta_unreal,omitempty"`
 	DeltaRealized  Fixed4 `json:"delta_realized,omitempty"`
 	FundingEst     Fixed4 `json:"funding_est,omitempty"`

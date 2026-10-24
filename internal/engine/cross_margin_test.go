@@ -85,22 +85,29 @@ func TestCrossMarginKeepsDistanceThresholdsAndTriggerPriority(t *testing.T) {
 }
 
 func TestComputeReconReconcilesRealizedUnrealizedAndFunding(t *testing.T) {
-	prev := reconBaseline{total: 100, unreal: 2, realized: -3}
-	snap := reconAccount{QtyL: -0.3, EntryL: 1975.2, QtyR: 0.3, EntryR: 1932.11, EquityL: 455.9, EquityR: 493.65}
-	unrealL, unrealR, total, dT, dU, dR, funding, _ := computeRecon(snap, 1977.2, 1933.11, -3.14, prev, true)
+	prev := reconBaseline{total: 100, unreal: 2, realized: -3, book: 90}
+	// The right leg carries a spot balance (unified account): its book baseline
+	// is spot + book-unrealized, so a lagging exchange mark never leaks into
+	// the funding residual.
+	snap := reconAccount{QtyL: -0.3, EntryL: 1975.2, QtyR: 0.3, EntryR: 1932.11, EquityL: 455.9, EquityR: 493.65, SpotR: 490}
+	unrealL, unrealR, total, dT, dU, dR, funding, book, dB, _ := computeRecon(snap, 1977.2, 1933.11, -3.14, prev, true)
 	if math.Abs(unrealL-(-0.6)) > 1e-9 || math.Abs(unrealR-0.3) > 1e-9 {
 		t.Fatalf("unrealized wrong: l=%v r=%v", unrealL, unrealR)
 	}
 	if math.Abs(total-949.55) > 1e-9 || math.Abs(dT-(total-100)) > 1e-9 || math.Abs(dR-(-0.14)) > 1e-9 {
 		t.Fatalf("baseline math wrong: total=%v dT=%v dR=%v", total, dT, dR)
 	}
-	if funding != dT-dR-dU {
-		t.Fatalf("funding residual inconsistent: %v != %v", funding, dT-dR-dU)
+	// book = EquityL (no spot) + SpotR + unreal = 455.9 + 490 - 0.3 = 945.6
+	if math.Abs(book-945.6) > 1e-9 || math.Abs(dB-(book-90)) > 1e-9 {
+		t.Fatalf("book baseline wrong: book=%v dB=%v", book, dB)
+	}
+	if funding != dB-dR-dU {
+		t.Fatalf("funding residual inconsistent: %v != %v", funding, dB-dR-dU)
 	}
 	// First sample: no baseline, all deltas and the residual are zero.
-	_, _, _, dT2, dU2, dR2, fund2, _ := computeRecon(snap, 1977.2, 1933.11, -3.14, reconBaseline{}, false)
-	if dT2 != 0 || dU2 != 0 || dR2 != 0 || fund2 != 0 {
-		t.Fatalf("uninitialized baseline must zero deltas: %v %v %v %v", dT2, dU2, dR2, fund2)
+	_, _, _, dT2, dU2, dR2, fund2, _, dB2, _ := computeRecon(snap, 1977.2, 1933.11, -3.14, reconBaseline{}, false)
+	if dT2 != 0 || dU2 != 0 || dR2 != 0 || fund2 != 0 || dB2 != 0 {
+		t.Fatalf("uninitialized baseline must zero deltas: %v %v %v %v %v", dT2, dU2, dR2, fund2, dB2)
 	}
 }
 

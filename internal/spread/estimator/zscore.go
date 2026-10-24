@@ -68,8 +68,12 @@ func (z *ZScore) Update(t time.Time, x float64) {
 	if dt <= 0 {
 		return
 	}
-	a := 1 - math.Exp(-dt/z.muHalf)
-	b := 1 - math.Exp(-dt/z.sigmaHalf)
+	// muHalf/sigmaHalf are configured half-lives, so the per-update decay
+	// needs the ln2 factor: weight = 1 - exp(-ln2 * dt / halfLife). Without
+	// it the effective half-life would be ln2 * param (~69% of configured),
+	// disagreeing with volatility.go, which uses the same convention.
+	a := 1 - math.Exp(-math.Ln2*dt/z.muHalf)
+	b := 1 - math.Exp(-math.Ln2*dt/z.sigmaHalf)
 	z.mean += a * (x - z.mean)
 	z.mx2 += b * (x*x - z.mx2)
 	z.n++

@@ -39,7 +39,7 @@ func (v *Venue) nonce() uint64 {
 	}
 }
 
-func (v *Venue) lockSend(ctx context.Context) error {
+func (v *Venue) lockSend(mu chan struct{}, ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -48,10 +48,10 @@ func (v *Venue) lockSend(ctx context.Context) error {
 		return ctx.Err()
 	case <-v.ws.done:
 		return fmt.Errorf("venue closed")
-	case v.sendMu <- struct{}{}:
+	case mu <- struct{}{}:
 	}
 	if v.closed.Load() || ctx.Err() != nil {
-		<-v.sendMu
+		<-mu
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -108,6 +108,9 @@ func sigFigTighten(px float64, priceDecimals int, buy bool) float64 {
 	}
 	digits := int(math.Floor(math.Log10(px))) + 1
 	d := 5 - digits
+	if d < 0 {
+		d = 0 // integer prices are always allowed; never truncate the units
+	}
 	if d > priceDecimals {
 		d = priceDecimals
 	}
@@ -126,10 +129,10 @@ func (v *Venue) Submit(ctx context.Context, r domain.OrderReq) (domain.SubmitAck
 	if err != nil {
 		return domain.SubmitAck{}, err
 	}
-	if err := v.lockSend(ctx); err != nil {
+	if err := v.lockSend(v.orderSendMu, ctx); err != nil {
 		return domain.SubmitAck{}, fmt.Errorf("%w: %v", domain.ErrRejected, err)
 	}
-	defer func() { <-v.sendMu }()
+	defer func() { <-v.orderSendMu }()
 	nonce := v.nonce()
 	expiresAfter := submitExpiry(time.Now())
 	sig, err := v.signer.signOrder(asset, r.Side == domain.Buy, r.ReduceOnly, price, size, c, nonce, expiresAfter)
@@ -234,10 +237,10 @@ func (v *Venue) CancelOrder(ctx context.Context, inst domain.Instrument, clientI
 	if err != nil {
 		return fmt.Errorf("%w: %v", domain.ErrRejected, err)
 	}
-	if err := v.lockSend(ctx); err != nil {
+	if err := v.lockSend(v.auxSendMu, ctx); err != nil {
 		return err
 	}
-	defer func() { <-v.sendMu }()
+	defer func() { <-v.auxSendMu }()
 	nonce := v.nonce()
 	expiresAfter := submitExpiry(time.Now())
 	sig, err := v.signer.signCancelByCloid(inst.MarketID, c, nonce, expiresAfter)
@@ -474,10 +477,10 @@ func (v *Venue) SetLeverage(ctx context.Context, inst domain.Instrument, leverag
 	if cap, ok := v.maxLeverage(inst.MarketID); ok && leverage > cap {
 		return fmt.Errorf("%w: market %d maximum leverage is %d", domain.ErrLeverageRejected, inst.MarketID, cap)
 	}
-	if err := v.lockSend(ctx); err != nil {
+	if err := v.lockSend(v.auxSendMu, ctx); err != nil {
 		return err
 	}
-	defer func() { <-v.sendMu }()
+	defer func() { <-v.auxSendMu }()
 	nonce := v.nonce()
 	expiresAfter := submitExpiry(time.Now())
 	sig, err := v.signer.signUpdateLeverage(inst.MarketID, false, leverage, nonce, expiresAfter)

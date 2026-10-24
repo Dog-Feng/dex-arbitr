@@ -51,6 +51,7 @@ type marginMonitor struct {
 	qtyL, qtyR           float64
 	accountValueL        float64
 	accountValueR        float64
+	spotL, spotR         float64 // pure spot USDC balance (unified accounts)
 	aggL, aggR           float64
 	modeL, modeR         domain.MarginMode
 	notionalL, notionalR float64
@@ -62,14 +63,15 @@ type marginMonitor struct {
 // discard liquidation data that was successfully read from the other venue.
 func (m *marginMonitor) refresh(ctx context.Context, l, r exchange.Venue, leftID, rightID int) {
 	m.lastRefresh = time.Now()
-	pl, aggL, crossL, avL, errL := venueMarginSnapshot(ctx, l, leftID)
-	pr, aggR, crossR, avR, errR := venueMarginSnapshot(ctx, r, rightID)
+	pl, aggL, crossL, avL, spotL, errL := venueMarginSnapshot(ctx, l, leftID)
+	pr, aggR, crossR, avR, spotR, errR := venueMarginSnapshot(ctx, r, rightID)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if errL == nil {
 		m.liqL, m.entryL, m.qtyL, m.aggL = pl.LiquidationPrice, pl.AvgEntry, pl.Qty, aggL
 		m.modeL, m.notionalL, m.crossL = pl.MarginMode, pl.Notional, crossL
 		m.accountValueL = avL
+		m.spotL = spotL
 		if m.accountValueL <= 0 && crossL != nil {
 			m.accountValueL = crossL.Equity
 		}
@@ -81,6 +83,7 @@ func (m *marginMonitor) refresh(ctx context.Context, l, r exchange.Venue, leftID
 		m.liqR, m.entryR, m.qtyR, m.aggR = pr.LiquidationPrice, pr.AvgEntry, pr.Qty, aggR
 		m.modeR, m.notionalR, m.crossR = pr.MarginMode, pr.Notional, crossR
 		m.accountValueR = avR
+		m.spotR = spotR
 		if m.accountValueR <= 0 && crossR != nil {
 			m.accountValueR = crossR.Equity
 		}
@@ -97,24 +100,29 @@ type reconAccount struct {
 	QtyL, QtyR       float64
 	EntryL, EntryR   float64
 	EquityL, EquityR float64
+	SpotL, SpotR     float64
 }
 
 func (m *marginMonitor) reconAccount() reconAccount {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return reconAccount{QtyL: m.qtyL, QtyR: m.qtyR, EntryL: m.entryL, EntryR: m.entryR,
-		EquityL: m.accountValueL, EquityR: m.accountValueR}
+		EquityL: m.accountValueL, EquityR: m.accountValueR, SpotL: m.spotL, SpotR: m.spotR}
 }
 
 // reconBaseline is the previous minute's reconciliation snapshot.
 type reconBaseline struct {
-	total, unreal, realized float64
+	total, unreal, realized, book float64
 }
 
-// computeRecon derives the per-minute reconciliation numbers. funding is the
-// residual account-value change not explained by ledger-realized or
-// unrealized moves (funding payments, fee rebates, and the unexplained rest).
-func computeRecon(snap reconAccount, markL, markR, realized float64, prev reconBaseline, initialized bool) (unrealL, unrealR, total, deltaTotal, deltaUnreal, deltaRealized, funding float64, next reconBaseline) {
+// computeRecon derives the per-minute reconciliation numbers. total follows
+// the venues' page equity (exchange mark terms); book is the book-consistent
+// equity baseline: a venue with a spot balance contributes spot + book-mark
+// unrealized PnL, so the funding residual does not absorb the gap between a
+// lagging exchange mark and the order book. funding is then the residual
+// account-value change not explained by ledger-realized or book-unrealized
+// moves (funding payments, fee rebates, and the unexplained rest).
+func computeRecon(snap reconAccount, markL, markR, realized float64, prev reconBaseline, initialized bool) (unrealL, unrealR, total, deltaTotal, deltaUnreal, deltaRealized, funding, book, deltaBook float64, next reconBaseline) {
 	if snap.QtyL != 0 && snap.EntryL > 0 && markL > 0 {
 		unrealL = snap.QtyL * (markL - snap.EntryL)
 	}
@@ -123,13 +131,25 @@ func computeRecon(snap reconAccount, markL, markR, realized float64, prev reconB
 	}
 	unreal := unrealL + unrealR
 	total = snap.EquityL + snap.EquityR
+	book = unreal
+	if snap.SpotL > 0 {
+		book += snap.SpotL
+	} else {
+		book += snap.EquityL
+	}
+	if snap.SpotR > 0 {
+		book += snap.SpotR
+	} else {
+		book += snap.EquityR
+	}
 	if initialized {
 		deltaTotal = total - prev.total
 		deltaUnreal = unreal - prev.unreal
 		deltaRealized = realized - prev.realized
+		deltaBook = book - prev.book
 	}
-	funding = deltaTotal - deltaRealized - deltaUnreal
-	return unrealL, unrealR, total, deltaTotal, deltaUnreal, deltaRealized, funding, reconBaseline{total: total, unreal: unreal, realized: realized}
+	funding = deltaBook - deltaRealized - deltaUnreal
+	return unrealL, unrealR, total, deltaTotal, deltaUnreal, deltaRealized, funding, book, deltaBook, reconBaseline{total: total, unreal: unreal, realized: realized, book: book}
 }
 
 // assess decides the action from the current mark prices; fresh=false means
@@ -297,23 +317,24 @@ func remainingMargin(qty, entry, liq, mark float64) (float64, bool) {
 // venuePositions returns the pair's position on marketID and the venue's total
 // notional aggregated across all markets (the account-level exposure).
 func venuePositions(ctx context.Context, v exchange.Venue, marketID int) (domain.Position, float64, error) {
-	pos, agg, _, _, err := venueMarginSnapshot(ctx, v, marketID)
+	pos, agg, _, _, _, err := venueMarginSnapshot(ctx, v, marketID)
 	return pos, agg, err
 }
 
 // venueMarginSnapshot obtains positions and optional account evidence in one
 // request. A snapshot failure must not fall back to a separate positions read:
 // combining those responses could approve a position with stale account data.
-func venueMarginSnapshot(ctx context.Context, v exchange.Venue, marketID int) (domain.Position, float64, *domain.CrossMarginRisk, float64, error) {
+func venueMarginSnapshot(ctx context.Context, v exchange.Venue, marketID int) (domain.Position, float64, *domain.CrossMarginRisk, float64, float64, error) {
 	var ps []domain.Position
 	var cross *domain.CrossMarginRisk
-	var accountValue float64
+	var accountValue, spotValue float64
 	var err error
 	if s, ok := v.(exchange.AccountSnapshotter); ok {
 		var snapshot domain.AccountSnapshot
 		snapshot, err = s.AccountSnapshot(ctx)
 		ps = snapshot.Positions
 		accountValue = snapshot.AccountValue
+		spotValue = snapshot.SpotValue
 		if snapshot.CrossMargin != nil {
 			copyRisk := *snapshot.CrossMargin
 			cross = &copyRisk
@@ -322,21 +343,21 @@ func venueMarginSnapshot(ctx context.Context, v exchange.Venue, marketID int) (d
 		ps, err = v.Positions(ctx)
 	}
 	if err != nil {
-		return domain.Position{}, 0, nil, 0, err
+		return domain.Position{}, 0, nil, 0, 0, err
 	}
 	var pos domain.Position
 	var agg float64
 	for _, p := range ps {
 		if math.IsNaN(p.Qty) || math.IsInf(p.Qty, 0) || math.IsNaN(p.AvgEntry) || math.IsInf(p.AvgEntry, 0) || p.AvgEntry < 0 || math.IsNaN(p.LiquidationPrice) || math.IsInf(p.LiquidationPrice, 0) {
-			return domain.Position{}, 0, nil, 0, fmt.Errorf("%s market %d has invalid position data", v.Name(), p.MarketID)
+			return domain.Position{}, 0, nil, 0, 0, fmt.Errorf("%s market %d has invalid position data", v.Name(), p.MarketID)
 		}
 		agg += math.Abs(p.Qty) * p.AvgEntry
 		if !finite(agg) {
-			return domain.Position{}, 0, nil, 0, fmt.Errorf("%s has invalid aggregate position value", v.Name())
+			return domain.Position{}, 0, nil, 0, 0, fmt.Errorf("%s has invalid aggregate position value", v.Name())
 		}
 		if p.MarketID == marketID {
 			pos = p
 		}
 	}
-	return pos, agg, cross, accountValue, nil
+	return pos, agg, cross, accountValue, spotValue, nil
 }

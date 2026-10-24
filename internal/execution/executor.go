@@ -58,6 +58,9 @@ type LegSpec struct {
 	Inst  domain.Instrument
 	Side  domain.Side
 	Price float64
+	// MarginBps is the opening's expected deviation (bps). completeStep skips
+	// the completion when its cost would consume that edge. 0 disables.
+	MarginBps float64
 }
 
 // LegResult is the resolved outcome of a leg.
@@ -70,11 +73,15 @@ type LegResult struct {
 	SubmitErr      error
 	Latency        time.Duration // submit -> terminal state (WS/REST) or give-up
 	PriceEstimated bool          // AvgPrice is a protective/decision price estimate
+	// Fee is the exchange-reported fee of this leg's own order fills;
+	// 0 means unknown (callers fall back to the static rate estimate).
+	Fee float64
 	// RescueFilled/RescuePrice are the quantity and volume-weighted price this
 	// leg completed via rescue orders (opposite side for opens, same side for
 	// closes). They let callers reconstruct the effective close price.
 	RescueFilled         float64
 	RescuePrice          float64
+	RescueFee            float64
 	RescuePriceEstimated bool
 	request              domain.OrderReq
 	// extra holds same-side completion fills merged into Filled, so a
@@ -85,8 +92,8 @@ type LegResult struct {
 
 // extraFills accumulates completion fills merged into a leg.
 type extraFills struct {
-	qty, quote float64
-	estimate   bool
+	qty, quote, fee float64
+	estimate        bool
 }
 
 // original returns the leg as reported by its own order, without merged
@@ -104,6 +111,10 @@ func (lr LegResult) original() LegResult {
 	if o.Filled > 0 {
 		o.AvgPrice = (lr.Filled*lr.AvgPrice - lr.extra.quote) / o.Filled
 	}
+	o.Fee = lr.Fee - lr.extra.fee
+	if o.Fee < 0 {
+		o.Fee = 0
+	}
 	o.extra = extraFills{}
 	return o
 }
@@ -118,6 +129,7 @@ func (lr LegResult) withExtra(x extraFills) LegResult {
 	total := lr.Filled + x.qty
 	lr.AvgPrice = (lr.Filled*lr.AvgPrice + x.quote) / total
 	lr.Filled = total
+	lr.Fee += x.fee
 	lr.PriceEstimated = lr.PriceEstimated || x.estimate
 	return lr
 }
@@ -169,6 +181,7 @@ type pendingRescue struct {
 	beforeL, beforeR float64
 	accountedQty     [2]float64
 	accountedQuote   [2]float64
+	accountedFee     [2]float64
 }
 
 // ErrUnresolved means a submitted order may still change the account position.
@@ -312,18 +325,12 @@ func (e *Executor) ExecuteBounded(ctx context.Context, l, r LegSpec, qty float64
 	}
 	res.SettlementKnown = true
 	if !reduceOnly && e.cfg.TopUpBps > 0 {
-		completed, terr := e.completeStep(ctx, l, r, qty, beforeL, beforeR, pl, pr, &res)
+		completed, pl2, pr2, terr := e.completeStep(ctx, l, r, qty, beforeL, beforeR, pl, pr, maxOpenNotional, &res)
 		if terr != nil {
 			res.Err = terr
 			return res
 		}
 		if completed {
-			// The completion changed one leg; re-read authoritative positions.
-			pl2, pr2, perr := e.positions(ctx, l, r)
-			if perr != nil {
-				res.Err = perr
-				return res
-			}
 			pl, pr = pl2, pr2
 			res.PosL, res.PosR = pl, pr
 		}
@@ -697,6 +704,22 @@ func (e *Executor) ResolveTerminals(ctx context.Context, l, r LegSpec, res Resul
 		res.Err = err
 		return res
 	}
+	// A step completion participates in terminal resolution exactly like in
+	// ResolveOutstanding, so recovery never blocks on an unqueried top-up.
+	if res.topUp != nil && !res.topUp.result.Resolved {
+		leg := l
+		if res.topUp.req.Inst.MarketID == r.Inst.MarketID && res.topUp.req.Side == r.Side {
+			leg = r
+		}
+		res.topUp.result = e.queryExisting(ctx, res.topUp.req, leg.Venue, res.topUp.result)
+		if res.topUp.result.Resolved && res.topUp.result.Filled > 0 {
+			if leg.Inst.MarketID == l.Inst.MarketID && leg.Side == l.Side {
+				mergeTopUp(&res.L, res.topUp.result)
+			} else {
+				mergeTopUp(&res.R, res.topUp.result)
+			}
+		}
+	}
 	// A forward completion participates in terminal resolution exactly like
 	// in ResolveOutstanding, so recovery never blocks on unqueried orders.
 	if res.forward != nil && !res.forward.confirmed {
@@ -850,12 +873,14 @@ func legMinQty(inst domain.Instrument, price float64) float64 {
 	return m
 }
 
-// completeStep tops up the under-filled leg of an opening when exactly one
-// leg filled short of the requested quantity. A single IOC completes the
-// step; any failure falls back to the ordinary shrink path. The completion
-// price is the decision price widened by at most TopUpBps in the aggressive
-// direction, so chasing the book is hard-bounded.
-func (e *Executor) completeStep(ctx context.Context, l, r LegSpec, qty, beforeL, beforeR, pl, pr float64, res *Result) (bool, error) {
+// completeStep tops up the single under-filled leg of an opening with a new
+// IOC. It returns the confirmed positions after a completed top-up, or the
+// pre-completion positions when the completion was skipped (rejected, empty,
+// below minimum, over budget, or priced out); the caller then shrinks. The
+// completion is verified with the same settle delay and retry loop as a normal
+// leg, so a stale position read can never turn a completed leg into an extra
+// rescue round.
+func (e *Executor) completeStep(ctx context.Context, l, r LegSpec, qty, beforeL, beforeR, pl, pr, maxOpenNotional float64, res *Result) (completed bool, pl2, pr2 float64, err error) {
 	dl := float64(l.Side) * (pl - beforeL)
 	dr := float64(r.Side) * (pr - beforeR)
 	epsL := math.Pow10(-l.Inst.SizeDecimals) / 2
@@ -868,34 +893,86 @@ func (e *Executor) completeStep(ctx context.Context, l, r LegSpec, qty, beforeL,
 	case dr < qty-epsR && dl >= qty-epsL:
 		short, s = r, qty-dr
 	default:
-		return false, nil // both legs full, or both short: shrink aligns them
+		return false, pl, pr, nil // both legs full, or both short: shrink aligns them
 	}
 	if s <= 0 || s < legMinQty(short.Inst, short.Price) {
-		return false, nil // below the venue minimum: cannot complete
+		return false, pl, pr, nil // below the venue minimum: cannot complete
 	}
 	s = domain.Round(s, short.Inst.SizeDecimals)
 	if s <= 0 || s < legMinQty(short.Inst, short.Price) {
-		return false, nil
+		return false, pl, pr, nil
+	}
+	// The completion must not pay more than the opening's expected edge.
+	if short.MarginBps > 0 && e.cfg.TopUpBps+short.Inst.TakerFee*1e4 >= short.MarginBps {
+		return false, pl, pr, nil
+	}
+	limit := topUpPrice(short, e.cfg.TopUpBps)
+	// Cap at the fresh counterparty top plus the same allowance: never chase a
+	// book that already moved past the decision bound.
+	if e.book != nil && short.Venue != nil {
+		if b, ok := e.book(short.Venue.Name(), short.Inst.MarketID); ok && b.Valid() {
+			top := b.Asks[0].Price
+			if short.Side == domain.Sell {
+				top = b.Bids[0].Price
+			}
+			capped := topUpPrice(LegSpec{Inst: short.Inst, Side: short.Side, Price: top}, e.cfg.TopUpBps)
+			if short.Side == domain.Buy && capped < limit {
+				limit = capped
+			}
+			if short.Side == domain.Sell && capped > limit {
+				limit = capped
+			}
+		}
+	}
+	if limit <= 0 || math.IsNaN(limit) || math.IsInf(limit, 0) {
+		return false, pl, pr, nil
+	}
+	// The completion extends the opening, so its notional counts against the
+	// same budget the original legs were admitted under.
+	if maxOpenNotional > 0 {
+		opened := res.L.Filled*res.L.AvgPrice + res.R.Filled*res.R.AvgPrice
+		if opened+s*limit > maxOpenNotional {
+			return false, pl, pr, nil
+		}
 	}
 	req := domain.OrderReq{
 		ClientID: e.ids.Next(), Inst: short.Inst, Side: short.Side, Qty: s,
-		Price: topUpPrice(short, e.cfg.TopUpBps), Type: domain.Limit, ReduceOnly: false,
+		Price: limit, Type: domain.Limit, ReduceOnly: false,
 	}
 	up := e.submitAndResolve(ctx, req, short.Venue)
 	res.topUp = &topUpState{req: req, result: up}
 	if !up.Resolved {
 		res.SettlementKnown = false
-		return false, fmt.Errorf("%w: completion order %d unresolved", ErrUnresolved, req.ClientID)
+		return false, pl, pr, fmt.Errorf("%w: completion order %d unresolved", ErrUnresolved, req.ClientID)
 	}
 	if up.Filled <= 0 {
-		return false, nil // rejected or empty: fall back to shrinking
+		return false, pl, pr, nil // rejected or empty: fall back to shrinking
 	}
-	if short.Inst.MarketID == l.Inst.MarketID && short.Side == l.Side {
+	onL := short.Inst.MarketID == l.Inst.MarketID && short.Side == l.Side
+	if onL {
 		mergeTopUp(&res.L, up)
 	} else {
 		mergeTopUp(&res.R, up)
 	}
-	return true, nil
+	// Verify the completion against positions: the completed leg must reflect
+	// its fill and the other leg must not have moved.
+	var upL, upR = LegResult{Resolved: true}, LegResult{Resolved: true}
+	qL, qR := 0.0, 0.0
+	if onL {
+		upL, qL = up, up.Filled
+	} else {
+		upR, qR = up, up.Filled
+	}
+	pl2, pr2, known, cerr := e.confirmPositions(ctx, l, r, pl, pr, &upL, &upR, qL, qR, l.Side, r.Side)
+	if cerr != nil {
+		res.SettlementKnown = false
+		return false, pl, pr, cerr
+	}
+	if !known {
+		res.SettlementKnown = false
+		return false, pl, pr, ErrUnresolved
+	}
+	return true, pl2, pr2, nil
 }
 
 // topUpPrice widens the decision price by bps in the aggressive direction and
@@ -923,6 +1000,7 @@ func mergeTopUp(leg *LegResult, up LegResult) {
 	x := leg.extra
 	x.qty += up.Filled
 	x.quote += up.Filled * up.AvgPrice
+	x.fee += up.Fee
 	x.estimate = x.estimate || up.PriceEstimated
 	*leg = leg.original().withExtra(x)
 }
@@ -1058,6 +1136,26 @@ func (e *Executor) positions(ctx context.Context, l, r LegSpec) (float64, float6
 	return pl, pr, errors.Join(el, er)
 }
 
+// positionsWithRetry refreshes both positions with the same bounded retry loop
+// confirmPositions uses. Emergency and recovery flatten call it before
+// submitting, so a single transient REST failure cannot abort the unwind.
+func (e *Executor) positionsWithRetry(ctx context.Context, l, r LegSpec) (float64, float64, error) {
+	var lastErr error
+	for i := 0; i <= e.cfg.QueryRetries; i++ {
+		pl, pr, err := e.positions(ctx, l, r)
+		if err == nil {
+			return pl, pr, nil
+		}
+		lastErr = err
+		if i < e.cfg.QueryRetries {
+			if perr := pause(ctx, e.cfg.QueryInterval); perr != nil {
+				return 0, 0, errors.Join(lastErr, perr)
+			}
+		}
+	}
+	return 0, 0, lastErr
+}
+
 // limitPrice returns the IOC limit price for a leg: the decision price moved
 // allowance ticks in the aggressive direction. leg.Price itself is left
 // untouched so fill estimates and expected_bps keep using the decision price.
@@ -1066,7 +1164,7 @@ func (e *Executor) limitPrice(leg LegSpec, qty float64) float64 {
 	if n <= 0 {
 		return boundPrice(leg)
 	}
-	off := float64(n) * leg.Inst.Tick()
+	off := float64(n) * leg.Inst.TickAt(leg.Price)
 	px := leg.Price + off
 	if leg.Side == domain.Sell {
 		px = leg.Price - off
@@ -1115,7 +1213,7 @@ func (e *Executor) allowance(leg LegSpec, qty float64) int {
 	if k <= 0 {
 		k = e.cfg.TickK
 	}
-	ticks := int(math.Ceil(k*sigma/leg.Inst.Tick()*e.depthScale(leg, qty) - 1e-9))
+	ticks := int(math.Ceil(k*sigma/leg.Inst.TickAt(leg.Price)*e.depthScale(leg, qty) - 1e-9))
 	// Cover the depth the quantity actually consumes (IOC walks past level 1).
 	if e.book != nil && leg.Venue != nil {
 		if b, ok := e.book(leg.Venue.Name(), leg.Inst.MarketID); ok {
@@ -1191,7 +1289,7 @@ func ticksTo(leg LegSpec, price float64) int {
 	if d <= 0 {
 		return 0
 	}
-	return int(math.Ceil(d/leg.Inst.Tick() - 1e-9))
+	return int(math.Ceil(d/leg.Inst.TickAt(leg.Price) - 1e-9))
 }
 
 func (e *Executor) submitAndResolve(ctx context.Context, req domain.OrderReq, v exchange.Venue) (lr LegResult) {
@@ -1295,8 +1393,10 @@ func (e *Executor) awaitOrder(ctx context.Context, req domain.OrderReq, v exchan
 		if qerr == nil && u.Status.Terminal() {
 			return fill(lr, u, start, req.Price)
 		}
+		timer := time.NewTimer(e.cfg.QueryInterval)
 		select {
 		case u, ok := <-w:
+			timer.Stop()
 			if !ok {
 				w = nil
 				continue
@@ -1305,8 +1405,9 @@ func (e *Executor) awaitOrder(ctx context.Context, req domain.OrderReq, v exchan
 				return fill(lr, u, start, req.Price)
 			}
 		case <-ctx.Done():
+			timer.Stop()
 			return lr
-		case <-time.After(e.cfg.QueryInterval):
+		case <-timer.C:
 		}
 	}
 	slog.Warn("order state unresolved; will infer from positions", "venue", v.Name(), "cid", req.ClientID)
@@ -1318,6 +1419,7 @@ func (e *Executor) awaitOrder(ctx context.Context, req domain.OrderReq, v exchan
 func fill(lr LegResult, u domain.OrderUpdate, start time.Time, estimate float64) LegResult {
 	x := lr.extra
 	lr.Status, lr.Filled, lr.AvgPrice, lr.Resolved = u.Status, u.FilledQty, u.AvgPrice(), true
+	lr.Fee = u.Fee
 	lr.PriceEstimated = false
 	if lr.Filled > 0 && (lr.AvgPrice <= 0 || math.IsNaN(lr.AvgPrice) || math.IsInf(lr.AvgPrice, 0)) {
 		lr.AvgPrice, lr.PriceEstimated = estimate, true
@@ -1345,7 +1447,7 @@ func (e *Executor) EmergencyFlatten(ctx context.Context, l, r LegSpec, target, p
 	if err = ctx.Err(); err != nil {
 		return res, err
 	}
-	pl, pr, err = e.positions(ctx, l, r)
+	pl, pr, err = e.positionsWithRetry(ctx, l, r)
 	if err != nil {
 		return res, fmt.Errorf("emergency positions: %w", err)
 	}
@@ -1370,7 +1472,7 @@ func (e *Executor) FlattenToZero(ctx context.Context, l, r LegSpec) (res Result,
 		return res, err
 	}
 	var pl, pr float64
-	if pl, pr, err = e.positions(ctx, l, r); err != nil {
+	if pl, pr, err = e.positionsWithRetry(ctx, l, r); err != nil {
 		return res, fmt.Errorf("recovery positions: %w", err)
 	}
 	res.PosL, res.PosR, res.PositionsKnown, res.SettlementKnown = pl, pr, true, true
@@ -1438,7 +1540,7 @@ func (e *Executor) flatten(ctx context.Context, l, r LegSpec, targetL, targetR f
 			if deltas[i] < 0 {
 				side = domain.Buy
 			}
-			px, typ := RescuePrice(rescue, attempt, b, side, leg.Inst.PriceDecimals)
+			px, typ := RescuePrice(rescue, attempt, b, side, leg.Inst)
 			if px <= 0 || math.IsNaN(px) || math.IsInf(px, 0) {
 				return fmt.Errorf("invalid rescue price on %s", leg.Venue.Name())
 			}
@@ -1596,6 +1698,7 @@ func accountRescue(l, r LegSpec, res *Result, p *pendingRescue) {
 		res.RescueQty += lr.Filled - p.accountedQty[i]
 		if p.accountedQty[i] == 0 {
 			mergeRescue(legResult, lr.Filled, lr.AvgPrice)
+			legResult.RescueFee += lr.Fee
 		} else {
 			totalQty := legResult.RescueFilled + lr.Filled - p.accountedQty[i]
 			totalQuote := legResult.RescueFilled*legResult.RescuePrice + quote - p.accountedQuote[i]
@@ -1603,9 +1706,10 @@ func accountRescue(l, r LegSpec, res *Result, p *pendingRescue) {
 			if totalQty > 0 {
 				legResult.RescuePrice = totalQuote / totalQty
 			}
+			legResult.RescueFee += lr.Fee - p.accountedFee[i]
 		}
 		legResult.RescuePriceEstimated = legResult.RescuePriceEstimated || lr.PriceEstimated
-		p.accountedQty[i], p.accountedQuote[i] = lr.Filled, quote
+		p.accountedQty[i], p.accountedQuote[i], p.accountedFee[i] = lr.Filled, quote, lr.Fee
 	}
 }
 

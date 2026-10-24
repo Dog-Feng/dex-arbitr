@@ -19,10 +19,10 @@ func (v *Venue) SendAsset(ctx context.Context, sourceDex, destinationDex string,
 	if v.signer == nil || v.cfg.Account == "" {
 		return domain.ErrNoCredentials
 	}
-	if err := v.lockSend(ctx); err != nil {
+	if err := v.lockSend(v.auxSendMu, ctx); err != nil {
 		return err
 	}
-	defer func() { <-v.sendMu }()
+	defer func() { <-v.auxSendMu }()
 	nonce := v.nonce()
 	sig, err := v.signer.signSendAsset(v.cfg.Account, sourceDex, destinationDex, usdcToken, amount, nonce)
 	if err != nil {

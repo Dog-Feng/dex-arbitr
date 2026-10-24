@@ -91,7 +91,10 @@ func TestWatchClosedBooksClearScoreAndReturnError(t *testing.T) {
 func TestWatchUsesStrategyThresholdsAndOptionalVolatility(t *testing.T) {
 	for _, kind := range []string{"arbitrage", "volume"} {
 		t.Run(kind, func(t *testing.T) {
-			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			// The mean sampler (20ms) and the 1s evaluation ticker both must
+			// fire at least once; under -race with a parallel package load the
+			// old 3s budget occasionally expired before the second eval tick.
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
 			left, right := make(chan domain.Book, 1), make(chan domain.Book, 1)
 			done := make(chan struct{})

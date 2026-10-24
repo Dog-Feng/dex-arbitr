@@ -26,6 +26,11 @@ type fakeVenue struct {
 	posBump    float64
 	bumped     bool
 	orders     []domain.OrderReq
+	// staleAfterOrders makes the next Positions read after the venue received
+	// staleAfterOrders orders return stalePos once, simulating the exchange
+	// settle delay on a freshly completed leg.
+	staleAfterOrders int
+	stalePos         float64
 }
 
 func newFake(name string, f func(int, domain.OrderReq) float64) *fakeVenue {
@@ -80,6 +85,10 @@ func (f *fakeVenue) Positions(context.Context) ([]domain.Position, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.reads++
+	if f.staleAfterOrders > 0 && f.n >= f.staleAfterOrders && !f.bumped {
+		f.bumped = true
+		return []domain.Position{{MarketID: 1, Qty: f.stalePos}}, nil
+	}
 	if f.bumpAtRead > 0 && f.reads >= f.bumpAtRead && !f.bumped {
 		f.bumped = true
 		f.pos += f.posBump
@@ -170,7 +179,7 @@ func TestDepthTicks(t *testing.T) {
 func TestBothFilled(t *testing.T) {
 	l, r := newFake("L", full), newFake("R", full)
 	e := testExec(t, l, r)
-	res := e.Execute(context.Background(), LegSpec{l, inst, domain.Buy, 100.1}, LegSpec{r, inst, domain.Sell, 100}, 0.01, false, 0, 0)
+	res := e.Execute(context.Background(), LegSpec{l, inst, domain.Buy, 100.1, 0}, LegSpec{r, inst, domain.Sell, 100, 0}, 0.01, false, 0, 0)
 	if res.L.Filled != 0.01 || res.R.Filled != 0.01 || res.RescueOrders != 0 || res.PosL != 0.01 || res.PosR != -0.01 {
 		t.Fatalf("%+v", res)
 	}
@@ -180,7 +189,7 @@ func TestOneLegFailsThenFlatten(t *testing.T) {
 	l := newFake("L", full)
 	r := newFake("R", func(int, domain.OrderReq) float64 { return 0 }) // R never fills
 	e := testExec(t, l, r)
-	res := e.Execute(context.Background(), LegSpec{l, inst, domain.Buy, 100.1}, LegSpec{r, inst, domain.Sell, 100}, 0.01, false, 0, 0)
+	res := e.Execute(context.Background(), LegSpec{l, inst, domain.Buy, 100.1, 0}, LegSpec{r, inst, domain.Sell, 100, 0}, 0.01, false, 0, 0)
 	if res.RescueOrders != 1 || res.PosL != 0 || res.PosR != 0 {
 		t.Fatalf("%+v", res)
 	}
@@ -200,7 +209,7 @@ func TestRescueEscalatesPrice(t *testing.T) {
 	})
 	r := newFake("R", func(int, domain.OrderReq) float64 { return 0 })
 	e := testExec(t, l, r)
-	res := e.Execute(context.Background(), LegSpec{l, inst, domain.Buy, 100.1}, LegSpec{r, inst, domain.Sell, 100}, 0.01, false, 0, 0)
+	res := e.Execute(context.Background(), LegSpec{l, inst, domain.Buy, 100.1, 0}, LegSpec{r, inst, domain.Sell, 100, 0}, 0.01, false, 0, 0)
 	if res.PosL != 0 || res.RescueOrders != 10 {
 		t.Fatalf("%+v", res)
 	}
@@ -229,7 +238,7 @@ func TestCloseCompletesLaggingLeg(t *testing.T) {
 	})
 	l.pos, r.pos = 0.01, -0.01
 	e := testExec(t, l, r)
-	res := e.Execute(context.Background(), LegSpec{l, inst, domain.Sell, 100}, LegSpec{r, inst, domain.Buy, 100.1}, 0.01, true, 0.01, -0.01)
+	res := e.Execute(context.Background(), LegSpec{l, inst, domain.Sell, 100, 0}, LegSpec{r, inst, domain.Buy, 100.1, 0}, 0.01, true, 0.01, -0.01)
 	if res.PosL != 0 || res.PosR != 0 || res.RescueOrders != 1 {
 		t.Fatalf("%+v", res)
 	}
@@ -255,7 +264,7 @@ func TestFlattenRecoversLateFillOnIdleLeg(t *testing.T) {
 	l.pos, r.pos = 0.01, -0.01
 	l.bumpAtRead, l.posBump = 2, -0.01
 	e := testExec(t, l, r)
-	res := e.Execute(context.Background(), LegSpec{l, inst, domain.Sell, 100}, LegSpec{r, inst, domain.Buy, 100.1}, 0.01, true, 0.01, -0.01)
+	res := e.Execute(context.Background(), LegSpec{l, inst, domain.Sell, 100, 0}, LegSpec{r, inst, domain.Buy, 100.1, 0}, 0.01, true, 0.01, -0.01)
 	if res.Err != nil || !res.SettlementKnown {
 		t.Fatalf("flatten should recover from the late fill: %+v", res)
 	}
@@ -284,7 +293,7 @@ func TestSilentVenueInferredFromPositions(t *testing.T) {
 	l, r := newFake("L", full), newFake("R", full)
 	l.silent = true
 	e := testExec(t, l, r)
-	res := e.Execute(context.Background(), LegSpec{l, inst, domain.Buy, 100.1}, LegSpec{r, inst, domain.Sell, 100}, 0.01, false, 0, 0)
+	res := e.Execute(context.Background(), LegSpec{l, inst, domain.Buy, 100.1, 0}, LegSpec{r, inst, domain.Sell, 100, 0}, 0.01, false, 0, 0)
 	if res.L.Resolved || res.L.Filled != 0.01 || res.RescueOrders != 0 {
 		t.Fatalf("%+v", res)
 	}
@@ -480,5 +489,75 @@ func TestTopUpPriceBounds(t *testing.T) {
 	}
 	if got := topUpPrice(LegSpec{Inst: i, Side: domain.Sell, Price: 100}, 25); got != 99.75 {
 		t.Fatalf("sell top-up price %v", got)
+	}
+}
+
+// TestTopUpConfirmsPositions locks the M1 fix: a stale position read after a
+// completion must retry through confirmPositions instead of shrinking a
+// completed leg into extra rescue orders.
+func TestTopUpConfirmsPositions(t *testing.T) {
+	lv := newFake("L", func(n int, r domain.OrderReq) float64 {
+		if n == 0 {
+			return 0.004 // first leg partially fills
+		}
+		return r.Qty // the completion order fills fully
+	})
+	rv := newFake("R", full)
+	// The first Positions read after the completion order (order 2 on L)
+	// returns the pre-completion position, simulating a slow exchange settle.
+	lv.staleAfterOrders, lv.stalePos = 2, 0.004
+	e := topUpExec(t, lv, rv)
+	e.cfg.SettleDelay, e.cfg.QueryInterval = 50*time.Millisecond, 50*time.Millisecond
+	res := e.Execute(context.Background(),
+		LegSpec{Venue: lv, Inst: topUpInst, Side: domain.Buy, Price: 100},
+		LegSpec{Venue: rv, Inst: topUpInst, Side: domain.Sell, Price: 101}, 0.01, false, 0, 0)
+	if res.Err != nil || !res.PositionsKnown || !res.SettlementKnown {
+		t.Fatalf("unsettled: %+v", res)
+	}
+	requireQty(t, res.PosL, 0.01)
+	requireQty(t, res.PosR, -0.01)
+	if res.RescueOrders != 0 {
+		t.Fatalf("stale read produced rescue orders: %+v", res)
+	}
+	if len(lv.orders) != 2 {
+		t.Fatalf("completion order missing: %+v", lv.orders)
+	}
+}
+
+// TestCompleteStepMarginalGate locks the M1 marginal check: a completion that
+// would consume the opening's whole edge is skipped before any order goes out.
+func TestCompleteStepMarginalGate(t *testing.T) {
+	lv := newFake("L", full)
+	e := NewExecutor(DefaultConfig(), nil, NewIDGen(), nil, nil, nil, func(string) {})
+	e.cfg.TopUpBps = 25
+	l := LegSpec{Inst: topUpInst, Side: domain.Buy, Price: 100, MarginBps: 20} // 25bps top-up >= 20bps edge
+	r := LegSpec{Inst: topUpInst, Side: domain.Sell, Price: 101}
+	res := &Result{L: LegResult{Filled: 0.004, AvgPrice: 100}, R: LegResult{Filled: 0.01, AvgPrice: 101}}
+	completed, _, _, err := e.completeStep(context.Background(), l, r, 0.01, 0, 0, 0.004, -0.01, 0, res)
+	if err != nil || completed {
+		t.Fatalf("marginal gate did not skip completion: completed=%v err=%v", completed, err)
+	}
+	if len(lv.orders) != 0 {
+		t.Fatalf("marginal gate submitted orders: %+v", lv.orders)
+	}
+}
+
+// TestCompleteStepBudgetGate locks the M1 budget check: a completion whose
+// notional would exceed the opening reservation is skipped.
+func TestCompleteStepBudgetGate(t *testing.T) {
+	lv := newFake("L", full)
+	e := NewExecutor(DefaultConfig(), nil, NewIDGen(), nil, nil, nil, func(string) {})
+	e.cfg.TopUpBps = 25
+	l := LegSpec{Inst: topUpInst, Side: domain.Buy, Price: 100}
+	r := LegSpec{Inst: topUpInst, Side: domain.Sell, Price: 101}
+	res := &Result{L: LegResult{Filled: 0.004, AvgPrice: 100}, R: LegResult{Filled: 0.01, AvgPrice: 101}}
+	// Opened notional is 0.004*100 + 0.01*101 = 1.41; budget 1.5 leaves no
+	// room for the 0.006 completion at ~100.25.
+	completed, _, _, err := e.completeStep(context.Background(), l, r, 0.01, 0, 0, 0.004, -0.01, 1.5, res)
+	if err != nil || completed {
+		t.Fatalf("budget gate did not skip completion: completed=%v err=%v", completed, err)
+	}
+	if len(lv.orders) != 0 {
+		t.Fatalf("budget gate submitted orders: %+v", lv.orders)
 	}
 }

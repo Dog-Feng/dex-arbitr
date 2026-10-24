@@ -9,7 +9,9 @@ import (
 	"errors"
 	"flag"
 	"log/slog"
+	"math"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/Dog-Feng/dex-arbitr/internal/config"
@@ -33,6 +35,15 @@ func main() {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, nil)))
 	if *amount == "" {
 		slog.Error("flags", "err", "amount is required")
+		os.Exit(2)
+	}
+	amt, err := strconv.ParseFloat(*amount, 64)
+	if err != nil || math.IsNaN(amt) || math.IsInf(amt, 0) || amt <= 0 {
+		slog.Error("flags", "err", "amount must be a finite positive decimal number")
+		os.Exit(2)
+	}
+	if math.Abs(amt-math.Round(amt*1e6)/1e6) > 1e-9 {
+		slog.Error("flags", "err", "amount exceeds USDC precision (6 decimals)")
 		os.Exit(2)
 	}
 	c, err := config.Load(*cfgPath)

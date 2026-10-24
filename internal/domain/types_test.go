@@ -91,3 +91,29 @@ func TestDecimalRoundingStaysConservativeAndIdempotent(t *testing.T) {
 		}
 	}
 }
+
+// TestTickAt pins the significant-figure price grid: Hyperliquid allows 5 sig
+// figs with integer prices always representable, and unlimited venues keep the
+// full price-decimals tick.
+func TestTickAt(t *testing.T) {
+	cases := []struct {
+		name string
+		inst Instrument
+		px   float64
+		want float64
+	}{
+		{"five sig figs at ~1960", Instrument{PriceDecimals: 3, SigFigs: 5}, 1960, 0.1},
+		{"five sig figs at ~19.6", Instrument{PriceDecimals: 3, SigFigs: 5}, 19.6, 0.001},
+		{"integer prices stay allowed", Instrument{PriceDecimals: 2, SigFigs: 5}, 101234.5, 1},
+		{"finer than precision falls back", Instrument{PriceDecimals: 3, SigFigs: 5}, 1.2, 0.001},
+		{"no limit uses full precision", Instrument{PriceDecimals: 3}, 1960, 0.001},
+		{"invalid price falls back", Instrument{PriceDecimals: 3, SigFigs: 5}, 0, 0.001},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.inst.TickAt(tc.px); got != tc.want {
+				t.Fatalf("TickAt(%v) = %v, want %v", tc.px, got, tc.want)
+			}
+		})
+	}
+}

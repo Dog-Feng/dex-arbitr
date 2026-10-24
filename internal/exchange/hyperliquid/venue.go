@@ -97,9 +97,20 @@ type Venue struct {
 	staleSeen map[int64]time.Time
 
 	lastNonce atomic.Int64
-	sendMu    chan struct{}
-	closed    atomic.Bool
-	closeDone chan struct{}
+	// orderSendMu serializes order submissions; auxSendMu serializes cancels
+	// and leverage updates on a separate queue, so an urgent cancel is never
+	// stuck behind a slow order send.
+	orderSendMu chan struct{}
+	auxSendMu   chan struct{}
+	closed      atomic.Bool
+	closeDone   chan struct{}
+	// cleanupDone closes when the cleanup goroutine exits, so Close can join it.
+	cleanupDone chan struct{}
+	// backfillCtx bounds in-flight fill backfills; Close cancels it and
+	// backfills waits for every backfill goroutine to finish.
+	backfillCtx    context.Context
+	backfillCancel context.CancelFunc
+	backfills      sync.WaitGroup
 }
 
 // fillState accumulates the fill facts of one order. Every trade is deduped
@@ -246,8 +257,11 @@ func NewWithConfig(cfg Config) (*Venue, error) {
 		pendingFills: map[int64][]pendingFill{}, finalTouched: map[int64]time.Time{},
 		staleSeen: map[int64]time.Time{},
 		maxLev:    map[int]int{}, warnedCoins: map[string]time.Time{},
-		sendMu: make(chan struct{}, 1), closeDone: make(chan struct{}),
+		orderSendMu: make(chan struct{}, 1), auxSendMu: make(chan struct{}, 1),
+		closeDone:   make(chan struct{}),
+		cleanupDone: make(chan struct{}),
 	}
+	v.backfillCtx, v.backfillCancel = context.WithCancel(context.Background())
 	if cfg.AgentKey != "" {
 		s, err := newSigner(cfg.AgentKey)
 		if err != nil {
@@ -287,13 +301,17 @@ func signingMainnet(network, exchangeURL string) (bool, error) {
 func (v *Venue) Name() string   { return v.cfg.Name }
 func (v *Venue) CanTrade() bool { return v.signer != nil && v.cfg.Account != "" }
 
-// Close stops websocket loops and consumer channels.
+// Close stops websocket loops, consumer channels and background goroutines.
+// cleanupLoop and any in-flight fill backfills are joined before it returns.
 func (v *Venue) Close() error {
 	if !v.closed.CompareAndSwap(false, true) {
 		<-v.closeDone
 		return nil
 	}
-	defer close(v.closeDone)
+	// Signal every close-aware goroutine first: cleanupLoop wakes, in-flight
+	// backfills are canceled, and a concurrent second Close unblocks.
+	close(v.closeDone)
+	v.backfillCancel()
 	v.ws.close()
 	v.booksMu.Lock()
 	for _, bs := range v.books {
@@ -309,6 +327,8 @@ func (v *Venue) Close() error {
 	}
 	v.orderSubs = nil
 	v.ordersMu.Unlock()
+	v.backfills.Wait()
+	<-v.cleanupDone
 	return nil
 }
 
@@ -376,6 +396,9 @@ func (v *Venue) Instruments(ctx context.Context) ([]domain.Instrument, error) {
 			Venue: v.cfg.Name, Symbol: sym, MarketID: id,
 			SizeDecimals: m.SzDecimals, PriceDecimals: priceDecimals,
 			MinBase: 0, MinQuote: 10, TakerFee: taker, MakerFee: maker,
+			// Perp prices carry at most 5 significant figures; integer prices
+			// are always representable (see Instrument.TickAt).
+			SigFigs: 5,
 		})
 	}
 	return out, nil
@@ -449,10 +472,12 @@ func (v *Venue) SubscribeBook(ctx context.Context, inst domain.Instrument) (<-ch
 	}
 	v.booksMu.Unlock()
 	if !ok {
-		// fast:true delivers 5 levels per side per block (~0.5s) instead of
-		// the throttled 20-level feed (~5s). The bbo feed refreshes the top
-		// level even faster (~0.4s) and is merged into the same book state.
-		v.ws.subscribe("l2Book/"+coin, map[string]any{"type": "l2Book", "coin": coin, "fast": true})
+		// The regular l2Book subscription pushes the full book (BookDepth
+		// levels) on change; the bbo feed refreshes the top level between
+		// pushes (~0.4s) and is merged into the same book state, so the top
+		// never goes stale in quiet markets while deeper levels keep the
+		// configured depth.
+		v.ws.subscribe("l2Book/"+coin, map[string]any{"type": "l2Book", "coin": coin})
 		v.ws.subscribe("bbo/"+coin, map[string]any{"type": "bbo", "coin": coin})
 	}
 	go func() {
@@ -485,15 +510,20 @@ type bookState struct {
 	updated  time.Time
 }
 
+// snapshot copies the top depth levels so a published Book never aliases the
+// live book state. The bbo feed mutates the state afterwards; sharing the
+// backing array would let those writes tear a book a consumer is reading.
 func (bs *bookState) snapshot(venue string) domain.Book {
-	bids := bs.bids
-	if bs.depth > 0 && len(bids) > bs.depth {
-		bids = bids[:bs.depth]
+	n := len(bs.bids)
+	if bs.depth > 0 && n > bs.depth {
+		n = bs.depth
 	}
-	asks := bs.asks
-	if bs.depth > 0 && len(asks) > bs.depth {
-		asks = asks[:bs.depth]
+	bids := append([]domain.Level(nil), bs.bids[:n]...)
+	m := len(bs.asks)
+	if bs.depth > 0 && m > bs.depth {
+		m = bs.depth
 	}
+	asks := append([]domain.Level(nil), bs.asks[:m]...)
 	return domain.Book{Venue: venue, MarketID: bs.marketID, Bids: bids, Asks: asks, Seq: bs.seq, Ts: bs.updated}
 }
 
@@ -600,6 +630,10 @@ func (v *Venue) onBbo(raw []byte) {
 	if bs == nil || !bs.synced {
 		return // wait for the first full snapshot
 	}
+	// A bbo older than the current state regresses the book; drop it.
+	if m.Data.Time < bs.seq {
+		return
+	}
 	topBid, haveBid := domain.Level{}, false
 	if len(bs.bids) > 0 {
 		topBid, haveBid = bs.bids[0], true
@@ -621,19 +655,33 @@ func (v *Venue) onBbo(raw []byte) {
 		if len(bs.bids) == 0 {
 			bs.bids = []domain.Level{topBid}
 		} else {
-			bs.bids[0] = topBid
+			bs.bids = mergeBboTop(bs.bids, topBid, true)
 		}
 	}
 	if askErr == nil {
 		if len(bs.asks) == 0 {
 			bs.asks = []domain.Level{topAsk}
 		} else {
-			bs.asks[0] = topAsk
+			bs.asks = mergeBboTop(bs.asks, topAsk, false)
 		}
 	}
 	bs.seq = m.Data.Time
 	bs.updated = time.Now()
 	v.publishBook(bs, bs.snapshot(v.cfg.Name))
+}
+
+// mergeBboTop replaces the top level with the fresh bbo top and drops older
+// levels the new top has crossed or met, keeping every published book strictly
+// ordered. It builds a new slice so snapshots already handed out stay intact.
+func mergeBboTop(levels []domain.Level, top domain.Level, bid bool) []domain.Level {
+	out := make([]domain.Level, 0, len(levels)+1)
+	out = append(out, top)
+	for _, lv := range levels {
+		if bid && lv.Price < top.Price || !bid && lv.Price > top.Price {
+			out = append(out, lv)
+		}
+	}
+	return out
 }
 
 func parseBboLevel(l struct {
@@ -767,8 +815,9 @@ func (v *Venue) onOrderUpdate(raw []byte) {
 		// A filled or partially-filled canceled order whose fills have not
 		// been observed yet must resolve through the fill backfill; a
 		// zero-size terminal report would desync the executor's position
-		// accounting.
-		publishNow := status == domain.StatusRejected ||
+		// accounting. A resting (open) order publishes a non-terminal update
+		// so the executor sees the acceptance even if no fill ever arrives.
+		publishNow := status == domain.StatusRejected || status == domain.StatusOpen ||
 			(status.Terminal() && aggQty > 0)
 		if publishNow {
 			status = partialIOC(status, aggQty, v.orderOrig[u.Order.Oid])
@@ -779,9 +828,22 @@ func (v *Venue) onOrderUpdate(raw []byte) {
 			})
 		}
 		v.ordersMu.Unlock()
-		if (status == domain.StatusFilled || status == domain.StatusCanceled) && aggQty == 0 {
+		if status == domain.StatusUnknown && u.Status != "" {
+			// An unmapped status must not silently look like "never heard of
+			// it": warn and verify through REST so a new exchange-side status
+			// code resolves instead of parking the order forever.
+			slog.Warn("unmapped order status; verifying via REST", "venue", v.cfg.Name, "oid", u.Order.Oid, "status", u.Status)
+			v.verifyOrder(cid, u.Order.Oid, u.Order.Coin)
+		}
+		if (status == domain.StatusFilled || status == domain.StatusCanceled) && aggQty == 0 && !v.closed.Load() {
 			// Late fill aggregation: fetch fills once for the terminal oid.
-			go v.backfillFills(u.Order.Oid, cid, u.StatusTimestamp, status, orig)
+			// The goroutine is tracked and canceled by Close, so a venue
+			// shutdown never leaves an orphaned REST backfill behind.
+			v.backfills.Add(1)
+			go func() {
+				defer v.backfills.Done()
+				v.backfillFills(u.Order.Oid, cid, u.StatusTimestamp, status, orig)
+			}()
 		}
 	}
 }
@@ -890,11 +952,67 @@ func (v *Venue) publishOrder(u domain.OrderUpdate) {
 		case c <- u:
 		default:
 			slog.Warn("order update dropped (slow consumer)", "venue", v.cfg.Name, "cid", u.ClientID)
+			v.republishLater(u)
 		}
 	}
 	if u.Status.Terminal() && u.OrderIndex > 0 {
 		v.finalTouched[u.OrderIndex] = time.Now()
 	}
+}
+
+// republishLater retries a dropped terminal update once after a short delay,
+// so a momentary slow consumer cannot lose a terminal outcome. The goroutine
+// is tracked like the fill backfill and canceled by Close.
+func (v *Venue) republishLater(u domain.OrderUpdate) {
+	if !u.Status.Terminal() || v.closed.Load() {
+		return
+	}
+	v.backfills.Add(1)
+	go func() {
+		defer v.backfills.Done()
+		select {
+		case <-time.After(2 * time.Second):
+		case <-v.backfillCtx.Done():
+			return
+		}
+		v.ordersMu.Lock()
+		defer v.ordersMu.Unlock()
+		for _, c := range v.orderSubs {
+			select {
+			case c <- u:
+			default:
+				slog.Warn("order update dropped again (slow consumer)", "venue", v.cfg.Name, "cid", u.ClientID)
+			}
+		}
+	}()
+}
+
+// verifyOrder re-queries an order through REST after an unmapped WS status.
+// The executor's QueryOrder fallback would surface it too; resolving it here
+// keeps the venue's own subscribers consistent without another round trip.
+func (v *Venue) verifyOrder(cid, oid int64, coin string) {
+	if v.cfg.Account == "" || v.closed.Load() {
+		return
+	}
+	id, ok := v.assetForCoin(coin)
+	if !ok {
+		return
+	}
+	v.backfills.Add(1)
+	go func() {
+		defer v.backfills.Done()
+		ctx, cancel := context.WithTimeout(v.backfillCtx, 5*time.Second)
+		defer cancel()
+		u, err := v.QueryOrder(ctx, domain.Instrument{MarketID: id}, cid)
+		if err != nil || u.Status == domain.StatusUnknown {
+			return
+		}
+		u.OrderIndex = oid
+		u.Venue = v.cfg.Name
+		v.ordersMu.Lock()
+		defer v.ordersMu.Unlock()
+		v.publishOrder(u)
+	}()
 }
 
 // markFinal records a terminal status and starts its retention window. A
@@ -914,7 +1032,7 @@ func (v *Venue) backfillFills(oid, cid int64, statusTs int64, status domain.Orde
 	if v.cfg.Account == "" {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(v.backfillCtx, 5*time.Second)
 	defer cancel()
 	end := time.Now().UnixMilli() + 2000
 	fills, err := v.rest.fillsByTime(ctx, v.cfg.Account, statusTs-1000, end)
@@ -1004,8 +1122,7 @@ func (v *Venue) SubscribeOrders(ctx context.Context) (<-chan domain.OrderUpdate,
 	return ch, nil
 }
 
-// Position returns the pair's position on marketID and the venue's total
-// notional aggregated across all markets.
+// Positions returns every perp position of the account from one snapshot read.
 func (v *Venue) Positions(ctx context.Context) ([]domain.Position, error) {
 	snapshot, err := v.AccountSnapshot(ctx)
 	if err != nil {
@@ -1028,6 +1145,7 @@ func (v *Venue) AccountSnapshot(ctx context.Context) (domain.AccountSnapshot, er
 	}
 	var snapshot domain.AccountSnapshot
 	seen := map[string]bool{}
+	var unrealized float64
 	for _, ap := range ch.AssetPositions {
 		coin := ap.Position.Coin
 		if seen[coin] {
@@ -1067,6 +1185,9 @@ func (v *Venue) AccountSnapshot(ctx context.Context) (domain.AccountSnapshot, er
 		if err != nil || notional < 0 {
 			notional = 0
 		}
+		if u, err := number(ap.Position.UnrealizedPnl); err == nil {
+			unrealized += u
+		}
 		mode := domain.MarginIsolated
 		if ap.Position.Leverage.Type == "cross" {
 			mode = domain.MarginCross
@@ -1092,30 +1213,36 @@ func (v *Venue) AccountSnapshot(ctx context.Context) (domain.AccountSnapshot, er
 			break
 		}
 	}
-	// The per-dex account value feeds the minute reconciliation log. Use the
-	// margin summary first and the cross summary as a fallback for dexes that
-	// report account value only there.
-	if v, err := number(ch.MarginSummary.AccountValue); err == nil && v > 0 {
-		snapshot.AccountValue = v
-	} else if v, err := number(ch.CrossMarginSummary.AccountValue); err == nil && v > 0 {
-		snapshot.AccountValue = v
-	}
-	// Spot USDC lives in a separate pool from perp collateral but belongs to
-	// the same account. Adding it makes the reported account value match the
-	// exchange UI, where spot and perp values are shown combined.
+	// The account value feeds the minute reconciliation log and must match the
+	// exchange UI's "账户权益" (account equity). Under the unified account the
+	// collateral of builder perps (io) stays in the spot USDC balance while the
+	// dex-level marginSummary.accountValue reports only the position's own
+	// equity — adding the two double counts the margin. The UI equity is the
+	// spot USDC plus the unrealized PnL of open positions; accounts that hold
+	// their collateral in the perp account (spot total 0) fall back to the dex
+	// margin summary.
+	spotTotal := 0.0
 	spot, err := v.rest.spotClearinghouse(ctx, v.cfg.Account)
 	if err != nil {
-		slog.Debug("spot clearinghouse unavailable", "venue", v.cfg.Name, "err", err)
+		slog.Warn("spot clearinghouse unavailable; equity excludes spot balances", "venue", v.cfg.Name, "err", err)
 	} else {
 		for _, b := range spot.Balances {
 			if b.Coin != "USDC" {
 				continue
 			}
 			if total, err := number(b.Total); err == nil && total > 0 {
-				snapshot.AccountValue += total
+				spotTotal = total
 			}
 			break
 		}
+	}
+	if spotTotal > 0 {
+		snapshot.SpotValue = spotTotal
+		snapshot.AccountValue = spotTotal + unrealized
+	} else if v, err := number(ch.MarginSummary.AccountValue); err == nil && v > 0 {
+		snapshot.AccountValue = v
+	} else if v, err := number(ch.CrossMarginSummary.AccountValue); err == nil && v > 0 {
+		snapshot.AccountValue = v
 	}
 	return snapshot, nil
 }
@@ -1202,6 +1329,7 @@ func (v *Venue) warnCoinOnce(coin string) {
 // cleanupLoop periodically drops per-order state once a terminal outcome has
 // been published long enough to cover every query and recovery window.
 func (v *Venue) cleanupLoop() {
+	defer close(v.cleanupDone)
 	t := time.NewTicker(time.Minute)
 	defer t.Stop()
 	for {

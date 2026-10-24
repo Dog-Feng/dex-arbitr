@@ -109,6 +109,9 @@ auto:                       # only used when strategy.pair_selection = auto
 
 execution:
   price_ticks: 30      # fixed IOC allowance; fallback while sigma is not ready
+  # tick 单位：lighter 腿为 PriceDecimals 最小变动；hyperliquid 腿按 5 位
+  # 有效数字规则在决策价格处取有效 tick（整数价格始终可表示，例如 ANTH
+  # ~1960 处 1 tick = 0.1），救援阶梯与动态让价均使用同一有效 tick。
   dynamic_ticks: true  # scale the allowance by sigma (volatility.horizon)
   tick_k: 2.5          # one-sided coverage coefficient (leg-price vol); calibrate by replay
   min_ticks: 1

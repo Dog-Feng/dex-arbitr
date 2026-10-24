@@ -129,7 +129,10 @@ func TestOnBbo(t *testing.T) {
 	}
 	v.books[200001] = bs
 	v.onBbo([]byte(`{"channel":"bbo","data":{"coin":"io:ANTH","time":1754450974231,"bbo":[{"px":"1963.35","sz":"2.0","n":3},{"px":"1963.45","sz":"0.002","n":1}]}}`))
-	if bs.bids[0].Price != 1963.35 || bs.bids[0].Size != 2.0 || len(bs.bids) != 2 || bs.bids[1].Price != 1963.2 {
+	// The new top replaces the old one; deeper levels the top did not cross
+	// are retained, so the book stays strictly ordered and full.
+	if bs.bids[0].Price != 1963.35 || bs.bids[0].Size != 2.0 || len(bs.bids) != 3 ||
+		bs.bids[1].Price != 1963.3 || bs.bids[2].Price != 1963.2 {
 		t.Fatalf("bids after bbo: %+v", bs.bids)
 	}
 	if bs.asks[0].Price != 1963.45 || bs.asks[0].Size != 0.002 || len(bs.asks) != 1 {
@@ -196,6 +199,7 @@ func TestSigFigTighten(t *testing.T) {
 		{12.34, 2, true, 12.34},      // few sig figs: grid finer than precision
 		{0.0012345, 6, true, 0.001234},
 		{100000.0, 0, false, 100000.0},
+		{101234.5, 1, true, 101234}, // integer prices are allowed: never truncate units
 	}
 	for _, tc := range cases {
 		if got := sigFigTighten(tc.in, tc.dec, tc.buy); got != tc.want {
@@ -447,5 +451,246 @@ func TestSigningMainnet(t *testing.T) {
 				t.Fatalf("signingMainnet(%q, %q) = %v, want %v", tc.network, tc.exchangeURL, got, tc.want)
 			}
 		})
+	}
+}
+
+// bboVenue builds a venue whose io:ANTH book is seeded with the given levels.
+func bboVenue(t *testing.T, bids, asks []domain.Level) (*Venue, *bookState) {
+	t.Helper()
+	v, err := NewWithConfig(Config{
+		Name: "entropy", Dex: "io", InfoURL: "https://example.invalid/info",
+		ExchangeURL: "https://example.invalid/exchange", WSURL: "wss://example.invalid/ws", BookDepth: 5,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	v.assetsMu.Lock()
+	v.assets["io:ANTH"] = 200001
+	v.assetsMu.Unlock()
+	bs := &bookState{marketID: 200001, depth: 5, synced: true, bids: bids, asks: asks,
+		seq: 1754450974231, updated: time.Now()}
+	v.books[200001] = bs
+	return v, bs
+}
+
+// TestOnBboPrunesCrossedLevels locks the H2 level-ordering fix: a new top that
+// crossed deeper levels removes them, so the book stays strictly ordered.
+func TestOnBboPrunesCrossedLevels(t *testing.T) {
+	v, bs := bboVenue(t,
+		[]domain.Level{{Price: 100, Size: 1}, {Price: 99.9, Size: 2}, {Price: 99.8, Size: 3}},
+		[]domain.Level{{Price: 100.1, Size: 1}, {Price: 100.2, Size: 2}})
+	v.onBbo([]byte(`{"channel":"bbo","data":{"coin":"io:ANTH","time":1754450974400,"bbo":[{"px":"99.85","sz":"1.5"},{"px":"100.35","sz":"0.5"}]}}`))
+	if len(bs.bids) != 2 || bs.bids[0].Price != 99.85 || bs.bids[1].Price != 99.8 {
+		t.Fatalf("bids not pruned to ordered levels: %+v", bs.bids)
+	}
+	if len(bs.asks) != 1 || bs.asks[0].Price != 100.35 {
+		t.Fatalf("asks not pruned to ordered levels: %+v", bs.asks)
+	}
+}
+
+// TestStaleBboDropped locks the H2 time-order fix: a bbo older than the book
+// state must not regress it.
+func TestStaleBboDropped(t *testing.T) {
+	v, bs := bboVenue(t,
+		[]domain.Level{{Price: 100, Size: 1}},
+		[]domain.Level{{Price: 100.1, Size: 1}})
+	v.onBbo([]byte(`{"channel":"bbo","data":{"coin":"io:ANTH","time":1754450974000,"bbo":[{"px":"99.9","sz":"1.5"},{"px":"100.05","sz":"0.5"}]}}`))
+	if bs.bids[0].Price != 100 || bs.seq != 1754450974231 {
+		t.Fatalf("stale bbo applied: %+v seq=%d", bs.bids, bs.seq)
+	}
+}
+
+// TestPublishedBookImmutable locks the H2 deep-copy fix: a snapshot handed out
+// before a bbo update keeps its original levels.
+func TestPublishedBookImmutable(t *testing.T) {
+	v, bs := bboVenue(t,
+		[]domain.Level{{Price: 100, Size: 1}, {Price: 99.9, Size: 2}},
+		[]domain.Level{{Price: 100.1, Size: 1}})
+	before := bs.snapshot("entropy")
+	v.onBbo([]byte(`{"channel":"bbo","data":{"coin":"io:ANTH","time":1754450974400,"bbo":[{"px":"99.85","sz":"1.5"},{"px":"100.15","sz":"0.5"}]}}`))
+	if before.Bids[0].Price != 100 || before.Bids[1].Price != 99.9 || before.Asks[0].Price != 100.1 {
+		t.Fatalf("published book mutated by bbo: %+v", before.Bids)
+	}
+	if bs.bids[0].Price != 99.85 {
+		t.Fatalf("live book not updated: %+v", bs.bids)
+	}
+}
+
+// TestBboConcurrentRead exercises the bbo writer against concurrent snapshot
+// readers; the race detector verifies published books never alias live state.
+func TestBboConcurrentRead(t *testing.T) {
+	v, bs := bboVenue(t,
+		[]domain.Level{{Price: 100, Size: 1}, {Price: 99.9, Size: 2}},
+		[]domain.Level{{Price: 100.1, Size: 1}, {Price: 100.2, Size: 2}})
+	done := make(chan struct{})
+	payload := []byte(`{"channel":"bbo","data":{"coin":"io:ANTH","time":1754450974400,"bbo":[{"px":"99.85","sz":"1.5"},{"px":"100.15","sz":"0.5"}]}}`)
+	go func() {
+		defer close(done)
+		for i := 0; i < 200; i++ {
+			v.onBbo(payload)
+		}
+	}()
+	for i := 0; i < 200; i++ {
+		v.booksMu.Lock()
+		b := bs.snapshot("entropy")
+		v.booksMu.Unlock()
+		if len(b.Bids) == 0 || b.Bids[0].Price <= 0 {
+			t.Fatalf("torn read: %+v", b.Bids)
+		}
+		if b.Bids[0].Price >= b.Asks[0].Price {
+			t.Fatalf("crossed read: %+v", b)
+		}
+	}
+	<-done
+}
+
+// TestCancelAlreadyTerminalIsIdempotent locks the L2 fix: canceling an order
+// the exchange already terminated is a successful no-op, not an error.
+func TestCancelAlreadyTerminalIsIdempotent(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode: %v", err)
+			return
+		}
+		if _, isAction := req["action"]; isAction {
+			_, _ = w.Write([]byte(`{"status":"err","response":"Order was never placed, already canceled, or filled."}`))
+			return
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	t.Cleanup(srv.Close)
+	v, err := NewWithConfig(Config{
+		Name: "entropy", Dex: "io", InfoURL: srv.URL, ExchangeURL: srv.URL,
+		WSURL: "wss://example.invalid/ws", Account: testAccount, BookDepth: 5,
+		AgentKey: "0x1111111111111111111111111111111111111111111111111111111111111111",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := v.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}()
+	inst := domain.Instrument{MarketID: 200001, PriceDecimals: 3, SizeDecimals: 3}
+	if err := v.CancelOrder(context.Background(), inst, 7); err != nil {
+		t.Fatalf("idempotent cancel of an already-terminal order failed: %v", err)
+	}
+}
+
+// TestAccountSnapshotDelistedCoin locks the M5 fix: a position on a delisted
+// or unknown coin keeps the snapshot valid, contributes its notional, and is
+// attributed a reserved negative market id.
+func TestAccountSnapshotDelistedCoin(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode: %v", err)
+			return
+		}
+		switch req["type"] {
+		case "perpDexs":
+			_, _ = w.Write([]byte(`[null,{"name":"xyz"},null,null,null,null,null,null,null,null,{"name":"io"}]`))
+		case "meta":
+			_, _ = w.Write([]byte(`{"universe":[
+				{"szDecimals":3,"name":"io:ANTH","maxLeverage":6,"onlyIsolated":true,"marginMode":"strictIsolated","growthMode":"enabled","deployerFeeScale":"1.0"},
+				{"szDecimals":2,"name":"io:SBE","maxLeverage":6,"onlyIsolated":true,"isDelisted":true,"marginMode":"strictIsolated","deployerFeeScale":"1.0"}
+			]}`))
+		case "clearinghouseState":
+			_, _ = w.Write([]byte(`{"assetPositions":[
+				{"position":{"coin":"io:SBE","szi":"1","entryPx":"5","liquidationPx":"6","positionValue":"5","unrealizedPnl":"0.5","leverage":{"type":"isolated"}}},
+				{"position":{"coin":"io:GHOST","szi":"2","entryPx":"0","liquidationPx":"0","positionValue":"10","unrealizedPnl":"1.5","leverage":{"type":"isolated"}}}],
+				"marginSummary":{"accountValue":"80"},"crossMarginSummary":{"accountValue":"80"}}`))
+		case "spotClearinghouseState":
+			_, _ = w.Write([]byte(`{"balances":[{"coin":"USDC","total":"50"}]}`))
+		default:
+			t.Errorf("unexpected info request: %v", req["type"])
+		}
+	}))
+	t.Cleanup(srv.Close)
+	v, err := NewWithConfig(Config{
+		Name: "entropy", Dex: "io", InfoURL: srv.URL, ExchangeURL: srv.URL,
+		WSURL: "wss://example.invalid/ws", Account: testAccount, BookDepth: 5,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := v.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}()
+	snap, err := v.AccountSnapshot(context.Background())
+	if err != nil {
+		t.Fatalf("snapshot with delisted position failed: %v", err)
+	}
+	// The delisted but known coin keeps its real market id and valid data.
+	sbeOK := false
+	ghostOK := false
+	for _, p := range snap.Positions {
+		if p.MarketID == 200001 && p.Symbol == "SBE" && p.Qty == 1 {
+			sbeOK = true
+		}
+		if p.MarketID == -1 && p.Symbol == "GHOST" && p.Qty == 2 && p.Notional == 10 {
+			ghostOK = true
+		}
+	}
+	if !sbeOK {
+		t.Fatalf("delisted-but-known position lost: %+v", snap.Positions)
+	}
+	if !ghostOK {
+		t.Fatalf("unknown position not attributed with reserved id: %+v", snap.Positions)
+	}
+	// Unified-account equity: spot USDC 50 + unrealized 0.5 + 1.5. The dex
+	// marginSummary accountValue (80) must NOT be added on top.
+	if math.Abs(snap.AccountValue-52) > 1e-9 {
+		t.Fatalf("account value = %v, want 52 (spot 50 + unrealized 2)", snap.AccountValue)
+	}
+}
+
+// TestAccountSnapshotFallsBackToMarginSummary locks the classic-account path:
+// with no spot USDC, the dex margin summary is the account equity.
+func TestAccountSnapshotFallsBackToMarginSummary(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode: %v", err)
+			return
+		}
+		switch req["type"] {
+		case "perpDexs":
+			_, _ = w.Write([]byte(`[null,{"name":"xyz"},null,null,null,null,null,null,null,null,{"name":"io"}]`))
+		case "meta":
+			_, _ = w.Write([]byte(`{"universe":[
+				{"szDecimals":3,"name":"io:ANTH","maxLeverage":6,"onlyIsolated":true,"marginMode":"strictIsolated","growthMode":"enabled","deployerFeeScale":"1.0"}
+			]}`))
+		case "clearinghouseState":
+			_, _ = w.Write([]byte(`{"assetPositions":[],"marginSummary":{"accountValue":"80"},"crossMarginSummary":{"accountValue":"80"}}`))
+		case "spotClearinghouseState":
+			_, _ = w.Write([]byte(`{"balances":[{"coin":"USDC","total":"0"}]}`))
+		default:
+			t.Errorf("unexpected info request: %v", req["type"])
+		}
+	}))
+	t.Cleanup(srv.Close)
+	v, err := NewWithConfig(Config{
+		Name: "entropy", Dex: "io", InfoURL: srv.URL, ExchangeURL: srv.URL,
+		WSURL: "wss://example.invalid/ws", Account: testAccount, BookDepth: 5,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := v.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}()
+	snap, err := v.AccountSnapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if math.Abs(snap.AccountValue-80) > 1e-9 {
+		t.Fatalf("account value = %v, want 80 (margin summary fallback)", snap.AccountValue)
 	}
 }
