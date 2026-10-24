@@ -900,8 +900,23 @@ func (a *PairActor) logAccountRecon() {
 	unrealL, unrealR, total, deltaTotal, deltaUnreal, deltaRealized, funding, next :=
 		computeRecon(snap, markL, markR, a.volAcc.pnlUSD, a.reconLast, a.reconInit)
 	a.reconLast, a.reconInit = next, true
+	recon := monitor.AccountRecon{
+		QtyL:           monitor.Fixed8(snap.QtyL),
+		QtyR:           monitor.Fixed8(snap.QtyR),
+		EquityL:        monitor.Fixed4(snap.EquityL),
+		EquityR:        monitor.Fixed4(snap.EquityR),
+		TotalEquity:    monitor.Fixed4(total),
+		UnrealL:        monitor.Fixed4(unrealL),
+		UnrealR:        monitor.Fixed4(unrealR),
+		UnrealTotal:    monitor.Fixed4(unrealL + unrealR),
+		LedgerRealized: monitor.Fixed4(a.volAcc.pnlUSD),
+		DeltaTotal:     monitor.Fixed4(deltaTotal),
+		DeltaUnreal:    monitor.Fixed4(deltaUnreal),
+		DeltaRealized:  monitor.Fixed4(deltaRealized),
+		FundingEst:     monitor.Fixed4(funding),
+	}
+	a.record(monitor.KindAccountRecon, func(e *monitor.Event) { e.Recon = &recon })
 	a.log.Info("account_recon",
-		"pair", a.key, "L", a.cfg.L.Name(), "R", a.cfg.R.Name(),
 		"qty_l", strconv.FormatFloat(snap.QtyL, 'f', 8, 64),
 		"qty_r", strconv.FormatFloat(snap.QtyR, 'f', 8, 64),
 		"equity_l", strconv.FormatFloat(snap.EquityL, 'f', 4, 64),

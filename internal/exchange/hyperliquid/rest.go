@@ -181,6 +181,17 @@ type clearinghouseState struct {
 	CrossMaintenanceMarginUsed json.Number `json:"crossMaintenanceMarginUsed"`
 }
 
+// spotClearinghouseState is the subset of the spot account summary used for
+// the reconciliation account value: the USDC spot balance of the main account.
+type spotClearinghouseState struct {
+	Balances []struct {
+		Coin  string      `json:"coin"`
+		Token int         `json:"token"`
+		Total json.Number `json:"total"`
+		Hold  json.Number `json:"hold"`
+	} `json:"balances"`
+}
+
 func (r *restClient) clearinghouse(ctx context.Context, user, dex string) (clearinghouseState, error) {
 	req := map[string]any{"type": "clearinghouseState", "user": strings.ToLower(user)}
 	if dex != "" {
@@ -193,6 +204,21 @@ func (r *restClient) clearinghouse(ctx context.Context, user, dex string) (clear
 	var out clearinghouseState
 	if err := json.Unmarshal(raw, &out); err != nil {
 		return clearinghouseState{}, fmt.Errorf("clearinghouseState: invalid JSON: %w", err)
+	}
+	return out, nil
+}
+
+// spotClearinghouse returns the main-account spot balances. Spot and perp
+// collateral are separate pools; the spot USDC total feeds the reconciliation
+// log so account value matches what the exchange UI reports.
+func (r *restClient) spotClearinghouse(ctx context.Context, user string) (spotClearinghouseState, error) {
+	raw, err := r.postInfo(ctx, map[string]any{"type": "spotClearinghouseState", "user": strings.ToLower(user)})
+	if err != nil {
+		return spotClearinghouseState{}, err
+	}
+	var out spotClearinghouseState
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return spotClearinghouseState{}, fmt.Errorf("spotClearinghouseState: invalid JSON: %w", err)
 	}
 	return out, nil
 }

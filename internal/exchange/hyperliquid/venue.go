@@ -1100,6 +1100,23 @@ func (v *Venue) AccountSnapshot(ctx context.Context) (domain.AccountSnapshot, er
 	} else if v, err := number(ch.CrossMarginSummary.AccountValue); err == nil && v > 0 {
 		snapshot.AccountValue = v
 	}
+	// Spot USDC lives in a separate pool from perp collateral but belongs to
+	// the same account. Adding it makes the reported account value match the
+	// exchange UI, where spot and perp values are shown combined.
+	spot, err := v.rest.spotClearinghouse(ctx, v.cfg.Account)
+	if err != nil {
+		slog.Debug("spot clearinghouse unavailable", "venue", v.cfg.Name, "err", err)
+	} else {
+		for _, b := range spot.Balances {
+			if b.Coin != "USDC" {
+				continue
+			}
+			if total, err := number(b.Total); err == nil && total > 0 {
+				snapshot.AccountValue += total
+			}
+			break
+		}
+	}
 	return snapshot, nil
 }
 

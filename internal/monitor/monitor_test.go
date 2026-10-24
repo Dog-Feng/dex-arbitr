@@ -1,6 +1,7 @@
 package monitor
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -65,6 +66,63 @@ func TestMonitorPerPair(t *testing.T) {
 	}
 	if qqq, ok := g.Pairs["QQQ"]; !ok || qqq.Samples != 3600 || qqq.Ready {
 		t.Fatalf("QQQ pair warmup: %+v", g.Pairs["QQQ"])
+	}
+}
+
+func TestMonitorAccountRecon(t *testing.T) {
+	m := New(nil)
+	recon := func(pair string, eqL, eqR, qty float64) {
+		m.Record(Event{Kind: KindAccountRecon, Pair: pair, Recon: &AccountRecon{
+			QtyL: Fixed8(qty), QtyR: Fixed8(-qty),
+			EquityL: Fixed4(eqL), EquityR: Fixed4(eqR), TotalEquity: Fixed4(eqL + eqR),
+			UnrealL: Fixed4(0.1), UnrealR: Fixed4(-0.2), UnrealTotal: Fixed4(-0.1),
+			LedgerRealized: Fixed4(0.5), DeltaTotal: Fixed4(-0.01),
+			DeltaUnreal: Fixed4(-0.02), DeltaRealized: Fixed4(0.03), FundingEst: Fixed4(0.04),
+		}})
+	}
+	recon("SPY", 460.3810, 490.7875, 0.3)
+	recon("QQQ", 100.0, 200.0, 0.1)
+	g := m.Metrics()
+	spy, ok := g.Pairs["SPY"]
+	if !ok || spy.Account == nil {
+		t.Fatalf("SPY pair recon missing: %+v", g.Pairs["SPY"])
+	}
+	if float64(spy.Account.EquityL) != 460.3810 || float64(spy.Account.EquityR) != 490.7875 {
+		t.Fatalf("SPY pair recon: %+v", spy.Account)
+	}
+	if float64(spy.Account.TotalEquity) != 951.1685 || float64(spy.Account.FundingEst) != 0.04 {
+		t.Fatalf("SPY pair recon total/funding: %+v", spy.Account)
+	}
+	if g.Account == nil {
+		t.Fatal("global recon missing")
+	}
+	if float64(g.Account.EquityL) != 560.3810 || float64(g.Account.EquityR) != 690.7875 {
+		t.Fatalf("global recon sum: %+v", g.Account)
+	}
+	if float64(g.Account.QtyL) != 0.4 || float64(g.Account.QtyR) != -0.4 {
+		t.Fatalf("global recon qty sum: %+v", g.Account)
+	}
+	if float64(g.Account.LedgerRealized) != 1.0 {
+		t.Fatalf("global recon realized sum: %+v", g.Account)
+	}
+	// The JSON view must use fixed decimals, never scientific notation.
+	raw, err := json.Marshal(g.Account)
+	if err != nil {
+		t.Fatalf("marshal global recon: %v", err)
+	}
+	for _, want := range []string{`"equity_l":560.3810`, `"qty_l":0.40000000`, `"funding_est":0.0800`} {
+		if !strings.Contains(string(raw), want) {
+			t.Fatalf("global recon json %s missing %s", raw, want)
+		}
+	}
+	// A later snapshot replaces the earlier one instead of accumulating.
+	recon("SPY", 461.0, 491.0, 0.4)
+	g = m.Metrics()
+	if float64(g.Pairs["SPY"].Account.EquityL) != 461.0 {
+		t.Fatalf("SPY recon not replaced: %+v", g.Pairs["SPY"].Account)
+	}
+	if float64(g.Account.EquityL) != 561.0 {
+		t.Fatalf("global recon after replace: %+v", g.Account)
 	}
 }
 

@@ -37,6 +37,7 @@ const (
 	KindPairHealth   Kind = "pair_health"
 	KindPairWarmup   Kind = "pair_warmup"
 	KindRiskState    Kind = "risk_state"
+	KindAccountRecon Kind = "account_recon"
 )
 
 // Event is a structured runtime event. Fields are interpreted by Kind.
@@ -76,6 +77,28 @@ type Event struct {
 	GrossUSD       float64 `json:"gross_usd,omitempty"`
 	MaxSteps       int     `json:"max_steps,omitempty"`
 	OldestStepAgeS float64 `json:"oldest_step_age_s,omitempty"`
+
+	// Recon carries the latest per-minute account reconciliation snapshot.
+	Recon *AccountRecon `json:"recon,omitempty"`
+}
+
+// AccountRecon is one per-minute account reconciliation snapshot. It is
+// observational: the equity and unrealized figures reconcile the venues'
+// account value with the ledger, funding_est is the unexplained residual.
+type AccountRecon struct {
+	QtyL           Fixed8 `json:"qty_l,omitempty"`
+	QtyR           Fixed8 `json:"qty_r,omitempty"`
+	EquityL        Fixed4 `json:"equity_l,omitempty"`
+	EquityR        Fixed4 `json:"equity_r,omitempty"`
+	TotalEquity    Fixed4 `json:"total_equity,omitempty"`
+	UnrealL        Fixed4 `json:"unreal_l,omitempty"`
+	UnrealR        Fixed4 `json:"unreal_r,omitempty"`
+	UnrealTotal    Fixed4 `json:"unreal_total,omitempty"`
+	LedgerRealized Fixed4 `json:"ledger_realized,omitempty"`
+	DeltaTotal     Fixed4 `json:"delta_total,omitempty"`
+	DeltaUnreal    Fixed4 `json:"delta_unreal,omitempty"`
+	DeltaRealized  Fixed4 `json:"delta_realized,omitempty"`
+	FundingEst     Fixed4 `json:"funding_est,omitempty"`
 }
 
 // AlertFunc receives an alert message (log, webhook, ...).
@@ -88,6 +111,15 @@ type Fixed8 float64
 // MarshalJSON implements json.Marshaler with fixed 8-decimal output.
 func (f Fixed8) MarshalJSON() ([]byte, error) {
 	return []byte(strconv.FormatFloat(float64(f), 'f', 8, 64)), nil
+}
+
+// Fixed4 marshals a USD amount as a fixed-point decimal with four digits so
+// equity and reconciliation figures match the console log precision.
+type Fixed4 float64
+
+// MarshalJSON implements json.Marshaler with fixed 4-decimal output.
+func (f Fixed4) MarshalJSON() ([]byte, error) {
+	return []byte(strconv.FormatFloat(float64(f), 'f', 4, 64)), nil
 }
 
 // AnalyticsCfg configures time-bucketed aggregation and anomaly detection.
@@ -187,6 +219,8 @@ type Metrics struct {
 
 	Alerts []string               `json:"alerts"`
 	Pairs  map[string]PairMetrics `json:"pairs"`
+	// Account is the summed latest reconciliation snapshot across pairs.
+	Account *AccountRecon `json:"account,omitempty"`
 	// TimeBuckets are recent per-bucket aggregates; the global row has no pair.
 	TimeBuckets []BucketMetrics `json:"time_buckets"`
 	// Anomalies are the most recent fired anomaly observations.
@@ -195,32 +229,33 @@ type Metrics struct {
 
 // PairMetrics is the per-pair slice of the snapshot.
 type PairMetrics struct {
-	Base            string  `json:"base"`
-	Active          bool    `json:"active"`
-	Mode            string  `json:"mode"`
-	Opens           uint64  `json:"opens"`
-	Closes          uint64  `json:"closes"`
-	Flips           uint64  `json:"flips"`
-	Executions      uint64  `json:"executions"`
-	OneLegFails     uint64  `json:"one_leg_fails"`
-	Rescues         uint64  `json:"rescues"`
-	Errors          uint64  `json:"errors"`
-	OpenSteps       int     `json:"open_steps"`
-	VolumeUSD       Fixed8  `json:"volume_usd"`
-	RealizedUSD     Fixed8  `json:"realized_usd"`
-	MuBps           float64 `json:"mu_bps"`
-	SigmaBps        float64 `json:"sigma_bps"`
-	TickK           float64 `json:"tick_k"`
-	FailRate        float64 `json:"fail_rate"`
-	RollingFailRate float64 `json:"rolling_fail_rate"` // latest actor window; fail_rate is lifetime
-	Score           float64 `json:"score"`
-	DepthQ          float64 `json:"depth_q"`
-	TickQ           float64 `json:"tick_q"`
-	Stability       float64 `json:"stability"`
-	Reverts         float64 `json:"reverts_per_min"`
-	Coverage        float64 `json:"coverage"`
-	Samples         int     `json:"samples"`
-	Ready           bool    `json:"ready"`
+	Base            string        `json:"base"`
+	Active          bool          `json:"active"`
+	Mode            string        `json:"mode"`
+	Opens           uint64        `json:"opens"`
+	Closes          uint64        `json:"closes"`
+	Flips           uint64        `json:"flips"`
+	Executions      uint64        `json:"executions"`
+	OneLegFails     uint64        `json:"one_leg_fails"`
+	Rescues         uint64        `json:"rescues"`
+	Errors          uint64        `json:"errors"`
+	OpenSteps       int           `json:"open_steps"`
+	VolumeUSD       Fixed8        `json:"volume_usd"`
+	RealizedUSD     Fixed8        `json:"realized_usd"`
+	MuBps           float64       `json:"mu_bps"`
+	SigmaBps        float64       `json:"sigma_bps"`
+	TickK           float64       `json:"tick_k"`
+	FailRate        float64       `json:"fail_rate"`
+	RollingFailRate float64       `json:"rolling_fail_rate"` // latest actor window; fail_rate is lifetime
+	Score           float64       `json:"score"`
+	DepthQ          float64       `json:"depth_q"`
+	TickQ           float64       `json:"tick_q"`
+	Stability       float64       `json:"stability"`
+	Reverts         float64       `json:"reverts_per_min"`
+	Coverage        float64       `json:"coverage"`
+	Samples         int           `json:"samples"`
+	Ready           bool          `json:"ready"`
+	Account         *AccountRecon `json:"account,omitempty"` // latest per-minute reconciliation
 }
 
 // Monitor consumes events, aggregates metrics and fires alerts.
@@ -259,6 +294,8 @@ type pairAcc struct {
 	coverage                                                  float64
 	samples                                                   int
 	ready                                                     bool
+	recon                                                     AccountRecon
+	reconSet                                                  bool
 	lastExec                                                  time.Time
 	consecFails                                               int
 	fullLoadSince                                             time.Time
@@ -466,6 +503,12 @@ func (m *Monitor) Record(e Event) {
 		}
 		a.mode = e.Mode
 		a.muBps, a.sigmaBps, a.tickK, a.failRate = e.MuBps, e.SigmaBps, e.TickK, e.FailRate
+	case KindAccountRecon:
+		if e.Recon != nil {
+			a := m.acc(e.Pair)
+			a.recon = *e.Recon
+			a.reconSet = true
+		}
 	case KindPairPromoted:
 		a := m.acc(e.Pair)
 		a.active = true
@@ -808,12 +851,14 @@ func (m *Monitor) Metrics() Metrics {
 		fail = float64(m.oneLeg) / float64(m.executions)
 	}
 	pairs := make(map[string]PairMetrics, len(m.pairs))
+	var total AccountRecon
+	totalSet := false
 	for key, a := range m.pairs {
 		pfail := 0.0
 		if a.executions > 0 {
 			pfail = float64(a.oneLeg) / float64(a.executions)
 		}
-		pairs[key] = PairMetrics{
+		pm := PairMetrics{
 			Base: a.base, Active: a.active, Mode: a.mode,
 			Opens: a.opens, Closes: a.closes, Flips: a.flips, Executions: a.executions,
 			OneLegFails: a.oneLeg, Rescues: a.rescues, Errors: a.errors,
@@ -823,6 +868,25 @@ func (m *Monitor) Metrics() Metrics {
 			RollingFailRate: a.failRate,
 			Coverage:        a.coverage, Samples: a.samples, Ready: a.ready,
 		}
+		if a.reconSet {
+			rc := a.recon
+			pm.Account = &rc
+			total.QtyL += rc.QtyL
+			total.QtyR += rc.QtyR
+			total.EquityL += rc.EquityL
+			total.EquityR += rc.EquityR
+			total.TotalEquity += rc.TotalEquity
+			total.UnrealL += rc.UnrealL
+			total.UnrealR += rc.UnrealR
+			total.UnrealTotal += rc.UnrealTotal
+			total.LedgerRealized += rc.LedgerRealized
+			total.DeltaTotal += rc.DeltaTotal
+			total.DeltaUnreal += rc.DeltaUnreal
+			total.DeltaRealized += rc.DeltaRealized
+			total.FundingEst += rc.FundingEst
+			totalSet = true
+		}
+		pairs[key] = pm
 	}
 	limit := m.analytics.MetricsBuckets
 	if limit <= 0 {
@@ -890,7 +954,7 @@ func (m *Monitor) Metrics() Metrics {
 			RescueCostUSD:  Fixed8(b.rescueCostUSD),
 		})
 	}
-	return Metrics{
+	out := Metrics{
 		UptimeSec:    time.Since(m.start).Seconds(),
 		Opens:        m.opens,
 		Closes:       m.closes,
@@ -915,6 +979,10 @@ func (m *Monitor) Metrics() Metrics {
 		TimeBuckets:  timeBuckets,
 		Anomalies:    append([]Anomaly(nil), m.anomalies...),
 	}
+	if totalSet {
+		out.Account = &total
+	}
+	return out
 }
 
 // Handler serves the metrics snapshot as JSON. When token is non-empty, every

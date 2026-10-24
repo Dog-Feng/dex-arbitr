@@ -299,6 +299,7 @@ price = max(左腿 ask1, 右腿 ask1)   // 任一腿都可能成为买腿，按�
 - 引擎在关键点发类型化事件（step_opened/step_closed/flip/executed/rescue/status/emergency/error），picker 另发 pair_promoted/pair_demoted/pair_health/pair_warmup；monitor.Monitor.Record 按 pair 归集指标并告警。
 - 双视图：`/metrics` 顶层是全局汇总（跨对合计，含 `flips` 反转计数），新增 `pairs` 字段是每个交易对的明细（状态、步数、成交量、盈亏、flips、μ/σ、tick_k、失败率、churn score 分量、预热覆盖度、是否活跃）。
 - 金额字段（`volume_usd` / `realized_usd`，以及 status 日志的 `volume_usd` / `pnl_usd`）以 8 位固定小数输出，避免浮点残差显示为科学计数法。
+- 每分钟对账（`account_recon`）除控制台日志外，同时以 `account_recon` 事件投递给 monitor：`/metrics.pairs.*.account` 输出该对最新的对账快照（`qty_l/qty_r`、`equity_l/equity_r`、`total_equity`、`unreal_l/r/total`、`ledger_realized`、`delta_total/delta_unreal/delta_realized`、`funding_est`），顶层 `/metrics.account` 为各对字段求和；仓位字段按 8 位、金额字段按 4 位固定小数输出，与控制台日志精度一致。
 - 时间桶与异常（纯观察，不影响任何交易决策）：`monitor.analytics` 配置 15 分钟桶（UTC 存储）与异常规则阈值，`/metrics` 输出 `time_buckets`（每桶全局/每对的开平、flips、量、盈亏、延迟分位、μ/σ、满仓峰值、最老步龄）与 `anomalies`（consecutive_fails / flip_friction / full_load / oldest_step_age / loss_buckets / latency_p95 / silent / risk_flapping / mu_jump / rescue_slippage / unrescued）；触发即走 ALERT 通道，详见 [监控统计与异常检测方案](monitoring-analytics-design.md)。
 - 交易事件落盘与离线分析：开启 analytics 时，step_opened/step_closed/executed/flip/rescue/status/pnl/risk_state/error/emergency 事件以 JSONL 追加写入 `state_dir/trades/trades.jsonl`（纯观察）；`go run ./cmd/analytics -trades <file> [-from/-to] [-sessions name:HH:MM-HH:MM]` 离线生成每桶/每会话报表，复用与 `/metrics.time_buckets` 相同的聚合口径。
 - 滚动失败率：actor 独立维护失败滚动窗口（`FailRate()`，atomic），picker 通过 candidate 读取做硬剔除；`/metrics` 同时给出 `fail_rate`（终身）与 `rolling_fail_rate`（最近窗口）。
@@ -435,7 +436,7 @@ arbd 的运行日志时间戳显示为东八区（UTC+8，RFC3339 带 `+08:00` �
 | positions / position reconciliation passed | 启动仓位核对；失败即 PAUSED |
 | mean ready -> RUNNING | μ 采样满 60m 就绪 |
 | status | 每分钟：mode/steps/volume_usd/pnl_usd（进程级累计，重启归零）/fail_rate/sigma_bps/vol_ready；μ/σ/价差/tick_k 经 monitor status 事件到 /metrics |
-| account_recon | 每分钟：两腿仓位 `qty_l/qty_r`、各腿账户总资产 `equity_l/equity_r` 与 `total_equity`、未实现盈亏 `unreal_l/r/total`、账本累计已实现 `ledger_realized`，以及相对上一分钟的 `delta_total/delta_unreal/delta_realized` 与 `funding_est`（资金费等残差）；纯观察，用于账户对账 |
+| account_recon | 每分钟：两腿仓位 `qty_l/qty_r`、各腿账户总资产 `equity_l/equity_r` 与 `total_equity`、未实现盈亏 `unreal_l/r/total`、账本累计已实现 `ledger_realized`，以及相对上一分钟的 `delta_total/delta_unreal/delta_realized` 与 `funding_est`（资金费等残差）；纯观察，用于账户对账，同时经 monitor 事件同步到 `/metrics.pairs.*.account` 与顶层 `/metrics.account` |
 | action | 决策：kind/dir/qty/两腿价/expected_bps/reason |
 | executed | 成交：fill/px/status/rescue/rescue_cost_usd/pos/took/latency |
 | step opened / step pnl / step closed | 步账本与已实现盈亏 |
