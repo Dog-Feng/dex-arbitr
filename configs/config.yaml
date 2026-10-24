@@ -82,6 +82,9 @@ strategy:
   cap_hysteresis_sigma: 1.0  # extra sigma to open inside the top cap_band steps (0 = off)
   z_open: 2                 # z-score open threshold (used when kind: zscore; 0 = default 2)
   step_z: 0.5               # z-score ladder: each step needs +0.5 sigma (0 = off)
+  z_close: 0                # zscore: force close when same-direction z <= z_close; 2.7d backtest shows fee-negative, keep off
+  close_hold: 180m          # force close any step held this long (0 = off); backtest optimum on ANTH
+  forced_close_cooldown: 15m # suppress same-direction re-opens after a forced close (0 = off)
   interval_min: 1s
   interval_max: 2s
   max_book_age: 3s

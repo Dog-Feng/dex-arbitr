@@ -47,6 +47,7 @@ type sim struct {
 	lastAction  time.Time
 	noOpenUntil time.Time
 	coolReset   bool
+	forcedAt    time.Time // strategy-level forced close cooldown anchor
 	forced      int
 	entryGaps   []float64
 }
@@ -243,6 +244,9 @@ func main() {
 	capHyst := flag.Float64("caphyst", 1, "cap hysteresis sigma")
 	zOpen := flag.Float64("zopen", 2, "z-score open threshold")
 	stepZ := flag.Float64("stepz", 0, "z-score ladder spacing per open step (0 = off)")
+	zClose := flag.Float64("zclose", 0, "z-score reversion exit: force close when same-direction z <= X (0 = off)")
+	closeHold := flag.Duration("closehold", 0, "force close any step held this long (0 = off)")
+	forcedCool := flag.Duration("forcedcool", 0, "suppress same-direction re-opens after a forced close (0 = off)")
 	timeStop := flag.Duration("timestop", 0, "simulated forced close after this holding time (0 = off)")
 	lossStop := flag.Float64("lossstop", 0, "simulated forced close when a step's gross <= -X bps (0 = off)")
 	cool := flag.Duration("cool", 0, "suppress opens for this long after a forced close (0 = off)")
@@ -279,7 +283,7 @@ func main() {
 		DepthMult: *depth, CloseOrder: "best", VolK: *volK, FeeBps: 0,
 		TakerFeeL: *feeL, TakerFeeR: *feeR, MinInventory: 0,
 		FlipHysteresisSigma: *flip, CapBand: *capBand, CapHysteresisSigma: *capHyst, ZOpen: *zOpen,
-		StepZ: *stepZ,
+		StepZ: *stepZ, ZClose: *zClose, CloseHold: *closeHold, ForcedCloseCooldown: *forcedCool,
 	}
 	strat, err := strategy.New(*kind)
 	if err != nil {
@@ -424,11 +428,16 @@ func main() {
 					v = lv.LongVol()
 				}
 			}
-			st := strategy.State{Mode: strategy.ModeRunning, Steps: s.steps, LastDir: s.lastDir, CapEngaged: s.capEngaged}
+			st := strategy.State{Mode: strategy.ModeRunning, Steps: s.steps, LastDir: s.lastDir, CapEngaged: s.capEngaged,
+				Now: t, ForcedCloseAt: s.forcedAt}
 			if !muReady || !volReady {
 				st.Mode = strategy.ModeWarmup
 			}
 			act := strat.Decide(s.p, st, lastQuote, mu, muReady, v)
+			if act.Forced {
+				s.forcedAt = t
+				s.forced++
+			}
 			if act.Kind == strategy.Open && t.Before(s.noOpenUntil) {
 				act = strategy.Action{Kind: strategy.None, Reason: "cooling down after a forced close"}
 			}

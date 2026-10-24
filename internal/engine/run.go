@@ -119,7 +119,8 @@ func (rt *runtime) buildActor(pair symbols.Pair, qty float64, maxSteps int, l, r
 			MinInventory: minInv, TakerFeeL: pair.Left.TakerFee, TakerFeeR: pair.Right.TakerFee,
 			FlipHysteresisSigma: c.Strategy.FlipHysteresisSigma,
 			CapBand:             c.Strategy.CapBand, CapHysteresisSigma: c.Strategy.CapHysteresisSigma,
-			ZOpen: c.Strategy.ZOpen, StepZ: c.Strategy.StepZ}),
+			ZOpen: c.Strategy.ZOpen, StepZ: c.Strategy.StepZ, ZClose: c.Strategy.ZClose,
+			CloseHold: c.Strategy.CloseHold, ForcedCloseCooldown: c.Strategy.ForcedCloseCooldown}),
 	})
 }
 

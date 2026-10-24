@@ -2,7 +2,9 @@
 
 日期：2026-10-21
 状态：方案 B（z-score 入场）与 z 单位阶梯（`step_z`）已实现并通过单日回放验证，
-可通过配置切换；方案 C（强制减仓）未实现。
+可通过配置切换；方案 C 已部分实现：`strategy.z_close`（z 回归强制平）与
+`strategy.close_hold`（时长强制平）+ `strategy.forced_close_cooldown`（强制平后同方向冷却），
+默认关闭、逐项开关；浮亏止损（`loss_stop_bps`）仅在回放工具中模拟。
 实现分支：`codex/zscore-spread`（从 `feat/entropy-venue-20261019` 拉出）。
 
 ## 1. 背景：观察到的现象
@@ -67,7 +69,9 @@
 ## 4. 方案 B：z-score 入场算法（改造）
 
 > 实现状态：已完成。`estimator.kind: zscore` + `strategy.kind: zscore` +
-> `strategy.z_open` 可切换；平仓规则与 Arbitrage 完全一致；未实现止损/时长止损。
+> `strategy.z_open` 可切换；常规平仓规则与 Arbitrage 完全一致。2026-10-24 起新增
+> 强制退出：`z_close`（同方向 z 回到该值以内强制平，可能小亏，用于兑现回归）、
+> `close_hold`（持仓超时强制平，用于解冻）、`forced_close_cooldown`（强制平后同方向重开冷却）。
 
 ### 4.1 原理
 
@@ -112,12 +116,23 @@ z = (q.Mid - μ) / σ_long
 
 ## 5. 方案 C（建议）：z-score 入场 + 强制减仓出口
 
-> 实现状态：未实现（本分支刻意不含强制减仓）。
+> 实现状态：`z_close` 与 `close_hold` 已实现（2026-10-24）；`loss_stop_bps` 仍未实现，
+> 仅在回放工具中模拟。
 
 无论采用 A 还是 B，都建议新增至少一条**无条件减仓路径**，配在 `strategy` 下可开关：
 
 - `hold_time_limit`：单步持仓超过 N 分钟强制平（默认关闭）；
 - `loss_stop_bps`：单步未实现毛利低于 -X bps 强制平（默认关闭）。
+
+已落地为 `strategy.z_close`（默认 0.5 语义：同方向 z <= z_close 即强制平，不设毛利门，
+因为毛利为正的情况常规平仓规则已覆盖）与 `strategy.close_hold`（默认关闭），
+并配套 `strategy.forced_close_cooldown` 防止平后立刻同方向重开。
+
+2026-10-24 用 2.7 天 100ms 样本（209.5 万行）回测结论：
+`close_hold=180m + forced_close_cooldown=15m + z_close=0` 为当前最优——净 PnL +5.15
+（基线 +3.87），结束时零冻结步数；`z_close` 无论 0.5 还是 0.2 都因低 σ 时段
+毛利覆盖不了手续费而显著亏损（-36 / -7.9），建议保持关闭；`close_hold=60m` 过度
+churn（净 -14.7）。配置按此调整。
 
 这是"满仓冻结"的根治项，独立于入场算法。
 
@@ -164,7 +179,8 @@ max_steps 控制（实际冻结步数随阶梯自动降到 17~33，无需手动�
 
 1. （已实现）z-score 入场 + `strategy.step_z` 阶梯，配置切换；
 2. （已实现）配置校验：`strategy.kind: zscore` 必须配 `estimator.kind: zscore`；
-3. （未实现）止损语义：时长止损、浮亏止损——留待跨日样本回放后再定；
+3. （已实现）时长止损 `close_hold` 与 z 回归平仓 `z_close`（2026-10-24）；浮亏止损
+   `loss_stop_bps` 仍未实现，留待跨日样本回放后再定；
 4. 参数初值：z_open=2、step_z=0.5~1.0、μ 半衰 15m、σ_long 半衰 3h、floor 0.5；
 5. 上线策略：先 paper（dry_run），对比期间 metrics 与回放报告，再切实盘。
 

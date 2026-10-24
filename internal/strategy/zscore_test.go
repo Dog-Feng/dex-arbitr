@@ -106,3 +106,70 @@ func TestZScoreStepLadder(t *testing.T) {
 		t.Fatalf("step_z=0 must preserve the flat threshold: %+v", act)
 	}
 }
+
+func TestZCloseForcesReversionExit(t *testing.T) {
+	p := zParams()
+	p.ZClose = 0.5
+	// A losing step (OpenL above bid, OpenR below ask) cannot close on the
+	// profit rule; z_close=0.5 must force it out when z falls below 0.5.
+	now := time.Now()
+	s := State{Mode: ModeRunning, Now: now,
+		Steps: []Step{{ID: 1, Dir: DirLS, Qty: 0.01, OpenL: 100.1, OpenR: 99.9, OpenedAt: now.Add(-time.Minute)}}}
+	// dev=0.8, sigma=2 => z=0.4 <= 0.5
+	act := (ZScore{}).Decide(p, s, zQuote(0.8), 0, true, 2)
+	if act.Kind != Close || !act.Forced || act.StepID != 1 {
+		t.Fatalf("expected forced reversion close, got %+v", act)
+	}
+	// dev=2.4 => z=1.2 > 0.5: no forced exit.
+	if act := (ZScore{}).Decide(p, s, zQuote(2.4), 0, true, 2); act.Kind == Close && act.Forced {
+		t.Fatalf("z above z_close must not force a close: %+v", act)
+	}
+}
+
+func TestCloseHoldForcesOldStep(t *testing.T) {
+	p := P
+	p.CloseHold = time.Hour
+	now := time.Now()
+	old := Step{ID: 1, Dir: DirLS, Qty: 0.01, OpenL: 100.1, OpenR: 99.9, OpenedAt: now.Add(-2 * time.Hour)}
+	young := Step{ID: 2, Dir: DirLS, Qty: 0.01, OpenL: 100.1, OpenR: 99.9, OpenedAt: now.Add(-time.Minute)}
+	s := State{Mode: ModeRunning, Now: now, Steps: []Step{old, young}}
+	act := (Arbitrage{}).Decide(p, s, zQuote(1), 0, true, 0)
+	if act.Kind != Close || !act.Forced || act.StepID != 1 {
+		t.Fatalf("expected forced close of the aged step, got %+v", act)
+	}
+	// No recorded open time: cannot age the step, must be left alone.
+	unaged := Step{ID: 3, Dir: DirLS, Qty: 0.01, OpenL: 100.1, OpenR: 99.9}
+	s = State{Mode: ModeRunning, Now: now, Steps: []Step{unaged}}
+	if act := (Arbitrage{}).Decide(p, s, zQuote(0.5), 0, true, 0); act.Kind != None {
+		t.Fatalf("step without opened_at must not be force closed: %+v", act)
+	}
+}
+
+func TestForcedCloseCooldownBlocksSameDirection(t *testing.T) {
+	p := P
+	p.ForcedCloseCooldown = 5 * time.Minute
+	now := time.Now()
+	q, _ := spread.Compute(book(999.9, 1000, 1), book(1001, 1001.1, 1)) // LS rich
+	// Same direction as the last forced close: blocked during cooldown.
+	s := State{Mode: ModeRunning, Now: now, LastDir: DirLS, ForcedCloseAt: now.Add(-time.Minute)}
+	if act := (Arbitrage{}).Decide(p, s, q, 0, true, 0); act.Kind != None {
+		t.Fatalf("same-direction reopen must wait out the cooldown: %+v", act)
+	}
+	// Opposite direction is not suppressed.
+	s.ForcedCloseAt = now.Add(-10 * time.Minute)
+	if act := (Arbitrage{}).Decide(p, s, q, 0, true, 0); act.Kind != Open {
+		t.Fatalf("open after cooldown must resume: %+v", act)
+	}
+}
+
+func TestForcedExitsOffByDefault(t *testing.T) {
+	now := time.Now()
+	old := Step{ID: 1, Dir: DirLS, Qty: 0.01, OpenL: 100.1, OpenR: 99.9, OpenedAt: now.Add(-24 * time.Hour)}
+	s := State{Mode: ModeRunning, Now: now, Steps: []Step{old}}
+	if act := (Arbitrage{}).Decide(P, s, zQuote(0.5), 0, true, 0); act.Kind != None {
+		t.Fatalf("forced exits must be off by default: %+v", act)
+	}
+	if act := (ZScore{}).Decide(zParams(), s, zQuote(0.8), 0, true, 2); act.Kind == Close && act.Forced {
+		t.Fatalf("z_close must be off by default: %+v", act)
+	}
+}

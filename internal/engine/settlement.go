@@ -452,6 +452,9 @@ func (a *PairActor) apply(ctx context.Context, act strategy.Action, q spread.Quo
 			return
 		}
 	}
+	if act.Forced && act.Kind == strategy.Close {
+		a.forcedCloseAt = time.Now()
+	}
 	beforeL, beforeR := a.posL, a.posR
 	a.resetVolumeIfNewDay(time.Now())
 	var res execution.Result

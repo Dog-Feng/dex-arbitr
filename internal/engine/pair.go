@@ -127,6 +127,7 @@ type PairActor struct {
 	latR                *latencySeries
 	winUpdatedAt        time.Time
 	lastDir             strategy.Dir
+	forcedCloseAt       time.Time // last forced-exit close; feeds the reopen cooldown
 	interventions       []time.Time
 	// capEngaged records that the step count touched MaxSteps; opens stay
 	// blocked until the count falls to MaxSteps-CapBand or below.
@@ -681,6 +682,8 @@ func (a *PairActor) decideOnce(ctx context.Context, now time.Time, nextAt time.T
 	st := a.state
 	st.LastDir = a.lastDir
 	st.CapEngaged = a.capEngaged
+	st.Now = now
+	st.ForcedCloseAt = a.forcedCloseAt
 	vol := a.volBps()
 	if _, zk := a.cfg.Strategy.(strategy.ZScore); zk {
 		// The z-score strategy normalizes by the long-horizon dispersion of

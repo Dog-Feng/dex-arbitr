@@ -98,6 +98,15 @@ type Params struct {
 	// step requires z >= ZOpen + StepZ*|cnt| so steps spread over the
 	// deviation band instead of stacking at one level. 0 disables the ladder.
 	StepZ float64
+	// ZClose is the zscore reversion exit: a held step is force closed when
+	// its same-direction z falls to ZClose or below, booking the reversion
+	// whatever profit remains (may be a small loss). 0 disables it.
+	ZClose float64
+	// CloseHold force closes any step held at least this long. 0 disables it.
+	CloseHold time.Duration
+	// ForcedCloseCooldown suppresses same-direction re-opens after a forced
+	// close for this long. 0 disables it.
+	ForcedCloseCooldown time.Duration
 }
 
 // Strategy decides an action from the pair state and market view.
@@ -132,10 +141,12 @@ func (v Volume) Decide(p Params, s State, q spread.Quote, mu float64, muReady bo
 
 // State is the pair state the strategy needs.
 type State struct {
-	Mode       Mode
-	Steps      []Step // all same direction (single signed counter)
-	LastDir    Dir    // direction last traded; 0 = unknown (e.g. after restart)
-	CapEngaged bool   // capacity band engaged (steps touched MaxSteps since last reset)
+	Mode          Mode
+	Steps         []Step    // all same direction (single signed counter)
+	LastDir       Dir       // direction last traded; 0 = unknown (e.g. after restart)
+	CapEngaged    bool      // capacity band engaged (steps touched MaxSteps since last reset)
+	Now           time.Time // decision wall clock; zero falls back to time.Now()
+	ForcedCloseAt time.Time // last forced close; re-opens suppressed during cooldown
 }
 
 // Counter is the signed step count (negative = long left / short right).
@@ -173,6 +184,7 @@ type Action struct {
 	L, R        Leg
 	ExpectedBps float64 // open: deviation from mean; close: gross profit
 	Reason      string
+	Forced      bool // close came from a forced-exit rule, not the profit rule
 }
 
 // GrossProfitUSD computes price cash flows for the specified closed quantity.
@@ -296,7 +308,7 @@ func gate(p Params, s State, q spread.Quote) (Action, bool) {
 	if _, ok := spread.Compute(q.L, q.R); !ok || !validPrice(q.RefMid) || !finite(q.LS) || !finite(q.SL) || !finite(q.Mid) {
 		return Action{Reason: "invalid quote"}, false
 	}
-	if s.Mode < ModeWarmup || s.Mode > ModePaused || !validPrice(p.StepQty) || p.MaxSteps <= 0 || !validPrice(p.DepthMult) || !finite(p.OpenBps) || !finite(p.CloseBps) || !finite(p.VolK) || p.VolK < 0 || !finite(p.FeeBps) || p.FeeBps < 0 || !finite(p.TakerFeeL) || p.TakerFeeL < 0 || !finite(p.TakerFeeR) || p.TakerFeeR < 0 || p.MinInventory < 0 || !finite(p.FlipHysteresisSigma) || p.FlipHysteresisSigma < 0 || p.CapBand < 0 || !finite(p.CapHysteresisSigma) || p.CapHysteresisSigma < 0 || !finite(p.ZOpen) || p.ZOpen < 0 || !finite(p.StepZ) || p.StepZ < 0 {
+	if s.Mode < ModeWarmup || s.Mode > ModePaused || !validPrice(p.StepQty) || p.MaxSteps <= 0 || !validPrice(p.DepthMult) || !finite(p.OpenBps) || !finite(p.CloseBps) || !finite(p.VolK) || p.VolK < 0 || !finite(p.FeeBps) || p.FeeBps < 0 || !finite(p.TakerFeeL) || p.TakerFeeL < 0 || !finite(p.TakerFeeR) || p.TakerFeeR < 0 || p.MinInventory < 0 || !finite(p.FlipHysteresisSigma) || p.FlipHysteresisSigma < 0 || p.CapBand < 0 || !finite(p.CapHysteresisSigma) || p.CapHysteresisSigma < 0 || !finite(p.ZOpen) || p.ZOpen < 0 || !finite(p.StepZ) || p.StepZ < 0 || !finite(p.ZClose) || p.ZClose < 0 || p.CloseHold < 0 || p.ForcedCloseCooldown < 0 {
 		return Action{Reason: "invalid strategy parameters"}, false
 	}
 	return Action{}, true
@@ -346,6 +358,109 @@ func decideClose(p Params, s State, q spread.Quote) (Action, bool) {
 	return Action{Reason: fmt.Sprintf("%d profitable close candidate(s) but none has top-of-book depth for its size", len(cs))}, true
 }
 
+// stateNow returns the decision wall clock, falling back to the process clock
+// for callers that do not set State.Now.
+func stateNow(s State) time.Time {
+	if s.Now.IsZero() {
+		return time.Now()
+	}
+	return s.Now
+}
+
+// decideHoldClose force closes steps held at least CloseHold. It runs after
+// the normal profit close, so profitable steps always exit first. Steps with
+// no recorded open time cannot be aged and are left alone.
+func decideHoldClose(p Params, s State, q spread.Quote, now time.Time) (Action, bool) {
+	if p.CloseHold <= 0 || len(s.Steps) == 0 {
+		return Action{}, false
+	}
+	type cand struct {
+		st Step
+		ix int
+	}
+	var cs []cand
+	for i, st := range s.Steps {
+		if st.OpenedAt.IsZero() || now.Sub(st.OpenedAt) < p.CloseHold {
+			continue
+		}
+		cs = append(cs, cand{st, i})
+	}
+	if len(cs) == 0 {
+		return Action{}, false
+	}
+	sort.SliceStable(cs, func(i, j int) bool { return cs[i].st.OpenedAt.Before(cs[j].st.OpenedAt) })
+	for _, c := range cs {
+		ol, or := c.st.Dir.LegSides()
+		l, r := ol.Opposite(), or.Opposite()
+		if !depthOK(q, l, r, c.st.Qty*p.DepthMult) {
+			continue
+		}
+		la, ra := legs(q, l, r)
+		return Action{Kind: Close, Forced: true, Dir: c.st.Dir, StepID: c.st.ID, Qty: c.st.Qty, L: la, R: ra,
+			ExpectedBps: QuoteProfitBps(c.st, q),
+			Reason:      fmt.Sprintf("force close step %d: held %s >= %s", c.st.ID, now.Sub(c.st.OpenedAt).Round(time.Second), p.CloseHold)}, true
+	}
+	return Action{Reason: "steps exceed close_hold but none has top-of-book depth"}, true
+}
+
+// zScoreClose is the zscore reversion exit: when the held direction's z has
+// fallen to ZClose or below, the deviation has reverted and the step is force
+// closed, booking whatever profit remains (possibly a small loss). It runs
+// after the normal profit close and the holding-time limit.
+func zScoreClose(p Params, s State, q spread.Quote, zLS, zSL float64) (Action, bool) {
+	cnt := s.Counter()
+	if p.ZClose <= 0 || cnt == 0 || !finite(zLS) || !finite(zSL) {
+		return Action{}, false
+	}
+	z := zLS
+	if cnt > 0 {
+		z = zSL
+	}
+	if z > p.ZClose {
+		return Action{}, false
+	}
+	type cand struct {
+		st Step
+		pf float64
+		ix int
+	}
+	var cs []cand
+	for i, st := range s.Steps {
+		cs = append(cs, cand{st, profit(st, q), i})
+	}
+	switch p.CloseOrder {
+	case "lifo":
+		sort.Slice(cs, func(i, j int) bool { return cs[i].ix > cs[j].ix })
+	case "fifo":
+		sort.Slice(cs, func(i, j int) bool { return cs[i].ix < cs[j].ix })
+	default: // best
+		sort.SliceStable(cs, func(i, j int) bool { return cs[i].pf > cs[j].pf })
+	}
+	for _, c := range cs {
+		ol, or := c.st.Dir.LegSides()
+		l, r := ol.Opposite(), or.Opposite()
+		if !depthOK(q, l, r, c.st.Qty*p.DepthMult) {
+			continue
+		}
+		la, ra := legs(q, l, r)
+		return Action{Kind: Close, Forced: true, Dir: c.st.Dir, StepID: c.st.ID, Qty: c.st.Qty, L: la, R: ra, ExpectedBps: c.pf,
+			Reason: fmt.Sprintf("force close step %d: z %.2f <= %.2f (reversion exit)", c.st.ID, z, p.ZClose)}, true
+	}
+	return Action{Reason: "reversion exit due but no step has top-of-book depth"}, true
+}
+
+// forcedCloseCooldown reports whether a same-direction open is still inside
+// the post-forced-close cooldown window.
+func forcedCloseCooldown(p Params, s State, d Dir) (time.Duration, bool) {
+	if p.ForcedCloseCooldown <= 0 || s.ForcedCloseAt.IsZero() || s.LastDir != d {
+		return 0, false
+	}
+	if rem := p.ForcedCloseCooldown - stateNow(s).Sub(s.ForcedCloseAt); rem > 0 {
+		return rem, true
+	}
+	return 0, false
+}
+
 // Decide is pure: same inputs => same action. mu is the spread mean in bps
 // (only used for opening; muReady=false blocks opens). vol is the short-horizon
 // spread volatility in bps; openings require the deviation to exceed
@@ -355,6 +470,9 @@ func (Arbitrage) Decide(p Params, s State, q spread.Quote, mu float64, muReady b
 		return act
 	}
 	if act, ok := decideClose(p, s, q); ok {
+		return act
+	}
+	if act, ok := decideHoldClose(p, s, q, stateNow(s)); ok {
 		return act
 	}
 	need := p.StepQty * p.DepthMult
@@ -383,6 +501,9 @@ func (Arbitrage) Decide(p Params, s State, q spread.Quote, mu float64, muReady b
 		needDev := openingThreshold(p, q, d, vol)
 		if math.IsNaN(dev) || math.IsInf(dev, 0) || math.IsNaN(needDev) || math.IsInf(needDev, 0) {
 			return Action{Reason: "invalid threshold"}, true
+		}
+		if rem, cool := forcedCloseCooldown(p, s, d); cool {
+			return Action{Reason: fmt.Sprintf("%s blocked: forced-close cooldown %.0fs remaining", d, rem.Seconds())}, true
 		}
 		// A reversal after a flat position needs one extra sigma of deviation
 		// so marginal noise around the mean cannot flip the book back and
@@ -462,6 +583,16 @@ func (ZScore) Decide(p Params, s State, q spread.Quote, mu float64, muReady bool
 	if act, ok := decideClose(p, s, q); ok {
 		return act
 	}
+	if act, ok := decideHoldClose(p, s, q, stateNow(s)); ok {
+		return act
+	}
+	if p.ZClose > 0 && s.Counter() != 0 && muReady && !math.IsNaN(mu) && !math.IsInf(mu, 0) && vol > 0 {
+		zLS := (q.LS - mu) / vol
+		zSL := (q.SL + mu) / vol
+		if act, ok := zScoreClose(p, s, q, zLS, zSL); ok {
+			return act
+		}
+	}
 	need := p.StepQty * p.DepthMult
 	cnt := s.Counter()
 	band := p.CapBand
@@ -482,6 +613,9 @@ func (ZScore) Decide(p Params, s State, q spread.Quote, mu float64, muReady bool
 	try := func(d Dir, z, dev float64) (Action, bool) {
 		if math.IsNaN(z) || math.IsInf(z, 0) {
 			return Action{Reason: "invalid z"}, true
+		}
+		if rem, cool := forcedCloseCooldown(p, s, d); cool {
+			return Action{Reason: fmt.Sprintf("%s blocked: forced-close cooldown %.0fs remaining", d, rem.Seconds())}, true
 		}
 		needZ := p.ZOpen
 		feeBps := openFeeBps(p, q, d)

@@ -89,6 +89,9 @@ type Config struct {
 		CapHysteresisSigma  float64       `yaml:"cap_hysteresis_sigma"`  // extra sigma to open inside the top cap_band steps
 		ZOpen               float64       `yaml:"z_open"`                // zscore: z threshold for opens (0 = default 2)
 		StepZ               float64       `yaml:"step_z"`                // zscore: z-unit ladder spacing per open step (0 = off)
+		ZClose              float64       `yaml:"z_close"`               // zscore: force close held step when same-direction z <= z_close (0 = off)
+		CloseHold           time.Duration `yaml:"close_hold"`            // force close any step held this long (0 = off)
+		ForcedCloseCooldown time.Duration `yaml:"forced_close_cooldown"` // suppress same-direction re-opens after a forced close (0 = off)
 		IntervalMin         time.Duration `yaml:"interval_min"`
 		IntervalMax         time.Duration `yaml:"interval_max"`
 		MaxBookAge          time.Duration `yaml:"max_book_age"`
@@ -487,6 +490,15 @@ func (c *Config) validate() error {
 	}
 	if c.Strategy.StepZ < 0 {
 		return fmt.Errorf("strategy.step_z must be >= 0")
+	}
+	if c.Strategy.ZClose < 0 {
+		return fmt.Errorf("strategy.z_close must be >= 0")
+	}
+	if c.Strategy.CloseHold < 0 {
+		return fmt.Errorf("strategy.close_hold must be >= 0")
+	}
+	if c.Strategy.ForcedCloseCooldown < 0 {
+		return fmt.Errorf("strategy.forced_close_cooldown must be >= 0")
 	}
 	if c.Strategy.DepthMult <= 0 {
 		return fmt.Errorf("strategy.depth_mult must be > 0")
