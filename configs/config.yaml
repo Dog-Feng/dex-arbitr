@@ -29,7 +29,7 @@ venues:
     opts:
       account: ${ENTROPY_ACCOUNT}
       private_key: ${ENTROPY_AGENT_KEY}
-      book_depth: 20
+      book_depth: 5        # fast l2Book 每边 5 档（~0.5s/块）；顶档由 bbo（~0.4s）合并刷新
 
 matching:
   strip_suffixes: [PERP, USDC, USDG, USDT, USD]   # USDC/USDG/USDT treated 1:1

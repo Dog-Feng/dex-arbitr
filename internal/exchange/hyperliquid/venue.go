@@ -472,12 +472,13 @@ func (v *Venue) SubscribeBook(ctx context.Context, inst domain.Instrument) (<-ch
 	}
 	v.booksMu.Unlock()
 	if !ok {
-		// The regular l2Book subscription pushes the full book (BookDepth
-		// levels) on change; the bbo feed refreshes the top level between
-		// pushes (~0.4s) and is merged into the same book state, so the top
-		// never goes stale in quiet markets while deeper levels keep the
-		// configured depth.
-		v.ws.subscribe("l2Book/"+coin, map[string]any{"type": "l2Book", "coin": coin})
+		// fast:true delivers 5 levels per side per block (~0.5s) instead of
+		// the change-throttled regular feed (~5-6s). The bbo feed refreshes
+		// the top level even faster (~0.4s) and is merged into the same book
+		// state, so the top never goes stale in quiet markets. Deep levels
+		// beyond 5 are not needed by the strategy, which prices and decides
+		// on the top of book.
+		v.ws.subscribe("l2Book/"+coin, map[string]any{"type": "l2Book", "coin": coin, "fast": true})
 		v.ws.subscribe("bbo/"+coin, map[string]any{"type": "bbo", "coin": coin})
 	}
 	go func() {
