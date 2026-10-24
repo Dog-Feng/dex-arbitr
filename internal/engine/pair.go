@@ -413,13 +413,18 @@ func (a *PairActor) persist() error {
 }
 
 // estimatorSnapshot returns the mean estimator's restart state, or nil when
-// the estimator does not support persistence (SMA cold-starts by design).
+// the estimator does not support persistence (SMA cold-starts by design) or
+// has not sampled anything yet (a zero-history state cannot pass store
+// validation and must not fail a shutdown persist).
 func (a *PairActor) estimatorSnapshot() *estimator.State {
 	if a.cfg.Est == nil {
 		return nil
 	}
 	if p, ok := a.cfg.Est.(estimator.Persistable); ok {
 		s := p.Save()
+		if s.N < 1 {
+			return nil
+		}
 		return &s
 	}
 	return nil

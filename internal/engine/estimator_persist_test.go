@@ -59,6 +59,38 @@ func TestEstimatorRestoredOnActorRestart(t *testing.T) {
 	}
 }
 
+// TestPersistBeforeFirstSampleSkipsEstimator locks the zero-history boundary:
+// a shutdown persist before the estimator's first sample must succeed and
+// simply not write an estimator snapshot.
+func TestPersistBeforeFirstSampleSkipsEstimator(t *testing.T) {
+	st, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := st.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	est := estimator.NewZScore(zscoreParams())
+	a, err := NewPairActor(PairConfig{Pair: symbols.NewPair("TEST", testInst(), testInst()),
+		L: newActorTestVenue("L"), R: newActorTestVenue("R"), DryRun: true,
+		Store: st, Est: est, MaxBookAge: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.persist(); err != nil {
+		t.Fatalf("persist before first sample failed: %v", err)
+	}
+	loaded, err := st.Load(a.key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Estimator != nil {
+		t.Fatalf("zero-history estimator state persisted: %+v", loaded.Estimator)
+	}
+}
+
 // TestSampleMeanFeedsEstimatorFromBooks locks the event-driven mean sampling:
 // a book wake samples the spread mid into the estimator in the actor's own
 // goroutine.
