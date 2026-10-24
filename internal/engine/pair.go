@@ -236,11 +236,13 @@ func NewPairActor(cfg PairConfig) (*PairActor, error) {
 	a.checkpoint = st.Unresolved
 	a.startupRecovered.Store(!st.Unresolved)
 	a.checkpointExit = st.CheckpointExit
-	if st.Estimator != nil {
+	if a.cfg.View == nil && st.Estimator != nil {
 		// Resume the mean estimator's warmup history: a restart skips the
 		// full warmup window. Freshness gates still block readiness until a
 		// new sample arrives, and the first update decays the restored mean
-		// by the real elapsed time.
+		// by the real elapsed time. Auto mode skips the restore: its shared
+		// collector is already sampling live data at startup, and the saved
+		// snapshot would regress a fresher estimator.
 		if p, ok := cfg.Est.(estimator.Persistable); ok {
 			if err := p.Restore(*st.Estimator); err != nil {
 				a.log.Warn("estimator state unusable; cold-starting warmup", "kind", st.Estimator.Kind, "err", err)

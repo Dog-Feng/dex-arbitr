@@ -34,7 +34,7 @@ func TestEstimatorRestoredOnActorRestart(t *testing.T) {
 		}
 	})
 	est1 := estimator.NewZScore(zscoreParams())
-	start := time.Unix(1700000000, 0)
+	start := time.Now().Add(-40 * time.Second)
 	for i := 1; i <= 30; i++ {
 		est1.Update(start.Add(time.Duration(i)*time.Second), float64(i))
 	}

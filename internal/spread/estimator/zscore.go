@@ -127,13 +127,22 @@ func (z *ZScore) Save() State {
 	return State{Kind: "zscore", Mean: z.mean, MX2: z.mx2, N: z.n, Started: z.started, Last: z.last}
 }
 
-// Restore resumes a previously saved estimator. The freshness gate still
-// blocks readiness until a new sample arrives, and the first Update decays
-// the restored values by the real elapsed time, so a long stop naturally
-// discounts the old history instead of trusting it.
+// Restore resumes a previously saved estimator. Two conditions reject the
+// saved state, leaving the caller to cold-start: the history never completed
+// its warmup window, or the stop gap outlived the dispersion half-life, after
+// which the restored dispersion would be near its floor and inflate z on
+// noise. Within those bounds the freshness gate still blocks readiness until
+// a new sample arrives, and the first Update decays the restored values by
+// the real elapsed time.
 func (z *ZScore) Restore(s State) error {
 	if s.Kind != "zscore" || !validState(s) {
 		return errInvalidState
+	}
+	if s.Last.Sub(s.Started) < z.p.MinWarmup {
+		return errInvalidState // incomplete warmup history
+	}
+	if time.Since(s.Last) > time.Duration(2*z.sigmaHalf)*time.Second {
+		return ErrStaleState
 	}
 	z.mean, z.mx2, z.n, z.started, z.last = s.Mean, s.MX2, s.N, s.Started, s.Last
 	return nil

@@ -26,7 +26,14 @@ type Persistable interface {
 	Restore(State) error
 }
 
-var errInvalidState = errors.New("invalid estimator state")
+var (
+	errInvalidState = errors.New("invalid estimator state")
+	// ErrStaleState means the saved history has decayed too far to trust:
+	// the stop gap outlived the dispersion half-life, so readiness gates
+	// must cold-start instead of resuming a warmup clock whose dispersion
+	// no longer exists.
+	ErrStaleState = errors.New("estimator state stale")
+)
 
 func validState(s State) bool {
 	return s.N >= 1 &&

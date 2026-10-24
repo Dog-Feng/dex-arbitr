@@ -1,6 +1,7 @@
 package estimator
 
 import (
+	"errors"
 	"math"
 	"testing"
 	"time"
@@ -9,7 +10,7 @@ import (
 func TestZScoreSaveRestoreRoundtrip(t *testing.T) {
 	params := Params{Interval: time.Second, MinWarmup: 10 * time.Second, MuHalfLife: time.Minute, SigmaHalfLife: time.Hour, SigmaFloor: 0.5}
 	z := NewZScore(params)
-	start := time.Unix(1700000000, 0)
+	start := time.Now().Add(-40 * time.Second)
 	for i := 1; i <= 30; i++ {
 		z.Update(start.Add(time.Duration(i)*time.Second), float64(i))
 	}
@@ -45,5 +46,16 @@ func TestZScoreRestoreRejectsBadState(t *testing.T) {
 	}
 	if err := z.Restore(State{Kind: "zscore", N: 5, Mean: 1, MX2: 1, Started: now, Last: now.Add(-time.Second)}); err == nil {
 		t.Fatal("last before started accepted")
+	}
+	// A history that never completed its warmup window is not resumable.
+	short := State{Kind: "zscore", N: 3, Mean: 1, MX2: 1, Started: now.Add(-5 * time.Second), Last: now}
+	if err := z.Restore(short); err == nil {
+		t.Fatal("incomplete warmup history accepted")
+	}
+	// A stop gap beyond 2x the dispersion half-life decays the history too
+	// far: restoring would trade on a floor dispersion.
+	stale := State{Kind: "zscore", N: 30, Mean: 1, MX2: 1, Started: now.Add(-4 * time.Hour), Last: now.Add(-3 * time.Hour)}
+	if err := z.Restore(stale); !errors.Is(err, ErrStaleState) {
+		t.Fatalf("stale history accepted: %v", err)
 	}
 }
