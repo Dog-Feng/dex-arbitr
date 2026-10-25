@@ -10,6 +10,9 @@ BASE="${BASE:-/home/ubuntu/dex-arbitr}"
 BRANCH="${BRANCH:-codex/zscore-spread}"
 REPO="${REPO:-https://github.com/Dog-Feng/dex-arbitr.git}"
 GOROOT_BIN="${GOROOT_BIN:-/usr/local/go/bin}"
+# SCAN_CONFIG 指定扫描专用配置（可只含 rhlighter+entropy 两个 dex）；
+# 缺省用交易配置。
+SCAN_CONFIG="${SCAN_CONFIG:-$BASE/config.yaml}"
 
 log() { echo "[scan] $(date '+%F %T') $*"; }
 export PATH="$GOROOT_BIN:$PATH"
@@ -36,14 +39,14 @@ go build -o "$BASE/bin/scanboard" ./cmd/scanboard
 cd "$BASE"
 
 # ---------- 3. 配置检查 ----------
-[ -f "$BASE/config.yaml" ] || { log "缺少 config.yaml"; exit 1; }
+[ -f "$SCAN_CONFIG" ] || { log "缺少 $SCAN_CONFIG"; exit 1; }
 [ -f "$BASE/lenses.json" ] || cp "$BASE/app/configs/lenses.example.json" "$BASE/lenses.json"
 
 # ---------- 4. 重启 scanboard（只动 scanboard） ----------
-log "restart scanboard"
+log "restart scanboard (config=$SCAN_CONFIG)"
 pkill -f "$BASE/bin/scanboard" 2>/dev/null || true
 sleep 2
-nohup "$BASE/bin/scanboard" -config "$BASE/config.yaml" -lenses "$BASE/lenses.json" \
+nohup "$BASE/bin/scanboard" -config "$SCAN_CONFIG" -lenses "$BASE/lenses.json" \
     -out "$BASE/scanboard-$(date +%Y%m%d).jsonl" >> "$BASE/scanboard.log" 2>&1 &
 
 sleep 3

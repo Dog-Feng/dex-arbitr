@@ -83,8 +83,10 @@ if [ "${START_ARBD:-1}" = "1" ]; then
 fi
 
 if [ "${START_SCANBOARD:-1}" = "1" ]; then
-    log "start scanboard"
-    nohup "$BASE/bin/scanboard" -config "$BASE/config.yaml" -lenses "$BASE/lenses.json" \
+    SCAN_CONFIG="${SCAN_CONFIG:-$BASE/config.yaml}"
+    [ -f "$SCAN_CONFIG" ] || { log "缺少 $SCAN_CONFIG（扫描配置）"; exit 1; }
+    log "start scanboard (config=$SCAN_CONFIG)"
+    nohup "$BASE/bin/scanboard" -config "$SCAN_CONFIG" -lenses "$BASE/lenses.json" \
         -out "$BASE/scanboard-$(date +%Y%m%d).jsonl" >> "$BASE/scanboard.log" 2>&1 &
     sleep 2
     log "scanboard 日志: $BASE/scanboard.log"
