@@ -113,6 +113,9 @@ func TestSampleMeanFeedsEstimatorFromBooks(t *testing.T) {
 	}
 	now := time.Now()
 	a.bookL, a.bookR = actorTestBook("L", 100), actorTestBook("R", 102)
+	// Explicitly backdate the book timestamps: quote() rejects future
+	// timestamps, and clock granularity differs across platforms.
+	a.bookL.Ts, a.bookR.Ts = now.Add(-100*time.Millisecond), now.Add(-100*time.Millisecond)
 	a.sampleMean(now)
 	want := (102.05 - 100.05) / ((100.05 + 102.05) / 2) * 1e4
 	if got := estimator.MeanAt(est, now); math.Abs(got-want) > 1e-9 {
