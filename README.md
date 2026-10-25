@@ -64,7 +64,68 @@ execution:
 
 ---
 
-## Linux 部署（root 用户 + systemd）
+## Linux 部署（ubuntu 用户 + 家目录脚本，推荐）
+
+交易引擎与多镜头扫描器分离运维：**扫描器长跑持续收集样本，交易引擎可频繁更新重启而不中断扫描**。
+
+### 目录布局
+
+| 路径 | 用途 |
+|---|---|
+| `/home/ubuntu/dex-arbitr/app` | 代码（git 仓库，ubuntu 属主） |
+| `/home/ubuntu/dex-arbitr/bin` | 二进制：arbd / selfcheck / scanboard / pairlist |
+| `/home/ubuntu/dex-arbitr/config.yaml` | 运行配置（SFTP 上传，仓库外） |
+| `/home/ubuntu/dex-arbitr/arb.env` | 密钥（600，SFTP 上传） |
+| `/home/ubuntu/dex-arbitr/lenses.json` | 扫描镜头定义（缺省用仓库示例） |
+| `/home/ubuntu/dex-arbitr/state` | 步数状态（自动创建） |
+| `/home/ubuntu/dex-arbitr/arbd.log` / `scanboard.log` | 运行日志 |
+| `/home/ubuntu/dex-arbitr/scanboard-YYYYMMDD.jsonl` | 扫描数据（按天） |
+
+### 首次部署
+
+root 做一次目录准备：
+
+```bash
+mkdir -p /home/ubuntu/dex-arbitr && chown ubuntu:ubuntu /home/ubuntu/dex-arbitr
+```
+
+ubuntu 用户拉取脚本：
+
+```bash
+cd /home/ubuntu/dex-arbitr
+curl -fsSL https://raw.githubusercontent.com/Dog-Feng/dex-arbitr/codex/zscore-spread/scripts/start.sh -o start.sh
+curl -fsSL https://raw.githubusercontent.com/Dog-Feng/dex-arbitr/codex/zscore-spread/scripts/up-arbd.sh -o up-arbd.sh
+curl -fsSL https://raw.githubusercontent.com/Dog-Feng/dex-arbitr/codex/zscore-spread/scripts/up-scanboard.sh -o up-scanboard.sh
+chmod +x start.sh up-arbd.sh up-scanboard.sh
+```
+
+SFTP 上传 `config.yaml` 与 `arb.env` 到该目录后：
+
+```bash
+sed -i 's/\r$//' config.yaml arb.env start.sh up-arbd.sh up-scanboard.sh   # 去 Windows CRLF
+./start.sh                                  # 首次引导：拉码→构建→只读自检→启动两个模块
+```
+
+`start.sh` 支持 `START_ARBD=0` / `START_SCANBOARD=0` 单独关闭某模块；`SELFCHECK_LIVE=1` 追加真实 0.01 往返自检（会真实下单）。
+
+### 日常更新（两模块互不干扰）
+
+```bash
+./up-arbd.sh        # 只更新并重启交易引擎（扫描持续收集，不中断）
+./up-scanboard.sh   # 只更新并重启扫描器（交易不中断）
+```
+
+### 注意事项
+
+- 旧版 root/systemd 部署需先 `systemctl stop arbd` 并清理其 state 目录下的 `.agent-*.lock`，防止 agent-key 锁冲突。
+- 扫描器重启后各镜头重新预热（zscore 15m / sma 1h），期间仍持续落盘（`"reason":"mean not ready"`），数据文件无缺口。
+- zscore 均值状态随 state 持久化：arbd 重启在 6 小时内免预热。
+- Windows 编辑/上传的文件必须先 `sed -i 's/\r$//'` 去 CRLF，否则脚本报错、env 值被 `\r` 污染。
+- 服务器必须位于 Lighter 允许交易的地区（否则下单返回 20558）。
+
+---
+
+## Linux 部署（root 用户 + systemd，旧版备查）
 
 以 Ubuntu/Debian x86_64 为例。**所有操作都以 root 用户执行**，统一目录：
 
