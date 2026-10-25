@@ -1,7 +1,10 @@
 // Command scanboard evaluates multiple strategy lenses over every matched
-// pair and appends one JSONL line per lens per evaluation to a file, so the
-// same market instant can be compared under arbitrage, volume and z-score
-// criteria with different thresholds for backtesting.
+// pair and appends one JSONL line per actionable signal to a file: only
+// evaluations where a lens would actually open (z-score steps > 0 or a
+// positive arbitrage/volume net margin) are recorded, so the file holds the
+// comparison results across algorithms and thresholds without heartbeat
+// noise. Heartbeat lines (not ready / below threshold) are evaluated but
+// never written.
 //
 // Example:
 //
@@ -270,6 +273,9 @@ func run(ctx context.Context, configPath, lensesPath, outPath string, interval t
 			if werr := scan.WatchLenses(ctx, m.Pair.Base, m.L, m.R, m.Pair.Left, m.Pair.Right, lenses, feeBps,
 				interval, c.Volatility.Interval, c.Strategy.MaxBookAge, c.Volatility.MaxAge,
 				func(r scan.LensResult) {
+					if r.Reason != "" {
+						return // 只记"有信号"的结果行（steps>0 或 net_bps>0），心跳/未就绪不入库
+					}
 					if werr := sink.Write(r); werr != nil {
 						select {
 						case errs <- fmt.Errorf("write %s: %w", m.Pair.Base, werr):
