@@ -85,7 +85,7 @@ strategy:
   z_open: 2                 # z-score open threshold (used when kind: zscore; 0 = default 2)
   step_z: 0.5               # z-score ladder: each step needs +0.5 sigma (0 = off)
   z_close: 0                # zscore: force close when same-direction z <= z_close; 2.7d backtest shows fee-negative, keep off
-  close_hold: 0            # 0 = 不强平：持仓只等盈利平仓/价差回归（网格摊平成本策略；保证金门仍是最后防线）
+  close_hold: 180m          # force close any step held this long (0 = off); backtest optimum on ANTH
   forced_close_cooldown: 15m # suppress same-direction re-opens after a forced close (0 = off)
   interval_min: 1s
   interval_max: 2s
@@ -167,4 +167,4 @@ pairs:
     left: rhlighter
     right: entropy
     step_qty: 0.01
-    max_steps: 50          # 细网格铺满价差偏离带（0.01×50 = 0.5 ANTH ≈ $980）
+    max_steps: 50
