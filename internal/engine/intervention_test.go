@@ -148,6 +148,29 @@ func TestSubMinResidualStaysPausedWithoutIntervention(t *testing.T) {
 	}
 }
 
+// TestSubMinResidualEscalatesAfterRetries locks the dust deadlock escape: a
+// sub-minimum residual that cannot self-heal escalates to the intervention
+// path after the retry window instead of pausing the pair forever.
+func TestSubMinResidualEscalatesAfterRetries(t *testing.T) {
+	a, l, r := auditInterventionActor(t)
+	instQ := domain.Instrument{MarketID: 1, SizeDecimals: 4, PriceDecimals: 2, TakerFee: .001, MinQuote: .9}
+	a.cfg.Pair.Left, a.cfg.Pair.Right = instQ, instQ
+	l.pos, r.pos = .012, -.008
+	a.posL, a.posR = .012, -.008
+	a.pending = &pendingExecution{
+		action:  strategy.Action{Kind: strategy.Open, Dir: strategy.DirLS, Qty: .01},
+		beforeL: 0, beforeR: 0,
+		dustWarned: true,
+		dustTries:  subMinEscalateTries - 1,
+		result: execution.Result{PosL: .012, PosR: -.008, PositionsKnown: true, SettlementKnown: true,
+			Err: fmt.Errorf("%w: rescue quantity below venue minimum", execution.ErrSubMinResidual)},
+	}
+	a.resolvePending(context.Background())
+	if a.pending == nil || !a.pending.intervention {
+		t.Fatalf("dust residual did not escalate to intervention: pending=%+v", a.pending)
+	}
+}
+
 func TestInterventionRetainsPartialUnknownFlatten(t *testing.T) {
 	a, l, r := auditInterventionActor(t)
 	l.pos, r.pos = 0, -.01

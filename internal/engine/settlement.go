@@ -26,6 +26,7 @@ type pendingExecution struct {
 	lastAttempt       time.Time
 	stalls            int
 	dustWarned        bool
+	dustTries         int
 	intervention      bool
 	interventionTries int
 	interrupted       *execution.Result // settled original orders, separate from the new flatten
@@ -38,6 +39,12 @@ const interventionStallLimit = 3
 // subMinRetryInterval spaces recovery retries once a sub-minimum residual has
 // been reported. Emergency and drain requests keep the normal interval.
 const subMinRetryInterval = 30 * time.Second
+
+// subMinEscalateTries is how many dust retries are tolerated before a
+// sub-minimum residual that cannot self-heal escalates to the external
+// intervention path (flatten, clear the ledger, resume under the intervention
+// budget) instead of pausing the pair forever.
+const subMinEscalateTries = 10
 
 func (a *PairActor) syncPositionState() {
 	a.flatPositions.Store(math.Abs(a.posL) < math.Pow10(-a.cfg.Pair.Left.SizeDecimals)/2 &&
@@ -208,13 +215,23 @@ func (a *PairActor) resolvePending(ctx context.Context) {
 			// ledger stays intact and trading stays paused. Openings first try
 			// a forward completion inside the executor; what remains here is
 			// retried at subMinRetryInterval. Warn once so the pair does not
-			// loop silently.
+			// loop silently. If the residual still cannot self-heal after the
+			// escalation window, fall back to the intervention path instead of
+			// pausing forever.
 			if !p.dustWarned {
 				p.dustWarned = true
 				a.record(monitor.KindError, func(e *monitor.Event) {
-					e.Msg = fmt.Sprintf("sub-minimum residual %.8f/%.8f cannot be traded; pair stays paused until it clears", res.PosL, res.PosR)
+					e.Msg = fmt.Sprintf("sub-minimum residual %.8f/%.8f cannot be traded; pair stays paused while retrying", res.PosL, res.PosR)
 				})
 				a.log.Warn("sub-minimum residual keeps pair paused", "posL", res.PosL, "posR", res.PosR, "err", res.Err)
+			}
+			p.dustTries++
+			if p.dustTries >= subMinEscalateTries {
+				a.record(monitor.KindError, func(e *monitor.Event) {
+					e.Msg = fmt.Sprintf("sub-minimum residual persisted across %d retries; escalating to intervention flatten", p.dustTries)
+				})
+				a.log.Warn("sub-minimum residual escalation", "tries", p.dustTries)
+				a.recoverExternalIntervention(ctx, p, res)
 			}
 		} else {
 			p.stalls = 0
