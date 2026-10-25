@@ -72,16 +72,22 @@ pkill -f "$BASE/bin/scanboard" 2>/dev/null || true
 sleep 2
 rm -f "$BASE/state"/.agent-*.lock
 
-# ---------- 6. 启动 ----------
-log "start arbd"
-nohup "$BASE/bin/arbd" -config "$BASE/config.yaml" >> "$BASE/arbd.log" 2>&1 &
-echo $! > "$BASE/arbd.pid"
+# ---------- 6. 启动（可用 START_ARBD=0 / START_SCANBOARD=0 单独关掉其一） ----------
+if [ "${START_ARBD:-1}" = "1" ]; then
+    log "start arbd"
+    nohup "$BASE/bin/arbd" -config "$BASE/config.yaml" >> "$BASE/arbd.log" 2>&1 &
+    echo $! > "$BASE/arbd.pid"
+    sleep 3
+    log "arbd pid=$(cat "$BASE/arbd.pid"), 日志: $BASE/arbd.log"
+    tail -n 20 "$BASE/arbd.log"
+fi
 
-log "start scanboard"
-nohup "$BASE/bin/scanboard" -config "$BASE/config.yaml" -lenses "$BASE/lenses.json" \
-    -out "$BASE/scanboard-$(date +%Y%m%d).jsonl" >> "$BASE/scanboard.log" 2>&1 &
+if [ "${START_SCANBOARD:-1}" = "1" ]; then
+    log "start scanboard"
+    nohup "$BASE/bin/scanboard" -config "$BASE/config.yaml" -lenses "$BASE/lenses.json" \
+        -out "$BASE/scanboard-$(date +%Y%m%d).jsonl" >> "$BASE/scanboard.log" 2>&1 &
+    sleep 2
+    log "scanboard 日志: $BASE/scanboard.log"
+fi
 
-sleep 3
-log "arbd pid=$(cat "$BASE/arbd.pid"), 日志: $BASE/arbd.log"
-log "scanboard 日志: $BASE/scanboard.log"
-tail -n 20 "$BASE/arbd.log"
+log "启动完成。日常更新请分别使用 up-arbd.sh / up-scanboard.sh"
