@@ -13,6 +13,8 @@ GOROOT_BIN="${GOROOT_BIN:-/usr/local/go/bin}"
 # SCAN_CONFIG 指定扫描专用配置（可只含 rhlighter+entropy 两个 dex）；
 # 缺省用交易配置。
 SCAN_CONFIG="${SCAN_CONFIG:-$BASE/config.yaml}"
+# SCAN_ARGS 透传给 scanboard 的额外参数，例如 "-spread-every 30s" 或 "-spread-every 0"
+SCAN_ARGS="${SCAN_ARGS:-}"
 
 log() { echo "[scan] $(date '+%F %T') $*"; }
 export PATH="$GOROOT_BIN:$PATH"
@@ -46,8 +48,9 @@ cd "$BASE"
 log "restart scanboard (config=$SCAN_CONFIG)"
 pkill -f "$BASE/bin/scanboard" 2>/dev/null || true
 sleep 2
+# shellcheck disable=SC2086  # SCAN_ARGS 有意按空格拆分透传
 nohup "$BASE/bin/scanboard" -config "$SCAN_CONFIG" -lenses "$BASE/lenses.json" \
-    -out "$BASE/scanboard-$(date +%Y%m%d).jsonl" >> "$BASE/scanboard.log" 2>&1 &
+    -out "$BASE/scanboard-$(date +%Y%m%d).jsonl" $SCAN_ARGS >> "$BASE/scanboard.log" 2>&1 &
 
 sleep 3
 log "scanboard started, 日志: $BASE/scanboard.log"
