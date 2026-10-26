@@ -41,8 +41,10 @@ import (
 func main() {
 	path := flag.String("config", "configs/config.yaml", "base config (venues, matching)")
 	lenses := flag.String("lenses", "", "lens definitions JSON file (required)")
-	out := flag.String("out", "scanboard.jsonl", "JSONL output path (append)")
+	out := flag.String("out", "scanboard.jsonl", "JSONL output path for signal lines (append)")
 	interval := flag.Duration("interval", time.Second, "mean sampling / evaluation interval")
+	spreadEvery := flag.Duration("spread-every", 10*time.Second, "spread snapshot cadence for time-series statistics (0 = off)")
+	spreadOut := flag.String("spread-out", "", "spread snapshot JSONL path (default: <out>.spread)")
 	flag.Parse()
 	if err := validateFlags(*path, *lenses, *out, *interval); err != nil {
 		slog.Error("flags", "err", err)
@@ -51,7 +53,7 @@ func main() {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, nil)))
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	if err := run(ctx, *path, *lenses, *out, *interval); err != nil {
+	if err := run(ctx, *path, *lenses, *out, *interval, *spreadEvery, *spreadOut); err != nil {
 		slog.Error("scanboard", "err", err)
 		os.Exit(1)
 	}
@@ -213,7 +215,7 @@ func readOnlyOptions(opts map[string]string) map[string]string {
 	return copy
 }
 
-func run(ctx context.Context, configPath, lensesPath, outPath string, interval time.Duration) (err error) {
+func run(ctx context.Context, configPath, lensesPath, outPath string, interval, spreadEvery time.Duration, spreadOutPath string) (err error) {
 	c, err := config.Load(configPath)
 	if err != nil {
 		return err
@@ -239,6 +241,23 @@ func run(ctx context.Context, configPath, lensesPath, outPath string, interval t
 			err = errors.Join(err, closeSinkErr)
 		}
 	}()
+	var spreadSink *jsonlSink
+	if spreadEvery > 0 {
+		spreadPath := spreadOutPath
+		if spreadPath == "" {
+			spreadPath = outPath + ".spread"
+		}
+		spreadSink, err = newJSONLSink(spreadPath)
+		if err != nil {
+			return fmt.Errorf("open %s: %w", spreadPath, err)
+		}
+		defer func() {
+			if closeSinkErr := spreadSink.Close(); closeSinkErr != nil {
+				err = errors.Join(err, closeSinkErr)
+			}
+		}()
+		slog.Info("spread snapshots enabled", "every", spreadEvery, "out", spreadPath)
+	}
 	venues := map[string]exchange.Venue{}
 	defer func() {
 		for name, v := range venues {
@@ -270,8 +289,19 @@ func run(ctx context.Context, configPath, lensesPath, outPath string, interval t
 		go func() {
 			defer wg.Done()
 			feeBps := 2 * (m.Pair.Left.TakerFee + m.Pair.Right.TakerFee) * 1e4
+			onSpread := func(r scan.LensResult) {
+				if spreadSink == nil {
+					return
+				}
+				if werr := spreadSink.Write(r); werr != nil {
+					select {
+					case errs <- fmt.Errorf("write spread %s: %w", m.Pair.Base, werr):
+					default:
+					}
+				}
+			}
 			if werr := scan.WatchLenses(ctx, m.Pair.Base, m.L, m.R, m.Pair.Left, m.Pair.Right, lenses, feeBps,
-				interval, c.Volatility.Interval, c.Strategy.MaxBookAge, c.Volatility.MaxAge,
+				interval, c.Volatility.Interval, spreadEvery, c.Strategy.MaxBookAge, c.Volatility.MaxAge,
 				func(r scan.LensResult) {
 					if r.Reason != "" {
 						return // 只记"有信号"的结果行（steps>0 或 net_bps>0），心跳/未就绪不入库
@@ -282,7 +312,7 @@ func run(ctx context.Context, configPath, lensesPath, outPath string, interval t
 						default:
 						}
 					}
-				}); werr != nil {
+				}, onSpread); werr != nil {
 				select {
 				case errs <- fmt.Errorf("scan %s: %w", m.Pair.Base, werr):
 				default:

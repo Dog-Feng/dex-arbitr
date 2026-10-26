@@ -194,8 +194,8 @@ func TestWatchLensesEmitsLines(t *testing.T) {
 	go func() {
 		done <- WatchLenses(ctx, "TEST", watchVenue{name: "left", books: left}, watchVenue{name: "right", books: right},
 			domain.Instrument{MarketID: 1}, domain.Instrument{MarketID: 1}, []Lens{lens}, 12,
-			100*time.Millisecond, 100*time.Millisecond, time.Second, 300*time.Millisecond,
-			func(r LensResult) { lines = append(lines, r) })
+			100*time.Millisecond, 100*time.Millisecond, 0, time.Second, 300*time.Millisecond,
+			func(r LensResult) { lines = append(lines, r) }, nil)
 	}()
 	if err := <-done; err != nil {
 		t.Fatalf("WatchLenses: %v", err)
@@ -208,5 +208,61 @@ func TestWatchLensesEmitsLines(t *testing.T) {
 	}
 	if lines[0].Ts.IsZero() {
 		t.Fatalf("result timestamp missing: %+v", lines[0])
+	}
+}
+
+// TestWatchLensesSpreadSnapshots locks the spread time-series stream: at the
+// spread cadence, every lens snapshot (readiness and reason included) is
+// delivered to onSpread for pair-level spread statistics.
+func TestWatchLensesSpreadSnapshots(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	left, right := make(chan domain.Book, 10), make(chan domain.Book, 10)
+	go func() {
+		tick := time.NewTicker(10 * time.Millisecond)
+		defer tick.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case now := <-tick.C:
+				l, r := book(100, 100.02, 1, 1), book(100, 100.02, 1, 1)
+				l.Ts, r.Ts = now, now
+				l.Venue, r.Venue = "left", "right"
+				l.MarketID, r.MarketID = 1, 1
+				select {
+				case left <- l:
+				case <-ctx.Done():
+					return
+				}
+				select {
+				case right <- r:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}
+	}()
+	lens := Lens{Name: "sma_fast", Strategy: "arbitrage", EstimatorKind: "sma",
+		Estimator: estimator.Params{Interval: 100 * time.Millisecond, Window: time.Second, MinWarmup: 200 * time.Millisecond, MinCoverage: 0.8},
+		OpenBps:   0, VolK: 1, DepthMult: 3, StepQty: 0.01, MaxSteps: 50}
+	var spreadLines []LensResult
+	done := make(chan error, 1)
+	go func() {
+		done <- WatchLenses(ctx, "TEST", watchVenue{name: "left", books: left}, watchVenue{name: "right", books: right},
+			domain.Instrument{MarketID: 1}, domain.Instrument{MarketID: 1}, []Lens{lens}, 12,
+			100*time.Millisecond, 100*time.Millisecond, 150*time.Millisecond, time.Second, 300*time.Millisecond,
+			func(LensResult) {}, func(r LensResult) { spreadLines = append(spreadLines, r) })
+	}()
+	if err := <-done; err != nil {
+		t.Fatalf("WatchLenses: %v", err)
+	}
+	if len(spreadLines) == 0 {
+		t.Fatal("no spread snapshots emitted")
+	}
+	for _, r := range spreadLines {
+		if r.Ts.IsZero() || r.Pair != "TEST" || r.Lens != "sma_fast" {
+			t.Fatalf("spread snapshot malformed: %+v", r)
+		}
 	}
 }

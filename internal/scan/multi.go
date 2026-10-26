@@ -173,9 +173,11 @@ func lensDepthOK(q spread.Quote, need float64) bool {
 // volatility chain samples at volEvery, and evaluation runs once per
 // sampleEvery interval. Book freshness and the two-leg time-skew gate follow
 // the same rules as Watch, so the statistics a lens sees match the engine's
-// sampling semantics. Results are emitted for every lens at every evaluation,
-// ready or not.
-func WatchLenses(ctx context.Context, base string, l, r exchange.Venue, li, ri domain.Instrument, lenses []Lens, feeBps float64, sampleEvery, volEvery, maxBookAge, maxVolBookAge time.Duration, on func(LensResult)) error {
+// sampling semantics. Every evaluation is delivered to on; additionally, when
+// spreadEvery > 0, a full snapshot of every lens (readiness and reason
+// included) is delivered to onSpread at that cadence, for spread time-series
+// statistics.
+func WatchLenses(ctx context.Context, base string, l, r exchange.Venue, li, ri domain.Instrument, lenses []Lens, feeBps float64, sampleEvery, volEvery, spreadEvery, maxBookAge, maxVolBookAge time.Duration, on func(LensResult), onSpread func(LensResult)) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	if sampleEvery <= 0 {
@@ -228,6 +230,28 @@ func WatchLenses(ctx context.Context, base string, l, r exchange.Venue, li, ri d
 	defer sample.Stop()
 	fast := time.NewTicker(volEvery)
 	defer fast.Stop()
+	var spreadTicker *time.Ticker
+	if spreadEvery > 0 {
+		spreadTicker = time.NewTicker(spreadEvery)
+		defer spreadTicker.Stop()
+	}
+	render := func(now time.Time, emit func(LensResult)) {
+		q, ok := quote(now, maxBookAge)
+		if !ok {
+			return // no snapshot without fresh books
+		}
+		for _, st := range states {
+			mu := estimator.MeanAt(st.est, now)
+			muReady := estimator.ReadyAt(st.est, now)
+			sigmaReady := vol.ReadyAt(now)
+			sigmaShort := vol.VolAt(now)
+			longVol := 0.0
+			if lv, isLV := st.est.(estimator.LongVol); isLV {
+				longVol = lv.LongVol()
+			}
+			emit(evaluateLens(st.lens, q, mu, muReady, sigmaShort, sigmaReady, longVol, feeBps, base, l.Name(), r.Name(), now))
+		}
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -255,22 +279,24 @@ func WatchLenses(ctx context.Context, base string, l, r exchange.Venue, li, ri d
 			}
 		case <-sample.C:
 			now := time.Now()
-			q, ok := quote(now, maxBookAge)
-			if !ok {
-				continue // no evaluation without fresh books
-			}
-			for _, st := range states {
-				st.est.Update(now, q.Mid)
-				mu := estimator.MeanAt(st.est, now)
-				muReady := estimator.ReadyAt(st.est, now)
-				sigmaReady := vol.ReadyAt(now)
-				sigmaShort := vol.VolAt(now)
-				longVol := 0.0
-				if lv, isLV := st.est.(estimator.LongVol); isLV {
-					longVol = lv.LongVol()
+			if q, ok := quote(now, maxBookAge); ok {
+				for _, st := range states {
+					st.est.Update(now, q.Mid)
 				}
-				on(evaluateLens(st.lens, q, mu, muReady, sigmaShort, sigmaReady, longVol, feeBps, base, l.Name(), r.Name(), now))
+			}
+			render(now, on)
+		case <-spreadCh(spreadTicker):
+			if onSpread != nil {
+				render(time.Now(), onSpread)
 			}
 		}
 	}
+}
+
+// spreadCh adapts a nil ticker (disabled) into a never-firing channel.
+func spreadCh(t *time.Ticker) <-chan time.Time {
+	if t == nil {
+		return nil
+	}
+	return t.C
 }
