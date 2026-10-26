@@ -43,6 +43,8 @@ cd "$BASE"
 # ---------- 3. 配置检查 ----------
 [ -f "$SCAN_CONFIG" ] || { log "缺少 $SCAN_CONFIG"; exit 1; }
 [ -f "$BASE/lenses.json" ] || cp "$BASE/app/configs/lenses.example.json" "$BASE/lenses.json"
+DATA_DIR="${DATA_DIR:-$BASE/data}"
+mkdir -p "$DATA_DIR"
 
 # ---------- 4. 重启 scanboard（只动 scanboard） ----------
 log "restart scanboard (config=$SCAN_CONFIG)"
@@ -50,8 +52,8 @@ pkill -f "$BASE/bin/scanboard" 2>/dev/null || true
 sleep 2
 # shellcheck disable=SC2086  # SCAN_ARGS 有意按空格拆分透传
 nohup "$BASE/bin/scanboard" -config "$SCAN_CONFIG" -lenses "$BASE/lenses.json" \
-    -out "$BASE/scanboard-$(date +%Y%m%d).jsonl" $SCAN_ARGS >> "$BASE/scanboard.log" 2>&1 &
+    -out "$DATA_DIR/scanboard-$(date +%Y%m%d).jsonl" $SCAN_ARGS >> "$DATA_DIR/scanboard.log" 2>&1 &
 
 sleep 3
-log "scanboard started, 日志: $BASE/scanboard.log"
-tail -n 10 "$BASE/scanboard.log"
+log "scanboard started, 日志: $DATA_DIR/scanboard.log"
+tail -n 10 "$DATA_DIR/scanboard.log"

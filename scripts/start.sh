@@ -85,11 +85,13 @@ fi
 if [ "${START_SCANBOARD:-1}" = "1" ]; then
     SCAN_CONFIG="${SCAN_CONFIG:-$BASE/config.yaml}"
     [ -f "$SCAN_CONFIG" ] || { log "缺少 $SCAN_CONFIG（扫描配置）"; exit 1; }
+    DATA_DIR="${DATA_DIR:-$BASE/data}"
+    mkdir -p "$DATA_DIR"
     log "start scanboard (config=$SCAN_CONFIG)"
     nohup "$BASE/bin/scanboard" -config "$SCAN_CONFIG" -lenses "$BASE/lenses.json" \
-        -out "$BASE/scanboard-$(date +%Y%m%d).jsonl" >> "$BASE/scanboard.log" 2>&1 &
+        -out "$DATA_DIR/scanboard-$(date +%Y%m%d).jsonl" >> "$DATA_DIR/scanboard.log" 2>&1 &
     sleep 2
-    log "scanboard 日志: $BASE/scanboard.log"
+    log "scanboard 数据目录: $DATA_DIR"
 fi
 
 log "启动完成。日常更新请分别使用 up-arbd.sh / up-scanboard.sh"

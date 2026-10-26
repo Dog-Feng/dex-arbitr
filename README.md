@@ -78,8 +78,8 @@ execution:
 | `/home/ubuntu/dex-arbitr/arb.env` | 密钥（600，SFTP 上传） |
 | `/home/ubuntu/dex-arbitr/lenses.json` | 扫描镜头定义（缺省用仓库示例） |
 | `/home/ubuntu/dex-arbitr/state` | 步数状态（自动创建） |
-| `/home/ubuntu/dex-arbitr/arbd.log` / `scanboard.log` | 运行日志 |
-| `/home/ubuntu/dex-arbitr/scanboard-YYYYMMDD.jsonl` | 扫描数据（按天） |
+| `/home/ubuntu/dex-arbitr/data/` | 扫描输出目录：`scanboard.log`、`scanboard-YYYYMMDD.jsonl`（信号）、`scanboard-YYYYMMDD.jsonl.spread`（价差快照） |
+| `/home/ubuntu/dex-arbitr/arbd.log` | arbd 运行日志 |
 
 ### 首次部署
 
