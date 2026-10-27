@@ -232,6 +232,41 @@ func TestSettlementUnknownOrCanceledCannotMutateLedger(t *testing.T) {
 	}
 }
 
+func TestInterventionBooksFlattenedGross(t *testing.T) {
+	a := settlementActor(t)
+	openAccounting(t, a, strategy.DirLS, 100, 110) // entry fees -0.21
+	// Flatten closes both legs at adverse prices: long L 100->90, short R 110->120.
+	res := fillResult(1, 90, 1, 120, 0, 0)
+	if err := a.finishIntervention(res); err != nil {
+		t.Fatal(err)
+	}
+	if len(a.state.Steps) != 0 {
+		t.Fatalf("ledger not cleared: %+v", a.state.Steps)
+	}
+	// gross = -20 (DirLS: long L -10, short R -10), flatten fees -0.21,
+	// entry fees already -0.21 -> total -20.42.
+	nearSettlement(t, "intervention books gross", a.procPnlUSD, -20.42)
+	if a.volAcc.pnlUncertain {
+		t.Fatal("clean-priced matching flatten marked uncertain")
+	}
+}
+
+func TestInterventionSkipsGrossWhenLedgerMismatches(t *testing.T) {
+	a := settlementActor(t)
+	openAccounting(t, a, strategy.DirLS, 100, 110) // entry fees -0.21
+	// Flatten closes only half of each leg yet reports flat: the account was
+	// modified externally, so the ledger quantity cannot price a gross.
+	res := fillResult(0.5, 90, 0.5, 120, 0, 0)
+	if err := a.finishIntervention(res); err != nil {
+		t.Fatal(err)
+	}
+	// Only the flatten fees are booked: (0.5*90 + 0.5*120)*0.001 = 0.105.
+	nearSettlement(t, "mismatched intervention books fees only", a.procPnlUSD, -0.21-0.105)
+	if !a.volAcc.pnlUncertain {
+		t.Fatal("mismatched flatten did not mark uncertainty")
+	}
+}
+
 func TestSettlementDrainRequiresEachLegFlat(t *testing.T) {
 	a := settlementActor(t)
 	openAccounting(t, a, strategy.DirLS, 100, 110)

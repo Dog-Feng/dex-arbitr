@@ -395,7 +395,48 @@ func (a *PairActor) finishIntervention(res execution.Result, interrupted ...exec
 		nl += left
 		nr += right
 	}
-	fees := nl*a.cfg.Pair.Left.TakerFee + nr*a.cfg.Pair.Right.TakerFee
+	fees := a.executionFees(res, nl, nr)
+	delta := -fees
+	// Book the real PnL of the flattened ledger against the confirmed close
+	// prices when the flatten closed exactly the ledger quantity. This covers
+	// the sub-minimum-residual escalation where the ledger is consistent; an
+	// externally modified account (quantities disagree) keeps the conservative
+	// no-profit claim and the uncertainty marker. Estimated prices still book
+	// a best-effort PnL but stay flagged, matching finishUnwind.
+	qtyL := math.Abs(a.expectedL())
+	qtyR := qtyL // hedged pair: both legs carry equal magnitude
+	ql := res.L.Filled + res.L.RescueFilled
+	qr := res.R.Filled + res.R.RescueFilled
+	epsL := math.Pow10(-a.cfg.Pair.Left.SizeDecimals) / 2
+	epsR := math.Pow10(-a.cfg.Pair.Right.SizeDecimals) / 2
+	uncertain := res.L.PriceEstimated || res.R.PriceEstimated || res.L.RescuePriceEstimated || res.R.RescuePriceEstimated
+	if len(a.state.Steps) > 0 && qtyL > 0 && qtyR > 0 &&
+		math.Abs(ql-qtyL) < epsL && math.Abs(qr-qtyR) < epsR {
+		lp, err := closePrice(res.L, ql)
+		if err != nil {
+			return err
+		}
+		rp, err := closePrice(res.R, qr)
+		if err != nil {
+			return err
+		}
+		for _, st := range a.state.Steps {
+			uncertain = uncertain || st.PriceEstimated
+			gross := strategy.GrossProfitUSD(st, lp, rp, st.Qty)
+			if math.IsNaN(gross) || math.IsInf(gross, 0) {
+				uncertain = true
+				a.record(monitor.KindError, func(e *monitor.Event) {
+					e.Msg = fmt.Sprintf("step %d flattened without a known PnL basis; no profit claimed", st.ID)
+				})
+				continue
+			}
+			delta += gross
+		}
+	} else {
+		// Quantities disagree with the ledger: an externally modified account.
+		// No profit is claimed and the day PnL stays flagged uncertain.
+		uncertain = true
+	}
 	closed := len(a.state.Steps)
 	if closed > 0 {
 		a.lastDir = a.state.Steps[0].Dir
@@ -406,13 +447,15 @@ func (a *PairActor) finishIntervention(res execution.Result, interrupted ...exec
 	a.syncCounter()
 	a.syncPositionState()
 	a.state.Mode = strategy.ModePaused
-	a.addSettled(nl+nr, -fees)
-	a.volAcc.pnlUncertain = true
+	a.addSettled(nl+nr, delta)
+	if uncertain {
+		a.volAcc.pnlUncertain = true
+	}
 	for i := 0; i < closed; i++ {
 		a.record(monitor.KindStepClosed, nil)
 	}
 	a.record(monitor.KindExecuted, func(e *monitor.Event) { e.USD = nl + nr })
-	a.record(monitor.KindPnL, func(e *monitor.Event) { e.USD = -fees })
+	a.record(monitor.KindPnL, func(e *monitor.Event) { e.USD = delta })
 	return nil
 }
 
