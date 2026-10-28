@@ -809,6 +809,17 @@ func (a *PairActor) accountExecution(act strategy.Action, q spread.Quote, before
 	// executions recovered after midnight.
 	a.addSettled(nl+nr, deltaPnL)
 	oneLeg := math.Abs(res.L.Filled-res.R.Filled) >= eps || res.RescueOrders > 0
+	if oneLeg {
+		// Surface which leg came up short and by how much, so one-leg
+		// failures can be attributed to a venue without replaying fills.
+		shortLeg, shortQty := a.cfg.R.Name(), res.R.Filled
+		if res.L.Filled < res.R.Filled {
+			shortLeg, shortQty = a.cfg.L.Name(), res.L.Filled
+		}
+		a.log.Warn("one-leg fill short",
+			"short_leg", shortLeg, "l_filled", res.L.Filled, "r_filled", res.R.Filled,
+			"short_qty", shortQty, "rescue_qty", res.RescueQty)
+	}
 	a.observeFailure(oneLeg)
 	a.lat.add(res.L.Latency)
 	a.lat.add(res.R.Latency)
